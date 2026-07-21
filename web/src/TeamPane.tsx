@@ -1,11 +1,16 @@
 import {
+  BaseEdge,
   Background,
   Controls,
+  EdgeLabelRenderer,
   Handle,
   MarkerType,
   Position,
   ReactFlow,
+  getBezierPath,
+  useViewport,
   type Edge,
+  type EdgeProps,
   type Node,
   type NodeChange,
   type NodeProps,
@@ -28,10 +33,19 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  layoutTeamGraph,
+  type TeamGraphLayout,
+  type TeamGraphLayoutMode,
+} from "./team-graph-layout";
+import { stableTeamGraphNodeGeometry } from "./team-graph-node";
+import { EDGE_CONTROL_SIZE_TOLERANCE, edgeControlMeetsMinimum } from "./team-graph-controls";
+import { projectCollaborationGroup, relationshipContractAriaLabel } from "./collaboration-groups";
 import {
   api,
   type AgentProfile,
+  type CollaborationGroup,
   type OrganizationRelationship,
   type TeamAgent,
   type TeamObservedLink,
@@ -56,7 +70,7 @@ interface Props {
 type TeamViewMode = "organization" | "collaboration" | "activity" | "directory";
 type GraphViewMode = Exclude<TeamViewMode, "directory">;
 type NodePositions = Record<string, { x: number; y: number }>;
-const TEAM_POSITIONS_KEY = "codex-loom.team.positions.v3";
+const TEAM_POSITIONS_KEY = "codex-loom.team.positions.v4";
 const DEFAULT_ACTIVITY_EDGE_LIMIT = 12;
 
 type AgentNodeData = {
@@ -65,6 +79,14 @@ type AgentNodeData = {
   perspective: GraphViewMode;
   organizationRole?: "root" | "member";
   onMessage: (name: string) => void;
+};
+
+type RelationshipContractEdgeData = {
+  kind: "organization" | "collaboration";
+  from: string;
+  to: string;
+  description: string;
+  onSelect: (id: string) => void;
 };
 
 type ActivityPair = {
@@ -88,23 +110,37 @@ type TeamGraph = {
   edges: Edge[];
   visibleAgentIds: string[];
   visibleEdgeIds: string[];
+  layout?: {
+    ready: boolean;
+    componentCount: number;
+    width: number;
+    height: number;
+  };
 };
 
-const EMPTY_TEAM: TeamView = { agents: [], organizationLinks: [], collaborationLinks: [], observedLinks: [], explicitLinks: [] };
+type ResolvedGraphLayout = TeamGraphLayout & { key: string };
+
+const EMPTY_TEAM: TeamView = { agents: [], organizationLinks: [], collaborationLinks: [], collaborationGroups: [], observedLinks: [], explicitLinks: [] };
 const nodeTypes = { agentCard: AgentGraphNode };
+const edgeTypes = { relationshipContract: RelationshipContractEdge };
 
 export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessages }: Props) {
   const route = readTeamRouteState();
   const [team, setTeam] = useState<TeamView>(EMPTY_TEAM);
+  const [teamLoaded, setTeamLoaded] = useState(false);
   const [activityLinks, setActivityLinks] = useState<TeamObservedLink[]>([]);
   const [activityDays, setActivityDays] = useState(route.days);
   const [query, setQuery] = useState(route.query);
   const [selectedAgentId, setSelectedAgentId] = useState(route.agent);
   const [selectedLinkId, setSelectedLinkId] = useState(route.link);
+  const [selectedGroupId, setSelectedGroupId] = useState(route.group);
+  const [groupEditor, setGroupEditor] = useState<CollaborationGroup | "new" | null>(null);
   const [viewMode, setViewMode] = useState<TeamViewMode>(route.view);
   const [loading, setLoading] = useState(false);
   const [flowInstance, setFlowInstance] = useState<any>(null);
   const [nodePositions, setNodePositions] = useState<NodePositions>(loadNodePositions);
+  const [layoutRevision, setLayoutRevision] = useState(0);
+  const [resolvedGraphLayout, setResolvedGraphLayout] = useState<ResolvedGraphLayout | null>(null);
 
   useEffect(() => {
     window.localStorage.setItem(TEAM_POSITIONS_KEY, JSON.stringify(nodePositions));
@@ -123,10 +159,12 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
         ...next,
         organizationLinks: next.organizationLinks || [],
         collaborationLinks: next.collaborationLinks || next.explicitLinks || [],
+        collaborationGroups: next.collaborationGroups || [],
         observedLinks: next.observedLinks || [],
         explicitLinks: next.explicitLinks || next.collaborationLinks || [],
       });
       setActivityLinks(activityData.observedLinks || []);
+      setTeamLoaded(true);
     } finally {
       setLoading(false);
     }
@@ -147,7 +185,9 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
           value.type === "loom/team-link-updated" ||
           value.type === "loom/team-link-deleted" ||
           value.type === "loom/organization-link-updated" ||
-          value.type === "loom/organization-link-deleted"
+          value.type === "loom/organization-link-deleted" ||
+          value.type === "loom/collaboration-group-updated" ||
+          value.type === "loom/collaboration-group-deleted"
         ) {
           refresh(activityDays).catch(() => {});
         }
@@ -164,6 +204,8 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
   const selectedOrganization = team.organizationLinks.find((link) => organizationLinkId(link) === selectedLinkId) || null;
   const selectedCollaboration = team.collaborationLinks.find((link) => collaborationLinkId(link) === selectedLinkId) || null;
   const selectedActivity = activityPairs.find((link) => link.id === selectedLinkId) || null;
+  const selectedGroup = team.collaborationGroups.find((group) => group.id === selectedGroupId) || null;
+  const graphGroupId = selectedGroup?.id || "";
   const adjacentOrganization = selectedAgent
     ? team.organizationLinks.filter((link) => link.parentAgentId === selectedAgent.id || link.childAgentId === selectedAgent.id)
     : [];
@@ -180,6 +222,13 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
     if (byName) setSelectedAgentId(byName.id);
   }, [selectedAgentId, team.agents]);
 
+  useEffect(() => {
+    if (teamLoaded && selectedGroupId && !team.collaborationGroups.some((group) => group.id === selectedGroupId)) {
+      setSelectedGroupId("");
+      setGroupEditor(null);
+    }
+  }, [selectedGroupId, team.collaborationGroups, teamLoaded]);
+
   const filteredAgents = useMemo(() => {
     const q = query.trim().toLowerCase();
     const visible = q ? team.agents.filter((agent) => agentSearchText(agent).includes(q)) : team.agents;
@@ -187,25 +236,54 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
   }, [team.agents, query]);
 
   const graphMode: GraphViewMode = viewMode === "directory" ? "organization" : viewMode;
-  const graph = useMemo(
-    () => buildTeamGraph(team, activityPairs, graphMode, query, selectedAgentId, selectedLinkId, nodePositions, onMessageAgent),
-    [team, activityPairs, graphMode, query, selectedAgentId, selectedLinkId, nodePositions, onMessageAgent],
+  const baseGraph = useMemo(
+    () => buildTeamGraph(team, activityPairs, graphMode, query, selectedAgentId, selectedLinkId, selectedGroup, nodePositions, onMessageAgent, (id) => {
+      setSelectedAgentId("");
+      setSelectedLinkId(id);
+    }),
+    [team, activityPairs, graphMode, query, selectedAgentId, selectedLinkId, selectedGroup, nodePositions, onMessageAgent],
   );
-  const graphFitKey = graph.visibleAgentIds.join("\u0000");
+  const graphLayoutKey = useMemo(
+    () => teamGraphTopologyKey(baseGraph, graphMode, graphGroupId, layoutRevision),
+    [baseGraph.edges, baseGraph.visibleAgentIds, graphMode, graphGroupId, layoutRevision],
+  );
+
+  useEffect(() => {
+    if (viewMode === "directory" || graphMode === "activity" || baseGraph.nodes.length === 0) return;
+    let cancelled = false;
+    const edges = baseGraph.edges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target }));
+    layoutTeamGraph(baseGraph.visibleAgentIds, edges, graphMode as TeamGraphLayoutMode)
+      .then((layout) => {
+        if (!cancelled) setResolvedGraphLayout({ ...layout, key: graphLayoutKey });
+      })
+      .catch((error) => {
+        if (!cancelled) console.error("Team graph layout failed", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [graphLayoutKey, graphMode, viewMode]);
+
+  const graph = useMemo(
+    () => applyTeamGraphLayout(baseGraph, resolvedGraphLayout?.key === graphLayoutKey ? resolvedGraphLayout : null, nodePositions, graphMode, graphGroupId),
+    [baseGraph, graphLayoutKey, graphMode, nodePositions, resolvedGraphLayout, graphGroupId],
+  );
+  const graphFitKey = `${graphLayoutKey}:${graph.layout?.ready ? "ready" : "fallback"}`;
 
   useEffect(() => {
     if (viewMode === "directory" || !flowInstance || graph.nodes.length === 0) return;
-    const timer = window.setTimeout(() => flowInstance.fitView({ padding: 0.16, duration: 220 }), 120);
+    if ((graphMode === "organization" || graphMode === "collaboration") && !graph.layout?.ready) return;
+    const timer = window.setTimeout(() => flowInstance.fitView({ padding: 0.14, duration: 240 }), 80);
     return () => window.clearTimeout(timer);
-  }, [flowInstance, graphFitKey, viewMode]);
+  }, [flowInstance, graphFitKey, graphMode, viewMode]);
 
   const activeAgents = team.agents.filter(teamAgentWorking).length;
   const profiledAgents = team.agents.filter((agent) => agent.profile.version > 0).length;
   const openRequests = team.agents.reduce((sum, agent) => sum + agent.openIn, 0);
 
   useEffect(() => {
-    writeTeamRouteState({ agent: selectedAgentId, link: selectedLinkId, query, view: viewMode, days: activityDays });
-  }, [activityDays, query, selectedAgentId, selectedLinkId, viewMode]);
+    writeTeamRouteState({ agent: selectedAgentId, link: selectedLinkId, group: selectedGroupId, query, view: viewMode, days: activityDays });
+  }, [activityDays, query, selectedAgentId, selectedGroupId, selectedLinkId, viewMode]);
 
   const selectAgent = (key: string) => {
     const id = resolveAgentId(key);
@@ -239,6 +317,29 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
     await refresh();
   };
 
+  const saveCollaborationGroup = async (payload: Pick<CollaborationGroup, "name" | "description" | "status" | "memberAgentIds" | "relationshipIds">, current?: CollaborationGroup) => {
+    const result = current
+      ? await api("PATCH", `/api/team/collaboration-groups/${encodeURIComponent(current.id)}`, { ...payload, expectedVersion: current.version })
+      : await api("POST", "/api/team/collaboration-groups", payload);
+    setSelectedGroupId(result.group.id);
+    setGroupEditor(null);
+    setViewMode("collaboration");
+    await refresh();
+  };
+
+  const archiveCollaborationGroup = async (group: CollaborationGroup) => {
+    await api("PATCH", `/api/team/collaboration-groups/${encodeURIComponent(group.id)}`, {
+      name: group.name,
+      description: group.description,
+      status: "archived",
+      memberAgentIds: group.memberAgentIds,
+      relationshipIds: group.relationshipIds,
+      expectedVersion: group.version,
+    });
+    setGroupEditor(null);
+    await refresh();
+  };
+
   const createOrganizationRelationship = async (parent: string, child: string, description: string) => {
     const result = await api("POST", "/api/team/organization", { parent, child, description });
     await refresh();
@@ -266,11 +367,14 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
       selectedAgentId,
       selectedAgent: selectedAgent?.name || "",
       selectedLinkId,
+      selectedGroupId,
+      selectedGroup: selectedGroup?.name || "",
       loading,
       agentsCount: team.agents.length,
       profiledAgentsCount: profiledAgents,
       organizationLinksCount: team.organizationLinks.length,
       collaborationLinksCount: team.collaborationLinks.length,
+      collaborationGroupsCount: team.collaborationGroups.length,
       explicitLinksCount: team.collaborationLinks.length,
       observedLinksCount: team.observedLinks.length,
       activityLinksCount: activityPairs.length,
@@ -296,6 +400,13 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
       },
       setFilter: (value: string) => {
         setQuery(value);
+        return waitForAutomationState();
+      },
+      selectCollaborationGroup: (id: string) => {
+        setViewMode("collaboration");
+        setSelectedGroupId(id);
+        setSelectedAgentId("");
+        setSelectedLinkId("");
         return waitForAutomationState();
       },
       saveProfile: async (key: string, profile: Pick<AgentProfile, "identity" | "domain" | "scope">) => {
@@ -355,20 +466,22 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
           return waitForGraphState();
         },
         relayout: () => {
-          setNodePositions((previous) => Object.fromEntries(Object.entries(previous).filter(([key]) => !key.startsWith(`${graphMode}:`))));
-          window.setTimeout(() => flowInstance?.fitView?.({ padding: 0.2, duration: 220 }), 30);
+          const prefix = graphPositionPrefix(graphMode, graphGroupId);
+          setNodePositions((previous) => Object.fromEntries(Object.entries(previous).filter(([key]) => !key.startsWith(prefix))));
+          setLayoutRevision((value) => value + 1);
           return waitForGraphState();
         },
         moveNode: (id: string, x: number, y: number) => {
-          setNodePositions((previous) => ({ ...previous, [`${graphMode}:${id}`]: { x, y } }));
+          setNodePositions((previous) => ({ ...previous, [graphPositionKey(graphMode, graphGroupId, id)]: { x, y } }));
           return waitForGraphState();
         },
+        edgeControls: (minimumSize = 44) => graphEdgeControlState(minimumSize),
     };
     root.team = teamAutomation;
     root.graph = graphAutomation;
     window.codexLoom = root;
     window.codexHub = root;
-  }, [activityDays, activityPairs, filteredAgents.length, flowInstance, graph, graphMode, loading, openRequests, profiledAgents, query, selectedAgent, selectedAgentId, selectedLinkId, team, viewMode]);
+  }, [activityDays, activityPairs, filteredAgents.length, flowInstance, graph, graphGroupId, graphMode, loading, openRequests, profiledAgents, query, selectedAgent, selectedAgentId, selectedGroup, selectedGroupId, selectedLinkId, team, viewMode]);
 
   const handleGraphNodesChange = (changes: NodeChange[]) => {
     setNodePositions((previous) => {
@@ -376,7 +489,7 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
       for (const change of changes) {
         if (change.type === "position" && change.position) {
           if (next === previous) next = { ...previous };
-          next[`${graphMode}:${change.id}`] = change.position;
+          next[graphPositionKey(graphMode, graphGroupId, change.id)] = change.position;
         }
       }
       return next;
@@ -418,10 +531,11 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
   const hasInspectorSelection = Boolean(selectedAgent || selectedOrganization || selectedCollaboration || selectedActivity);
   const organizationAgentIds = new Set(team.organizationLinks.flatMap((relationship) => [relationship.parentAgentId, relationship.childAgentId]));
   const unassignedAgents = filteredAgents.filter((agent) => !organizationAgentIds.has(agent.id) && isActiveAgent(agent));
-  const graphLayoutClass = viewMode === "organization"
+  const activeGroups = team.collaborationGroups.filter((group) => group.status === "active");
+  const graphLayoutClass = viewMode === "organization" || viewMode === "collaboration"
     ? hasInspectorSelection
-      ? "lg:grid-cols-[230px_minmax(0,1fr)_360px]"
-      : "lg:grid-cols-[230px_minmax(0,1fr)]"
+      ? "lg:grid-cols-[260px_minmax(0,1fr)_360px]"
+      : "lg:grid-cols-[260px_minmax(0,1fr)]"
     : hasInspectorSelection
       ? "lg:grid-cols-[minmax(0,1fr)_360px]"
       : "lg:grid-cols-1";
@@ -464,6 +578,23 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
                 <option value={1}>24 hours</option><option value={7}>7 days</option><option value={30}>30 days</option><option value={0}>All time</option>
               </select>
             )}
+            {viewMode === "collaboration" && (
+              <select
+                value={selectedGroupId}
+                onChange={(event) => {
+                  setSelectedGroupId(event.target.value);
+                  setSelectedAgentId("");
+                  setSelectedLinkId("");
+                  setGroupEditor(null);
+                }}
+                aria-label="Collaboration group"
+                className="h-9 min-w-0 rounded-md bg-background px-2 text-[12px] outline-none ring-1 ring-border focus:ring-ring/25 sm:min-w-[180px] sm:max-w-[260px]"
+              >
+                <option value="">All collaboration</option>
+                {activeGroups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+                {selectedGroup?.status === "archived" && <option value={selectedGroup.id}>{selectedGroup.name} (archived)</option>}
+              </select>
+            )}
             <select value={selectedAgentId} onChange={(event) => { setSelectedAgentId(event.target.value); setSelectedLinkId(""); }} aria-label="Focus agent" className={`h-9 min-w-0 rounded-md bg-background px-2 text-[12px] outline-none ring-1 ring-border focus:ring-ring/25 sm:min-w-[145px] sm:max-w-[210px] ${viewMode === "activity" ? "" : "col-span-2"}`}>
               <option value="">all agents</option>
               {team.agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
@@ -485,12 +616,37 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
                 </div>
               </aside>
             )}
+            {viewMode === "collaboration" && (
+              <aside className="min-h-0 border-b border-border bg-card/35 p-3 lg:overflow-y-auto lg:border-b-0 lg:border-r">
+                {groupEditor ? (
+                  <CollaborationGroupEditor
+                    team={team}
+                    group={groupEditor === "new" ? null : groupEditor}
+                    onCancel={() => setGroupEditor(null)}
+                    onSave={saveCollaborationGroup}
+                    onError={onError}
+                  />
+                ) : (
+                  <CollaborationGroupPanel
+                    team={team}
+                    group={selectedGroup}
+                    onCreate={() => setGroupEditor("new")}
+                    onEdit={() => selectedGroup && setGroupEditor(selectedGroup)}
+                    onArchive={(group) => archiveCollaborationGroup(group).catch((error: Error) => onError(error.message))}
+                    onSelectRelationship={(relationship) => {
+                      setSelectedAgentId("");
+                      setSelectedLinkId(collaborationLinkId(relationship));
+                    }}
+                  />
+                )}
+              </aside>
+            )}
             <section className="relative min-h-[460px] border-b border-border bg-background lg:min-h-0 lg:border-b-0 lg:border-r">
-              <ReactFlow nodes={graph.nodes} edges={graph.edges} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.22 }} minZoom={0.35} maxZoom={1.3} nodesDraggable nodesConnectable={false} elementsSelectable onInit={setFlowInstance} onNodesChange={handleGraphNodesChange} onNodeClick={(_, node) => selectAgent(node.id)} onEdgeClick={(_, edge) => { setSelectedAgentId(""); setSelectedLinkId(edge.id); }} proOptions={{ hideAttribution: true }} className="bg-background">
+              <ReactFlow nodes={graph.nodes} edges={graph.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView fitViewOptions={{ padding: 0.14 }} minZoom={0.4} maxZoom={1.2} nodesDraggable nodesConnectable={false} elementsSelectable onInit={setFlowInstance} onNodesChange={handleGraphNodesChange} onNodeClick={(_, node) => selectAgent(node.id)} onEdgeClick={(_, edge) => { setSelectedAgentId(""); setSelectedLinkId(edge.id); }} proOptions={{ hideAttribution: true }} className="bg-background">
                 <Background gap={22} size={1} color="rgba(120, 113, 108, 0.16)" />
                 <Controls showInteractive={false} />
               </ReactFlow>
-              {graph.nodes.length === 0 && <GraphEmptyState mode={viewMode} focused={Boolean(selectedAgentId)} />}
+              {graph.nodes.length === 0 && <GraphEmptyState mode={viewMode} focused={Boolean(selectedAgentId)} group={selectedGroup} />}
             </section>
             {hasInspectorSelection && inspector}
           </div>
@@ -510,6 +666,188 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
         )}
       </div>
     </main>
+  );
+}
+
+function CollaborationGroupPanel({
+  team,
+  group,
+  onCreate,
+  onEdit,
+  onArchive,
+  onSelectRelationship,
+}: {
+  team: TeamView;
+  group: CollaborationGroup | null;
+  onCreate: () => void;
+  onEdit: () => void;
+  onArchive: (group: CollaborationGroup) => void;
+  onSelectRelationship: (relationship: TeamRelationship) => void;
+}) {
+  const agents = new Map(team.agents.map((agent) => [agent.id, agent]));
+  if (!group) {
+    const active = team.collaborationGroups.filter((item) => item.status === "active");
+    return (
+      <div>
+        <div className="flex items-center justify-between gap-2">
+          <SectionTitle icon={<Link2 className="size-3.5" />} label="Collaboration groups" count={active.length} />
+          <button type="button" onClick={onCreate} title="Create collaboration group" className="flex size-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground hover:text-foreground"><Plus className="size-3.5" /></button>
+        </div>
+        <div className="mt-4 border-y border-border">
+          {active.map((item) => (
+            <div key={item.id} className="border-b border-border py-2.5 last:border-b-0">
+              <div className="text-[12px] font-semibold">{item.name}</div>
+              <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-muted-foreground">{item.description}</div>
+              <div className="mt-1.5 font-mono text-[9px] text-muted-foreground">{item.memberAgentIds.length} members · {item.relationshipIds.length} included collaboration edges</div>
+            </div>
+          ))}
+          {active.length === 0 && <p className="py-5 text-[11px] text-muted-foreground">No active collaboration groups.</p>}
+        </div>
+      </div>
+    );
+  }
+
+  const projection = projectCollaborationGroup(group, team.collaborationLinks);
+  const declaredRelationships = projection.includedRelationships;
+  const isolatedAgentIds = new Set(projection.isolatedMemberAgentIDs);
+  return (
+    <div>
+      <div className="flex items-start justify-between gap-2 border-b border-border pb-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <h2 className="break-words text-[15px] font-semibold">{group.name}</h2>
+            {group.status === "archived" && <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[9px] uppercase text-muted-foreground">archived</span>}
+          </div>
+          <div className="mt-1 font-mono text-[9px] text-muted-foreground">{group.id} · v{group.version}</div>
+        </div>
+        {group.status === "active" && <button type="button" onClick={onEdit} title="Edit collaboration group" className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-background text-muted-foreground hover:text-foreground"><Edit3 className="size-3.5" /></button>}
+      </div>
+      <p className="py-3 text-[12px] leading-5 text-foreground/90">{group.description}</p>
+      <section className="border-t border-border py-3">
+        <SectionTitle icon={<Network className="size-3.5" />} label="Members" count={group.memberAgentIds.length} />
+        <div className="mt-2 space-y-1">
+          {group.memberAgentIds.map((id) => (
+            <div key={id} className="flex min-w-0 items-center justify-between gap-2 py-1.5 text-[11px]">
+              <span className="min-w-0 truncate font-medium">{agents.get(id)?.name || id}</span>
+              {isolatedAgentIds.has(id) && <span className="shrink-0 font-mono text-[9px] text-muted-foreground">no included collaboration edge</span>}
+            </div>
+          ))}
+        </div>
+      </section>
+      <section className="border-t border-border py-3">
+        <SectionTitle icon={<Link2 className="size-3.5" />} label="Included collaboration edges" count={group.relationshipIds.length} />
+        <div className="mt-2 space-y-1">
+          {declaredRelationships.map((relationship) => (
+            <button key={relationship.id} type="button" onClick={() => onSelectRelationship(relationship)} className="block w-full border-l-2 border-primary/40 py-1.5 pl-2.5 text-left hover:border-primary">
+              <div className="truncate text-[11px] font-medium">{relationship.from} → {relationship.to}</div>
+              <div className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-muted-foreground">{relationship.description}</div>
+            </button>
+          ))}
+          {projection.missingRelationshipIDs.map((id) => <div key={id} className="py-1.5 font-mono text-[9px] text-muted-foreground">{id} · historical relationship unavailable</div>)}
+          {group.relationshipIds.length === 0 && <p className="py-2 text-[11px] text-muted-foreground">No collaboration edge is included in this group.</p>}
+        </div>
+      </section>
+      {group.status === "active" && (
+        <button type="button" onClick={() => { if (window.confirm(`Archive ${group.name}?`)) onArchive(group); }} className="mt-2 flex h-8 w-full items-center justify-center rounded-md border border-border bg-background text-[11px] font-medium text-muted-foreground hover:text-foreground">Archive group</button>
+      )}
+      {group.status === "archived" && <p className="mt-2 border-t border-border pt-3 font-mono text-[10px] uppercase text-muted-foreground">Archived · read-only</p>}
+    </div>
+  );
+}
+
+function CollaborationGroupEditor({
+  team,
+  group,
+  onCancel,
+  onSave,
+  onError,
+}: {
+  team: TeamView;
+  group: CollaborationGroup | null;
+  onCancel: () => void;
+  onSave: (payload: Pick<CollaborationGroup, "name" | "description" | "status" | "memberAgentIds" | "relationshipIds">, current?: CollaborationGroup) => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [name, setName] = useState(group?.name || "");
+  const [description, setDescription] = useState(group?.description || "");
+  const [memberAgentIds, setMemberAgentIds] = useState<string[]>(group?.memberAgentIds || []);
+  const [relationshipIds, setRelationshipIds] = useState<string[]>(group?.relationshipIds || []);
+  const [saving, setSaving] = useState(false);
+  const members = new Set(memberAgentIds);
+  const selectedRelationships = new Set(relationshipIds);
+
+  const toggleMember = (id: string) => {
+    if (members.has(id)) {
+      const removedRelationships = team.collaborationLinks.filter((relationship) => selectedRelationships.has(relationship.id) && (relationship.fromAgentId === id || relationship.toAgentId === id)).map((relationship) => relationship.id);
+      setMemberAgentIds((current) => current.filter((value) => value !== id));
+      if (removedRelationships.length > 0) setRelationshipIds((current) => current.filter((value) => !removedRelationships.includes(value)));
+    } else {
+      setMemberAgentIds((current) => [...current, id]);
+    }
+  };
+  const toggleRelationship = (relationship: TeamRelationship) => {
+    if (selectedRelationships.has(relationship.id)) {
+      setRelationshipIds((current) => current.filter((value) => value !== relationship.id));
+      return;
+    }
+    setRelationshipIds((current) => [...current, relationship.id]);
+    setMemberAgentIds((current) => Array.from(new Set([...current, relationship.fromAgentId, relationship.toAgentId])));
+  };
+  const submit = async () => {
+    setSaving(true);
+    try {
+      await onSave({ name: name.trim(), description: description.trim(), status: group?.status || "active", memberAgentIds, relationshipIds }, group || undefined);
+    } catch (error: any) {
+      onError(error.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2">
+        <SectionTitle icon={<Link2 className="size-3.5" />} label={group ? "Edit group" : "New group"} />
+        <button type="button" onClick={onCancel} title="Cancel" className="flex size-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground"><X className="size-3.5" /></button>
+      </div>
+      <label className="mt-4 block">
+        <span className="mb-1 block text-[10px] font-semibold uppercase text-muted-foreground">Name</span>
+        <input value={name} onChange={(event) => setName(event.target.value)} maxLength={160} className="h-9 w-full rounded-md bg-background px-2.5 text-[12px] outline-none ring-1 ring-border focus:ring-ring/25" />
+      </label>
+      <label className="mt-3 block">
+        <span className="mb-1 block text-[10px] font-semibold uppercase text-muted-foreground">Description</span>
+        <textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={4} maxLength={16000} className="w-full resize-y rounded-md bg-background p-2.5 text-[12px] leading-5 outline-none ring-1 ring-border focus:ring-ring/25" />
+      </label>
+      <section className="mt-4 border-t border-border pt-3">
+        <SectionTitle icon={<Network className="size-3.5" />} label="Members" count={memberAgentIds.length} />
+        <div className="mt-2 max-h-44 overflow-y-auto border-y border-border py-1">
+          {team.agents.map((agent) => (
+            <label key={agent.id} className="flex cursor-pointer items-center gap-2 px-1 py-1.5 text-[11px] hover:bg-muted/40">
+              <input type="checkbox" checked={members.has(agent.id)} onChange={() => toggleMember(agent.id)} className="size-3.5 accent-primary" />
+              <span className="min-w-0 truncate">{agent.name}</span>
+            </label>
+          ))}
+        </div>
+      </section>
+      <section className="mt-4 border-t border-border pt-3">
+        <SectionTitle icon={<Link2 className="size-3.5" />} label="Declared edges" count={relationshipIds.length} />
+        <div className="mt-2 max-h-52 overflow-y-auto border-y border-border py-1">
+          {team.collaborationLinks.map((relationship) => (
+            <label key={relationship.id} className="flex cursor-pointer items-start gap-2 px-1 py-2 text-[11px] hover:bg-muted/40">
+              <input type="checkbox" checked={selectedRelationships.has(relationship.id)} onChange={() => toggleRelationship(relationship)} className="mt-0.5 size-3.5 accent-primary" />
+              <span className="min-w-0">
+                <span className="block truncate font-medium">{relationship.from} → {relationship.to}</span>
+                <span className="mt-0.5 block line-clamp-2 text-[10px] leading-4 text-muted-foreground">{relationship.description}</span>
+              </span>
+            </label>
+          ))}
+          {team.collaborationLinks.length === 0 && <p className="px-1 py-4 text-[11px] text-muted-foreground">No collaboration relationships exist yet.</p>}
+        </div>
+      </section>
+      <div className="mt-4 flex gap-2">
+        <button type="button" onClick={onCancel} className="h-9 flex-1 rounded-md border border-border bg-background text-[12px] text-muted-foreground">Cancel</button>
+        <button type="button" disabled={!name.trim() || !description.trim() || memberAgentIds.length === 0 || saving} onClick={submit} className="flex h-9 flex-1 items-center justify-center gap-1.5 rounded-md bg-primary text-[12px] font-medium text-primary-foreground disabled:opacity-50"><Save className="size-3.5" />Save</button>
+      </div>
+    </div>
   );
 }
 
@@ -942,7 +1280,7 @@ function RelationshipInspector({
             <div className="text-[15px] font-semibold">{relationship.from} -&gt; {relationship.to}</div>
             <div className="mt-1 truncate font-mono text-[10px] text-muted-foreground">{relationship.id}</div>
           </div>
-          <span className="rounded-md bg-primary/10 px-2 py-1 text-[10px] font-medium text-primary">declared</span>
+          <span className="rounded-md bg-primary/10 px-2 py-1 text-[10px] font-medium text-primary">collaboration</span>
         </div>
       </section>
       <section>
@@ -1008,8 +1346,10 @@ function buildTeamGraph(
   query: string,
   selectedAgentId: string,
   selectedLinkId: string,
+  selectedGroup: CollaborationGroup | null,
   nodePositions: NodePositions,
   onMessage: (name: string) => void,
+  onSelectEdge: (id: string) => void,
 ): TeamGraph {
   const q = query.trim().toLowerCase();
   const agentsById = new Map(team.agents.map((agent) => [agent.id, agent]));
@@ -1031,13 +1371,22 @@ function buildTeamGraph(
       visibleAgentIds.add(link.childAgentId);
     }
   } else if (mode === "collaboration") {
-    collaborationLinks = team.collaborationLinks.filter((link) => {
+    const groupProjection = selectedGroup ? projectCollaborationGroup(selectedGroup, team.collaborationLinks) : null;
+    const candidates = groupProjection?.includedRelationships || team.collaborationLinks;
+    collaborationLinks = candidates.filter((link) => {
       if (selectedAgentId && link.fromAgentId !== selectedAgentId && link.toAgentId !== selectedAgentId) return false;
       return !q || [link.from, link.to, link.description].join(" ").toLowerCase().includes(q);
     });
     for (const link of collaborationLinks) {
       visibleAgentIds.add(link.fromAgentId);
       visibleAgentIds.add(link.toAgentId);
+    }
+    if (selectedGroup) {
+      for (const id of groupProjection?.memberAgentIDs || []) {
+        if (selectedAgentId && id !== selectedAgentId) continue;
+        const agent = agentsById.get(id) || externalAgent(id);
+        if (!q || agentSearchText(agent).includes(q)) visibleAgentIds.add(id);
+      }
     }
   } else {
     const candidates = activityPairs.filter((pair) => {
@@ -1063,14 +1412,15 @@ function buildTeamGraph(
     const degreeB = graphDegree(mode, b, organizationLinks, collaborationLinks, visibleActivityPairs);
     return degreeB - degreeA || (agentsById.get(a)?.name || a).localeCompare(agentsById.get(b)?.name || b);
   });
-  const positions = mode === "organization" ? computeOrganizationPositions(ids, organizationLinks) : computePositions(ids);
+  const positions = computePositions(ids);
   const organizationChildren = new Set(organizationLinks.map((link) => link.childAgentId));
   const nodes: Node<AgentNodeData>[] = ids.map((id) => {
     const agent = agentsById.get(id) || externalAgent(id);
     return {
       id,
       type: "agentCard",
-      position: nodePositions[`${mode}:${id}`] || positions.get(id) || { x: 0, y: 0 },
+      ...stableTeamGraphNodeGeometry(),
+      position: nodePositions[graphPositionKey(mode, selectedGroup?.id || "", id)] || positions.get(id) || { x: 0, y: 0 },
       selected: selectedAgentId === id,
       zIndex: 2,
       data: {
@@ -1087,21 +1437,23 @@ function buildTeamGraph(
     id: organizationLinkId(link),
     source: link.parentAgentId,
     target: link.childAgentId,
-    type: "smoothstep",
+    type: "relationshipContract",
     selected: selectedLinkId === organizationLinkId(link),
     zIndex: selectedLinkId === organizationLinkId(link) ? 1 : 0,
     markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14, color: "var(--foreground)" },
     style: { stroke: "var(--foreground)", strokeWidth: selectedLinkId === organizationLinkId(link) ? 3 : 1.6 },
+    data: { kind: "organization", from: link.parent, to: link.child, description: link.description, onSelect: onSelectEdge } satisfies RelationshipContractEdgeData,
   }));
   const collaborationEdges: Edge[] = collaborationLinks.map((link) => ({
     id: collaborationLinkId(link),
     source: link.fromAgentId,
     target: link.toAgentId,
-    type: "smoothstep",
+    type: "relationshipContract",
     selected: selectedLinkId === collaborationLinkId(link),
     zIndex: selectedLinkId === collaborationLinkId(link) ? 1 : 0,
     markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14, color: "var(--loom-teal)" },
     style: { stroke: "var(--loom-teal)", strokeWidth: selectedLinkId === collaborationLinkId(link) ? 3 : 2, strokeDasharray: "7 4" },
+    data: { kind: "collaboration", from: link.from, to: link.to, description: link.description, onSelect: onSelectEdge } satisfies RelationshipContractEdgeData,
   }));
   const activityEdges: Edge[] = visibleActivityPairs.map((pair) => {
     const warning = pair.failedCount > 0 || pair.openCount > 0 || pair.queuedCount > 0;
@@ -1123,11 +1475,101 @@ function buildTeamGraph(
   return { nodes, edges, visibleAgentIds: ids, visibleEdgeIds: edges.map((edge) => edge.id) };
 }
 
+function RelationshipContractEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd, style, selected, data }: EdgeProps<Edge<RelationshipContractEdgeData>>) {
+  const [path, labelX, labelY] = getBezierPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition });
+  const [open, setOpen] = useState(false);
+  const [tooltipPosition, setTooltipPosition] = useState({ offsetX: 0, above: false });
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const { zoom } = useViewport();
+  const controlScale = 1 / Math.max(zoom, 0.01);
+
+  useLayoutEffect(() => {
+    if (!open || !tooltipRef.current || !buttonRef.current) return;
+    const tooltipRect = tooltipRef.current.getBoundingClientRect();
+    const buttonRect = buttonRef.current.getBoundingClientRect();
+    const margin = 8;
+    const gap = 8;
+    const above = buttonRect.bottom + gap + tooltipRect.height > window.innerHeight - margin
+      && buttonRect.top - gap - tooltipRect.height >= margin;
+    let offsetX = tooltipPosition.offsetX;
+    if (tooltipRect.left < margin) offsetX += margin - tooltipRect.left;
+    if (tooltipRect.right > window.innerWidth - margin) offsetX -= tooltipRect.right - (window.innerWidth - margin);
+    if (Math.abs(offsetX - tooltipPosition.offsetX) > 0.5 || above !== tooltipPosition.above) {
+      setTooltipPosition({ offsetX, above });
+    }
+  }, [open, tooltipPosition, zoom]);
+
+  if (!data) return <BaseEdge id={id} path={path} markerEnd={markerEnd} style={style} />;
+  const label = relationshipContractAriaLabel(data.kind, data.from, data.to, data.description);
+  return (
+    <>
+      <BaseEdge id={id} path={path} markerEnd={markerEnd} style={style} />
+      <path
+        d={path}
+        fill="none"
+        stroke="transparent"
+        strokeWidth={20}
+        style={{ cursor: "pointer", pointerEvents: "stroke" }}
+        aria-hidden="true"
+        onMouseEnter={() => setOpen(true)}
+        onMouseLeave={() => setOpen(false)}
+        onClick={(event) => {
+          event.stopPropagation();
+          data.onSelect(id);
+          setOpen(true);
+        }}
+      />
+      <EdgeLabelRenderer>
+        <div className="nodrag nopan absolute" style={{ pointerEvents: "all", transform: `translate(-50%, -50%) translate(${labelX}px,${labelY}px) scale(${controlScale})`, transformOrigin: "center", zIndex: selected || open ? 20 : 3 }}>
+          <button
+            ref={buttonRef}
+            data-team-edge-control={id}
+            type="button"
+            aria-label={label}
+            aria-expanded={open}
+            onMouseEnter={() => setOpen(true)}
+            onMouseLeave={() => setOpen(false)}
+            onFocus={() => setOpen(true)}
+            onBlur={() => setOpen(false)}
+            onClick={(event) => { event.stopPropagation(); data.onSelect(id); setOpen(true); }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setOpen(false);
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                data.onSelect(id);
+                setOpen(true);
+              }
+            }}
+            className="flex size-11 items-center justify-center rounded-full sm:size-9"
+          >
+            <span className={`flex size-8 items-center justify-center rounded-full border bg-background/95 shadow-sm transition-colors ${selected ? "border-ring text-foreground" : "border-border text-muted-foreground hover:border-foreground/40 hover:text-foreground"}`}>
+              <span className={`size-2 rounded-full ${data.kind === "collaboration" ? "bg-[var(--loom-teal)]" : "bg-foreground/60"}`} />
+            </span>
+          </button>
+          {open && (
+            <div
+              ref={tooltipRef}
+              role="tooltip"
+              className={`absolute left-1/2 w-[min(320px,calc(100vw-1rem))] -translate-x-1/2 border border-border bg-card p-3 text-left shadow-lg ${tooltipPosition.above ? "bottom-12 sm:bottom-10" : "top-12 sm:top-10"}`}
+              style={{ marginLeft: tooltipPosition.offsetX }}
+            >
+              <div className="font-mono text-[9px] font-semibold uppercase text-muted-foreground">{data.kind}</div>
+              <div className="mt-1 break-words text-[12px] font-semibold">{data.from} → {data.to}</div>
+              <p className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap break-words text-[11px] leading-5 text-foreground/90">{data.description}</p>
+            </div>
+          )}
+        </div>
+      </EdgeLabelRenderer>
+    </>
+  );
+}
+
 function AgentGraphNode({ data }: NodeProps<Node<AgentNodeData>>) {
   const { agent, selected, perspective, organizationRole, onMessage } = data;
   const domain = firstLine(agent.profile.domain) || firstLine(agent.profile.identity) || "No domain declared";
   return (
-    <div className={`w-[240px] rounded-md border bg-card p-3 shadow-card ${selected ? "border-ring/50 ring-2 ring-ring/18" : "border-border"}`}>
+    <div className={`flex h-[132px] w-[240px] flex-col rounded-md border bg-card p-3 shadow-card ${selected ? "border-ring/50 ring-2 ring-ring/18" : "border-border"}`}>
       <Handle type="target" position={Position.Left} className="!size-2 !border-border !bg-muted-foreground" />
       <Handle type="source" position={Position.Right} className="!size-2 !border-border !bg-muted-foreground" />
       <div className="flex items-start justify-between gap-2">
@@ -1140,7 +1582,7 @@ function AgentGraphNode({ data }: NodeProps<Node<AgentNodeData>>) {
         <StatusBadge status={teamAgentStatus(agent)} />
       </div>
       <div className="mt-2 h-9 overflow-hidden text-[11px] leading-[18px] text-foreground/85" title={agent.profile.domain || agent.profile.identity}>{domain}</div>
-      <div className="mt-2 flex items-end justify-between gap-3 border-t border-border pt-2">
+      <div className="mt-auto flex h-8 items-end justify-between gap-3 border-t border-border pt-1.5">
         <div className="font-mono text-[9px] uppercase text-muted-foreground">{perspective === "organization" ? organizationRole : perspective === "activity" ? `${agent.messageIn + agent.messageOut} messages` : agent.profile.version > 0 ? `profile v${agent.profile.version}` : "no profile"}</div>
         {isActiveAgent(agent) && selected && (
           <button onClick={(event) => { event.stopPropagation(); onMessage(agent.name); }} title="Message agent" className="flex size-7 items-center justify-center rounded-md border border-border bg-background text-muted-foreground hover:text-foreground"><Send className="size-3.5" /></button>
@@ -1185,13 +1627,15 @@ function UnassignedAgent({ agent, selected, onSelect }: { agent: TeamAgent; sele
   );
 }
 
-function GraphEmptyState({ mode, focused }: { mode: GraphViewMode; focused: boolean }) {
+function GraphEmptyState({ mode, focused, group }: { mode: GraphViewMode; focused: boolean; group?: CollaborationGroup | null }) {
   const copy = mode === "organization"
     ? focused
       ? "This Agent is unassigned. Add its parent or a direct report in the Inspector."
       : "No organization relationships yet. Select an Agent from Unassigned and add its parent or direct report in the Inspector."
     : mode === "collaboration"
-      ? "No declared collaboration matches this view. Select an Agent from the focus menu to add one."
+      ? group
+        ? "No Agent or included collaboration edge in this group matches the current focus and search."
+        : "No declared collaboration matches this view. Select an Agent from the focus menu to add one."
       : "No message activity exists in this time window.";
   return <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-8"><div className="max-w-md border border-dashed border-border bg-background/90 px-6 py-8 text-center text-[12px] leading-5 text-muted-foreground">{copy}</div></div>;
 }
@@ -1302,7 +1746,9 @@ function loadNodePositions(): NodePositions {
     for (const [id, value] of Object.entries(raw || {})) {
       const position = value as { x?: unknown; y?: unknown };
       if (typeof position.x === "number" && Number.isFinite(position.x) && typeof position.y === "number" && Number.isFinite(position.y)) {
-        positions[id] = { x: position.x, y: position.y };
+        const legacy = id.match(/^(organization|collaboration|activity):([^:]+)$/);
+        const key = legacy ? `${legacy[1]}:all:${legacy[2]}` : id;
+        positions[key] = { x: position.x, y: position.y };
       }
     }
     return positions;
@@ -1325,36 +1771,6 @@ function computePositions(ids: string[]) {
   return positions;
 }
 
-function computeOrganizationPositions(ids: string[], links: OrganizationRelationship[]) {
-  const positions = new Map<string, { x: number; y: number }>();
-  const visible = new Set(ids);
-  const children = new Map<string, string[]>();
-  const hasParent = new Set<string>();
-  for (const link of links) {
-    if (!visible.has(link.parentAgentId) || !visible.has(link.childAgentId)) continue;
-    children.set(link.parentAgentId, [...(children.get(link.parentAgentId) || []), link.childAgentId]);
-    hasParent.add(link.childAgentId);
-  }
-  const roots = ids.filter((id) => !hasParent.has(id));
-  const levels: string[][] = [];
-  let frontier = roots;
-  const seen = new Set<string>();
-  while (frontier.length > 0) {
-    const level = frontier.filter((id) => !seen.has(id));
-    if (level.length === 0) break;
-    levels.push(level);
-    for (const id of level) seen.add(id);
-    frontier = level.flatMap((id) => children.get(id) || []);
-  }
-  const remainder = ids.filter((id) => !seen.has(id));
-  if (remainder.length > 0) levels.push(remainder);
-  levels.forEach((level, depth) => {
-    level.sort();
-    level.forEach((id, index) => positions.set(id, { x: depth * 310, y: index * 145 }));
-  });
-  return positions;
-}
-
 function strongestActivityPairs(pairs: ActivityPair[], selectedLinkId: string, limit: number) {
   const selected = pairs.find((pair) => pair.id === selectedLinkId);
   const ranked = [...pairs].sort((a, b) => {
@@ -1367,6 +1783,52 @@ function strongestActivityPairs(pairs: ActivityPair[], selectedLinkId: string, l
   return result;
 }
 
+function teamGraphTopologyKey(graph: TeamGraph, mode: GraphViewMode, groupID: string, revision: number) {
+  const nodes = [...graph.visibleAgentIds].sort().join(",");
+  const edges = graph.edges
+    .map((edge) => `${edge.id}:${edge.source}>${edge.target}`)
+    .sort()
+    .join(",");
+  return `${mode}:${groupID || "all"}:${revision}:${nodes}|${edges}`;
+}
+
+function applyTeamGraphLayout(
+  graph: TeamGraph,
+  layout: ResolvedGraphLayout | null,
+  manualPositions: NodePositions,
+  mode: GraphViewMode,
+  groupID: string,
+): TeamGraph {
+  if (mode === "activity") return graph;
+  if (!layout) {
+    return {
+      ...graph,
+      layout: { ready: false, componentCount: 0, width: 0, height: 0 },
+    };
+  }
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) => ({
+      ...node,
+      position: manualPositions[graphPositionKey(mode, groupID, node.id)] || layout.positions[node.id] || node.position,
+    })),
+    layout: {
+      ready: true,
+      componentCount: layout.components.length,
+      width: layout.width,
+      height: layout.height,
+    },
+  };
+}
+
+function graphPositionPrefix(mode: GraphViewMode, groupID: string) {
+  return `${mode}:${mode === "collaboration" ? groupID || "all" : "all"}:`;
+}
+
+function graphPositionKey(mode: GraphViewMode, groupID: string, agentID: string) {
+  return `${graphPositionPrefix(mode, groupID)}${agentID}`;
+}
+
 function graphState(graph: TeamGraph, selectedAgentId: string, selectedLinkId: string) {
   return {
     nodesCount: graph.nodes.length,
@@ -1376,6 +1838,26 @@ function graphState(graph: TeamGraph, selectedAgentId: string, selectedLinkId: s
     visibleNodeIds: graph.visibleAgentIds,
     visibleEdgeIds: graph.visibleEdgeIds,
     positions: Object.fromEntries(graph.nodes.map((node) => [node.id, node.position])),
+    layout: graph.layout || null,
+  };
+}
+
+function graphEdgeControlState(minimumSize: number) {
+  const controls = Array.from(document.querySelectorAll<HTMLElement>("[data-team-edge-control]"))
+    .map((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        id: element.dataset.teamEdgeControl || "",
+        width: rect.width,
+        height: rect.height,
+      };
+    });
+  return {
+    minimumSize,
+    tolerance: EDGE_CONTROL_SIZE_TOLERANCE,
+    count: controls.length,
+    pass: controls.length > 0 && controls.every((control) => edgeControlMeetsMinimum(control.width, control.height, minimumSize)),
+    controls,
   };
 }
 
@@ -1416,7 +1898,7 @@ function readTeamRouteState() {
   const hash = window.location.hash.slice(1);
   const queryStart = hash.indexOf("?");
   const defaultView: TeamViewMode = "directory";
-  if (queryStart < 0) return { agent: "", link: "", query: "", view: defaultView, days: 7 };
+  if (queryStart < 0) return { agent: "", link: "", group: "", query: "", view: defaultView, days: 7 };
   const params = new URLSearchParams(hash.slice(queryStart + 1));
   const rawView = params.get("view");
   const views: TeamViewMode[] = ["organization", "collaboration", "activity", "directory"];
@@ -1425,17 +1907,19 @@ function readTeamRouteState() {
   return {
     agent: params.get("agent") || "",
     link: params.get("link") || "",
+    group: params.get("group") || "",
     query: params.get("q") || "",
     view,
     days: [0, 1, 7, 30].includes(rawDays) ? rawDays : 7,
   };
 }
 
-function writeTeamRouteState({ agent, link, query, view, days }: { agent: string; link: string; query: string; view: TeamViewMode; days: number }) {
+function writeTeamRouteState({ agent, link, group, query, view, days }: { agent: string; link: string; group: string; query: string; view: TeamViewMode; days: number }) {
   const params = new URLSearchParams();
   params.set("view", view);
   if (agent) params.set("agent", agent);
   if (link) params.set("link", link);
+  if (view === "collaboration" && group) params.set("group", group);
   if (query.trim()) params.set("q", query.trim());
   if (view === "activity") params.set("days", String(days));
   const value = params.toString();

@@ -1320,6 +1320,7 @@ function sourceLabel(value: string) {
     case "internal": return "Agent message";
     case "continuation": return "Causal reply";
     case "external": return "External Inbox";
+    case "trigger": return "External trigger";
     case "schedule": return "Schedule";
     case "human_answer": return "Needs You answer";
     default: return value.replaceAll("_", " ");

@@ -358,7 +358,9 @@ func collectWorkloadQueueSamples(snapshot workloadSnapshot, start, selectedEnd, 
 	for _, message := range snapshot.messages {
 		queuedAtText := message.CreatedAt
 		source := "internal"
-		if message.ScheduleID != "" {
+		if message.TriggerID != "" {
+			source = "trigger"
+		} else if message.ScheduleID != "" {
 			source = "schedule"
 			if message.ScheduledAt != "" {
 				queuedAtText = message.ScheduledAt

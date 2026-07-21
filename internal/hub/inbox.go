@@ -182,14 +182,14 @@ func internalInboxState(msg *AgentMessage) (string, string) {
 	if msg.DeliveryStatus == "cancelled" {
 		return "handled", "cancelled"
 	}
+	if msg.DeliveryStatus == "queued" || msg.DeliveryStatus == "delivering" {
+		return "queued", ""
+	}
 	if msg.Resolution == "reply" || msg.Status == "answered" {
 		return "handled", "reply"
 	}
 	if msg.Resolution == "no_reply" || msg.Response == "none" {
 		return "handled", "no_reply"
-	}
-	if msg.DeliveryStatus == "queued" || msg.DeliveryStatus == "delivering" {
-		return "queued", ""
 	}
 	if msg.HandlingStatus == "interrupted" {
 		return "interrupted", ""
@@ -645,8 +645,8 @@ func (h *Hub) RetryInboxItem(id string) (InboxItem, error) {
 	if item == nil {
 		return InboxItem{}, errf(404, "inbox item not found: %s", id)
 	}
-	if item.State != "failed" && item.State != "deferred" && item.State != "pending_access" {
-		return InboxItem{}, errf(409, "only failed, deferred, or pending-access inbox items can be retried")
+	if item.State != "failed" && item.State != "deferred" && item.State != "pending_access" && item.State != "interrupted" {
+		return InboxItem{}, errf(409, "only interrupted, failed, deferred, or pending-access inbox items can be retried")
 	}
 	next := *item
 	if item.State == "pending_access" {

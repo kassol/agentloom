@@ -216,6 +216,16 @@ func (h *Hub) DeleteRelationship(id string) (TeamRelationship, error) {
 	if rel == nil {
 		return TeamRelationship{}, errf(404, "relationship not found: %s", id)
 	}
+	for _, group := range h.collaborationGroups {
+		if group.Status != CollaborationGroupStatusActive {
+			continue
+		}
+		for _, relationshipID := range group.RelationshipIDs {
+			if relationshipID == rel.ID {
+				return TeamRelationship{}, errf(409, "relationship %s is included in active collaboration group %q (%s)", rel.ID, group.Name, group.ID)
+			}
+		}
+	}
 	cp := *rel
 	delete(h.teamLinks, rel.ID)
 	if err := h.st.SaveTeamLinks(h.teamLinks); err != nil {
@@ -249,6 +259,9 @@ func (h *Hub) resolveAgentIDLocked(key string) (string, bool) {
 func (h *Hub) agentNameLocked(agentID, fallback string) string {
 	if agentID == schedulerAgentID {
 		return schedulerIdentity
+	}
+	if agentID == triggerAgentID {
+		return triggerIdentity
 	}
 	if meta := h.agents[agentID]; meta != nil {
 		return meta.Name

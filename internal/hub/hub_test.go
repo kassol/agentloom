@@ -2,6 +2,7 @@ package hub
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -97,6 +98,104 @@ func TestCompletedNotificationWithFailedTurnStatusProjectsFailure(t *testing.T) 
 	}
 	if !found {
 		t.Fatalf("events do not contain loom/turn-failed: %#v", events)
+	}
+}
+
+func TestTurnStartedNotificationRebindsStaleResponseIDAndLinkedWork(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.stopping = true
+	h.attempts = map[string]*HandlingAttempt{}
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "research", ThreadID: "thread-1", Status: "running",
+		CurrentTurnID: "turn-stale", CurrentTask: "Investigate", CreatedAt: now(), UpdatedAt: now(),
+	}
+	h.attempts["att-1"] = &HandlingAttempt{
+		ID: "att-1", InboxItemID: "inb-1", AgentID: "agent-1", Status: "running", TurnID: "turn-stale", StartedAt: now(),
+	}
+	h.comms["msg-1"] = &AgentMessage{
+		ID: "msg-1", ToAgentID: "agent-1", DeliveryStatus: "delivered", DeliveredTurnID: "turn-stale",
+		HandlingStatus: "running", ActiveHandlingID: "matt-1", UpdatedAt: now(),
+		HandlingAttempts: []AgentMessageHandlingAttempt{{
+			ID: "matt-1", TurnID: "turn-stale", Status: "running", StartedAt: now(),
+		}},
+	}
+	turn := &turnState{
+		turnID: "turn-stale", task: "Investigate", source: "internal", attemptID: "att-1",
+		agentMessageID: "msg-1", handlingAttemptID: "matt-1", startedAt: time.Now(),
+		stopWatchdog: make(chan struct{}),
+	}
+	rt := &runtime{agentID: "agent-1", approvals: map[string]*approval{}, activeTurn: turn}
+	h.runtimes["agent-1"] = rt
+
+	h.onNotification(rt, "turn/started", json.RawMessage(`{
+		"threadId":"thread-1","turn":{"id":"turn-actual","status":"inProgress"}
+	}`))
+
+	if rt.activeTurn != turn || turn.turnID != "turn-actual" || !turn.startedConfirmed {
+		t.Fatalf("active Turn = %#v, want same confirmed Turn rebound to turn-actual", rt.activeTurn)
+	}
+	if turn.task != "Investigate" || turn.source != "internal" {
+		t.Fatalf("rebind lost local work context: %#v", turn)
+	}
+	if got := h.agents["agent-1"].CurrentTurnID; got != "turn-actual" {
+		t.Fatalf("Agent current Turn = %q", got)
+	}
+	if got := h.attempts["att-1"].TurnID; got != "turn-actual" {
+		t.Fatalf("Inbox attempt Turn = %q", got)
+	}
+	message := h.comms["msg-1"]
+	if message.DeliveredTurnID != "turn-actual" || len(message.HandlingAttempts) != 1 || message.HandlingAttempts[0].TurnID != "turn-actual" {
+		t.Fatalf("message handling was not rebound: %#v", message)
+	}
+}
+
+func TestStaleTerminalNotificationDoesNotFinishCurrentTurn(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.stopping = true
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "research", ThreadID: "thread-1", Status: "running",
+		CurrentTurnID: "turn-current", CurrentTask: "Current work", CreatedAt: now(), UpdatedAt: now(),
+	}
+	turn := &turnState{
+		turnID: "turn-current", startedConfirmed: true, task: "Current work", source: "owner",
+		startedAt: time.Now(), stopWatchdog: make(chan struct{}),
+	}
+	rt := &runtime{agentID: "agent-1", approvals: map[string]*approval{}, activeTurn: turn}
+	h.runtimes["agent-1"] = rt
+
+	h.onNotification(rt, "turn/completed", json.RawMessage(`{
+		"threadId":"thread-1","turn":{"id":"turn-previous","status":"completed"}
+	}`))
+
+	if rt.activeTurn != turn || turn.finished {
+		t.Fatalf("stale terminal event finished current Turn: %#v", rt.activeTurn)
+	}
+	if meta := h.agents["agent-1"]; meta.Status != "running" || meta.CurrentTurnID != "turn-current" || meta.LastTurn != nil {
+		t.Fatalf("stale terminal event changed Agent projection: %#v", meta)
+	}
+}
+
+func TestActiveTurnInterruptMismatch(t *testing.T) {
+	actual, ok := activeTurnInterruptMismatch(errors.New("expected active turn id turn-old but found turn-current"))
+	if !ok || actual != "turn-current" {
+		t.Fatalf("parsed mismatch = %q, %v", actual, ok)
+	}
+	for _, message := range []string{
+		"some other interrupt failure",
+		"expected active turn id turn-old",
+		"expected active turn id turn-old but found invalid turn",
+	} {
+		if actual, ok := activeTurnInterruptMismatch(errors.New(message)); ok {
+			t.Fatalf("unexpected mismatch parse for %q: %q", message, actual)
+		}
 	}
 }
 
@@ -252,7 +351,43 @@ func TestApplyRolloutStatusShowsRecentExternalRunningTurn(t *testing.T) {
 	}
 }
 
-func TestApplyRolloutStatusIgnoresStaleExternalRunningTurn(t *testing.T) {
+func TestApplyRolloutStatusSummarizesCompletedTopicControlEnvelope(t *testing.T) {
+	const threadID = "test-thread-topic-display"
+	dir := t.TempDir()
+	day := filepath.Join(dir, "2026", "07", "20")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prompt := `<loom_topic_context version="1"><brief><summary>Internal state</summary></brief></loom_topic_context>
+<owner_topic_input version="1"><message><![CDATA[Verify the visible Topic task.]]></message></owner_topic_input>`
+	records := []map[string]any{
+		{"timestamp": "2026-07-20T01:00:00Z", "type": "event_msg", "payload": map[string]any{"type": "task_started", "turn_id": "turn-topic"}},
+		{"timestamp": "2026-07-20T01:00:01Z", "type": "event_msg", "payload": map[string]any{"type": "user_message", "message": prompt}},
+		{"timestamp": "2026-07-20T01:00:02Z", "type": "event_msg", "payload": map[string]any{"type": "task_complete", "turn_id": "turn-topic"}},
+	}
+	var data []byte
+	for _, record := range records {
+		line, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, line...)
+		data = append(data, '\n')
+	}
+	path := filepath.Join(day, "rollout-2026-07-20T01-00-00-"+threadID+".jsonl")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_SESSIONS_DIR", dir)
+
+	view := AgentView{Agent: Agent{ThreadID: threadID, Status: "idle"}}
+	applyRolloutStatus(&view)
+	if view.LastTurn == nil || view.LastTurn.Task != "Verify the visible Topic task." {
+		t.Fatalf("last Turn = %#v", view.LastTurn)
+	}
+}
+
+func TestApplyRolloutStatusMarksStaleExternalRunningTurnInterrupted(t *testing.T) {
 	const threadID = "test-thread-stale-running"
 	dir := t.TempDir()
 	writeTestRollout(t, dir, threadID, "2000-01-01T00:00:00Z")
@@ -261,8 +396,8 @@ func TestApplyRolloutStatusIgnoresStaleExternalRunningTurn(t *testing.T) {
 	view := AgentView{Agent: Agent{ThreadID: threadID, Status: "idle"}}
 	applyRolloutStatus(&view)
 
-	if view.Status != "idle" {
-		t.Fatalf("status = %q, want idle", view.Status)
+	if view.Status != "interrupted" {
+		t.Fatalf("status = %q, want interrupted", view.Status)
 	}
 	if view.CurrentTurnID != "" {
 		t.Fatalf("current turn = %q, want empty", view.CurrentTurnID)
@@ -272,7 +407,7 @@ func TestApplyRolloutStatusIgnoresStaleExternalRunningTurn(t *testing.T) {
 	}
 }
 
-func TestApplyRolloutStatusClearsPersistedStaleRunningTurn(t *testing.T) {
+func TestApplyRolloutStatusMarksPersistedStaleRunningTurnInterrupted(t *testing.T) {
 	const threadID = "test-thread-persisted-stale-running"
 	dir := t.TempDir()
 	writeTestRollout(t, dir, threadID, "2000-01-01T00:00:00Z")
@@ -289,14 +424,89 @@ func TestApplyRolloutStatusClearsPersistedStaleRunningTurn(t *testing.T) {
 	}
 	applyRolloutStatus(&view)
 
-	if view.Status != "idle" {
-		t.Fatalf("status = %q, want idle", view.Status)
+	if view.Status != "interrupted" {
+		t.Fatalf("status = %q, want interrupted", view.Status)
 	}
 	if view.CurrentTask != "" || view.CurrentTurnID != "" {
 		t.Fatalf("current task/turn = %q/%q, want empty", view.CurrentTask, view.CurrentTurnID)
 	}
 	if view.LastTurn == nil || view.LastTurn.Status != "interrupted" || view.LastTurn.TurnID != "turn-running" {
 		t.Fatalf("last turn = %#v, want stale persisted running turn summarized as interrupted", view.LastTurn)
+	}
+}
+
+func TestApplyRolloutStatusKeepsDismissedInterruptedTurnIdle(t *testing.T) {
+	const threadID = "test-thread-dismissed-interruption"
+	dir := t.TempDir()
+	writeTestRollout(t, dir, threadID, time.Now().UTC().Format(time.RFC3339Nano))
+	t.Setenv("CODEX_SESSIONS_DIR", dir)
+
+	view := AgentView{Agent: Agent{
+		ThreadID: threadID, Status: "idle",
+		LastTurn: &TurnSummary{TurnID: "turn-running", Task: "keep working", Status: "interrupted", CompletedAt: now()},
+	}}
+	applyRolloutStatus(&view)
+
+	if view.Status != "idle" || view.CurrentTurnID != "" {
+		t.Fatalf("dismissed view = %#v, want idle", view)
+	}
+}
+
+func TestGetTurnLocatesAgentAndDurableSource(t *testing.T) {
+	const threadID = "test-thread-turn-get"
+	dir := t.TempDir()
+	writeTestRollout(t, dir, threadID, "2026-07-21T01:00:00Z")
+	t.Setenv("CODEX_SESSIONS_DIR", dir)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.agents["agent-0"] = &Agent{ID: "agent-0", Name: "no-rollout", ThreadID: "thread-without-rollout", Status: "idle"}
+	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: threadID, Cwd: "/repo", Status: "idle"}
+	h.comms["msg-1"] = &AgentMessage{
+		ID: "msg-1", ToAgentID: "agent-1", DeliveryMode: "turn_start", DeliveredTurnID: "turn-running",
+		DeliveryStatus: "delivered", HandlingStatus: "interrupted", LastHandlingError: "CodexLoom restarted",
+		TopicID: "tpc-1",
+	}
+	h.commOrder = []string{"msg-1"}
+
+	turn, err := h.GetTurn("turn-running")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.AgentID != "agent-1" || turn.Agent != "worker" || turn.ThreadID != threadID || turn.Status != "interrupted" {
+		t.Fatalf("Turn identity/status = %#v", turn)
+	}
+	if turn.Source == nil || turn.Source.Kind != "internal" || turn.Source.ID != "msg-1" || turn.Source.TopicID != "tpc-1" {
+		t.Fatalf("Turn source = %#v", turn.Source)
+	}
+	if turn.Error != "CodexLoom restarted" || len(turn.Items) != 1 || turn.Items[0]["text"] != "keep working" {
+		t.Fatalf("Turn detail = %#v", turn)
+	}
+	if _, err := h.GetTurn("turn-missing"); err == nil {
+		t.Fatal("missing Turn did not return an error")
+	}
+}
+
+func TestGetTurnPreservesRecentExternalRunningStatus(t *testing.T) {
+	const threadID = "test-thread-turn-get-live"
+	dir := t.TempDir()
+	writeTestRollout(t, dir, threadID, time.Now().UTC().Format(time.RFC3339Nano))
+	t.Setenv("CODEX_SESSIONS_DIR", dir)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: threadID, Status: "idle"}
+
+	turn, err := h.GetTurn("turn-running")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.Status != "running" {
+		t.Fatalf("status = %q, want running for recent external Turn", turn.Status)
 	}
 }
 

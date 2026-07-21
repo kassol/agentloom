@@ -1,7 +1,7 @@
-import { Activity, Archive, Bot, Cable, ChevronRight, CircleHelp, Inbox as InboxIcon, Info, Menu, Network, PanelLeftClose, PanelLeftOpen, Plus, RotateCw, Settings2, X } from "lucide-react";
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { Activity, Archive, BookOpen, Bot, Cable, ChevronRight, CircleHelp, CirclePause, Inbox as InboxIcon, Info, Menu, Network, PanelLeftClose, PanelLeftOpen, Plus, RotateCw, Settings2, X } from "lucide-react";
+import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type RemoteSnapshot } from "./types";
+import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type RemoteSnapshot, type Topic } from "./types";
 import { summarizeTask } from "./feed";
 import { BrandLockup, BrandMark } from "./components/BrandMark";
 import { Button } from "./components/ui/button";
@@ -10,6 +10,10 @@ import { Input } from "./components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "./components/ui/popover";
 import { publishThreadEvent, threadEventSubscriberCount } from "./thread-events";
 import { executionDotClass, executionLabel, isAgentExecuting, isOwnerResultEvent } from "./product-state";
+import { NeedsYouPane } from "./NeedsYouPane";
+import { TopicsPane } from "./TopicsPane";
+import { WorkspaceErrorBoundary, WorkspaceReady } from "./workspace-recovery";
+import { moveItem, reorderItem, type DropEdge } from "./tab-order";
 import type { OverviewSection } from "./OverviewPane";
 import type { SettingsSection } from "./SettingsPane";
 
@@ -19,7 +23,6 @@ const IntegrationsPane = lazy(() => import("./IntegrationsPane").then((module) =
 const MessagesPane = lazy(() => import("./MessagesPane").then((module) => ({ default: module.MessagesPane })));
 const SchedulesPane = lazy(() => import("./SchedulesPane").then((module) => ({ default: module.SchedulesPane })));
 const TeamPane = lazy(() => import("./TeamPane").then((module) => ({ default: module.TeamPane })));
-const NeedsYouPane = lazy(() => import("./NeedsYouPane").then((module) => ({ default: module.NeedsYouPane })));
 const OverviewPane = lazy(() => import("./OverviewPane").then((module) => ({ default: module.OverviewPane })));
 const SettingsPane = lazy(() => import("./SettingsPane").then((module) => ({ default: module.SettingsPane })));
 
@@ -89,7 +92,8 @@ function AgentActivityPopover({
 }) {
   const [open, setOpen] = useState(false);
   const activeAgents = agents.filter(isAgentWorking);
-  const idleCount = agents.length - activeAgents.length;
+  const interruptedCount = agents.filter((agent) => agent.status === "interrupted").length;
+  const idleCount = agents.length - activeAgents.length - interruptedCount;
   const taskSummary = (agent: Agent) => summarizeTask(agent.currentTask || agent.goal?.objective || "") || "Running turn";
 
   return (
@@ -115,7 +119,11 @@ function AgentActivityPopover({
           <>
             <span><strong className="text-foreground">{agents.length}</strong> agents</span>
             <span><strong className="text-success">{activeAgents.length}</strong> active</span>
-            <span><strong className="text-foreground/65">{idleCount}</strong> idle</span>
+            {interruptedCount > 0 ? (
+              <span><strong className="text-warning">{interruptedCount}</strong> interrupted</span>
+            ) : (
+              <span><strong className="text-foreground/65">{idleCount}</strong> idle</span>
+            )}
             {humanRequests.length > 0 ? <span><strong className="text-warning">{humanRequests.length}</strong> need you</span> : null}
           </>
         )}
@@ -260,6 +268,13 @@ function agentRuntimeLabel(agent: Agent) {
   return executionLabel(agent).toLowerCase();
 }
 
+function interruptedAgentTitle(agent: Agent) {
+  if (agent.status !== "interrupted") return "";
+  const timestamp = agent.lastTurn?.completedAt ? new Date(agent.lastTurn.completedAt) : null;
+  const when = timestamp && !Number.isNaN(timestamp.getTime()) ? ` · last active ${timestamp.toLocaleString()}` : "";
+  return `Turn interrupted by restart${when}`;
+}
+
 function AgentTabs({
   agents,
   allAgents,
@@ -271,6 +286,8 @@ function AgentTabs({
   onClose,
   onEdit,
   onSelectRequest,
+  onReorder,
+  onMove,
 }: {
   agents: Agent[];
   allAgents: Agent[];
@@ -282,11 +299,115 @@ function AgentTabs({
   onClose: (id: string) => void;
   onEdit: (id: string) => void;
   onSelectRequest: (id: string) => void;
+  onReorder: (movingID: string, targetID: string, edge: DropEdge) => void;
+  onMove: (id: string, offset: -1 | 1) => void;
 }) {
   const [openInfoId, setOpenInfoId] = useState<string | null>(null);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: string; edge: DropEdge } | null>(null);
+  const dropTargetRef = useRef<{ id: string; edge: DropEdge } | null>(null);
+  const tabListRef = useRef<HTMLDivElement>(null);
+  const suppressClickRef = useRef<string | null>(null);
+  const pointerRef = useRef<{
+    id: string;
+    pointerId: number;
+    pointerType: string;
+    startX: number;
+    startY: number;
+    element: HTMLElement;
+    activated: boolean;
+    timer: ReturnType<typeof setTimeout> | null;
+  } | null>(null);
+
+  const clearPointer = () => {
+    const pointer = pointerRef.current;
+    if (pointer?.timer) clearTimeout(pointer.timer);
+    if (pointer?.element.hasPointerCapture(pointer.pointerId)) pointer.element.releasePointerCapture(pointer.pointerId);
+    pointerRef.current = null;
+    dropTargetRef.current = null;
+    setDraggingId(null);
+    setDropTarget(null);
+    document.body.style.removeProperty("user-select");
+  };
+
+  useEffect(() => () => clearPointer(), []);
+
+  const updateDropTarget = (clientX: number) => {
+    const tabList = tabListRef.current;
+    const movingID = pointerRef.current?.id;
+    if (!tabList || !movingID) return;
+    const tabs = [...tabList.querySelectorAll<HTMLElement>("[data-agent-tab-root]")].filter((tab) => tab.dataset.agentTabRoot !== movingID);
+    if (tabs.length === 0) return;
+    const target = tabs.find((tab) => clientX <= tab.getBoundingClientRect().right) || tabs[tabs.length - 1];
+    const rect = target.getBoundingClientRect();
+    const nextTarget = { id: target.dataset.agentTabRoot || "", edge: clientX < rect.left + rect.width / 2 ? "before" as const : "after" as const };
+    dropTargetRef.current = nextTarget;
+    setDropTarget(nextTarget);
+    const listRect = tabList.getBoundingClientRect();
+    if (clientX < listRect.left + 36) tabList.scrollBy({ left: -24 });
+    else if (clientX > listRect.right - 36) tabList.scrollBy({ left: 24 });
+  };
+
+  const activatePointer = (clientX: number) => {
+    const pointer = pointerRef.current;
+    if (!pointer || pointer.activated) return;
+    pointer.activated = true;
+    if (pointer.timer) clearTimeout(pointer.timer);
+    pointer.timer = null;
+    pointer.element.setPointerCapture(pointer.pointerId);
+    document.body.style.userSelect = "none";
+    setDraggingId(pointer.id);
+    updateDropTarget(clientX);
+  };
+
+  const beginPointer = (event: ReactPointerEvent<HTMLDivElement>, id: string) => {
+    if (!event.isPrimary || event.button !== 0 || (event.target as Element).closest("[data-tab-action]")) return;
+    const pointer = {
+      id,
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      startX: event.clientX,
+      startY: event.clientY,
+      element: event.currentTarget,
+      activated: false,
+      timer: null as ReturnType<typeof setTimeout> | null,
+    };
+    pointerRef.current = pointer;
+    if (event.pointerType !== "mouse") {
+      pointer.timer = setTimeout(() => activatePointer(pointer.startX), 220);
+    }
+  };
+
+  const movePointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = pointerRef.current;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    const distance = Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY);
+    if (!pointer.activated) {
+      if (pointer.pointerType === "mouse" && distance >= 5) activatePointer(event.clientX);
+      else if (pointer.pointerType !== "mouse" && distance >= 8) clearPointer();
+      return;
+    }
+    event.preventDefault();
+    updateDropTarget(event.clientX);
+  };
+
+  const endPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = pointerRef.current;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    if (pointer.activated) {
+      const target = dropTargetRef.current;
+      if (target) onReorder(pointer.id, target.id, target.edge);
+      suppressClickRef.current = pointer.id;
+      window.setTimeout(() => {
+        if (suppressClickRef.current === pointer.id) suppressClickRef.current = null;
+      }, 0);
+    }
+    clearPointer();
+  };
+
   return (
     <div className="flex h-9 shrink-0 items-stretch overflow-hidden border-b border-sidebar-border/80 bg-sidebar/45 pl-12 md:pl-0" aria-label="Open agents">
-      <div className="flex min-w-0 flex-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="tablist">
+      <div ref={tabListRef} className="flex min-w-0 flex-1 touch-pan-x overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="tablist">
         {agents.map((agent, index) => {
           const active = agent.id === activeId;
           const unseen = unseenIds.has(agent.id);
@@ -296,26 +417,45 @@ function AgentTabs({
           return (
             <div
               key={agent.id}
-              className={`group relative flex min-w-[156px] max-w-[240px] shrink-0 items-center border-r border-border/70 ${active ? "bg-background text-foreground" : "text-muted-foreground hover:bg-background/60 hover:text-foreground"}`}
+              data-agent-tab-root={agent.id}
+              onPointerDown={(event) => beginPointer(event, agent.id)}
+              onPointerMove={movePointer}
+              onPointerUp={endPointer}
+              onPointerCancel={clearPointer}
+              className={`group relative flex min-w-[156px] max-w-[240px] shrink-0 cursor-grab items-center border-r border-border/70 active:cursor-grabbing ${draggingId === agent.id ? "z-10 opacity-55" : ""} ${active ? "bg-background text-foreground" : "text-muted-foreground hover:bg-background/60 hover:text-foreground"}`}
             >
+              {dropTarget?.id === agent.id ? <span className={`pointer-events-none absolute inset-y-1 z-20 w-0.5 bg-ring ${dropTarget.edge === "before" ? "left-0" : "right-0"}`} /> : null}
               {active ? <span className="absolute inset-x-0 bottom-[-1px] h-px bg-background" /> : null}
               <button
                 type="button"
                 role="tab"
                 aria-selected={active}
+                aria-grabbed={draggingId === agent.id}
                 data-agent-id={agent.id}
                 data-agent-status={agent.status}
                 className="flex h-full min-w-0 flex-1 items-center gap-2 pl-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/40"
-                onClick={() => onSelect(agent.id)}
-                title={`${agent.name}\n${agent.cwd}${shortcutNumber ? `\nSwitch: Ctrl/Option+${shortcutNumber}` : ""}`}
+                onClick={() => {
+                  if (suppressClickRef.current === agent.id) {
+                    suppressClickRef.current = null;
+                    return;
+                  }
+                  onSelect(agent.id);
+                }}
+                onKeyDown={(event) => {
+                  if (!event.altKey || !event.shiftKey || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
+                  event.preventDefault();
+                  onMove(agent.id, event.key === "ArrowLeft" ? -1 : 1);
+                }}
+                title={`${agent.name}\n${agent.cwd}${interruptedAgentTitle(agent) ? `\n${interruptedAgentTitle(agent)}` : ""}${shortcutNumber ? `\nSwitch: Ctrl/Option+${shortcutNumber}` : ""}\nReorder: drag or Alt+Shift+Arrow`}
               >
-                <span className={`size-1.5 shrink-0 rounded-full ${isAgentWorking(agent) ? `animate-pulse ${executionDotClass(agent)}` : unseen ? "bg-ring ring-2 ring-ring/15" : executionDotClass(agent)}`} />
+                {agent.status === "interrupted" ? <CirclePause className="size-3.5 shrink-0 text-warning" aria-label="Interrupted by restart" /> : <span className={`size-1.5 shrink-0 rounded-full ${isAgentWorking(agent) ? `animate-pulse ${executionDotClass(agent)}` : unseen ? "bg-ring ring-2 ring-ring/15" : executionDotClass(agent)}`} />}
                 <span className={`truncate text-[11.5px] ${active ? "font-semibold" : "font-medium"}`}>{agent.name}</span>
                 {needsYou > 0 ? <span className="flex min-w-4 shrink-0 items-center justify-center rounded-sm bg-warning/15 px-1 font-mono text-[8px] font-semibold text-warning" title={`${needsYou} request${needsYou === 1 ? "" : "s"} need your input`}>{needsYou}</span> : null}
                 {inbox > 0 ? <span className="flex min-w-4 shrink-0 items-center justify-center rounded-sm bg-muted px-1 font-mono text-[8px] font-semibold text-muted-foreground" title={`${inbox} Agent Inbox item${inbox === 1 ? "" : "s"}`}>{inbox}</span> : null}
               </button>
               <Popover open={openInfoId === agent.id} onOpenChange={(open) => setOpenInfoId(open ? agent.id : null)}>
                 <PopoverTrigger
+                  data-tab-action
                   openOnHover
                   delay={250}
                   closeDelay={180}
@@ -348,6 +488,7 @@ function AgentTabs({
               </Popover>
               <button
                 type="button"
+                data-tab-action
                 onClick={() => onClose(agent.id)}
                 className={`mr-1 flex size-6 shrink-0 items-center justify-center rounded-sm outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/40 ${active || unseen ? "text-muted-foreground" : "text-muted-foreground/0 group-hover:text-muted-foreground"}`}
                 title={`Close ${agent.name} tab`}
@@ -392,6 +533,11 @@ export default function App() {
     queryFn: () => api("GET", "/api/human-requests"),
     refetchInterval: 30_000,
   });
+  const topicsQuery = useQuery<{ topics: Topic[] }>({
+    queryKey: ["topics"],
+    queryFn: () => api("GET", "/api/topics"),
+    refetchInterval: 30_000,
+  });
   const agents = agentsQuery.data?.agents || [];
   const remote = remoteQuery.data || null;
   const backupStatus = backupQuery.data || { backups: [], dir: "", count: 0, totalBytes: 0, retention: { minCount: 2, maxCount: 5, maxBytes: 2 * 1024 ** 3, maxAgeDays: 30 } };
@@ -405,7 +551,7 @@ export default function App() {
   const [current, setCurrent] = useState<string | null>(() => sessionStorage.getItem("codexloom-active-agent"));
   const [openAgentIds, setOpenAgentIds] = useState<string[]>(readAgentTabs);
   const [unseenAgentIds, setUnseenAgentIds] = useState<Set<string>>(() => new Set());
-  const [view, setView] = useState<"agents" | "needs-you" | "inbox" | "integrations" | "messages" | "schedules" | "team" | "status" | "capacity" | "usage" | "settings" | "remote" | "design">("agents");
+  const [view, setView] = useState<"agents" | "needs-you" | "topics" | "inbox" | "integrations" | "messages" | "schedules" | "team" | "status" | "capacity" | "usage" | "settings" | "remote" | "design">("agents");
   const [overviewSection, setOverviewSection] = useState<OverviewSection>("status");
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("remote");
   const [targetHint, setTargetHint] = useState("");
@@ -413,6 +559,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false); // mobile drawer
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("codexloom-sidebar") === "compact");
   const [newAgentOpen, setNewAgentOpen] = useState(false);
+  const [topicCreateRequest, setTopicCreateRequest] = useState<{ agentId?: string; nonce: number } | null>(null);
   const [configRequest, setConfigRequest] = useState<{ agentId: string; nonce: number } | null>(null);
   const [archivingAgentIds, setArchivingAgentIds] = useState<Set<string>>(() => new Set());
   const [newName, setNewName] = useState("");
@@ -501,6 +648,7 @@ export default function App() {
           void queryClient.invalidateQueries({ queryKey: ["pending-work"] });
           void queryClient.invalidateQueries({ queryKey: ["human-requests"] });
           void queryClient.invalidateQueries({ queryKey: ["remote"] });
+          void queryClient.invalidateQueries({ queryKey: ["topics"] });
           for (const agentId of openAgentIdsRef.current) publishThreadEvent(agentId, evt);
           return;
         }
@@ -509,6 +657,9 @@ export default function App() {
         }
         if (evt.type === "loom/human-request") {
           void queryClient.invalidateQueries({ queryKey: ["human-requests"] });
+        }
+        if (evt.type === "loom/topic-updated" || evt.type === "loom/topic-event") {
+          void queryClient.invalidateQueries({ queryKey: ["topics"] });
         }
         if (evt.type === "loom/agents") {
           setAgents((previous) => mergeAgentSnapshot(previous, evt.data.agents || []));
@@ -554,7 +705,9 @@ export default function App() {
                       threadId: d.threadId ?? s.threadId,
                       status: d.status,
                       currentTask: d.currentTask || "",
+                      currentTurnId: d.currentTurnId || "",
                       lastError: d.lastError || "",
+                      lastTurn: Object.prototype.hasOwnProperty.call(d, "lastTurn") ? d.lastTurn || undefined : s.lastTurn,
                       model: d.model ?? s.model,
                       effort: d.effort ?? s.effort,
                       sandbox: d.sandbox ?? s.sandbox,
@@ -681,6 +834,11 @@ export default function App() {
       hashApplied.current = true;
       return;
     }
+    if (route === "topics") {
+      setView("topics");
+      hashApplied.current = true;
+      return;
+    }
     if (route === "inbox") {
       setView("inbox");
       hashApplied.current = true;
@@ -791,6 +949,14 @@ export default function App() {
     });
   };
 
+  const reorderAgentTabs = (movingID: string, targetID: string, edge: DropEdge) => {
+    setOpenAgentIds((ids) => reorderItem(ids, movingID, targetID, edge));
+  };
+
+  const moveAgentTab = (id: string, offset: -1 | 1) => {
+    setOpenAgentIds((ids) => moveItem(ids, id, offset));
+  };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing || openAgentIds.length === 0) return;
@@ -853,6 +1019,18 @@ export default function App() {
     setCurrent(null);
     setSidebarOpen(false);
     window.location.hash = requestID ? `needs-you?request=${encodeURIComponent(requestID)}` : "needs-you";
+  };
+
+  const selectTopics = (topicID?: string) => {
+    setView("topics");
+    setCurrent(null);
+    setSidebarOpen(false);
+    window.location.hash = topicID ? `topics?topic=${encodeURIComponent(topicID)}` : "topics";
+  };
+
+  const trackAgentWork = (agentID: string) => {
+    setTopicCreateRequest({ agentId: agentID, nonce: Date.now() });
+    selectTopics();
   };
 
   const selectInbox = (itemID?: string) => {
@@ -998,6 +1176,8 @@ export default function App() {
         (pendingWorkQuery.data?.entries || []).filter((entry) => entry.item.agentId === agent.id && !["handled", "cancelled"].includes(entry.item.state)).length,
       ])),
       needsYouCount: (humanRequestsQuery.data?.requests || []).filter((request) => request.state === "open").length,
+      topicsCount: (topicsQuery.data?.topics || []).filter((topic) => topic.status !== "archived").length,
+      topicAttentionCount: (topicsQuery.data?.topics || []).filter((topic) => topic.needsMeCount > 0 || topic.resultsReady).length,
       needsYouByAgent: Object.fromEntries(agents.map((agent) => [
         agent.id,
         (humanRequestsQuery.data?.requests || []).filter((request) => request.agentId === agent.id && request.state === "open").length,
@@ -1052,6 +1232,11 @@ export default function App() {
       await new Promise((resolve) => window.setTimeout(resolve, 50));
       return window.codexLoom?.state?.();
     };
+    root.openTopics = async (topicID?: string) => {
+      selectTopics(topicID);
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+      return window.codexLoom?.state?.();
+    };
     root.openMessages = async () => {
       selectMessages();
       await new Promise((resolve) => window.setTimeout(resolve, 50));
@@ -1084,7 +1269,7 @@ export default function App() {
       await new Promise((resolve) => window.setTimeout(resolve, 220));
       return window.codexLoom?.state?.();
     };
-  }, [agents, current, humanRequestsQuery.data?.requests, openAgentIds, pendingWorkQuery.data?.entries, remote?.status.state, restartStatus?.state, sidebarCollapsed, unseenAgentIds, view]);
+  }, [agents, current, humanRequestsQuery.data?.requests, openAgentIds, pendingWorkQuery.data?.entries, remote?.status.state, restartStatus?.state, sidebarCollapsed, topicsQuery.data?.topics, unseenAgentIds, view]);
 
   const updateAgent = (updated: Agent) => {
     setAgents((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
@@ -1098,6 +1283,7 @@ export default function App() {
   const humanRequests = humanRequestsQuery.data?.requests || [];
   const openHumanRequests = humanRequests.filter((request) => request.state === "open");
   const pendingWork = pendingWorkQuery.data?.entries || [];
+  const topicAttentionCount = (topicsQuery.data?.topics || []).filter((topic) => topic.needsMeCount > 0 || topic.resultsReady).length;
   const restartState = restartStatus?.state || "idle";
   const restartPending = restartState === "waiting" || restartState === "restarting";
   const activeCount = agents.filter(isAgentWorking).length;
@@ -1194,6 +1380,7 @@ export default function App() {
         <nav className="px-2 pb-2" aria-label="Workspace">
           <div className="space-y-0.5">
             <SidebarNavItem label="Needs You" icon={CircleHelp} active={view === "needs-you"} compact={false} onSelect={() => selectNeedsYou()} count={openHumanRequests.length} />
+            <SidebarNavItem label="Topics" icon={BookOpen} active={view === "topics"} compact={false} onSelect={() => selectTopics()} count={topicAttentionCount} />
             <SidebarNavItem label="Overview" icon={Activity} active={view === "status" || view === "capacity" || view === "usage"} compact={false} onSelect={() => selectOverview()} />
             <SidebarNavItem label="Team" icon={Network} active={view === "team" || view === "messages"} compact={false} onSelect={selectTeam} />
             <SidebarNavItem label="External" icon={Cable} active={view === "integrations"} compact={false} onSelect={selectIntegrations} />
@@ -1214,7 +1401,7 @@ export default function App() {
               const needsYou = openHumanRequests.filter((request) => request.agentId === s.id).length;
               const inboxCount = pendingWork.filter((entry) => entry.item.agentId === s.id && !["handled", "cancelled"].includes(entry.item.state)).length;
               const activity = s.currentTask || "";
-              const detailTitle = activity ? `${s.cwd}\n${summarizeTask(activity)}` : s.cwd;
+              const detailTitle = [s.cwd, activity ? summarizeTask(activity) : "", interruptedAgentTitle(s)].filter(Boolean).join("\n");
               return (
                 <div
                   key={s.id}
@@ -1229,7 +1416,7 @@ export default function App() {
                     title={detailTitle}
                     className="h-8 min-w-0 flex-1 justify-start overflow-hidden bg-transparent px-2.5 text-left hover:bg-transparent hover:text-inherit"
                   >
-                    <span className={`size-2 shrink-0 rounded-full ${isAgentWorking(s) ? "pulse" : ""} ${executionDotClass(s)}`} />
+                    {s.status === "interrupted" ? <CirclePause className="size-3.5 shrink-0 text-warning" aria-label="Interrupted by restart" /> : <span className={`size-2 shrink-0 rounded-full ${isAgentWorking(s) ? "pulse" : ""} ${executionDotClass(s)}`} />}
                     <span className={`min-w-0 flex-1 truncate text-[12.5px] ${active ? "font-semibold" : "font-medium"}`}>{s.name}</span>
                     {unseenAgentIds.has(s.id) ? <span className="size-1.5 shrink-0 rounded-full bg-ring" title="New result from Owner-started work" /> : null}
                     {inboxCount > 0 ? <span className="shrink-0 font-mono text-[8.5px] text-muted-foreground" title={`${inboxCount} Agent Inbox items`}>{inboxCount}</span> : null}
@@ -1328,13 +1515,25 @@ export default function App() {
           onClose={closeAgent}
           onEdit={editAgent}
           onSelectRequest={selectNeedsYou}
+          onReorder={reorderAgentTabs}
+          onMove={moveAgentTab}
         />
-        <Suspense fallback={<WorkbenchFallback />}>
-          <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+        <WorkspaceErrorBoundary resetKey={view}>
+          <Suspense fallback={<WorkbenchFallback />}>
+            <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+              <WorkspaceReady view={view} />
             {view === "needs-you" ? (
               <NeedsYouPane
                 requests={humanRequests}
                 onChanged={() => queryClient.invalidateQueries({ queryKey: ["human-requests"] })}
+                onOpenAgent={selectAgent}
+                onError={showToast}
+              />
+            ) : view === "topics" ? (
+              <TopicsPane
+                agents={agents}
+                createRequest={topicCreateRequest}
+                onCreateRequestHandled={() => setTopicCreateRequest(null)}
                 onOpenAgent={selectAgent}
                 onError={showToast}
               />
@@ -1392,6 +1591,7 @@ export default function App() {
                     onHumanRequestChanged={() => queryClient.invalidateQueries({ queryKey: ["human-requests"] })}
                     onPendingWorkChanged={() => queryClient.invalidateQueries({ queryKey: ["pending-work"] })}
                     onOpenUsage={openAgentUsage}
+                    onTrackTopic={() => trackAgentWork(agent.id)}
                     onAgentUpdated={updateAgent}
                     onError={showToast}
                   />
@@ -1406,8 +1606,9 @@ export default function App() {
                 <div className="text-sm text-muted-foreground/70">Select or create an agent to begin.</div>
               </div>
             ) : null}
-          </div>
-        </Suspense>
+            </div>
+          </Suspense>
+        </WorkspaceErrorBoundary>
       </div>
 
       {/* toast */}

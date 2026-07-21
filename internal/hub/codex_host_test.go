@@ -144,6 +144,63 @@ func TestSharedCodexHostAdoptsRemoteResumedThreadOnTurnStart(t *testing.T) {
 	}
 }
 
+func TestInterruptRetriesWithAuthoritativeActiveTurnID(t *testing.T) {
+	logPath := installFakeSharedCodexHost(t)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	defer h.Shutdown()
+	host, err := h.ensureCodexHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	turn := &turnState{
+		turnID: "turn-stale", task: "Investigate", source: "owner", startedAt: time.Now(),
+		stopWatchdog: make(chan struct{}),
+	}
+	h.mu.Lock()
+	h.agents["agent-race"] = &Agent{
+		ID: "agent-race", Name: "race", ThreadID: "thr-interrupt-race", Status: "running",
+		CurrentTurnID: "turn-stale", CurrentTask: "Investigate", CreatedAt: now(), UpdatedAt: now(),
+	}
+	h.runtimes["agent-race"] = &runtime{
+		agentID: "agent-race", client: host.client, hostGeneration: host.generation,
+		ready: host.ready, approvals: map[string]*approval{}, activeTurn: turn,
+	}
+	h.mu.Unlock()
+
+	result, err := h.Interrupt("agent-race", "test interrupt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Interrupted {
+		t.Fatalf("interrupt result = %#v", result)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		finished := h.runtimes["agent-race"].activeTurn == nil
+		h.mu.Unlock()
+		if finished {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.mu.Lock()
+	meta := *h.agents["agent-race"]
+	h.mu.Unlock()
+	if meta.Status != "idle" || meta.LastTurn == nil || meta.LastTurn.TurnID != "turn-actual" || meta.LastTurn.Status != "interrupted" {
+		t.Fatalf("Agent after reconciled interrupt = %#v", meta)
+	}
+	if got := countRequestMethod(t, logPath, "turn/interrupt"); got != 2 {
+		t.Fatalf("turn/interrupt requests = %d, want stale request plus one retry", got)
+	}
+}
+
 func TestTwoAgentsShareOneCodexHost(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	logPath := installFakeSharedCodexHost(t)
@@ -200,7 +257,7 @@ func TestTwoAgentsShareOneCodexHost(t *testing.T) {
 	if !ok || len(cwds) != 2 || cwds[0] != "/tmp/one" || cwds[1] != "/tmp/two" {
 		t.Fatalf("skills/list cwds = %#v, want both Agent workspaces", reload["cwds"])
 	}
-	for _, name := range []string{"loom-communication", "domain-agent-coaching", "loom-integrations", "loom-external-messaging", "loom-parall", "loom-feishu", "loom-needs-you", "loom-artifacts"} {
+	for _, name := range []string{"loom-communication", "domain-agent-coaching", "loom-integrations", "loom-external-messaging", "loom-parall", "loom-feishu", "loom-needs-you", "loom-artifacts", "loom-triggers"} {
 		if _, err := os.Stat(filepath.Join(dataDir, "builtin-skills", name, "SKILL.md")); err != nil {
 			t.Fatalf("materialized %s: %v", name, err)
 		}
@@ -377,7 +434,7 @@ func TestMissingUserSkillsLetsUserSkillWin(t *testing.T) {
 		t.Fatal(err)
 	}
 	missing := missingUserSkills()
-	if len(missing) != 7 || missing[0] != "domain-agent-coaching" || missing[1] != "loom-integrations" || missing[2] != "loom-external-messaging" || missing[3] != "loom-parall" || missing[4] != "loom-feishu" || missing[5] != "loom-needs-you" || missing[6] != "loom-artifacts" {
+	if len(missing) != 9 || missing[0] != "domain-agent-coaching" || missing[1] != "loom-integrations" || missing[2] != "loom-external-messaging" || missing[3] != "loom-parall" || missing[4] != "loom-feishu" || missing[5] != "loom-needs-you" || missing[6] != "loom-artifacts" || missing[7] != "loom-triggers" || missing[8] != "loom-topics" {
 		t.Fatalf("missing user skills = %#v", missing)
 	}
 }
@@ -425,6 +482,11 @@ while IFS= read -r line; do
 	  else
 	    printf '{"id":%s,"error":{"code":-32602,"message":"thread not found: thr-stale"}}\n' "$id"
 	  fi ;;
+	*'"method":"turn/interrupt"'*'"threadId":"thr-interrupt-race"'*'"turnId":"turn-stale"'*)
+	  printf '{"id":%s,"error":{"code":-32602,"message":"expected active turn id turn-stale but found turn-actual"}}\n' "$id" ;;
+	*'"method":"turn/interrupt"'*'"threadId":"thr-interrupt-race"'*'"turnId":"turn-actual"'*)
+	  printf '{"id":%s,"result":{}}\n' "$id"
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-interrupt-race","turn":{"id":"turn-actual","status":"interrupted"}}}\n' ;;
     *) printf '{"id":%s,"result":{}}\n' "$id" ;;
   esac
 done

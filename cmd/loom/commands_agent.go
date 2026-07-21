@@ -371,7 +371,7 @@ func cmdAskUser(a args) {
 		question = strings.TrimSpace(strings.Join(a.positional, " "))
 	}
 	if from == "" || question == "" {
-		usage(`ask-user --from AGENT --question TEXT [--context TEXT] [--blocks TEXT] [--option "Label::description" ...] [--optional]`)
+		usage(`ask-user --from AGENT --question TEXT [--context TEXT] [--blocks TEXT] [--topic TOPIC_ID] [--option "Label::description" ...] [--optional]`)
 	}
 	expectation := "required"
 	if _, optional := a.flags["optional"]; optional {
@@ -389,10 +389,15 @@ func cmdAskUser(a args) {
 		}
 		options = append(options, option)
 	}
+	blockedWork := strings.TrimSpace(a.flags["blocks"])
+	if blockedWork == "" {
+		blockedWork = strings.TrimSpace(a.flags["blocked-work"])
+	}
 	resp, err := api("POST", "/api/human-requests", map[string]any{
 		"agent": from, "expectation": expectation, "question": question,
-		"context": strings.TrimSpace(a.flags["context"]), "blockedWork": strings.TrimSpace(a.flags["blocks"]),
+		"context": strings.TrimSpace(a.flags["context"]), "blockedWork": blockedWork,
 		"options": options,
+		"topicId": strings.TrimSpace(a.flags["topic"]),
 	})
 	if err != nil {
 		fail(err)

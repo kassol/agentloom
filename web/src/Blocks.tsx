@@ -1,4 +1,4 @@
-import { BarChart3, FileText, Inbox, Paperclip } from "lucide-react";
+import { BarChart3, FileText, GitBranch, Inbox, Paperclip, RadioTower } from "lucide-react";
 import { UserBubble, AssistantBubble } from "./pages/agent/MessageBubbles";
 import { MarkdownContent } from "./pages/agent/markdown";
 import type { Block, ExternalAttachment, ExternalThreadContext } from "./feed";
@@ -164,6 +164,147 @@ export function BlockView({ block }: { block: Block }) {
                 {block.membershipId && <RouteMeta label="Membership" value={`${block.membershipId}${block.membershipVersion ? ` · v${block.membershipVersion}` : ""}`} />}
                 <RouteMeta label="Reply policy" value={block.replyPolicy || "none"} />
               </dl>
+            </details>
+            <RawEnvelope raw={block.raw} />
+          </div>
+        </article>
+      );
+    }
+
+    case "externalTrigger": {
+      return (
+        <article className="relative my-2 overflow-hidden rounded-md border border-[var(--loom-teal)]/35 bg-card shadow-card">
+          <div className="absolute inset-y-0 left-0 w-0.5 bg-[var(--loom-teal)]" />
+          <div className="px-4 py-3">
+            <div className="flex min-w-0 flex-wrap items-start gap-3">
+              <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-[var(--loom-teal)]/10 text-[var(--loom-teal)]">
+                <RadioTower className="size-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <span className="rounded-md bg-[var(--loom-teal)]/12 px-2 py-0.5 font-mono text-[10px] font-semibold text-[var(--loom-teal)]">TRIGGER</span>
+                  <span className="rounded-md border border-border px-1.5 py-0.5 font-mono text-[9.5px] font-semibold uppercase text-muted-foreground">{block.provider}</span>
+                  <span className="font-mono text-[9.5px] uppercase text-muted-foreground">{block.resourceKind}</span>
+                </div>
+                <h3 className="mt-1 truncate font-mono text-[13px] font-semibold text-foreground" title={block.subjectKey}>{block.subjectKey}</h3>
+                <div className="mt-0.5 text-[11px] text-muted-foreground">External state changed: <span className="font-medium text-foreground/80">{block.event}</span></div>
+              </div>
+              <div className="shrink-0 text-right font-mono text-[9.5px] text-muted-foreground">
+                {block.occurredAt && <div title="Provider event time">occurred {tsShort(block.occurredAt)}</div>}
+                {block.observedAt && <div className="mt-0.5" title="Time CodexLoom observed the event">observed {tsShort(block.observedAt)}</div>}
+              </div>
+            </div>
+            {block.summary && <div className="mt-3 border-t border-border/70 pt-3 text-[13px] leading-6 text-foreground/90"><MarkdownContent content={block.summary} /></div>}
+            <div className="mt-3 border-l-2 border-[var(--loom-teal)]/55 bg-[var(--loom-teal)]/5 px-3 py-2.5">
+              <div className="font-mono text-[9.5px] font-semibold uppercase text-[var(--loom-teal)]">Resume from here</div>
+              <div className="mt-1 text-[12.5px] leading-5 text-foreground/85"><MarkdownContent content={block.resumeInstruction} /></div>
+            </div>
+            {block.instruction && <div className="mt-2 text-[10.5px] leading-4 text-muted-foreground">{block.instruction}</div>}
+            {block.observation && (
+              <details className="mt-2 text-[10px] text-muted-foreground">
+                <summary className="cursor-pointer select-none font-mono hover:text-foreground">observed snapshot</summary>
+                <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words border-t border-border/60 bg-muted/25 px-3 py-2 font-mono text-[10.5px] leading-5 text-foreground/75">{JSON.stringify(block.observation, null, 2)}</pre>
+              </details>
+            )}
+            <details className="mt-2 text-[10px] text-muted-foreground">
+              <summary className="cursor-pointer select-none font-mono hover:text-foreground">routing details</summary>
+              <dl className="mt-2 grid min-w-0 gap-x-4 gap-y-1 border-t border-border/60 pt-2 sm:grid-cols-2">
+                <RouteMeta label="Trigger" value={block.triggerId} />
+                <RouteMeta label="Message" value={block.id} />
+                <RouteMeta label="Connection" value={block.connectionId} />
+                <RouteMeta label="Event key" value={block.eventKey} />
+              </dl>
+            </details>
+            <RawEnvelope raw={block.raw} />
+          </div>
+        </article>
+      );
+    }
+
+    case "topicContext": {
+      const payloadTone =
+        block.payload?.kind === "intervention" || block.payload?.variant === "req"
+          ? "bg-warning/10 text-warning"
+          : block.payload?.variant === "res"
+            ? "bg-success/10 text-success"
+            : "bg-secondary text-secondary-foreground";
+      return (
+        <article className="relative my-2 overflow-hidden rounded-md border border-primary/25 bg-card shadow-card">
+          <div className="absolute inset-y-0 left-0 w-0.5 bg-primary" />
+          <div className="px-4 py-3">
+            <header className="flex min-w-0 flex-wrap items-start gap-3">
+              <div className="flex size-8 shrink-0 items-center justify-center rounded-sm bg-primary/10 text-primary">
+                <GitBranch className="size-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <span className="rounded-sm bg-primary px-2 py-0.5 font-mono text-[9.5px] font-semibold text-primary-foreground">TOPIC</span>
+                  <span className="rounded-sm border border-border px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase text-muted-foreground">{block.status}</span>
+                  {block.responsibleAgent && <span className="truncate font-mono text-[10px] text-muted-foreground">Responsible · {block.responsibleAgent}</span>}
+                </div>
+                <h3 className="mt-1 text-[14px] font-semibold leading-5 text-foreground">{block.title || "Topic work"}</h3>
+              </div>
+              <div className="shrink-0 text-right font-mono text-[9.5px] text-muted-foreground">
+                <div>{tsShort(block.ts)}</div>
+                <div className="mt-0.5">v{block.briefVersion || "?"} · e{block.eventSeq || "?"}</div>
+              </div>
+            </header>
+
+            {block.payload && (
+              <section className="mt-3 border-t border-border/70 pt-3">
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  <span className={`rounded-sm px-2 py-0.5 font-mono text-[9.5px] font-semibold ${payloadTone}`}>{block.payload.label}</span>
+                  {block.payload.from && <span className="min-w-0 truncate font-mono text-[10px] text-muted-foreground">{block.payload.from} → {block.payload.to || block.responsibleAgent}</span>}
+                  {block.payload.turnId && <span className="min-w-0 truncate font-mono text-[9.5px] text-muted-foreground">Turn {block.payload.turnId}</span>}
+                </div>
+                {block.payload.subject && <div className="mt-1.5 text-[13px] font-semibold text-foreground">{block.payload.subject}</div>}
+                {block.payload.body && <div className="mt-2 min-w-0 text-[13px] leading-6 text-foreground/90"><MarkdownContent content={block.payload.body} /></div>}
+                {block.payload.reason && <div className="mt-2 border-l-2 border-warning/40 pl-3 text-[11.5px] leading-5 text-muted-foreground">Reason: {block.payload.reason}</div>}
+              </section>
+            )}
+
+            {(block.briefSummary || block.currentState || block.yourResponsibility) && (
+              <section className="mt-3 border-y border-border/70 py-3">
+                {block.briefSummary && <div className="text-[12.5px] font-medium leading-5 text-foreground">{block.briefSummary}</div>}
+                {block.currentState && <div className="mt-1.5 text-[12px] leading-5 text-muted-foreground"><MarkdownContent content={block.currentState} /></div>}
+                {block.yourResponsibility && (
+                  <div className="mt-2 grid min-w-0 gap-1 sm:grid-cols-[112px_1fr] sm:gap-3">
+                    <span className="font-mono text-[9.5px] font-semibold uppercase text-primary">Your responsibility</span>
+                    <span className="min-w-0 text-[11.5px] leading-5 text-foreground/80">{block.yourResponsibility}</span>
+                  </div>
+                )}
+              </section>
+            )}
+
+            <details className="group/topic mt-2 text-[10.5px] text-muted-foreground">
+              <summary className="flex cursor-pointer list-none select-none items-center gap-2 py-1 font-mono hover:text-foreground">
+                <span className="text-[8px] transition-transform group-open/topic:rotate-90">▶</span>
+                topic context
+                <span className="ml-auto truncate text-[9px]">{block.topicId}</span>
+              </summary>
+              <div className="mt-2 divide-y divide-border/60 border-y border-border/60">
+                <TopicContextRow label="Purpose" value={block.purpose} markdown />
+                <TopicContextRow label="Completion" value={block.completionBoundary} markdown />
+                <TopicContextRow label="Next step" value={block.nextStep} markdown />
+                <TopicContextRow label="Limitations" value={block.limitations} markdown />
+                {block.links.length > 0 && (
+                  <div className="grid min-w-0 gap-2 py-2.5 sm:grid-cols-[112px_1fr] sm:gap-3">
+                    <span className="font-mono text-[9px] font-semibold uppercase">Key links</span>
+                    <div className="min-w-0 space-y-1">
+                      {block.links.map((link, index) => <div key={`${link.type}:${link.id}:${index}`} className="min-w-0 break-words"><span className="font-mono text-primary">{link.type}</span> · {link.label || link.id} <span className="font-mono text-[9px] text-muted-foreground/70">{link.id}</span></div>)}
+                    </div>
+                  </div>
+                )}
+                {block.delta.length > 0 && (
+                  <div className="grid min-w-0 gap-2 py-2.5 sm:grid-cols-[112px_1fr] sm:gap-3">
+                    <span className="font-mono text-[9px] font-semibold uppercase">Delta</span>
+                    <div className="min-w-0 space-y-1.5">
+                      {block.delta.map((event, index) => <div key={`${event.seq}:${index}`} className="grid min-w-0 grid-cols-[32px_minmax(0,1fr)] gap-2"><span className="font-mono text-[9px] text-primary">#{event.seq}</span><span className="min-w-0 break-words"><span className="font-mono text-[9px] uppercase text-muted-foreground">{event.type}</span>{event.summary ? ` · ${event.summary}` : ""}</span></div>)}
+                    </div>
+                  </div>
+                )}
+                <TopicContextRow label="Instruction" value={block.instruction} />
+              </div>
             </details>
             <RawEnvelope raw={block.raw} />
           </div>
@@ -370,6 +511,16 @@ function RouteMeta({ label, value }: { label: string; value: string }) {
     <div className="grid min-w-0 grid-cols-[80px_1fr] gap-2">
       <dt className="uppercase">{label}</dt>
       <dd className="min-w-0 truncate font-mono text-foreground/70" title={value}>{value || "-"}</dd>
+    </div>
+  );
+}
+
+function TopicContextRow({ label, value, markdown = false }: { label: string; value: string; markdown?: boolean }) {
+  if (!value) return null;
+  return (
+    <div className="grid min-w-0 gap-2 py-2.5 sm:grid-cols-[112px_1fr] sm:gap-3">
+      <span className="font-mono text-[9px] font-semibold uppercase">{label}</span>
+      <div className="min-w-0 break-words text-[11.5px] leading-5 text-foreground/75">{markdown ? <MarkdownContent content={value} /> : value}</div>
     </div>
   );
 }

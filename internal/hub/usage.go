@@ -66,12 +66,52 @@ type UsageOverview struct {
 type agentUsageCacheEntry struct {
 	report *rollout.UsageReport
 	usage  AgentUsage
+	access uint64
 }
+
+const maxAgentUsageCacheEntries = 512
 
 var agentUsageCache = struct {
 	sync.Mutex
 	entries map[string]agentUsageCacheEntry
+	clock   uint64
 }{entries: map[string]agentUsageCacheEntry{}}
+
+func cachedAgentUsage(key string, report *rollout.UsageReport) (AgentUsage, bool) {
+	agentUsageCache.Lock()
+	defer agentUsageCache.Unlock()
+	cached, ok := agentUsageCache.entries[key]
+	if !ok {
+		return AgentUsage{}, false
+	}
+	if cached.report != report {
+		delete(agentUsageCache.entries, key)
+		return AgentUsage{}, false
+	}
+	agentUsageCache.clock++
+	cached.access = agentUsageCache.clock
+	agentUsageCache.entries[key] = cached
+	return cached.usage, true
+}
+
+func cacheAgentUsage(key string, report *rollout.UsageReport, usage AgentUsage) {
+	agentUsageCache.Lock()
+	defer agentUsageCache.Unlock()
+	agentUsageCache.clock++
+	agentUsageCache.entries[key] = agentUsageCacheEntry{report: report, usage: usage, access: agentUsageCache.clock}
+	if len(agentUsageCache.entries) <= maxAgentUsageCacheEntries {
+		return
+	}
+	oldestKey := ""
+	oldestAccess := ^uint64(0)
+	for candidate, entry := range agentUsageCache.entries {
+		if entry.access < oldestAccess {
+			oldestKey = candidate
+			oldestAccess = entry.access
+		}
+	}
+	delete(agentUsageCache.entries, oldestKey)
+}
 
 func normalizeUsageDays(days int) int {
 	if days <= 0 {
@@ -190,11 +230,8 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time) A
 		return result
 	}
 	cacheKey := agent.ThreadID + "\x00" + strconv.Itoa(days) + "\x00" + start.Format("2006-01-02") + "\x00" + endExclusive.Format("2006-01-02") + "\x00" + now.Location().String()
-	agentUsageCache.Lock()
-	cached, ok := agentUsageCache.entries[cacheKey]
-	agentUsageCache.Unlock()
-	if ok && cached.report == report {
-		result = cached.usage
+	if cached, ok := cachedAgentUsage(cacheKey, report); ok {
+		result = cached
 		result.AgentID = agent.ID
 		result.AgentName = agent.Name
 		result.Status = agent.Status
@@ -249,9 +286,7 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time) A
 	sort.SliceStable(result.Models, func(i, j int) bool {
 		return result.Models[i].Usage.TotalTokens > result.Models[j].Usage.TotalTokens
 	})
-	agentUsageCache.Lock()
-	agentUsageCache.entries[cacheKey] = agentUsageCacheEntry{report: report, usage: result}
-	agentUsageCache.Unlock()
+	cacheAgentUsage(cacheKey, report, result)
 	return result
 }
 

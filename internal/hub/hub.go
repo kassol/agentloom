@@ -17,6 +17,7 @@ package hub
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"log"
 	"regexp"
@@ -131,6 +132,9 @@ type AgentMessage struct {
 	SourceTurnID       string                        `json:"sourceTurnId,omitempty"`
 	ScheduleID         string                        `json:"scheduleId,omitempty"`
 	ScheduledAt        string                        `json:"scheduledAt,omitempty"`
+	TriggerID          string                        `json:"triggerId,omitempty"`
+	TopicID            string                        `json:"topicId,omitempty"`
+	TriggerEvent       *TriggerEvent                 `json:"triggerEvent,omitempty"`
 	Status             string                        `json:"status"`               // open, answered, closed
 	Resolution         string                        `json:"resolution,omitempty"` // reply, no_reply, cancelled, completed_elsewhere, superseded
 	ResolutionReason   string                        `json:"resolutionReason,omitempty"`
@@ -170,6 +174,7 @@ type CommParams struct {
 	Body       string        `json:"body"`
 	Response   string        `json:"response"`
 	ReplyTo    string        `json:"replyTo"`
+	TopicID    string        `json:"topicId,omitempty"`
 	System     bool          `json:"-"`
 	Timeout    time.Duration `json:"-"`
 	TimeoutSec int           `json:"timeoutSec"`
@@ -224,11 +229,13 @@ type approval struct {
 
 type turnState struct {
 	turnID            string
+	startedConfirmed  bool
 	task              string
 	source            string
 	inboxItemID       string
 	attemptID         string
 	agentMessageID    string
+	topicID           string
 	handlingAttemptID string
 	finalAnswer       string
 	startedAt         time.Time
@@ -267,8 +274,11 @@ type Hub struct {
 	comms                   map[string]*AgentMessage
 	commOrder               []string
 	schedules               map[string]*Schedule
+	triggers                map[string]*Trigger
+	topics                  map[string]*Topic
 	profiles                map[string]*AgentProfile
 	teamLinks               map[string]*TeamRelationship
+	collaborationGroups     map[string]*CollaborationGroup
 	organizationLinks       map[string]*OrganizationRelationship
 	connections             map[string]*PlatformConnection
 	addresses               map[string]*AgentAddress
@@ -305,10 +315,12 @@ type Hub struct {
 	stopOnce                sync.Once
 	stopping                bool
 	draining                bool
+	triggerObservations     map[string]struct{}
 	background              sync.WaitGroup
 	workers                 sync.WaitGroup
 	steerTurn               func(threadID, expectedTurnID, input string, timeout time.Duration) (string, error)
 	dispatchHumanAnswer     func(key, text string) (SendResult, error)
+	observeTrigger          triggerObserver
 }
 
 // New is retained for in-process callers that cannot recover from an invalid
@@ -341,8 +353,11 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		agents:                 map[string]*Agent{},
 		comms:                  map[string]*AgentMessage{},
 		schedules:              map[string]*Schedule{},
+		triggers:               map[string]*Trigger{},
+		topics:                 map[string]*Topic{},
 		profiles:               map[string]*AgentProfile{},
 		teamLinks:              map[string]*TeamRelationship{},
+		collaborationGroups:    map[string]*CollaborationGroup{},
 		organizationLinks:      map[string]*OrganizationRelationship{},
 		connections:            map[string]*PlatformConnection{},
 		addresses:              map[string]*AgentAddress{},
@@ -360,6 +375,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		runtimes:               map[string]*runtime{},
 		subs:                   map[string]map[*subscriber]struct{}{},
 		globalSubs:             map[*subscriber]struct{}{},
+		triggerObservations:    map[string]struct{}{},
 		stop:                   make(chan struct{}),
 	}
 	h.globalSeq = st.LastSeq(globalEventLogID)
@@ -381,11 +397,20 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	if h.teamLinks == nil {
 		h.teamLinks = map[string]*TeamRelationship{}
 	}
+	if err := h.st.LoadCollaborationGroups(&h.collaborationGroups); err != nil {
+		return nil, fmt.Errorf("load collaboration groups: %w", err)
+	}
+	if h.collaborationGroups == nil {
+		h.collaborationGroups = map[string]*CollaborationGroup{}
+	}
 	if err := h.st.LoadOrganizationLinks(&h.organizationLinks); err != nil {
 		return nil, fmt.Errorf("load organization links: %w", err)
 	}
 	if h.organizationLinks == nil {
 		h.organizationLinks = map[string]*OrganizationRelationship{}
+	}
+	if err := h.validateLoadedCollaborationGroupsLocked(); err != nil {
+		return nil, fmt.Errorf("validate collaboration groups: %w", err)
 	}
 	if err := h.loadIntegrations(); err != nil {
 		return nil, fmt.Errorf("load integrations: %w", err)
@@ -408,6 +433,23 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	if h.schedules == nil {
 		h.schedules = map[string]*Schedule{}
 	}
+	if err := h.st.LoadTriggers(&h.triggers); err != nil {
+		return nil, fmt.Errorf("load triggers: %w", err)
+	}
+	if h.triggers == nil {
+		h.triggers = map[string]*Trigger{}
+	}
+	if err := h.st.LoadTopics(&h.topics); err != nil {
+		return nil, fmt.Errorf("load Topics: %w", err)
+	}
+	if h.topics == nil {
+		h.topics = map[string]*Topic{}
+	}
+	if h.normalizeTopicsLocked() {
+		if err := h.persistTopicsLocked(); err != nil {
+			return nil, fmt.Errorf("persist normalized Topics: %w", err)
+		}
+	}
 	if err := h.loadRemoteLocked(); err != nil {
 		return nil, fmt.Errorf("load Remote config: %w", err)
 	}
@@ -419,6 +461,9 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	if err := h.migrateCommAgentIDsLocked(); err != nil {
 		return nil, fmt.Errorf("migrate communication agent ids: %w", err)
 	}
+	if err := h.reconcileTriggersLocked(); err != nil {
+		return nil, fmt.Errorf("reconcile triggers: %w", err)
+	}
 	for _, meta := range h.agents {
 		h.seqs[meta.ID] = st.LastSeq(meta.ID)
 	}
@@ -426,14 +471,35 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		return h, nil
 	}
 
-	// Reconcile: tasks running when the Hub last died are interrupted.
+	// Reconcile: tasks running when the Hub last died are interrupted. Keep the
+	// interrupted projection visible until the Owner continues or dismisses it;
+	// otherwise a restart silently turns unfinished work into an idle Agent.
 	h.mu.Lock()
 	for _, meta := range h.agents {
 		if meta.Source == "edge" {
 			continue // edge mirrors carry no CodexLoom-driven turn state
 		}
 		if meta.Status == "running" {
-			interruptedTurnID := meta.CurrentTurnID
+			interrupted, missingTerminal := reconcileInterruptedTurn(meta)
+			interruptedTurnID := interrupted.TurnID
+			if !missingTerminal {
+				if interruptedTurnID != "" {
+					for _, messageID := range h.commOrder {
+						msg := h.comms[messageID]
+						if msg == nil || msg.ToAgentID != meta.ID || msg.DeliveryMode != "turn_start" || msg.DeliveredTurnID != interruptedTurnID {
+							continue
+						}
+						h.finishAgentMessageTurnLocked(&turnState{turnID: interruptedTurnID, agentMessageID: msg.ID}, interrupted.Status, "")
+					}
+				}
+				meta.Status = "idle"
+				meta.LastError = ""
+				meta.LastTurn = interrupted
+				meta.CurrentTask = ""
+				meta.CurrentTurnID = ""
+				meta.UpdatedAt = now()
+				continue
+			}
 			if interruptedTurnID != "" {
 				for _, messageID := range h.commOrder {
 					msg := h.comms[messageID]
@@ -445,11 +511,12 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 			}
 			h.emitLocked(meta.ID, "loom/turn-interrupted", map[string]any{
 				"reason": "loom-restart",
-				"task":   meta.CurrentTask,
-				"turnId": meta.CurrentTurnID,
+				"task":   interrupted.Task,
+				"turnId": interrupted.TurnID,
 			})
-			meta.Status = "idle"
+			meta.Status = "interrupted"
 			meta.LastError = "interrupted: CodexLoom restarted while task was running"
+			meta.LastTurn = interrupted
 			meta.CurrentTask = ""
 			meta.CurrentTurnID = ""
 			meta.UpdatedAt = now()
@@ -460,12 +527,13 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		return nil, fmt.Errorf("persist startup recovery: %w", err)
 	}
 	h.mu.Unlock()
-	h.background.Add(5)
+	h.background.Add(6)
 	go func() { defer h.background.Done(); h.deliveryLoop() }()
 	go func() { defer h.background.Done(); h.schedulerLoop() }()
 	go func() { defer h.background.Done(); h.inboxLoop() }()
 	go func() { defer h.background.Done(); h.remoteLoop() }()
 	go func() { defer h.background.Done(); h.eventMaintenanceLoop() }()
+	go func() { defer h.background.Done(); h.triggerLoop() }()
 	return h, nil
 }
 
@@ -710,7 +778,9 @@ func (h *Hub) emitStatusLocked(meta *Agent, status string) {
 		"source":         meta.Source,
 		"status":         status,
 		"currentTask":    meta.CurrentTask,
+		"currentTurnId":  meta.CurrentTurnID,
 		"lastError":      meta.LastError,
+		"lastTurn":       meta.LastTurn,
 		"model":          meta.Model,
 		"effort":         meta.Effort,
 		"sandbox":        meta.Sandbox,
@@ -997,6 +1067,9 @@ func notificationUserText(params json.RawMessage) string {
 
 func displayUserTask(text string) string {
 	text = strings.TrimSpace(text)
+	if task, ok := displayLoomControlTask(text); ok {
+		return task
+	}
 	if index := strings.Index(text, "\n\n<loom_attachments"); index >= 0 {
 		text = strings.TrimSpace(text[:index])
 	} else if strings.HasPrefix(text, "<loom_attachments") {
@@ -1006,6 +1079,120 @@ func displayUserTask(text string) string {
 		return "Attached files"
 	}
 	return text
+}
+
+func displayLoomControlTask(text string) (string, bool) {
+	decoder := xml.NewDecoder(strings.NewReader(text))
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return "", false
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch start.Name.Local {
+		case "owner_topic_input":
+			var payload struct {
+				Message string `xml:"message"`
+			}
+			if err := decoder.DecodeElement(&payload, &start); err == nil {
+				if message := summarizeTopicText(payload.Message); message != "" {
+					return message, true
+				}
+			}
+		case "owner_topic_intervention":
+			var payload struct {
+				Guidance string `xml:"guidance"`
+			}
+			if err := decoder.DecodeElement(&payload, &start); err == nil {
+				if guidance := summarizeTopicText(payload.Guidance); guidance != "" {
+					return "Owner guidance: " + guidance, true
+				}
+			}
+		}
+	}
+}
+
+func (h *Hub) adoptRemoteTurnLocked(meta *Agent, rt *runtime, turnID string) *turnState {
+	turn := &turnState{
+		turnID: turnID, startedConfirmed: true, task: "Remote turn", source: "remote",
+		startedAt: time.Now(), lastActivity: time.Now(), stopWatchdog: make(chan struct{}),
+	}
+	rt.activeTurn = turn
+	meta.Status = "running"
+	meta.CurrentTask = turn.task
+	meta.CurrentTurnID = turnID
+	meta.LastError = ""
+	meta.UpdatedAt = now()
+	h.persistRuntimeProjectionLocked()
+	h.emitStatusLocked(meta, "running")
+	return turn
+}
+
+// rebindActiveTurnIDLocked reconciles a locally reserved Turn with the
+// authoritative id emitted by app-server. The associated Inbox/Message
+// records must move with it or completion would leave the work item hanging.
+func (h *Hub) rebindActiveTurnIDLocked(meta *Agent, turn *turnState, turnID string) {
+	turnID = strings.TrimSpace(turnID)
+	if turn == nil || turn.finished || turnID == "" || turn.turnID == turnID {
+		return
+	}
+	previousTurnID := turn.turnID
+	turn.turnID = turnID
+
+	// Establish records that are still at the pre-start boundary first.
+	h.markInboxAttemptRunningLocked(turn)
+	if err := h.markAgentMessageHandlingRunningLocked(turn, meta.ID); err != nil {
+		log.Printf("[codex-loom] establish reconciled message handling %s: %v", turn.agentMessageID, err)
+	}
+
+	if attempt := h.attempts[turn.attemptID]; attempt != nil &&
+		(attempt.TurnID == "" || attempt.TurnID == previousTurnID) {
+		next := *attempt
+		next.TurnID = turnID
+		if err := h.commitAttemptLocked(next); err != nil {
+			log.Printf("[codex-loom] persist reconciled Inbox attempt %s: %v", next.ID, err)
+		}
+	}
+	if message := h.comms[turn.agentMessageID]; message != nil {
+		next := *message
+		next.HandlingAttempts = cloneAgentMessageHandlingAttempts(message.HandlingAttempts)
+		changed := false
+		if next.DeliveredTurnID == "" || next.DeliveredTurnID == previousTurnID {
+			next.DeliveredTurnID = turnID
+			changed = true
+		}
+		for i := range next.HandlingAttempts {
+			attempt := &next.HandlingAttempts[i]
+			if (turn.handlingAttemptID != "" && attempt.ID == turn.handlingAttemptID) ||
+				(turn.handlingAttemptID == "" && next.ActiveHandlingID != "" && attempt.ID == next.ActiveHandlingID) {
+				if attempt.TurnID == "" || attempt.TurnID == previousTurnID {
+					attempt.TurnID = turnID
+					changed = true
+				}
+				break
+			}
+		}
+		if changed {
+			next.UpdatedAt = now()
+			if err := h.commitAgentMessageLocked(next); err != nil {
+				log.Printf("[codex-loom] persist reconciled message handling %s: %v", next.ID, err)
+			}
+		}
+	}
+
+	meta.Status = "running"
+	meta.CurrentTurnID = turnID
+	meta.UpdatedAt = now()
+	h.persistRuntimeProjectionLocked()
+	if previousTurnID != "" {
+		log.Printf("[codex-loom] reconciled active Turn for %s: %s -> %s", meta.Name, previousTurnID, turnID)
+		h.emitLocked(meta.ID, "loom/turn-reconciled", map[string]any{
+			"previousTurnId": previousTurnID, "turnId": turnID, "source": turn.source,
+		})
+	}
 }
 
 func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage) {
@@ -1022,20 +1209,34 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 		turnID = tp.Turn.ID
 	}
 
-	if method == "turn/started" && (rt.activeTurn == nil || rt.activeTurn.finished) {
-		rt.activeTurn = &turnState{
-			turnID: turnID, task: "Remote turn", source: "remote", startedAt: time.Now(), lastActivity: time.Now(),
-			stopWatchdog: make(chan struct{}),
+	if method == "turn/started" && turnID != "" {
+		switch turn := rt.activeTurn; {
+		case turn == nil || turn.finished:
+			h.adoptRemoteTurnLocked(meta, rt, turnID)
+		case turn.turnID == "":
+			h.rebindActiveTurnIDLocked(meta, turn, turnID)
+			turn.startedConfirmed = true
+		case turn.turnID == turnID:
+			turn.startedConfirmed = true
+		case !turn.startedConfirmed:
+			// turn/start may answer with a stale id immediately before the
+			// authoritative notification arrives. Preserve the local work
+			// context and move every linked record to the notified id.
+			h.rebindActiveTurnIDLocked(meta, turn, turnID)
+			turn.startedConfirmed = true
+		default:
+			// A confirmed Turn was superseded without its terminal event being
+			// observed. Close only that stale projection, then adopt the actual
+			// app-server Turn. Pending workers will see the new active Turn.
+			previousTurnID := turn.turnID
+			h.finishTurnLocked(meta, rt, "interrupted", "superseded by active Turn "+turnID)
+			h.adoptRemoteTurnLocked(meta, rt, turnID)
+			log.Printf("[codex-loom] adopted successor Turn for %s: %s -> %s", meta.Name, previousTurnID, turnID)
 		}
-		meta.Status = "running"
-		meta.CurrentTask = rt.activeTurn.task
-		meta.CurrentTurnID = turnID
-		meta.LastError = ""
-		meta.UpdatedAt = now()
-		h.persistRuntimeProjectionLocked()
-		h.emitStatusLocked(meta, "running")
 	}
-	if text := notificationUserText(params); text != "" && rt.activeTurn != nil && !rt.activeTurn.finished {
+	activeEvent := rt.activeTurn != nil && !rt.activeTurn.finished &&
+		(turnID == "" || rt.activeTurn.turnID == "" || rt.activeTurn.turnID == turnID)
+	if text := notificationUserText(params); text != "" && activeEvent {
 		task := displayUserTask(text)
 		rt.activeTurn.task = task
 		meta.CurrentTask = task
@@ -1047,19 +1248,13 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 		h.onGoalNotificationLocked(meta.ID, method, params)
 	}
 
-	if rt.activeTurn != nil && !rt.activeTurn.finished {
+	if activeEvent {
 		rt.activeTurn.lastActivity = time.Now()
 		if text := completedFinalAnswer(method, params); text != "" {
 			rt.activeTurn.finalAnswer = text
 		}
 		if turnID != "" && rt.activeTurn.turnID == "" {
-			rt.activeTurn.turnID = turnID
-			h.markInboxAttemptRunningLocked(rt.activeTurn)
-			if err := h.markAgentMessageHandlingRunningLocked(rt.activeTurn, meta.ID); err != nil {
-				log.Printf("[codex-loom] save notification message handling %s: %v", rt.activeTurn.agentMessageID, err)
-			}
-			meta.CurrentTurnID = turnID
-			h.persistRuntimeProjectionLocked()
+			h.rebindActiveTurnIDLocked(meta, rt.activeTurn, turnID)
 		}
 	}
 
@@ -1067,6 +1262,16 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 
 	switch method {
 	case "turn/completed", "turn/failed", "turn/aborted":
+		if rt.activeTurn == nil || rt.activeTurn.finished {
+			return
+		}
+		if turnID != "" && rt.activeTurn.turnID == "" {
+			h.rebindActiveTurnIDLocked(meta, rt.activeTurn, turnID)
+		}
+		if turnID != "" && rt.activeTurn.turnID != "" && rt.activeTurn.turnID != turnID {
+			log.Printf("[codex-loom] ignored terminal event for stale Turn on %s: active=%s event=%s", meta.Name, rt.activeTurn.turnID, turnID)
+			return
+		}
 		status := "completed"
 		errMsg := ""
 		if tp.Turn.Error != nil {
@@ -1166,11 +1371,18 @@ func (h *Hub) finishTurnLocked(meta *Agent, rt *runtime, status, errMsg string) 
 		"task":       turn.task,
 		"source":     turn.source,
 		"durationMs": time.Since(turn.startedAt).Milliseconds(),
+		"topicId":    turn.topicID,
 	}
 	if errMsg != "" {
 		payload["error"] = errMsg
 	}
 	h.emitLocked(meta.ID, evType, payload)
+	if turn.topicID != "" {
+		h.recordTopicWorkEventLocked(turn.topicID, TopicEvent{
+			Type: "turn_" + status, Actor: meta.Name, AgentID: meta.ID, Agent: meta.Name,
+			Summary: status + ": " + summarizeTopicText(turn.task), Ref: &TopicRef{Type: "turn", ID: turn.turnID, Label: meta.Name}, CreatedAt: now(),
+		})
+	}
 
 	meta.Status = "idle"
 	meta.CurrentTask = ""
@@ -1319,16 +1531,22 @@ func applyRolloutStatus(view *AgentView) {
 	if err != nil || latest == nil || latest.ID == "" {
 		return
 	}
+	// A restart-interrupted Turn remains visible until explicitly continued or
+	// dismissed. Its rollout has no terminal event by definition, so do not
+	// mistake a recently-written orphan for a live external Turn.
+	if view.LastTurn != nil && view.LastTurn.TurnID == latest.ID && view.LastTurn.Status == "interrupted" {
+		return
+	}
 	switch latest.Status {
 	case "running":
 		if !externalTurnLooksLive(view.ThreadID, latest.UpdatedAt) {
-			view.Status = "idle"
+			view.Status = "interrupted"
 			view.CurrentTask = ""
 			view.CurrentTurnID = ""
-			view.LastError = ""
+			view.LastError = "interrupted: active Turn ended without a terminal event"
 			view.LastTurn = &TurnSummary{
 				TurnID:      latest.ID,
-				Task:        latest.Task,
+				Task:        displayRolloutTask(latest.Task),
 				Status:      "interrupted",
 				CompletedAt: latest.UpdatedAt,
 			}
@@ -1337,7 +1555,7 @@ func applyRolloutStatus(view *AgentView) {
 			}
 			return
 		}
-		task := strings.TrimSpace(latest.Task)
+		task := displayRolloutTask(latest.Task)
 		if task == "" {
 			task = "external turn " + latest.ID
 		}
@@ -1356,11 +1574,18 @@ func applyRolloutStatus(view *AgentView) {
 		}
 		view.LastTurn = &TurnSummary{
 			TurnID:      latest.ID,
-			Task:        latest.Task,
+			Task:        displayRolloutTask(latest.Task),
 			Status:      latest.Status,
 			CompletedAt: latest.UpdatedAt,
 		}
 	}
+}
+
+func displayRolloutTask(task string) string {
+	if strings.TrimSpace(task) == "" {
+		return ""
+	}
+	return displayUserTask(task)
 }
 
 func externalTurnLooksLive(threadID, updatedAt string) bool {

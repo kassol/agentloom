@@ -6,11 +6,12 @@ import (
 )
 
 type TeamView struct {
-	Agents             []TeamAgent                `json:"agents"`
-	OrganizationLinks  []OrganizationRelationship `json:"organizationLinks"`
-	CollaborationLinks []TeamRelationship         `json:"collaborationLinks"`
-	ObservedLinks      []TeamObservedLink         `json:"observedLinks"`
-	ExplicitLinks      []TeamRelationship         `json:"explicitLinks"` // compatibility alias
+	Agents              []TeamAgent                `json:"agents"`
+	OrganizationLinks   []OrganizationRelationship `json:"organizationLinks"`
+	CollaborationLinks  []TeamRelationship         `json:"collaborationLinks"`
+	CollaborationGroups []CollaborationGroup       `json:"collaborationGroups"`
+	ObservedLinks       []TeamObservedLink         `json:"observedLinks"`
+	ExplicitLinks       []TeamRelationship         `json:"explicitLinks"` // compatibility alias
 }
 
 type TeamAgent struct {
@@ -74,6 +75,10 @@ func (h *Hub) Team() TeamView {
 		cp.To = h.agentNameLocked(cp.ToAgentID, cp.To)
 		explicit = append(explicit, cp)
 	}
+	groups := make([]CollaborationGroup, 0, len(h.collaborationGroups))
+	for _, group := range h.collaborationGroups {
+		groups = append(groups, collaborationGroupCopy(group))
+	}
 	organization := make([]OrganizationRelationship, 0, len(h.organizationLinks))
 	for _, relationship := range h.organizationLinks {
 		copy := *relationship
@@ -125,9 +130,10 @@ func (h *Hub) Team() TeamView {
 		}
 		return organization[i].ID < organization[j].ID
 	})
+	sortCollaborationGroups(groups)
 
 	return TeamView{
-		Agents: outAgents, OrganizationLinks: organization, CollaborationLinks: explicit,
+		Agents: outAgents, OrganizationLinks: organization, CollaborationLinks: explicit, CollaborationGroups: groups,
 		ObservedLinks: outLinks, ExplicitLinks: explicit,
 	}
 }
@@ -176,6 +182,10 @@ func aggregateTeamMessages(agents map[string]*TeamAgent, messages []AgentMessage
 		}
 		message.FromAgentID = teamAgentID(agents, message.FromAgentID, message.From)
 		message.ToAgentID = teamAgentID(agents, message.ToAgentID, message.To)
+		if message.FromAgentID == triggerAgentID {
+			// External Triggers are work ingress, not Agent-to-Agent collaboration.
+			continue
+		}
 		from := ensureTeamAgent(agents, message.FromAgentID, message.From)
 		to := ensureTeamAgent(agents, message.ToAgentID, message.To)
 		from.MessageOut++

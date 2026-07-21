@@ -305,7 +305,7 @@ func (h *Hub) SendAgentMessage(p CommParams) (CommResult, error) {
 }
 
 func (h *Hub) createAgentMessage(p CommParams) (CommResult, error) {
-	from, to, err := h.validateCommEndpoints(p.From, p.To, p.System && p.From == schedulerIdentity)
+	from, to, err := h.validateCommEndpoints(p.From, p.To, p.System)
 	if err != nil {
 		return CommResult{}, err
 	}
@@ -343,12 +343,23 @@ func (h *Hub) createAgentMessage(p CommParams) (CommResult, error) {
 		HandlingStatus: "pending",
 		CreatedAt:      now(),
 		UpdatedAt:      now(),
+		TopicID:        strings.TrimSpace(p.TopicID),
 	}
 	h.mu.Lock()
 	h.captureMessageSourceTurnLocked(msg)
+	if msg.TopicID != "" {
+		topic := h.topics[msg.TopicID]
+		if topic == nil || !topicHasAgent(topic, to.ID, to.ID) || from != nil && !topicHasAgent(topic, from.ID, from.ID) {
+			h.mu.Unlock()
+			return CommResult{}, errf(403, "message endpoints are not part of Topic %s", msg.TopicID)
+		}
+	}
 	if err := h.commitAgentMessageLocked(*msg); err != nil {
 		h.mu.Unlock()
 		return CommResult{}, errf(500, "save message: %s", err)
+	}
+	if msg.TopicID != "" {
+		h.recordTopicWorkEventLocked(msg.TopicID, TopicEvent{Type: "message_created", Actor: msg.From, AgentID: msg.FromAgentID, Agent: msg.From, Summary: msg.Subject, Ref: &TopicRef{Type: "message", ID: msg.ID, Label: msg.Subject}, CreatedAt: msg.CreatedAt})
 	}
 	h.mu.Unlock()
 
@@ -452,6 +463,7 @@ func (h *Hub) replyAgentMessage(p CommParams) (CommResult, error) {
 		HandlingStatus: "pending",
 		CreatedAt:      now(),
 		UpdatedAt:      now(),
+		TopicID:        orig.TopicID,
 	}
 	if orig.FromAgentID == schedulerAgentID {
 		msg.DeliveryStatus = "delivered"
@@ -465,6 +477,9 @@ func (h *Hub) replyAgentMessage(p CommParams) (CommResult, error) {
 			h.mu.Unlock()
 			return CommResult{}, errf(500, "save replied request: %s", err)
 		}
+		if msg.TopicID != "" {
+			h.recordTopicWorkEventLocked(msg.TopicID, TopicEvent{Type: "message_replied", Actor: msg.From, AgentID: msg.FromAgentID, Agent: msg.From, Summary: msg.Subject, Ref: &TopicRef{Type: "message", ID: msg.ID, Label: msg.Subject}, CreatedAt: msg.CreatedAt})
+		}
 		cp := *msg
 		h.mu.Unlock()
 		return CommResult{Message: &cp}, nil
@@ -473,6 +488,9 @@ func (h *Hub) replyAgentMessage(p CommParams) (CommResult, error) {
 	if err := h.commitAgentMessageLocked(*msg); err != nil {
 		h.mu.Unlock()
 		return CommResult{}, errf(500, "save reply: %s", err)
+	}
+	if msg.TopicID != "" {
+		h.recordTopicWorkEventLocked(msg.TopicID, TopicEvent{Type: "message_replied", Actor: msg.From, AgentID: msg.FromAgentID, Agent: msg.From, Summary: msg.Subject, Ref: &TopicRef{Type: "message", ID: msg.ID, Label: msg.Subject}, CreatedAt: msg.CreatedAt})
 	}
 	h.mu.Unlock()
 
@@ -500,7 +518,7 @@ func (h *Hub) validateCommEndpoints(fromKey, toKey string, allowSystemFrom bool)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	from := h.resolveLocked(fromKey)
-	if from == nil && !(allowSystemFrom && fromKey == schedulerIdentity) {
+	if from == nil && !(allowSystemFrom && (fromKey == schedulerIdentity || fromKey == topicIdentity)) {
 		return nil, nil, errf(404, "from agent not found: %s", fromKey)
 	}
 	to := h.resolveLocked(toKey)
@@ -523,6 +541,9 @@ func endpointID(s *Agent, fallback string) string {
 	}
 	if strings.TrimSpace(fallback) == schedulerIdentity {
 		return schedulerAgentID
+	}
+	if strings.TrimSpace(fallback) == topicIdentity {
+		return topicAgentID
 	}
 	return legacyAgentID(fallback)
 }
@@ -622,7 +643,11 @@ func (h *Hub) deliverNextQueuedForTarget(target string, timeout time.Duration) (
 		return nil, false
 	}
 
-	result, err := h.sendTask(snapshot.ToAgentID, formatAgentEnvelope(snapshot), timeout, "", "", "", snapshot.ID)
+	input, topicCursor := h.formatAgentEnvelopeForDelivery(snapshot)
+	result, err := h.sendTaskWithArtifacts(snapshot.ToAgentID, input, nil, timeout, "", "", "", snapshot.ID, snapshot.TopicID, "")
+	if err == nil && snapshot.TopicID != "" {
+		h.markTopicContextDelivered(snapshot.TopicID, snapshot.ToAgentID, topicCursor)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	current := h.comms[snapshot.ID]
@@ -690,6 +715,9 @@ func (h *Hub) captureMessageSourceTurnLocked(msg *AgentMessage) {
 		return
 	}
 	msg.SourceTurnID = rt.activeTurn.turnID
+	if msg.TopicID == "" {
+		msg.TopicID = rt.activeTurn.topicID
+	}
 }
 
 // tryDeliverReplyToActiveTurn injects only a causally linked reply into the
@@ -739,8 +767,11 @@ func (h *Hub) tryDeliverReplyToActiveTurn(target string, timeout time.Duration) 
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	input := formatAgentEnvelope(snapshot)
+	input, topicCursor := h.formatAgentEnvelopeForDelivery(snapshot)
 	acceptedTurnID, err := h.requestTurnSteer(client, threadID, activeTurnID, input, timeout)
+	if err == nil && snapshot.TopicID != "" {
+		h.markTopicContextDelivered(snapshot.TopicID, snapshot.ToAgentID, topicCursor)
+	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -866,7 +897,64 @@ func newMessageID() string {
 }
 
 func formatAgentEnvelope(msg *AgentMessage) string {
+	if msg != nil && msg.TriggerID != "" && msg.TriggerEvent != nil {
+		return formatTriggerEnvelopeAt(msg, now())
+	}
 	return formatAgentEnvelopeAt(msg, now())
+}
+
+func formatTriggerEnvelopeAt(msg *AgentMessage, currentTime string) string {
+	event := msg.TriggerEvent
+	if event == nil {
+		return formatAgentEnvelopeAt(msg, currentTime)
+	}
+	var b strings.Builder
+	b.WriteString(`<external_trigger version="1" id="`)
+	b.WriteString(xmlEscape(msg.ID))
+	b.WriteString(`" trigger_id="`)
+	b.WriteString(xmlEscape(msg.TriggerID))
+	if msg.TopicID != "" {
+		b.WriteString(`" topic_id="`)
+		b.WriteString(xmlEscape(msg.TopicID))
+	}
+	b.WriteString(`">` + "\n")
+	b.WriteString("  <timing")
+	writeXMLAttribute(&b, "occurred_at", event.OccurredAt)
+	writeXMLAttribute(&b, "observed_at", event.ObservedAt)
+	writeXMLAttribute(&b, "current_time", currentTime)
+	b.WriteString(" />\n")
+	b.WriteString("  <source")
+	writeXMLAttribute(&b, "provider", event.Provider)
+	writeXMLAttribute(&b, "connection_id", event.ConnectionID)
+	writeXMLAttribute(&b, "mode", "poll")
+	b.WriteString(" />\n")
+	b.WriteString("  <subject")
+	writeXMLAttribute(&b, "kind", event.ResourceKind)
+	writeXMLAttribute(&b, "key", event.SubjectKey)
+	b.WriteString(" />\n")
+	b.WriteString("  <event")
+	writeXMLAttribute(&b, "name", event.Event)
+	writeXMLAttribute(&b, "key", event.EventKey)
+	b.WriteString(" />\n")
+	b.WriteString("  <work")
+	writeXMLAttribute(&b, "agent_id", event.Work.AgentID)
+	writeXMLAttribute(&b, "thread_id_at_creation", event.Work.ThreadIDAtCreation)
+	writeXMLAttribute(&b, "source_turn_id", event.Work.SourceTurnID)
+	writeXMLAttribute(&b, "topic_id", event.Work.TopicID)
+	if event.Work.GoalCreatedAt != 0 {
+		writeXMLAttribute(&b, "goal_created_at", fmt.Sprintf("%d", event.Work.GoalCreatedAt))
+	}
+	b.WriteString(" />\n")
+	writeXMLCDATA(&b, "summary", event.Summary)
+	writeXMLCDATA(&b, "resume_instruction", event.ResumeInstruction)
+	writeXMLText(&b, "instruction", "Treat this event as a reason to re-check current authoritative state, not as proof that the original waiting condition is satisfied.")
+	if len(event.Snapshot) > 0 {
+		if raw, err := json.Marshal(event.Snapshot); err == nil {
+			writeXMLCDATA(&b, "observation", string(raw))
+		}
+	}
+	b.WriteString("</external_trigger>")
+	return b.String()
 }
 
 func formatAgentEnvelopeAt(msg *AgentMessage, currentTime string) string {
@@ -877,6 +965,10 @@ func formatAgentEnvelopeAt(msg *AgentMessage, currentTime string) string {
 	b.WriteString(xmlEscape(msg.Response))
 	b.WriteString(`" status="`)
 	b.WriteString(xmlEscape(msg.Status))
+	if msg.TopicID != "" {
+		b.WriteString(`" topic_id="`)
+		b.WriteString(xmlEscape(msg.TopicID))
+	}
 	b.WriteString(`">` + "\n")
 	b.WriteString("  <timing")
 	writeXMLAttribute(&b, "sent_at", msg.CreatedAt)

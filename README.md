@@ -45,7 +45,7 @@ The name `Loom` describes this organizing process: every thread keeps its own hi
 - **Agent-to-agent communication:** Send, queue, and reply to Messages while preserving delivery state, response relationships, and complete history.
 - **Team structure:** Separate draggable Organization, Collaboration, and Activity maps keep formal responsibility, declared cross-domain work, and Message evidence distinct; Directory remains the precise view of every Agent.
 - **External organization integration:** Manage external identities, Conversation Memberships, Inbox, and Outbox through Feishu (Lark), Slack, and Parall.
-- **Continuous operations:** Run Schedules, inspect global runtime state, create backups on demand, and restart gracefully after active turns finish.
+- **Continuous operations:** Run Schedules, resume existing work through durable external Triggers, inspect global runtime state, create backups on demand, and restart gracefully after active turns finish.
 
 Lead, Internal Agent, and Interface Agent are currently expressed through Profiles, declared relationships, Messages, and Conversation Memberships. Dedicated hierarchical messaging policies and organization templates are still being modeled.
 
@@ -231,6 +231,8 @@ CodexLoom is built on Codex. Codex continues to provide the agent runtime, threa
 - [Agent Profiles: defining a long-term identity, domain, and scope](docs/agent-profile.md)
 - [Agent communication and the `loom` CLI](docs/loom-cli.md)
 - [Built-in Skills and Codex discovery](docs/skills.md)
+- [Topics: bounded coordination across Turns, time, and Agents](docs/topics.md)
+- [External conditions and GitHub Triggers](docs/triggers.md)
 - [External platform integration design](docs/agent-platform-integration.md)
 - [Set up Feishu, Slack, and Parall integrations](docs/integrations.md)
 - [Conversation Membership: an agent's role in a specific conversation](docs/conversation-membership.md)

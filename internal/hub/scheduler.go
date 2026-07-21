@@ -154,6 +154,9 @@ func (h *Hub) SetScheduleEnabled(id string, enabled bool) (Schedule, error) {
 		return Schedule{}, errf(404, "schedule not found: %s", id)
 	}
 	previous := *s
+	if enabled && s.At != "" && s.LastRunAt != "" {
+		return Schedule{}, errf(409, "one-shot schedule %s has already fired; create a new schedule or run it manually", s.ID)
+	}
 	s.Enabled = enabled
 	if enabled && s.NextRunAt == "" {
 		next, err := h.nextRunForScheduleLocked(s, time.Now().UTC())
@@ -497,7 +500,9 @@ func parseCronField(raw string, min, max int, sundayAlias bool) (map[int]bool, b
 		}
 		start, end := min, max
 		if part == "*" {
-			any = true
+			// A stepped wildcard is a restricted set. Only a bare wildcard
+			// participates in cron's day/weekday wildcard semantics.
+			any = any || step == 1
 		} else if strings.Contains(part, "-") {
 			pieces := strings.Split(part, "-")
 			if len(pieces) != 2 {

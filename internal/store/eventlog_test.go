@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -111,5 +112,49 @@ func TestEventMaintenanceRotatesCompressesAndPrunes(t *testing.T) {
 	}
 	if got := st.LastSeq("agent"); got != 8 {
 		t.Fatalf("LastSeq after rotation = %d, want 8", got)
+	}
+}
+
+func TestEventMaintenanceIsSafeWhenRunConcurrently(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.SetEventLogPolicy(EventLogPolicy{
+		MaxActiveBytes: 300, ReplayEvents: 2, MaxReplayBytes: 4 << 10,
+		MaxArchives: 2, MaxArchiveBytes: 1 << 20, MaxArchiveAge: time.Hour,
+	})
+	payload, _ := json.Marshal(map[string]string{"text": strings.Repeat("x", 180)})
+	for seq := int64(1); seq <= 4; seq++ {
+		if err := st.AppendEvent("agent", Event{Seq: seq, Type: "test", Data: payload}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			_, maintainErr := st.MaintainEventLogs()
+			errs <- maintainErr
+		}()
+	}
+	ready.Wait()
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := filepath.Glob(filepath.Join(st.Dir(), "events", "*.pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending segments remain: %v", pending)
 	}
 }

@@ -1,12 +1,13 @@
 import type { Agent, InboxEntry } from "./types";
 
-export type ExecutionState = "starting" | "running" | "idle" | "draining" | "unavailable";
+export type ExecutionState = "starting" | "running" | "idle" | "interrupted" | "draining" | "unavailable";
 
 export function executionState(agent: Agent): ExecutionState {
   const status = String(agent.status || "").toLowerCase();
   if (status === "running") return "running";
   if (status === "starting") return "starting";
   if (status === "draining") return "draining";
+  if (status === "interrupted") return "interrupted";
   if (status === "idle") return "idle";
   return "unavailable";
 }
@@ -25,6 +26,7 @@ export function executionDotClass(agent: Agent) {
     case "running": return "bg-success ring-2 ring-success/20";
     case "starting": return "bg-warning ring-2 ring-warning/15";
     case "draining": return "bg-warning";
+    case "interrupted": return "bg-warning ring-2 ring-warning/20";
     case "idle": return "bg-muted-foreground/35";
     default: return "bg-destructive";
   }

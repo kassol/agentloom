@@ -2,6 +2,7 @@ package backup
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"io"
 	"os"
@@ -10,9 +11,41 @@ import (
 	"time"
 )
 
+func TestAddFileExcludesTornNDJSONTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "comms.ndjson")
+	complete := []byte("{\"message\":{\"id\":\"one\"}}\n")
+	if err := os.WriteFile(path, append(append([]byte(nil), complete...), []byte("{\"message\":")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := addFile(tw, path, "codex-loom/comms.ndjson"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := tar.NewReader(bytes.NewReader(archive.Bytes()))
+	header, err := tr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.Size != int64(len(complete)) || !bytes.Equal(data, complete) {
+		t.Fatalf("archived NDJSON size=%d data=%q", header.Size, data)
+	}
+}
+
 func TestCreateUsesCodexLoomNameAndLayout(t *testing.T) {
 	dataDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "collaboration-groups.json"), []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(dataDir, "events"), 0o700); err != nil {
@@ -46,6 +79,7 @@ func TestCreateUsesCodexLoomNameAndLayout(t *testing.T) {
 	defer gz.Close()
 	tr := tar.NewReader(gz)
 	found := false
+	foundCollaborationGroups := false
 	foundDerivedEvent := false
 	for {
 		header, err := tr.Next()
@@ -58,12 +92,18 @@ func TestCreateUsesCodexLoomNameAndLayout(t *testing.T) {
 		if header.Name == "codex-loom/agents.json" {
 			found = true
 		}
+		if header.Name == "codex-loom/collaboration-groups.json" {
+			foundCollaborationGroups = true
+		}
 		if header.Name == "codex-loom/events/agent-1.ndjson" {
 			foundDerivedEvent = true
 		}
 	}
 	if !found {
 		t.Fatal("snapshot did not contain codex-loom/agents.json")
+	}
+	if !foundCollaborationGroups {
+		t.Fatal("snapshot did not contain codex-loom/collaboration-groups.json")
 	}
 	if foundDerivedEvent {
 		t.Fatal("snapshot contained derived SSE replay events")

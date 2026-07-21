@@ -166,6 +166,9 @@ func (s *Store) LastSeq(agentID string) int64 {
 // MaintainEventLogs rotates oversized active logs, compresses immutable
 // segments, and prunes old diagnostic archives. It is safe to run repeatedly.
 func (s *Store) MaintainEventLogs() (EventMaintenanceReport, error) {
+	s.eventMaintenanceMu.Lock()
+	defer s.eventMaintenanceMu.Unlock()
+
 	var report EventMaintenanceReport
 	entries, err := os.ReadDir(filepath.Join(s.dir, "events"))
 	if err != nil {
@@ -418,6 +421,9 @@ type eventArchive struct {
 }
 
 func (s *Store) pruneEventArchives() (int, int64, error) {
+	s.eventMu.Lock()
+	policy := s.eventPolicy
+	s.eventMu.Unlock()
 	entries, err := os.ReadDir(filepath.Join(s.dir, "events"))
 	if err != nil {
 		return 0, 0, err
@@ -446,9 +452,9 @@ func (s *Store) pruneEventArchives() (int, int64, error) {
 		sort.Slice(archives, func(i, j int) bool { return archives[i].modTime.After(archives[j].modTime) })
 		keptBytes := int64(0)
 		for index, archive := range archives {
-			overCount := index >= s.eventPolicy.MaxArchives
-			overBytes := s.eventPolicy.MaxArchiveBytes == 0 || keptBytes+archive.size > s.eventPolicy.MaxArchiveBytes
-			overAge := s.eventPolicy.MaxArchiveAge == 0 || now.Sub(archive.modTime) > s.eventPolicy.MaxArchiveAge
+			overCount := index >= policy.MaxArchives
+			overBytes := policy.MaxArchiveBytes == 0 || keptBytes+archive.size > policy.MaxArchiveBytes
+			overAge := policy.MaxArchiveAge == 0 || now.Sub(archive.modTime) > policy.MaxArchiveAge
 			if overCount || overBytes || overAge {
 				if err := os.Remove(archive.path); err != nil {
 					errs = append(errs, err)

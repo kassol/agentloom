@@ -445,7 +445,7 @@ function InboxInspector({ entry, reply, reason, deferUntil, working, onReply, on
           <div className="mt-2 flex flex-wrap items-center gap-2">
             {replyAllowed && <button onClick={() => onAction("reply")} disabled={working || !reply.trim()} className="flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground disabled:opacity-50"><MessageSquareReply className="size-3.5" /> Reply</button>}
             <button onClick={() => onAction("no-reply")} disabled={working} className="flex h-8 items-center gap-1.5 rounded-md border border-border px-3 text-[12px] text-muted-foreground hover:text-foreground disabled:opacity-50"><SkipForward className="size-3.5" /> No reply</button>
-            {((internal && (entry.item.state === "interrupted" || entry.item.state === "failed")) || (!internal && (entry.item.state === "failed" || entry.item.state === "deferred"))) && <button onClick={() => onAction("retry")} disabled={working} className="flex h-8 items-center gap-1.5 rounded-md border border-border px-3 text-[12px]"><RotateCcw className="size-3.5" /> Continue</button>}
+            {((internal && (entry.item.state === "interrupted" || entry.item.state === "failed")) || (!internal && (entry.item.state === "interrupted" || entry.item.state === "failed" || entry.item.state === "deferred"))) && <button onClick={() => onAction("retry")} disabled={working} className="flex h-8 items-center gap-1.5 rounded-md border border-border px-3 text-[12px]"><RotateCcw className="size-3.5" /> Continue</button>}
           </div>
           {!internal && (
             <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_190px_auto]">

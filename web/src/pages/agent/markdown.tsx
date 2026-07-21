@@ -6,6 +6,7 @@ import { cjk } from "@streamdown/cjk";
 import { createMathPlugin } from "@streamdown/math";
 import { useEffect, useState } from "react";
 import type { PluggableList } from "unified";
+import { cn } from "../../lib/utils";
 import "katex/dist/katex.min.css";
 
 /* ================================================================
@@ -42,7 +43,7 @@ const customRehypePlugins: PluggableList = [
    MarkdownContent — Streamdown-based markdown renderer
    ================================================================ */
 
-export function MarkdownContent({ content, streaming = false }: { content: string; streaming?: boolean }) {
+export function MarkdownContent({ content, streaming = false, className }: { content: string; streaming?: boolean; className?: string }) {
   const needsMermaid = /```mermaid\b/i.test(content);
   const [mermaidPlugin, setMermaidPlugin] = useState<typeof import("@streamdown/mermaid")["mermaid"] | null>(null);
 
@@ -67,7 +68,7 @@ export function MarkdownContent({ content, streaming = false }: { content: strin
   };
 
   return (
-    <div className="max-w-none break-words prose">
+    <div className={cn("max-w-none break-words prose", className)}>
       <Streamdown
         plugins={plugins}
         rehypePlugins={customRehypePlugins}

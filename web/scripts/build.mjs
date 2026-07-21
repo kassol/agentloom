@@ -33,10 +33,11 @@ const filesBeforeBuild = new Set(assetFiles(assetsDir));
 const oldCurrentFiles = existsSync(manifestPath)
   ? outputFiles(JSON.parse(readFileSync(manifestPath, "utf8")))
   : new Set();
-let previousFiles = existsSync(previousAssetsPath)
-  ? new Set(JSON.parse(readFileSync(previousAssetsPath, "utf8")))
-  : new Set([...filesBeforeBuild].filter((file) => !oldCurrentFiles.has(file)));
-if (oldCurrentFiles.size === 0) previousFiles = filesBeforeBuild;
+const previousFiles = oldCurrentFiles.size > 0
+  ? oldCurrentFiles
+  : existsSync(previousAssetsPath)
+    ? new Set(JSON.parse(readFileSync(previousAssetsPath, "utf8")))
+    : filesBeforeBuild;
 
 execFileSync(path.join(webDir, "node_modules/.bin/vite"), ["build"], {
   cwd: webDir,
@@ -44,9 +45,6 @@ execFileSync(path.join(webDir, "node_modules/.bin/vite"), ["build"], {
 });
 
 const currentFiles = outputFiles(JSON.parse(readFileSync(manifestPath, "utf8")));
-const currentChanged = oldCurrentFiles.size > 0
-  && (oldCurrentFiles.size !== currentFiles.size || [...oldCurrentFiles].some((file) => !currentFiles.has(file)));
-if (currentChanged) previousFiles = oldCurrentFiles;
 
 for (const file of assetFiles(assetsDir)) {
   if (!previousFiles.has(file) && !currentFiles.has(file)) {

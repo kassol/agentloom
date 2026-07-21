@@ -35,6 +35,8 @@ type Server struct {
 	restart          restartState
 	connectorMu      sync.Mutex
 	activeConnectors map[string]struct{}
+	githubMu         sync.Mutex
+	githubDevices    map[string]*githubDeviceFlow
 	build            buildinfo.Info
 	readOnly         bool
 }
@@ -57,6 +59,7 @@ func NewWithOptions(h *hub.Hub, st *store.Store, web fs.FS, options Options) *Se
 	return &Server{
 		hub: h, st: st, web: web, restart: restartState{State: "idle"},
 		activeConnectors: map[string]struct{}{},
+		githubDevices:    map[string]*githubDeviceFlow{},
 		build: buildinfo.Current(web, buildinfo.Runtime{
 			StartedAt: options.StartedAt, DataDir: dataDir, Mode: options.Mode, ReadOnly: options.ReadOnly,
 		}),
@@ -84,6 +87,8 @@ func (s *Server) Handler() http.Handler {
 	s.registerIntegrationRoutes(mux)
 	s.registerAgentRoutes(mux)
 	s.registerOrganizationRoutes(mux)
+	s.registerTriggerRoutes(mux)
+	s.registerTopicRoutes(mux)
 	s.registerCompatibilityRoutes(mux)
 
 	mux.HandleFunc("/", s.serveWeb)
@@ -108,13 +113,16 @@ func (s *Server) agentThreadEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	since := int64(0)
+	reconnecting := false
 	if lastID := r.Header.Get("Last-Event-ID"); lastID != "" {
 		if v, err := strconv.ParseInt(lastID, 10, 64); err == nil {
 			since = v
+			reconnecting = true
 		}
 	} else if q := r.URL.Query().Get("since"); q != "" {
 		if v, err := strconv.ParseInt(q, 10, 64); err == nil {
 			since = v
+			reconnecting = true
 		}
 	}
 	tail, _ := strconv.Atoi(r.URL.Query().Get("tail"))
@@ -133,14 +141,27 @@ func (s *Server) agentThreadEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cancel()
 
+	currentSeq := s.hub.LastSeq(key)
 	events, err := s.hub.ReadEvents(key, since, tail)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	gap := reconnecting && currentSeq > since && (len(events) == 0 || tail <= 0 && events[0].Seq > since+1)
 
 	sseHeaders(w)
 	replayMax := since
+	if gap {
+		availableFrom := currentSeq + 1
+		if len(events) > 0 {
+			availableFrom = events[0].Seq
+		}
+		data, _ := json.Marshal(map[string]any{
+			"reason": "Agent event replay window compacted", "agent": key,
+			"since": since, "availableFrom": availableFrom,
+		})
+		writeThreadSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "loom/reconcile", Data: data}, canonical)
+	}
 	for _, ev := range events {
 		writeThreadSSE(w, ev, canonical)
 		if ev.Seq > replayMax {

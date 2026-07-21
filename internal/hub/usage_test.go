@@ -1,10 +1,13 @@
 package hub
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/rollout"
 )
 
 func writeUsageRollout(t *testing.T, threadID string) {
@@ -96,5 +99,44 @@ func TestPreviousUsageRangeMatchesElapsedClockForLiveWindow(t *testing.T) {
 	}
 	if got := previousEnd.Format(time.RFC3339); got != "2026-07-09T10:30:00+08:00" {
 		t.Fatalf("previous end = %s", got)
+	}
+}
+
+func TestAgentUsageCacheIsBoundedAndDropsStaleReports(t *testing.T) {
+	agentUsageCache.Lock()
+	previousEntries, previousClock := agentUsageCache.entries, agentUsageCache.clock
+	agentUsageCache.entries = map[string]agentUsageCacheEntry{}
+	agentUsageCache.clock = 0
+	agentUsageCache.Unlock()
+	defer func() {
+		agentUsageCache.Lock()
+		agentUsageCache.entries = previousEntries
+		agentUsageCache.clock = previousClock
+		agentUsageCache.Unlock()
+	}()
+
+	reports := make([]*rollout.UsageReport, maxAgentUsageCacheEntries+1)
+	for index := range reports {
+		reports[index] = &rollout.UsageReport{}
+		cacheAgentUsage(fmt.Sprintf("key-%03d", index), reports[index], AgentUsage{AgentName: fmt.Sprintf("agent-%03d", index)})
+	}
+	agentUsageCache.Lock()
+	cacheSize := len(agentUsageCache.entries)
+	_, oldestExists := agentUsageCache.entries["key-000"]
+	_, newestExists := agentUsageCache.entries[fmt.Sprintf("key-%03d", maxAgentUsageCacheEntries)]
+	agentUsageCache.Unlock()
+	if cacheSize != maxAgentUsageCacheEntries || oldestExists || !newestExists {
+		t.Fatalf("bounded cache size=%d oldest=%v newest=%v", cacheSize, oldestExists, newestExists)
+	}
+
+	key := fmt.Sprintf("key-%03d", maxAgentUsageCacheEntries)
+	if _, ok := cachedAgentUsage(key, &rollout.UsageReport{}); ok {
+		t.Fatal("cache accepted a stale UsageReport pointer")
+	}
+	agentUsageCache.Lock()
+	_, staleExists := agentUsageCache.entries[key]
+	agentUsageCache.Unlock()
+	if staleExists {
+		t.Fatal("stale UsageReport entry was not evicted")
 	}
 }

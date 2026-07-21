@@ -1,8 +1,8 @@
-import { ArrowDown, ArrowUpRight, BarChart3, CalendarClock, Check, ChevronRight, CircleHelp, FileText, Inbox, Loader2, MessageSquare, Network, Paperclip, Pause, Pencil, Play, Plus, RefreshCw, RotateCcw, Send, SkipForward, Square, Target, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUpRight, BarChart3, CalendarClock, Check, ChevronRight, CircleHelp, FileText, GitBranch, Inbox, Loader2, MessageSquare, Network, Paperclip, Pause, Pencil, Play, Plus, RadioTower, RefreshCw, RotateCcw, Send, SkipForward, Square, Target, Trash2, X } from "lucide-react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type ConversationMembership, type HumanRequest, type InboxEntry, type PlatformConnection, type Schedule, type TeamView, type ThreadGoal } from "./types";
+import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type ConversationMembership, type HumanRequest, type InboxEntry, type PlatformConnection, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
 import { emptyFeed, reduceFeed } from "./feed";
 import type { Block } from "./feed";
 import type { LoomEvent } from "./types";
@@ -83,6 +83,7 @@ export function AgentPane({
   onHumanRequestChanged,
   onPendingWorkChanged,
   onOpenUsage,
+  onTrackTopic,
   onError,
   onAgentUpdated,
 }: {
@@ -96,6 +97,7 @@ export function AgentPane({
   onHumanRequestChanged: () => Promise<unknown> | void;
   onPendingWorkChanged: () => Promise<unknown> | void;
   onOpenUsage: (agentID: string) => void;
+  onTrackTopic: () => void;
   onError: (msg: string) => void;
   onAgentUpdated: (agent: Agent) => void;
 }) {
@@ -107,10 +109,11 @@ export function AgentPane({
   const [answeringRequest, setAnsweringRequest] = useState<HumanRequest | null>(null);
   const [sending, setSending] = useState(false);
   const [heldActionID, setHeldActionID] = useState("");
+  const [interruptedAction, setInterruptedAction] = useState<"continue" | "dismiss" | "">("");
   const [sendStatus, setSendStatus] = useState<"idle" | "sending" | "sent" | "failed">("idle");
   const [sendKind, setSendKind] = useState<"task" | "answer">("task");
   const [configOpen, setConfigOpen] = useState(false);
-  const [configSection, setConfigSection] = useState<"profile" | "team" | "external" | "schedules" | "runtime" | "usage">("profile");
+  const [configSection, setConfigSection] = useState<"profile" | "team" | "external" | "triggers" | "runtime" | "usage">("profile");
   const [nameDraft, setNameDraft] = useState(agent.name);
   const [modelDraft, setModelDraft] = useState(agent.model || "");
   const [modelCustomOpen, setModelCustomOpen] = useState(isCustomModel(agent.model || ""));
@@ -133,6 +136,7 @@ export function AgentPane({
   const [savingMembership, setSavingMembership] = useState(false);
   const [team, setTeam] = useState<TeamView | null>(null);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [triggers, setTriggers] = useState<Trigger[]>([]);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const feedRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -296,14 +300,31 @@ export function AgentPane({
   }, [configOpen, agent.id]);
 
   useEffect(() => {
-    if (!configOpen || (configSection !== "team" && configSection !== "schedules")) return;
-    Promise.all([
-      api("GET", "/api/team"),
-      api("GET", "/api/schedules"),
-    ]).then(([teamData, scheduleData]) => {
-      setTeam(teamData.team || null);
-      setSchedules((scheduleData.schedules || []).filter((schedule: Schedule) => schedule.to === agent.name || schedule.to === agent.id));
-    }).catch((err: Error) => onError(err.message));
+    if (!configOpen || configSection !== "team") return;
+    api("GET", "/api/team")
+      .then((teamData) => setTeam(teamData.team || null))
+      .catch((err: Error) => onError(err.message));
+  }, [configOpen, configSection, agent.id, agent.name]);
+
+  useEffect(() => {
+    if (!configOpen || configSection !== "triggers") return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const [triggerData, scheduleData] = await Promise.all([
+          api("GET", `/api/triggers?agent=${encodeURIComponent(agent.id)}`),
+          api("GET", "/api/schedules"),
+        ]);
+        if (cancelled) return;
+        setTriggers(triggerData.triggers || []);
+        setSchedules((scheduleData.schedules || []).filter((schedule: Schedule) => schedule.to === agent.name || schedule.to === agent.id));
+      } catch (err: any) {
+        if (!cancelled) onError(err.message);
+      }
+    };
+    void load();
+    const timer = window.setInterval(load, 10_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, [configOpen, configSection, agent.id, agent.name]);
 
   useEffect(() => {
@@ -622,6 +643,33 @@ export function AgentPane({
     }
   };
 
+  const continueInterruptedTurn = async () => {
+    if (interruptedAction) return;
+    setInterruptedAction("continue");
+    try {
+      const data = await api("POST", `/api/agents/${agent.id}/turns/interrupted/continue`, {});
+      if (data.agent) onAgentUpdated(data.agent);
+      await onPendingWorkChanged();
+    } catch (err: any) {
+      onError(err.message);
+    } finally {
+      setInterruptedAction("");
+    }
+  };
+
+  const dismissInterruptedTurn = async () => {
+    if (interruptedAction) return;
+    setInterruptedAction("dismiss");
+    try {
+      const data = await api("POST", `/api/agents/${agent.id}/turns/interrupted/dismiss`, {});
+      if (data.agent) onAgentUpdated(data.agent);
+    } catch (err: any) {
+      onError(err.message);
+    } finally {
+      setInterruptedAction("");
+    }
+  };
+
   const continueHeldMessage = async (entry: InboxEntry) => {
     const messageID = entry.internalMessage?.id;
     if (!messageID || heldActionID) return;
@@ -895,7 +943,7 @@ export function AgentPane({
                 <button onClick={() => setConfigSection("profile")} className={`h-7 rounded px-3 ${configSection === "profile" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Profile</button>
                 <button onClick={() => setConfigSection("team")} className={`h-7 rounded px-3 ${configSection === "team" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Team</button>
                 <button onClick={() => setConfigSection("external")} className={`h-7 rounded px-3 ${configSection === "external" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>External</button>
-                <button onClick={() => setConfigSection("schedules")} className={`h-7 rounded px-3 ${configSection === "schedules" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Schedules</button>
+                <button onClick={() => setConfigSection("triggers")} className={`h-7 rounded px-3 ${configSection === "triggers" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Triggers</button>
                 <button onClick={() => setConfigSection("runtime")} className={`h-7 rounded px-3 ${configSection === "runtime" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Runtime</button>
                 <button onClick={() => setConfigSection("usage")} className={`h-7 rounded px-3 ${configSection === "usage" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Usage</button>
               </div>
@@ -991,8 +1039,11 @@ export function AgentPane({
                 )
               ) : configSection === "team" ? (
                 <AgentTeamPanel agent={agent} team={team} />
-              ) : configSection === "schedules" ? (
-                <AgentSchedulesPanel schedules={schedules} />
+              ) : configSection === "triggers" ? (
+                <AgentTriggersPanel agent={agent} triggers={triggers} schedules={schedules} connections={connections} onUpdate={async () => {
+                  const data = await api("GET", `/api/triggers?agent=${encodeURIComponent(agent.id)}`);
+                  setTriggers(data.triggers || []);
+                }} onError={onError} />
               ) : configSection === "usage" ? (
                 <AgentUsagePanel usage={usage} loading={loadingUsage} onOpenOverview={() => onOpenUsage(agent.id)} onRefresh={() => {
                   setLoadingUsage(true);
@@ -1141,7 +1192,10 @@ export function AgentPane({
 
       <div className="relative shrink-0 border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] md:px-6 md:py-3 md:pb-3">
         <div className="mx-auto max-w-[880px]">
-          {agent.lastError && !running ? (
+          {agent.status === "interrupted" && agent.lastTurn?.status === "interrupted" ? (
+            <InterruptedTurnBar agent={agent} action={interruptedAction} onContinue={continueInterruptedTurn} onDismiss={dismissInterruptedTurn} />
+          ) : null}
+          {agent.lastError && !running && agent.status !== "interrupted" ? (
             <div className="mb-2 border-l-2 border-destructive bg-destructive/5 px-3 py-2 text-[11.5px] text-destructive" role="alert">
               <span className="font-semibold">Last turn failed:</span>{" "}
               <span className="break-words">{readableRuntimeError(agent.lastError)}</span>
@@ -1247,6 +1301,7 @@ export function AgentPane({
                   }}
                 />
                 <button type="button" onClick={() => fileInputRef.current?.click()} disabled={sending || !!answeringRequest || attachments.length >= MAX_TURN_ARTIFACTS} className="flex size-8 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35" aria-label="Attach files" title={answeringRequest ? "Attachments are unavailable while answering a request" : "Attach files or images"}><Paperclip className="size-4" /></button>
+                {!answeringRequest ? <button type="button" onClick={onTrackTopic} disabled={sending} className="flex size-8 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-35" aria-label="Track this work as a Topic" title="Track this work as a Topic"><GitBranch className="size-4" /></button> : null}
                 <div className="min-w-0 truncate font-mono text-[10px] text-muted-foreground" aria-live="polite">
                 {sendStatus === "sending" && <span className="inline-flex items-center gap-1.5"><Loader2 className="size-3 animate-spin" />{sendKind === "answer" ? "Submitting answer" : sendingAttachmentCount > 0 ? `Uploading ${sendingAttachmentCount} attachment${sendingAttachmentCount === 1 ? "" : "s"}` : "Sending to thread"}</span>}
                 {sendStatus === "sent" && <span className="inline-flex items-center gap-1.5 text-success"><Check className="size-3" />{sendKind === "answer" ? "Answer queued" : "Sent to thread"}</span>}
@@ -1489,6 +1544,44 @@ function NeedsYouBar({ entries, onAnswer, onOpen }: { entries: HumanRequest[]; o
   );
 }
 
+function InterruptedTurnBar({
+  agent,
+  action,
+  onContinue,
+  onDismiss,
+}: {
+  agent: Agent;
+  action: "continue" | "dismiss" | "";
+  onContinue: () => void;
+  onDismiss: () => void;
+}) {
+  const task = agent.lastTurn?.task || "Unfinished work";
+  const lastActive = agent.lastTurn?.completedAt ? new Date(agent.lastTurn.completedAt) : null;
+  const timeLabel = lastActive && !Number.isNaN(lastActive.getTime()) ? lastActive.toLocaleString() : "time unavailable";
+  return (
+    <div className="mb-2 flex min-w-0 flex-wrap items-center gap-2 border-l-2 border-warning bg-warning/5 px-2.5 py-2" role="status">
+      <Square className="size-3 shrink-0 fill-warning/15 text-warning" />
+      <div className="min-w-0 flex-1 basis-56">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="shrink-0 font-mono text-[8.5px] font-semibold uppercase text-warning">Interrupted</span>
+          <span className="truncate text-[11px] font-semibold text-foreground" title={task}>{task}</span>
+        </div>
+        <div className="mt-0.5 truncate text-[10px] text-muted-foreground" title={`Turn interrupted by restart · last active ${timeLabel}`}>
+          Turn interrupted by restart · last active {timeLabel}
+        </div>
+      </div>
+      <div className="flex basis-full shrink-0 items-center justify-start gap-1 sm:basis-auto sm:justify-end">
+        <button type="button" onClick={onContinue} disabled={Boolean(action)} className="flex h-7 items-center gap-1 rounded-sm bg-primary px-2 text-[10px] font-medium text-primary-foreground disabled:opacity-50">
+          {action === "continue" ? <Loader2 className="size-3 animate-spin" /> : <RotateCcw className="size-3" />}Continue
+        </button>
+        <button type="button" onClick={onDismiss} disabled={Boolean(action)} className="h-7 rounded-sm px-2 text-[10px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50">
+          {action === "dismiss" ? "Dismissing" : "Dismiss"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function HeldWorkBar({
   entries,
   workingID,
@@ -1634,14 +1727,102 @@ function AgentTeamPanel({ agent, team }: { agent: Agent; team: TeamView | null }
   </div>;
 }
 
-function AgentSchedulesPanel({ schedules }: { schedules: Schedule[] }) {
+function AgentTriggersPanel({ agent, triggers, schedules, connections, onUpdate, onError }: { agent: Agent; triggers: Trigger[]; schedules: Schedule[]; connections: PlatformConnection[]; onUpdate: () => Promise<void>; onError: (message: string) => void }) {
+  const githubConnections = connections.filter((connection) => connection.provider === "github" && connection.enabled && !connection.archivedAt);
+  const [creating, setCreating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [connectionID, setConnectionID] = useState("");
+  const [resourceKind, setResourceKind] = useState<"pull-request" | "workflow-run">("pull-request");
+  const [target, setTarget] = useState("");
+  const [event, setEvent] = useState("merged");
+  const [expectedHead, setExpectedHead] = useState("");
+  const [resumeInstruction, setResumeInstruction] = useState("");
+  const [expires, setExpires] = useState("14d");
+
+  const active = triggers.filter((trigger) => ["pending", "armed", "paused"].includes(trigger.state));
+  const history = triggers.filter((trigger) => !["pending", "armed", "paused"].includes(trigger.state));
+
+  const submit = async () => {
+    setSaving(true);
+    try {
+      const subject = triggerSubjectFromTarget(resourceKind, target, expectedHead);
+      await api("POST", "/api/triggers", {
+        agent: agent.id, provider: "github", resourceKind, connectionId: connectionID,
+        subject, conditions: [{ event }], resumeInstruction, expiresAt: expires,
+      });
+      setCreating(false);
+      setTarget("");
+      setExpectedHead("");
+      setResumeInstruction("");
+      await onUpdate();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const act = async (trigger: Trigger, action: "pause" | "resume" | "cancel") => {
+    try {
+      await api("POST", `/api/triggers/${encodeURIComponent(trigger.id)}/${action}`, {});
+      await onUpdate();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
   return <div>
-    <div className="mb-3 flex items-center gap-2"><CalendarClock className="size-3.5 text-primary" /><span className="text-[12px] font-medium">Schedules</span><span className="ml-auto font-mono text-[9.5px] text-muted-foreground">{schedules.filter((schedule) => schedule.enabled).length} enabled</span></div>
+    <div className="mb-3 flex items-center gap-2"><RadioTower className="size-3.5 text-primary" /><span className="text-[12px] font-medium">External conditions</span><span className="ml-auto font-mono text-[9.5px] text-muted-foreground">{active.length} active</span></div>
     <div className="divide-y divide-border border-y border-border">
-      {schedules.map((schedule) => <div key={schedule.id} className="flex min-w-0 items-start gap-3 py-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${schedule.enabled ? "bg-success" : "bg-muted-foreground/35"}`} /><div className="min-w-0 flex-1"><div className="truncate text-[11.5px] font-semibold">{schedule.name}</div><div className="mt-0.5 truncate text-[10.5px] text-muted-foreground">{schedule.subject}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{schedule.cron || schedule.at || "No trigger"}{schedule.nextRunAt ? ` · next ${new Date(schedule.nextRunAt).toLocaleString()}` : ""}</div></div></div>)}
-      {schedules.length === 0 ? <div className="py-8 text-center text-[11px] text-muted-foreground">No schedules target this Agent.</div> : null}
+      {active.map((trigger) => <AgentTriggerRow key={trigger.id} trigger={trigger} onAction={act} />)}
+      {active.length === 0 ? <div className="py-7 text-center text-[11px] text-muted-foreground">This Agent is not waiting on an external condition.</div> : null}
+    </div>
+
+    {creating ? <div className="border-b border-border bg-muted/15 px-3 py-3">
+      <div className="grid gap-2 sm:grid-cols-2">
+        <label className="block"><span className="mb-1 block text-[9.5px] uppercase text-muted-foreground">GitHub source</span><select value={connectionID} onChange={(e) => setConnectionID(e.target.value)} className="h-8 w-full border border-border bg-background px-2 text-[11px] outline-none focus:border-ring"><option value="">Auto-select by Resource Owner</option>{githubConnections.map((connection) => <option key={connection.id} value={connection.id}>{connection.accountRef || connection.id} / {connection.scopeRef === "*" ? "all owners" : connection.scopeRef || "legacy"}</option>)}</select></label>
+        <label className="block"><span className="mb-1 block text-[9.5px] uppercase text-muted-foreground">Resource</span><select value={resourceKind} onChange={(e) => { const value = e.target.value as "pull-request" | "workflow-run"; setResourceKind(value); setEvent(value === "pull-request" ? "merged" : "completed"); }} className="h-8 w-full border border-border bg-background px-2 text-[11px] outline-none focus:border-ring"><option value="pull-request">Pull request</option><option value="workflow-run">Workflow run</option></select></label>
+      </div>
+      <div className="mt-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_150px]">
+        <label className="block"><span className="mb-1 block text-[9.5px] uppercase text-muted-foreground">Target</span><input value={target} onChange={(e) => setTarget(e.target.value)} placeholder={resourceKind === "pull-request" ? "owner/repo#1970" : "owner/repo/123456"} className="h-8 w-full border border-border bg-background px-2 font-mono text-[11px] outline-none focus:border-ring" /></label>
+        <label className="block"><span className="mb-1 block text-[9.5px] uppercase text-muted-foreground">Wake when</span><select value={event} onChange={(e) => setEvent(e.target.value)} className="h-8 w-full border border-border bg-background px-2 text-[11px] outline-none focus:border-ring">{(resourceKind === "pull-request" ? ["merged", "closed", "head-changed"] : ["completed", "success", "failure", "cancelled"]).map((value) => <option key={value}>{value}</option>)}</select></label>
+      </div>
+      {resourceKind === "pull-request" && event === "head-changed" ? <label className="mt-2 block"><span className="mb-1 block text-[9.5px] uppercase text-muted-foreground">Expected HEAD</span><input value={expectedHead} onChange={(e) => setExpectedHead(e.target.value)} placeholder="full commit SHA" className="h-8 w-full border border-border bg-background px-2 font-mono text-[11px] outline-none focus:border-ring" /></label> : null}
+      <label className="mt-2 block"><span className="mb-1 block text-[9.5px] uppercase text-muted-foreground">First action after wake</span><textarea value={resumeInstruction} onChange={(e) => setResumeInstruction(e.target.value)} rows={3} placeholder="Re-read the provider's current state, verify the expected contract, then continue the original work if valid." className="w-full resize-y border border-border bg-background px-2 py-1.5 text-[11px] leading-4 outline-none focus:border-ring" /></label>
+      <div className="mt-2 flex items-end justify-between gap-3"><label><span className="mb-1 block text-[9.5px] uppercase text-muted-foreground">Expires</span><input value={expires} onChange={(e) => setExpires(e.target.value)} className="h-8 w-24 border border-border bg-background px-2 font-mono text-[11px] outline-none focus:border-ring" /></label><div className="flex gap-2"><button onClick={() => setCreating(false)} className="h-8 px-3 text-[11px] text-muted-foreground hover:bg-muted">Cancel</button><button onClick={submit} disabled={saving || !target.trim() || !resumeInstruction.trim() || githubConnections.length === 0 || (event === "head-changed" && !expectedHead.trim())} className="h-8 bg-primary px-3 text-[11px] font-medium text-primary-foreground disabled:opacity-50">{saving ? "Creating" : "Arm trigger"}</button></div></div>
+    </div> : <div className="flex justify-end py-3"><button onClick={() => setCreating(true)} disabled={githubConnections.length === 0} className="flex h-8 items-center gap-1.5 border border-border px-3 text-[11px] font-medium hover:bg-muted disabled:opacity-45"><Plus className="size-3" />New trigger</button></div>}
+    {githubConnections.length === 0 ? <div className="border-l-2 border-warning bg-warning/5 px-3 py-2 text-[10.5px] text-warning"><GitBranch className="mr-1 inline size-3" />Connect GitHub in Settings before arming an external condition.</div> : null}
+
+    {history.length > 0 ? <details className="mt-5"><summary className="cursor-pointer text-[10px] font-semibold uppercase text-muted-foreground">Recent trigger history · {history.length}</summary><div className="mt-2 divide-y divide-border border-y border-border">{history.slice(0, 12).map((trigger) => <AgentTriggerRow key={trigger.id} trigger={trigger} onAction={act} />)}</div></details> : null}
+
+    <div className="mb-3 mt-6 flex items-center gap-2"><CalendarClock className="size-3.5 text-primary" /><span className="text-[12px] font-medium">Scheduled times</span><span className="ml-auto font-mono text-[9.5px] text-muted-foreground">{schedules.filter((schedule) => schedule.enabled).length} enabled</span></div>
+    <div className="divide-y divide-border border-y border-border">
+      {schedules.map((schedule) => <div key={schedule.id} className="flex min-w-0 items-start gap-3 py-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${schedule.enabled ? "bg-success" : "bg-muted-foreground/35"}`} /><div className="min-w-0 flex-1"><div className="truncate text-[11.5px] font-semibold">{schedule.name}</div><div className="mt-0.5 truncate text-[10.5px] text-muted-foreground">{schedule.subject}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{schedule.cron || schedule.at || "No schedule"}{schedule.nextRunAt ? ` · next ${new Date(schedule.nextRunAt).toLocaleString()}` : ""}</div></div></div>)}
+      {schedules.length === 0 ? <div className="py-7 text-center text-[11px] text-muted-foreground">No scheduled times target this Agent.</div> : null}
     </div>
   </div>;
+}
+
+function AgentTriggerRow({ trigger, onAction }: { trigger: Trigger; onAction: (trigger: Trigger, action: "pause" | "resume" | "cancel") => void }) {
+  const stateTone = trigger.state === "armed" || trigger.state === "triggered" ? "bg-success" : trigger.state === "failed" ? "bg-destructive" : trigger.state === "pending" || trigger.state === "paused" ? "bg-warning" : "bg-muted-foreground/35";
+  const target = trigger.resourceKind === "pull-request" ? `${trigger.subject.owner}/${trigger.subject.repo}#${trigger.subject.number}` : `${trigger.subject.owner}/${trigger.subject.repo}/${trigger.subject.runId}`;
+  return <div className="flex min-w-0 items-start gap-3 py-3">
+    <span className={`mt-1 size-2 shrink-0 rounded-full ${stateTone}`} />
+    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-1.5"><span className="truncate font-mono text-[11px] font-semibold">{target}</span><span className="shrink-0 font-mono text-[8.5px] uppercase text-muted-foreground">{trigger.state}</span></div><div className="mt-0.5 truncate text-[10.5px] text-muted-foreground">{trigger.conditions.map((condition) => condition.event).join(" or ")} · {trigger.resumeInstruction}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{trigger.lastObservedAt ? `checked ${new Date(trigger.lastObservedAt).toLocaleString()}` : "awaiting first check"}{trigger.expiresAt ? ` · expires ${new Date(trigger.expiresAt).toLocaleString()}` : ""}</div>{trigger.lastError ? <div className="mt-1 text-[9.5px] text-destructive">{trigger.lastError}</div> : null}</div>
+    {["pending", "armed", "paused", "failed"].includes(trigger.state) ? <div className="flex shrink-0 gap-1">{trigger.state === "paused" || trigger.state === "failed" ? <button onClick={() => onAction(trigger, "resume")} className="flex size-7 items-center justify-center text-muted-foreground hover:bg-muted hover:text-foreground" title={trigger.state === "failed" ? "Retry trigger" : "Resume trigger"}><Play className="size-3" /></button> : <button onClick={() => onAction(trigger, "pause")} className="flex size-7 items-center justify-center text-muted-foreground hover:bg-muted hover:text-foreground" title="Pause trigger"><Pause className="size-3" /></button>}<button onClick={() => onAction(trigger, "cancel")} className="flex size-7 items-center justify-center text-muted-foreground hover:bg-destructive/10 hover:text-destructive" title="Cancel trigger"><X className="size-3" /></button></div> : null}
+  </div>;
+}
+
+function triggerSubjectFromTarget(resourceKind: "pull-request" | "workflow-run", target: string, expectedHead: string) {
+  const value = target.trim();
+  if (resourceKind === "pull-request") {
+    const match = value.match(/^([^/]+)\/(.+)#(\d+)$/);
+    if (!match) throw new Error("Pull request target must be owner/repo#number");
+    return { owner: match[1], repo: match[2], number: match[3], ...(expectedHead.trim() ? { expectedHead: expectedHead.trim() } : {}) };
+  }
+  const match = value.match(/^([^/]+)\/([^/]+)\/(\d+)$/);
+  if (!match) throw new Error("Workflow run target must be owner/repo/run-id");
+  return { owner: match[1], repo: match[2], runId: match[3] };
 }
 
 function AgentUsagePanel({ usage, loading, onRefresh, onOpenOverview }: { usage: AgentTokenUsage | null; loading: boolean; onRefresh: () => void; onOpenOverview: () => void }) {

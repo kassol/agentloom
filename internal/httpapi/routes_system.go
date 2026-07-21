@@ -1,8 +1,10 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/hub"
@@ -59,6 +61,14 @@ func (s *Server) registerSystemRoutes(mux *http.ServeMux) {
 		days, _ := strconv.Atoi(r.URL.Query().Get("days"))
 		writeJSON(w, 200, map[string]any{"workload": s.hub.WorkloadOverview(days)})
 	})
+	mux.HandleFunc("GET /api/activity/daily", func(w http.ResponseWriter, r *http.Request) {
+		start, endExclusive, bucketMinutes, err := dailyActivityWindowFromRequest(r, time.Now())
+		if err != nil {
+			writeErr(w, &hub.HubError{Status: 400, Message: err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"activity": s.hub.DailyActivity(start, endExclusive, bucketMinutes)})
+	})
 
 	mux.HandleFunc("GET /api/remote", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"remote": s.hub.RemoteSnapshot()})
@@ -111,4 +121,39 @@ func (s *Server) registerSystemRoutes(mux *http.ServeMux) {
 		writeJSON(w, 200, map[string]any{"revoked": true})
 	})
 
+}
+
+func dailyActivityWindowFromRequest(r *http.Request, now time.Time) (time.Time, time.Time, int, error) {
+	location := time.Local
+	if timezone := strings.TrimSpace(r.URL.Query().Get("tz")); timezone != "" {
+		var err error
+		location, err = time.LoadLocation(timezone)
+		if err != nil {
+			return time.Time{}, time.Time{}, 0, fmt.Errorf("invalid timezone %q", timezone)
+		}
+	}
+	date := strings.TrimSpace(r.URL.Query().Get("date"))
+	if date == "" {
+		date = now.In(location).Format("2006-01-02")
+	}
+	start, err := time.ParseInLocation("2006-01-02", date, location)
+	if err != nil {
+		return time.Time{}, time.Time{}, 0, fmt.Errorf("invalid date %q", date)
+	}
+	today := now.In(location)
+	today = time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, location)
+	if start.After(today) {
+		return time.Time{}, time.Time{}, 0, fmt.Errorf("date must not be in the future")
+	}
+	bucketMinutes := 30
+	if value := strings.TrimSpace(r.URL.Query().Get("bucket")); value != "" {
+		bucketMinutes, err = strconv.Atoi(value)
+		if err != nil {
+			return time.Time{}, time.Time{}, 0, fmt.Errorf("invalid bucket %q", value)
+		}
+	}
+	if bucketMinutes != 15 && bucketMinutes != 30 && bucketMinutes != 60 {
+		return time.Time{}, time.Time{}, 0, fmt.Errorf("bucket must be 15, 30, or 60 minutes")
+	}
+	return start, start.AddDate(0, 0, 1), bucketMinutes, nil
 }

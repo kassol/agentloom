@@ -12,7 +12,7 @@ func TestMaterializeAndInspectBundledSkills(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 8 {
+	if len(results) != 10 {
 		t.Fatalf("materialize results = %#v", results)
 	}
 	for _, result := range results {

@@ -27,6 +27,7 @@ type HumanRequest struct {
 	ThreadID       string               `json:"threadId,omitempty"`
 	SourceTurnID   string               `json:"sourceTurnId,omitempty"`
 	SourceTask     string               `json:"sourceTask,omitempty"`
+	TopicID        string               `json:"topicId,omitempty"`
 	Expectation    string               `json:"expectation"`
 	Question       string               `json:"question"`
 	Context        string               `json:"context,omitempty"`
@@ -50,6 +51,7 @@ type CreateHumanRequestParams struct {
 	Context     string               `json:"context"`
 	BlockedWork string               `json:"blockedWork"`
 	Options     []HumanRequestOption `json:"options"`
+	TopicID     string               `json:"topicId,omitempty"`
 }
 
 type AnswerHumanRequestParams struct {
@@ -111,11 +113,15 @@ func (h *Hub) appendHumanRequestLocked(request HumanRequest) error {
 	if h.humanRequests == nil {
 		h.humanRequests = map[string]*HumanRequest{}
 	}
-	if _, exists := h.humanRequests[request.ID]; !exists {
+	_, existed := h.humanRequests[request.ID]
+	if !existed {
 		h.humanRequestOrder = append(h.humanRequestOrder, request.ID)
 	}
 	h.humanRequests[request.ID] = &request
 	h.emitGlobalLocked("loom/human-request", map[string]any{"request": request})
+	if !existed && request.TopicID != "" {
+		h.recordTopicWorkEventLocked(request.TopicID, TopicEvent{Type: "needs_you_created", Actor: request.AgentName, AgentID: request.AgentID, Agent: request.AgentName, Summary: request.Question, Ref: &TopicRef{Type: "human_request", ID: request.ID, Label: request.Question}, CreatedAt: request.CreatedAt})
+	}
 	return nil
 }
 
@@ -174,10 +180,20 @@ func (h *Hub) CreateHumanRequest(params CreateHumanRequestParams) (HumanRequest,
 		CreatedAt:      stamp,
 		UpdatedAt:      stamp,
 	}
+	if params.TopicID != "" {
+		topic := h.topics[strings.TrimSpace(params.TopicID)]
+		if topic == nil || !topicHasAgent(topic, agent.ID, agent.ID) {
+			return HumanRequest{}, errf(403, "Agent %s is not part of Topic %s", agent.Name, params.TopicID)
+		}
+		request.TopicID = topic.ID
+	}
 	if request.SourceTurnID == "" {
 		if rt := h.runtimes[agent.ID]; rt != nil && rt.activeTurn != nil && !rt.activeTurn.finished {
 			request.SourceTurnID = rt.activeTurn.turnID
 			request.SourceTask = rt.activeTurn.task
+			if request.TopicID == "" {
+				request.TopicID = rt.activeTurn.topicID
+			}
 		}
 	}
 	if request.Expectation == HumanRequestRequired && request.BlockedWork == "" {
@@ -361,12 +377,30 @@ func (h *Hub) deliverAnsweredHumanRequest(agentID string) (HumanRequest, bool) {
 		return HumanRequest{}, false
 	}
 
+	input := formatHumanInputResponse(request)
+	topicCursor := int64(0)
+	topicContextIncluded := false
+	if request.TopicID != "" {
+		context, cursor, contextErr := h.topicContextEnvelope(request.TopicID, request.AgentID)
+		if contextErr == nil {
+			input = context + "\n" + input
+			topicCursor = cursor
+			topicContextIncluded = true
+		}
+	}
 	var result SendResult
 	var err error
 	if dispatch != nil {
-		result, err = dispatch(request.AgentID, formatHumanInputResponse(request))
+		result, err = dispatch(request.AgentID, input)
 	} else {
-		result, err = h.SendTask(request.AgentID, formatHumanInputResponse(request), defaultInactivity)
+		if topicContextIncluded {
+			result, err = h.sendTaskWithTopic(request.AgentID, input, defaultInactivity, request.TopicID)
+		} else {
+			result, err = h.SendTask(request.AgentID, input, defaultInactivity)
+		}
+	}
+	if err == nil && topicContextIncluded {
+		h.markTopicContextDelivered(request.TopicID, request.AgentID, topicCursor)
 	}
 
 	h.mu.Lock()
@@ -405,7 +439,13 @@ func formatHumanInputResponse(request HumanRequest) string {
 	b.WriteString(xmlEscape(request.SourceTurnID))
 	b.WriteString(`" expectation="`)
 	b.WriteString(xmlEscape(request.Expectation))
-	b.WriteString("\">\n")
+	b.WriteString(`"`)
+	if request.TopicID != "" {
+		b.WriteString(` topic_id="`)
+		b.WriteString(xmlEscape(request.TopicID))
+		b.WriteString(`"`)
+	}
+	b.WriteString(">\n")
 	writeXMLCDATA(&b, "question", request.Question)
 	writeXMLCDATA(&b, "answer", request.Answer)
 	if request.BlockedWork != "" {

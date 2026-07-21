@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-//go:embed loom-communication domain-agent-coaching loom-integrations loom-external-messaging loom-parall loom-feishu loom-needs-you loom-artifacts
+//go:embed loom-communication domain-agent-coaching loom-integrations loom-external-messaging loom-parall loom-feishu loom-needs-you loom-artifacts loom-triggers loom-topics
 var bundledFS embed.FS
 
 type Definition struct {
@@ -53,6 +53,14 @@ var definitions = []Definition{
 	{
 		Name:        "loom-artifacts",
 		Description: "Receive and publish managed files in an Agent Thread.",
+	},
+	{
+		Name:        "loom-triggers",
+		Description: "Resume long-lived Agent work when an external fact changes.",
+	},
+	{
+		Name:        "loom-topics",
+		Description: "Coordinate bounded work that spans Turns, time, and multiple Agents.",
 	},
 }
 

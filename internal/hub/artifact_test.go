@@ -122,6 +122,18 @@ func TestDisplayUserTaskStripsAttachmentManifest(t *testing.T) {
 	}
 }
 
+func TestDisplayUserTaskSummarizesTopicControlEnvelopes(t *testing.T) {
+	ownerInput := `<loom_topic_context version="1"><brief><summary>Internal state</summary></brief></loom_topic_context>
+<owner_topic_input version="1"><message><![CDATA[Review the current candidate.]]></message></owner_topic_input>`
+	if got := displayUserTask(ownerInput); got != "Review the current candidate." {
+		t.Fatalf("Topic owner input display task = %q", got)
+	}
+	intervention := `<owner_topic_intervention version="1"><guidance><![CDATA[Keep this verification read-only.]]></guidance></owner_topic_intervention>`
+	if got := displayUserTask(intervention); got != "Owner guidance: Keep this verification read-only." {
+		t.Fatalf("Topic intervention display task = %q", got)
+	}
+}
+
 func TestThreadArtifactRejectsOversizeInput(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

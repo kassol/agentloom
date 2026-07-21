@@ -48,6 +48,14 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, 200, map[string]any{"agent": agent})
 	})
+	mux.HandleFunc("GET /api/turns/{turnId}", func(w http.ResponseWriter, r *http.Request) {
+		turn, err := s.hub.GetTurn(r.PathValue("turnId"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"turn": turn})
+	})
 	mux.HandleFunc("PATCH /api/agents/{key}/config", func(w http.ResponseWriter, r *http.Request) {
 		var body hub.ConfigParams
 		if err := readJSON(r, &body); err != nil {
@@ -245,6 +253,33 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 			return
 		}
 		writeJSON(w, 200, result)
+	})
+	mux.HandleFunc("POST /api/agents/{key}/turns/interrupted/continue", func(w http.ResponseWriter, r *http.Request) {
+		if s.isRestartPending() {
+			writeErr(w, &hub.HubError{Status: 409, Message: "restart pending; wait for CodexLoom to restart before continuing a Turn"})
+			return
+		}
+		var body struct {
+			TimeoutSec int `json:"timeoutSec"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		result, err := s.hub.ContinueInterruptedTurn(r.PathValue("key"), time.Duration(body.TimeoutSec)*time.Second)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 202, result)
+	})
+	mux.HandleFunc("POST /api/agents/{key}/turns/interrupted/dismiss", func(w http.ResponseWriter, r *http.Request) {
+		agent, err := s.hub.DismissInterruptedTurn(r.PathValue("key"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"agent": agent})
 	})
 	mux.HandleFunc("GET /api/agents/{key}/thread/history", func(w http.ResponseWriter, r *http.Request) {
 		count, _ := strconv.Atoi(r.URL.Query().Get("count"))

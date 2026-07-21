@@ -26,6 +26,12 @@ export interface Agent {
   currentTask: string;
   currentTurnId: string;
   lastError: string;
+  lastTurn?: {
+    turnId: string;
+    task: string;
+    status: "completed" | "interrupted" | "failed" | string;
+    completedAt: string;
+  };
   createdAt: string;
   updatedAt: string;
   processAlive: boolean;
@@ -146,6 +152,7 @@ export interface AgentMessage {
   response: "required" | "none";
   replyTo?: string;
   sourceTurnId?: string;
+  topicId?: string;
   status: "open" | "answered" | "closed";
   resolution?: "reply" | "no_reply" | "cancelled" | "completed_elsewhere" | "superseded";
   resolutionReason?: string;
@@ -187,6 +194,7 @@ export interface HumanRequest {
   threadId?: string;
   sourceTurnId?: string;
   sourceTask?: string;
+  topicId?: string;
   expectation: "required" | "optional";
   question: string;
   context?: string;
@@ -207,6 +215,7 @@ export interface PlatformConnection {
   id: string;
   provider: string;
   accountRef?: string;
+  scopeRef?: string;
   credentialRef?: string;
   status: "disconnected" | "connecting" | "connected" | "degraded";
   capabilities: string[];
@@ -666,6 +675,142 @@ export interface Schedule {
   updatedAt: string;
 }
 
+export interface TriggerCondition {
+  event: string;
+  parameters?: Record<string, string>;
+}
+
+export interface Trigger {
+  id: string;
+  agentId: string;
+  agent: string;
+  connectionId: string;
+  provider: string;
+  resourceKind: "pull-request" | "workflow-run" | string;
+  subject: Record<string, string>;
+  conditions: TriggerCondition[];
+  resumeInstruction: string;
+  work: {
+    agentId: string;
+    threadIdAtCreation?: string;
+    sourceTurnId?: string;
+    goalCreatedAt?: number;
+    topicId?: string;
+  };
+  state: "pending" | "armed" | "paused" | "triggered" | "cancelled" | "expired" | "failed";
+  expiresAt?: string;
+  lastObservedAt?: string;
+  lastEventKey?: string;
+  lastMessageId?: string;
+  lastError?: string;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type TopicStatus = "active" | "waiting" | "resolved" | "archived";
+
+export interface TopicRef {
+  type: string;
+  id: string;
+  label?: string;
+}
+
+export interface TopicParticipant {
+  agentId: string;
+  agent: string;
+  responsibility: string;
+  joinedAt: string;
+}
+
+export interface TopicBrief {
+  version: number;
+  summary: string;
+  currentState?: string;
+  nextStep?: string;
+  limitations?: string;
+  updatedBy: string;
+  updatedAt: string;
+  evidence?: TopicRef[];
+}
+
+export interface TopicWaitingOn {
+  kind: string;
+  refId?: string;
+  summary: string;
+  resumeAction?: string;
+  since: string;
+}
+
+export interface TopicLink {
+  type: string;
+  id: string;
+  relation: string;
+  label?: string;
+  linkedBy: string;
+  inheritedFrom?: string;
+  createdAt: string;
+}
+
+export interface TopicEvent {
+  seq: number;
+  type: string;
+  actor: string;
+  agentId?: string;
+  agent?: string;
+  summary: string;
+  ref?: TopicRef;
+  createdAt: string;
+}
+
+export interface TopicActiveTurn {
+  agentId: string;
+  agent: string;
+  turnId: string;
+  task: string;
+  source: string;
+  startedAt: string;
+}
+
+export interface Topic {
+  id: string;
+  title: string;
+  purpose: string;
+  completionBoundary: string;
+  status: TopicStatus;
+  responsibleAgentId: string;
+  responsibleAgent: string;
+  participants: TopicParticipant[];
+  currentBrief: TopicBrief;
+  briefHistory?: TopicBrief[];
+  waitingOn?: TopicWaitingOn;
+  links?: TopicLink[];
+  events?: TopicEvent[];
+  resultReadyVersion?: number;
+  ownerSeenBriefVersion?: number;
+  version: number;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+  needsMeCount: number;
+  resultsReady: boolean;
+  activeTurns: TopicActiveTurn[];
+}
+
+export interface GitHubDeviceFlow {
+  id: string;
+  status: "pending" | "connected" | "failed" | "expired";
+  userCode?: string;
+  verificationUri?: string;
+  scope?: string;
+  expiresAt?: string;
+  pollAfterSeconds?: number;
+  login?: string;
+  connection?: PlatformConnection;
+  error?: string;
+}
+
 export interface TeamAgent {
   name: string;
   id: string;
@@ -710,6 +855,18 @@ export interface TeamRelationship {
   updatedAt: string;
 }
 
+export interface CollaborationGroup {
+  id: string;
+  name: string;
+  description: string;
+  status: "active" | "archived";
+  memberAgentIds: string[];
+  relationshipIds: string[];
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface OrganizationRelationship {
   id: string;
   parentAgentId: string;
@@ -725,6 +882,7 @@ export interface TeamView {
   agents: TeamAgent[];
   organizationLinks: OrganizationRelationship[];
   collaborationLinks: TeamRelationship[];
+  collaborationGroups: CollaborationGroup[];
   observedLinks: TeamObservedLink[];
   /** Compatibility alias for pre-separation clients. */
   explicitLinks: TeamRelationship[];

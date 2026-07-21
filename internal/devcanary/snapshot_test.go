@@ -19,6 +19,14 @@ func TestCreateFilteredSnapshot(t *testing.T) {
   "a1":{"agentId":"a1","domain":"one"},
   "a2":{"agentId":"a2","domain":"two"}
 }`)
+	writeFixture(t, filepath.Join(source, "team-links.json"), `{
+  "r1":{"id":"r1","fromAgentId":"a1","toAgentId":"a2","from":"alpha","to":"beta","description":"handoff"}
+}`)
+	writeFixture(t, filepath.Join(source, "collaboration-groups.json"), `{
+	  "g1":{"id":"g1","name":"Shared","description":"shared group","status":"active","memberAgentIds":["a1","a2"],"relationshipIds":["r1"],"version":1},
+	  "g2":{"id":"g2","name":"Beta only","description":"other group","status":"active","memberAgentIds":["a2"],"relationshipIds":[],"version":1},
+	  "g3":{"id":"g3","name":"Archived","description":"historical group","status":"archived","memberAgentIds":["a1"],"relationshipIds":["missing"],"version":2}
+	}`)
 	writeFixture(t, filepath.Join(source, "integrations.json"), `{
   "connections":{"c1":{"id":"c1"},"c2":{"id":"c2"}},
   "addresses":{"d1":{"id":"d1","agentId":"a1","connectionId":"c1"},"d2":{"id":"d2","agentId":"a2","connectionId":"c2"}},
@@ -43,6 +51,17 @@ func TestCreateFilteredSnapshot(t *testing.T) {
 	if len(agents) != 1 || agents["a1"] == nil {
 		t.Fatalf("agents = %#v", agents)
 	}
+	var groups map[string]struct {
+		MemberAgentIDs  []string `json:"memberAgentIds"`
+		RelationshipIDs []string `json:"relationshipIds"`
+	}
+	readFixtureJSON(t, filepath.Join(destination, "collaboration-groups.json"), &groups)
+	if len(groups) != 2 || len(groups["g1"].MemberAgentIDs) != 1 || groups["g1"].MemberAgentIDs[0] != "a1" || len(groups["g1"].RelationshipIDs) != 0 {
+		t.Fatalf("collaboration groups = %#v", groups)
+	}
+	if len(groups["g3"].RelationshipIDs) != 1 || groups["g3"].RelationshipIDs[0] != "missing" {
+		t.Fatalf("collaboration groups = %#v", groups)
+	}
 	var integrations struct {
 		Connections map[string]any `json:"connections"`
 		Addresses   map[string]any `json:"addresses"`
@@ -62,6 +81,23 @@ func TestCreateFilteredSnapshot(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join(destination, "events"))
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("events = %v, %v", entries, err)
+	}
+}
+
+func TestCreateSnapshotCopiesCollaborationGroups(t *testing.T) {
+	source := t.TempDir()
+	destination := filepath.Join(t.TempDir(), "data")
+	writeFixture(t, filepath.Join(source, "agents.json"), `{"a1":{"id":"a1","name":"alpha"}}`)
+	writeFixture(t, filepath.Join(source, "collaboration-groups.json"), `{"g1":{"id":"g1","name":"One","status":"archived","memberAgentIds":["a1"],"relationshipIds":["missing"],"version":2}}`)
+	if _, err := CreateSnapshot(source, destination, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(destination, "collaboration-groups.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"missing"`) {
+		t.Fatalf("collaboration groups = %s", data)
 	}
 }
 

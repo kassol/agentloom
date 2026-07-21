@@ -54,7 +54,7 @@ func TestReadNDJSONRejectsMalformedRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(st.Dir(), "comms.ndjson")
-	if err := os.WriteFile(path, []byte("{\"message\":{\"id\":\"one\"}}\nnot-json\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("{\"message\":{\"id\":\"one\"}}\nnot-json\n{\"message\":{\"id\":\"two\"}}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var records []json.RawMessage
@@ -64,6 +64,39 @@ func TestReadNDJSONRejectsMalformedRecord(t *testing.T) {
 	}
 	if len(records) != 1 {
 		t.Fatalf("records before corruption = %d, want 1", len(records))
+	}
+}
+
+func TestReadNDJSONRejectsCompleteMalformedTail(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(st.Dir(), "comms.ndjson")
+	if err := os.WriteFile(path, []byte("{\"message\":{\"id\":\"one\"}}\nnot-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = st.ReadComms(func(json.RawMessage) {})
+	if err == nil {
+		t.Fatal("complete malformed tail was accepted")
+	}
+}
+
+func TestReadNDJSONIgnoresTornTrailingRecord(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(st.Dir(), "comms.ndjson")
+	if err := os.WriteFile(path, []byte("{\"message\":{\"id\":\"one\"}}\n{\"message\":"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var records []json.RawMessage
+	if err := st.ReadComms(func(raw json.RawMessage) { records = append(records, raw) }); err != nil {
+		t.Fatalf("torn trailing record: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1 complete record", len(records))
 	}
 }
 

@@ -1,6 +1,7 @@
 package rollout
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,8 +138,8 @@ func TestReadFilePreservesUserLocalImages(t *testing.T) {
 
 func TestFindRolloutMissing(t *testing.T) {
 	t.Setenv("CODEX_SESSIONS_DIR", t.TempDir())
-	if _, err := FindRollout("nope"); err == nil {
-		t.Fatal("expected error for missing rollout")
+	if _, err := FindRollout("nope"); !errors.Is(err, ErrRolloutNotFound) {
+		t.Fatalf("missing rollout error = %v", err)
 	}
 }
 
@@ -231,6 +232,39 @@ func TestReadWindowPagesNewestTurnsAndTracksAppend(t *testing.T) {
 	}
 	if summary == nil || summary.ID != "turn-4" || summary.Task != "fourth" || summary.Status != "completed" {
 		t.Fatalf("latest summary = %#v", summary)
+	}
+}
+
+func TestReadTurnReturnsOnlyRequestedTurn(t *testing.T) {
+	dir := t.TempDir()
+	threadID := "thread-turn-get"
+	day := filepath.Join(dir, "2026", "07", "21")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		`{"timestamp":"2026-07-21T01:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-one"}}`,
+		`{"timestamp":"2026-07-21T01:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"first"}}`,
+		`{"timestamp":"2026-07-21T01:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-one"}}`,
+		`{"timestamp":"2026-07-21T02:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-two"}}`,
+		`{"timestamp":"2026-07-21T02:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"second"}}`,
+		`{"timestamp":"2026-07-21T02:00:02Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-two"}}`,
+	}
+	path := filepath.Join(day, "rollout-2026-07-21T01-00-00-"+threadID+".jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_SESSIONS_DIR", dir)
+
+	turn, err := ReadTurn(threadID, "turn-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.ID != "turn-two" || turn.Status != "interrupted" || len(turn.Items) != 1 || turn.Items[0]["text"] != "second" {
+		t.Fatalf("turn = %#v", turn)
+	}
+	if _, err := ReadTurn(threadID, "turn-missing"); !errors.Is(err, ErrTurnNotFound) {
+		t.Fatalf("missing Turn error = %v", err)
 	}
 }
 

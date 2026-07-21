@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -13,8 +15,11 @@ type rolloutIndex struct {
 	offset  int64
 	modTime int64
 	turns   []int64
+	turnIDs []string
 	latest  *LatestTurnSummary
 }
+
+var ErrTurnNotFound = errors.New("turn not found")
 
 var indexCache = struct {
 	sync.Mutex
@@ -66,6 +71,45 @@ func ReadWindow(threadID string, count, offset int) (*Transcript, int, error) {
 	return transcript, total, err
 }
 
+// ReadTurn parses exactly one Turn from a Thread's rollout. The offset index
+// keeps lookup proportional to the number of Turn boundaries, while only the
+// matching Turn's byte range is decoded into history items.
+func ReadTurn(threadID, turnID string) (*Turn, error) {
+	if turnID == "" {
+		return nil, fmt.Errorf("%w: empty turn id", ErrTurnNotFound)
+	}
+	path, err := FindRollout(threadID)
+	if err != nil {
+		return nil, err
+	}
+	index, err := readRolloutIndex(path)
+	if err != nil {
+		return nil, err
+	}
+	for position, id := range index.turnIDs {
+		if id != turnID {
+			continue
+		}
+		startByte := index.turns[position]
+		endByte := index.offset
+		if position+1 < len(index.turns) {
+			endByte = index.turns[position+1]
+		}
+		transcript, err := readFileRange(path, threadID, startByte, endByte)
+		if err != nil {
+			return nil, err
+		}
+		for turnIndex := range transcript.Turns {
+			if transcript.Turns[turnIndex].ID == turnID {
+				turn := transcript.Turns[turnIndex]
+				return &turn, nil
+			}
+		}
+		break
+	}
+	return nil, fmt.Errorf("%w: %s", ErrTurnNotFound, turnID)
+}
+
 // LatestTurn returns the incrementally maintained status projection of the
 // newest rollout Turn without rescanning the Thread's full history.
 func LatestTurn(threadID string) (*LatestTurnSummary, error) {
@@ -91,7 +135,7 @@ func readRolloutIndex(path string) (*rolloutIndex, error) {
 
 	index := indexCache.entries[path]
 	if index == nil || info.Size() < index.offset || info.Size() == index.offset && info.ModTime().UnixNano() != index.modTime {
-		index = &rolloutIndex{turns: []int64{}}
+		index = &rolloutIndex{turns: []int64{}, turnIDs: []string{}}
 	}
 	if info.Size() > index.offset {
 		if err := extendRolloutIndex(path, index); err != nil {
@@ -106,6 +150,7 @@ func readRolloutIndex(path string) (*rolloutIndex, error) {
 	indexCache.entries[path] = index
 	copy := *index
 	copy.turns = append([]int64(nil), index.turns...)
+	copy.turnIDs = append([]string(nil), index.turnIDs...)
 	if index.latest != nil {
 		latest := *index.latest
 		copy.latest = &latest
@@ -165,6 +210,7 @@ func consumeIndexLine(index *rolloutIndex, lineStart int64, raw []byte) {
 	switch event.Type {
 	case "task_started":
 		index.turns = append(index.turns, lineStart)
+		index.turnIDs = append(index.turnIDs, event.TurnID)
 		index.latest = &LatestTurnSummary{ID: event.TurnID, Status: "running", UpdatedAt: line.Timestamp}
 	case "user_message":
 		if index.latest != nil {

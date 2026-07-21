@@ -11,6 +11,19 @@ import (
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
+func TestInternalInboxStateKeepsFireAndForgetMessageQueuedUntilDelivery(t *testing.T) {
+	message := &AgentMessage{Response: "none", Status: "closed", DeliveryStatus: "queued"}
+	state, resolution := internalInboxState(message)
+	if state != "queued" || resolution != "" {
+		t.Fatalf("queued state = %q resolution = %q", state, resolution)
+	}
+	message.DeliveryStatus = "delivered"
+	state, resolution = internalInboxState(message)
+	if state != "handled" || resolution != "no_reply" {
+		t.Fatalf("delivered state = %q resolution = %q", state, resolution)
+	}
+}
+
 func TestIngressIsIdempotentAcrossRestart(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -480,7 +493,7 @@ func TestInboxStateRecoversInterruptedWork(t *testing.T) {
 
 	h := New(st)
 	defer h.Shutdown()
-	if got := h.inbox[inbox.ID]; got == nil || got.State != "queued" || got.ActiveAttemptID != "" {
+	if got := h.inbox[inbox.ID]; got == nil || got.State != "interrupted" || got.ActiveAttemptID != "" {
 		t.Fatalf("recovered inbox = %#v", got)
 	}
 	if got := h.attempts[attempt.ID]; got == nil || got.Status != "interrupted" {

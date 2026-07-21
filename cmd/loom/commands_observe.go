@@ -35,6 +35,62 @@ func cmdHistory(a args) {
 	}
 }
 
+func cmdTurnGet(a args) {
+	if len(a.positional) != 1 {
+		usage("turn get <turn-id> [--json]")
+	}
+	resp, err := api("GET", "/api/turns/"+url.PathEscape(a.positional[0]), nil)
+	if err != nil {
+		fail(err)
+	}
+	turn, _ := resp["turn"].(map[string]any)
+	if a.flags["json"] == "true" {
+		encoded, marshalErr := json.MarshalIndent(turn, "", "  ")
+		if marshalErr != nil {
+			fail(marshalErr)
+		}
+		fmt.Println(string(encoded))
+		return
+	}
+
+	fmt.Printf("%s %s %s\n", magenta("turn"), str(turn, "id"), dim("["+str(turn, "status")+"]"))
+	fmt.Printf("agent: %s %s\n", bold(str(turn, "agent")), dim(str(turn, "agentId")))
+	fmt.Printf("thread: %s\n", dim(str(turn, "threadId")))
+	if startedAt := str(turn, "startedAt"); startedAt != "" {
+		fmt.Printf("time: %s", startedAt)
+		if completedAt := str(turn, "completedAt"); completedAt != "" {
+			fmt.Printf(" → %s", completedAt)
+		}
+		fmt.Println()
+	}
+	if source, ok := turn["source"].(map[string]any); ok {
+		fmt.Printf("source: %s", str(source, "kind"))
+		if id := str(source, "id"); id != "" {
+			fmt.Printf(" %s", id)
+		}
+		if topicID := str(source, "topicId"); topicID != "" {
+			fmt.Printf(" · topic %s", topicID)
+		}
+		fmt.Println()
+	}
+	if model := str(turn, "model"); model != "" {
+		fmt.Printf("model: %s", model)
+		if usage, ok := turn["usage"].(map[string]any); ok {
+			fmt.Printf(" · %.0f tokens", num(usage, "totalTokens"))
+		}
+		fmt.Println()
+	}
+	if message := str(turn, "error"); message != "" {
+		fmt.Printf("error: %s\n", red(message))
+	}
+	fmt.Println()
+	items, _ := turn["items"].([]any)
+	for _, value := range items {
+		item, _ := value.(map[string]any)
+		printHistoryItem(item)
+	}
+}
+
 func printHistoryItem(item map[string]any) {
 	switch str(item, "type") {
 	case "user":
@@ -313,10 +369,14 @@ func pad(s string, n int) string {
 }
 
 func clip(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n]
+	return string(runes[:n])
 }
 
 func oneline(s string, n int) string {

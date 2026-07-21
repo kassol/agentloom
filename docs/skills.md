@@ -4,7 +4,7 @@ CodexLoom 使用 Skill 保存 Agent 可复用的工作方法。Profile 说明一
 
 ## 内置 Skill
 
-CodexLoom 当前内置八个 Skill：
+CodexLoom 当前内置十个 Skill：
 
 | Skill | 使用者 | 作用 |
 |---|---|---|
@@ -16,6 +16,8 @@ CodexLoom 当前内置八个 Skill：
 | `loom-parall` | 需要补充读取 Parall 上下文的 Agent | 使用受管 Address 读取 Parall 原生 chats、messages、replies 和 members；Provider ID 与原生 JSON 对 Agent 可见，但 credential 保留在 Connector；不提供写操作 |
 | `loom-feishu` | 需要补充读取飞书上下文的 Agent | 使用受管 Address 读取飞书原生 message、topic replies 和 chat history；Hub 校验启用的 Membership，Gateway 二次校验 chat 归属；不提供写操作 |
 | `loom-artifacts` | 收到 Thread 附件或需要交付生成文件的 Agent | 读取 `loom_attachments` 中的受管文件；用 `loom artifact publish` 把最终图片、报告或数据文件快照回当前 Thread；外部平台附件仍走 `loom-external-messaging` |
+| `loom-triggers` | 正在等待外部事实变化的所有 Agent | 创建持久外部条件后释放当前 Turn；收到 Trigger 时先回源核验，再恢复原工作；区分 Trigger、Schedule、Needs You，禁止用 sleep 或 shell watcher 保活 |
+| `loom-topics` | 负责或参与跨 Turn、跨 Agent 持续事项的 Agent | 判断何时需要 Topic，维护 Responsible/Participant 边界、versioned brief、waiting 和证据；通过带 Topic ID 的 Message、Needs You 与 Trigger 保持因果连续性 |
 
 源文件在 `skills/<name>/`。每个 Skill 只有 Codex 需要的 `SKILL.md` 和 UI 元数据 `agents/openai.yaml`，随 CodexLoom 二进制一起内嵌和版本管理。
 
@@ -115,6 +117,8 @@ python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" ski
 python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" skills/loom-external-messaging
 python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" skills/loom-parall
 python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" skills/loom-feishu
+python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" skills/loom-triggers
+python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" skills/loom-topics
 go test ./skills ./internal/hub ./cmd/loom
 make build
 ```

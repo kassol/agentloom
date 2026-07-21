@@ -15,6 +15,7 @@ type PlatformConnection struct {
 	ID              string   `json:"id"`
 	Provider        string   `json:"provider"`
 	AccountRef      string   `json:"accountRef,omitempty"`
+	ScopeRef        string   `json:"scopeRef,omitempty"`
 	CredentialRef   string   `json:"credentialRef,omitempty"`
 	Status          string   `json:"status"`
 	Capabilities    []string `json:"capabilities,omitempty"`
@@ -258,6 +259,7 @@ type integrationConfig struct {
 type ConnectionParams struct {
 	Provider      string   `json:"provider"`
 	AccountRef    string   `json:"accountRef"`
+	ScopeRef      string   `json:"scopeRef"`
 	CredentialRef string   `json:"credentialRef"`
 	Capabilities  []string `json:"capabilities"`
 	Enabled       *bool    `json:"enabled"`
@@ -495,9 +497,12 @@ func (h *Hub) loadInboxState() error {
 			repaired = true
 		}
 		if item.State == "handling" {
-			item.State = "queued"
+			// A process loss makes the old handling attempt uncertain. Hold the
+			// durable Inbox item for an explicit Continue instead of replaying an
+			// external message automatically after every restart.
+			item.State = "interrupted"
 			item.ActiveAttemptID = ""
-			item.LastError = "recovered after CodexLoom restart"
+			item.LastError = "CodexLoom restarted during handling"
 			item.UpdatedAt = now()
 			repaired = true
 		}
@@ -652,7 +657,7 @@ func (h *Hub) CreateConnection(p ConnectionParams) (PlatformConnection, error) {
 	}
 	ts := now()
 	connection := PlatformConnection{
-		ID: newIntegrationID("conn"), Provider: provider, AccountRef: strings.TrimSpace(p.AccountRef),
+		ID: newIntegrationID("conn"), Provider: provider, AccountRef: strings.TrimSpace(p.AccountRef), ScopeRef: strings.TrimSpace(p.ScopeRef),
 		CredentialRef: credentialRef, Status: "disconnected", Capabilities: normalizeCapabilities(p.Capabilities),
 		Enabled: enabled, CreatedAt: ts, UpdatedAt: ts,
 	}
@@ -1045,6 +1050,9 @@ func (h *Hub) UpdateConnection(id string, p ConnectionParams) (PlatformConnectio
 	}
 	if p.AccountRef != "" {
 		next.AccountRef = strings.TrimSpace(p.AccountRef)
+	}
+	if p.ScopeRef != "" {
+		next.ScopeRef = strings.TrimSpace(p.ScopeRef)
 	}
 	if p.CredentialRef != "" {
 		value := strings.TrimSpace(p.CredentialRef)

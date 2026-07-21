@@ -363,7 +363,13 @@ func cmdIntegration(a args) {
 			default:
 				state = red(state)
 			}
-			fmt.Printf("%s %s  %s  %s\n", bold(str(connection, "id")), cyan(str(connection, "provider")), state, dim(str(connection, "accountRef")))
+			account := str(connection, "accountRef")
+			if scope := str(connection, "scopeRef"); scope != "" {
+				account += "/" + scope
+			} else if str(connection, "provider") == "github" {
+				account += "/legacy"
+			}
+			fmt.Printf("%s %s  %s  %s\n", bold(str(connection, "id")), cyan(str(connection, "provider")), state, dim(account))
 			for _, address := range addressesByConnection[str(connection, "id")] {
 				addressState := enabledState(address)
 				if str(address, "archivedAt") != "" {
@@ -384,7 +390,11 @@ func cmdIntegration(a args) {
 		cmdIntegrationSend(a)
 	case "connect":
 		if len(a.positional) < 2 {
-			usage("integration connect <provider> [--account REF] [--credential-ref env:NAME]")
+			usage("integration connect <provider> [--account REF] [--credential-ref env:NAME]; GitHub PAT: integration connect github --token-file PATH --resource-owner OWNER")
+		}
+		if strings.EqualFold(a.positional[1], "github") {
+			cmdConnectGitHub(a)
+			return
 		}
 		capabilities := []string{}
 		for _, value := range strings.Split(a.flags["capabilities"], ",") {
@@ -952,27 +962,27 @@ func readOwnerOnlySecretFile(path string) (string, error) {
 	path = strings.TrimSpace(path)
 	info, err := os.Lstat(path)
 	if err != nil {
-		return "", fmt.Errorf("read Agent key file: %w", err)
+		return "", fmt.Errorf("read secret file: %w", err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return "", fmt.Errorf("Agent key file must be a regular file, not a symlink")
+		return "", fmt.Errorf("secret file must be a regular file, not a symlink")
 	}
 	if info.Mode().Perm()&0o077 != 0 || info.Mode().Perm()&0o400 == 0 {
-		return "", fmt.Errorf("Agent key file permissions must be owner-only (0600 or 0400), got %04o", info.Mode().Perm())
+		return "", fmt.Errorf("secret file permissions must be owner-only (0600 or 0400), got %04o", info.Mode().Perm())
 	}
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid != uint32(os.Geteuid()) {
-		return "", fmt.Errorf("Agent key file must be owned by the current user")
+		return "", fmt.Errorf("secret file must be owned by the current user")
 	}
 	if info.Size() <= 0 || info.Size() > 64*1024 {
-		return "", fmt.Errorf("Agent key file must contain between 1 byte and 64 KiB")
+		return "", fmt.Errorf("secret file must contain between 1 byte and 64 KiB")
 	}
 	payload, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("read Agent key file: %w", err)
+		return "", fmt.Errorf("read secret file: %w", err)
 	}
 	key := strings.TrimSpace(string(payload))
 	if key == "" {
-		return "", fmt.Errorf("Agent key file is empty")
+		return "", fmt.Errorf("secret file is empty")
 	}
 	return key, nil
 }

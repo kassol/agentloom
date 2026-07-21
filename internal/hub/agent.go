@@ -424,14 +424,22 @@ func (h *Hub) SendTask(key, text string, inactivity time.Duration) (SendResult, 
 }
 
 func (h *Hub) SendTaskWithArtifacts(key, text string, artifactIDs []string, inactivity time.Duration) (SendResult, error) {
-	return h.sendTaskWithArtifacts(key, text, artifactIDs, inactivity, "", "", "", "")
+	return h.sendTaskWithArtifacts(key, text, artifactIDs, inactivity, "", "", "", "", "", "")
 }
 
 func (h *Hub) sendTask(key, text string, inactivity time.Duration, inboxItemID, attemptID, developerContext, agentMessageID string) (SendResult, error) {
-	return h.sendTaskWithArtifacts(key, text, nil, inactivity, inboxItemID, attemptID, developerContext, agentMessageID)
+	return h.sendTaskWithArtifacts(key, text, nil, inactivity, inboxItemID, attemptID, developerContext, agentMessageID, "", "")
 }
 
-func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inactivity time.Duration, inboxItemID, attemptID, developerContext, agentMessageID string) (SendResult, error) {
+func (h *Hub) sendTaskWithTopic(key, text string, inactivity time.Duration, topicID string) (SendResult, error) {
+	return h.sendTaskWithArtifacts(key, text, nil, inactivity, "", "", "", "", topicID, "")
+}
+
+func (h *Hub) sendTaskWithTopicDisplay(key, text, displayTask string, inactivity time.Duration, topicID string) (SendResult, error) {
+	return h.sendTaskWithArtifacts(key, text, nil, inactivity, "", "", "", "", topicID, displayTask)
+}
+
+func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inactivity time.Duration, inboxItemID, attemptID, developerContext, agentMessageID, topicID, displayTask string) (SendResult, error) {
 	text = strings.TrimSpace(text)
 	if text == "" && len(artifactIDs) == 0 {
 		return SendResult{}, errf(400, "text or an artifact is required")
@@ -454,6 +462,13 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 		h.mu.Unlock()
 		return SendResult{}, errf(404, "agent not found: %s", key)
 	}
+	if topicID != "" {
+		topic := h.topics[topicID]
+		if topic == nil || !topicHasAgent(topic, meta.ID, meta.ID) {
+			h.mu.Unlock()
+			return SendResult{}, errf(403, "Agent %s is not part of Topic %s", meta.Name, topicID)
+		}
+	}
 	if rt, ok := h.runtimes[meta.ID]; ok && rt.activeTurn != nil && !rt.activeTurn.finished {
 		h.mu.Unlock()
 		return SendResult{}, errf(409, "agent %q is already running a task", meta.Name)
@@ -475,6 +490,11 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 		return SendResult{}, err
 	}
 	taskText, input := codexArtifactInput(agentID, text, artifacts)
+	visibleText := text
+	if displayTask = strings.TrimSpace(displayTask); displayTask != "" {
+		taskText = displayTask
+		visibleText = displayTask
+	}
 
 	// Serialize readiness, profile injection and turn reservation for one
 	// runtime. Concurrent callers must not inject the same profile version.
@@ -528,6 +548,7 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 		inboxItemID:    inboxItemID,
 		attemptID:      attemptID,
 		agentMessageID: agentMessageID,
+		topicID:        topicID,
 		startedAt:      time.Now(),
 		lastActivity:   time.Now(),
 		stopWatchdog:   make(chan struct{}),
@@ -546,7 +567,7 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 		return SendResult{}, errf(500, "persist Turn start: %s", err)
 	}
 	rt.activeTurn = turn
-	h.emitLocked(agentID, "loom/user-message", map[string]any{"text": text, "attachments": artifacts})
+	h.emitLocked(agentID, "loom/user-message", map[string]any{"text": visibleText, "attachments": artifacts, "topicId": topicID})
 	h.emitStatusLocked(meta, "running")
 	threadID, approvalPolicy, sandbox, model, effort := meta.ThreadID, meta.ApprovalPolicy, meta.Sandbox, meta.Model, meta.Effort
 	h.mu.Unlock()
@@ -617,7 +638,10 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 			log.Printf("[codex-loom] save started message handling %s: %v", agentMessageID, err)
 		}
 	}
-	h.emitLocked(agentID, "loom/turn-started", map[string]any{"turnId": turn.turnID, "task": taskText, "source": turn.source})
+	h.emitLocked(agentID, "loom/turn-started", map[string]any{"turnId": turn.turnID, "task": taskText, "source": turn.source, "topicId": topicID})
+	if topicID != "" {
+		h.recordTopicWorkEventLocked(topicID, TopicEvent{Type: "turn_started", Actor: meta.Name, AgentID: agentID, Agent: meta.Name, Summary: summarizeTopicText(taskText), Ref: &TopicRef{Type: "turn", ID: turn.turnID, Label: meta.Name}, CreatedAt: now()})
+	}
 	h.mu.Unlock()
 
 	return SendResult{Dispatched: true, AgentID: agentID, SessionID: agentID, TurnID: turnID}, nil
@@ -714,6 +738,25 @@ type InterruptResult struct {
 	HeldSubject   string `json:"heldSubject,omitempty"`
 }
 
+func activeTurnInterruptMismatch(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	const prefix = "expected active turn id "
+	const separator = " but found "
+	message := strings.TrimSpace(err.Error())
+	rest, ok := strings.CutPrefix(message, prefix)
+	if !ok {
+		return "", false
+	}
+	_, actualTurnID, ok := strings.Cut(rest, separator)
+	actualTurnID = strings.TrimSpace(actualTurnID)
+	if !ok || actualTurnID == "" || strings.ContainsAny(actualTurnID, " \t\r\n") {
+		return "", false
+	}
+	return actualTurnID, true
+}
+
 func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	if reason == "" {
 		reason = "interrupted by caller"
@@ -755,21 +798,68 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	}
 	h.mu.Unlock()
 
-	params := map[string]any{"threadId": threadID}
-	if turnID != "" {
-		params["turnId"] = turnID
+	if turnID == "" {
+		return InterruptResult{}, errf(409, "active Turn is still starting; retry shortly")
 	}
-	_, err := client.Request("turn/interrupt", params, 10*time.Second)
+	interrupt := func(targetTurnID string) error {
+		_, err := client.Request("turn/interrupt", map[string]any{
+			"threadId": threadID,
+			"turnId":   targetTurnID,
+		}, 10*time.Second)
+		return err
+	}
+	err := interrupt(turnID)
+	if actualTurnID, mismatch := activeTurnInterruptMismatch(err); mismatch && actualTurnID != turnID {
+		h.mu.Lock()
+		currentMeta := h.agents[agentID]
+		currentRuntime := h.runtimes[agentID]
+		var retryTurn *turnState
+		if currentMeta != nil && currentRuntime == rt && rt.activeTurn != nil && !rt.activeTurn.finished {
+			current := rt.activeTurn
+			switch {
+			case current.turnID == actualTurnID:
+				retryTurn = current
+			case current.turnID == turnID && !current.startedConfirmed:
+				h.rebindActiveTurnIDLocked(currentMeta, current, actualTurnID)
+				current.startedConfirmed = true
+				retryTurn = current
+			case current.turnID == turnID:
+				h.finishTurnLocked(currentMeta, rt, "interrupted", "superseded by active Turn "+actualTurnID)
+				retryTurn = h.adoptRemoteTurnLocked(currentMeta, rt, actualTurnID)
+			}
+		}
+		h.mu.Unlock()
+		if retryTurn != nil {
+			turn = retryTurn
+			turnID = actualTurnID
+			heldMessageID = retryTurn.agentMessageID
+			heldSubject = ""
+			if heldMessageID != "" {
+				h.mu.Lock()
+				if message := h.comms[heldMessageID]; message != nil {
+					heldSubject = message.Subject
+				}
+				h.mu.Unlock()
+			}
+			err = interrupt(actualTurnID)
+		}
+	}
 	if err != nil {
 		return InterruptResult{}, errf(500, "turn/interrupt failed: %s", err)
 	}
 	// codex should follow up with turn/completed(status=interrupted); force
 	// the bookkeeping if that doesn't arrive shortly.
 	h.startWorker(func() {
-		time.Sleep(3 * time.Second)
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-turn.stopWatchdog:
+			return
+		case <-timer.C:
+		}
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		if !turn.finished {
+		if !turn.finished && rt.activeTurn == turn {
 			if m := h.agents[agentID]; m != nil {
 				h.finishTurnLocked(m, rt, "interrupted", reason)
 			}
@@ -786,6 +876,23 @@ func (h *Hub) ArchiveAgent(key string) (map[string]any, error) {
 		return nil, errf(404, "agent not found: %s", key)
 	}
 	agentID := meta.ID
+	for _, topic := range h.topics {
+		if topic != nil && topic.Status != TopicStatusArchived && topicHasAgent(topic, agentID, meta.Name) {
+			h.mu.Unlock()
+			return nil, errf(409, "agent %s is part of Topic %s (%s); archive the Topic or remove the participant first", meta.Name, topic.ID, topic.Title)
+		}
+	}
+	for _, group := range h.collaborationGroups {
+		if group == nil || group.Status != CollaborationGroupStatusActive {
+			continue
+		}
+		for _, memberAgentID := range group.MemberAgentIDs {
+			if memberAgentID == agentID {
+				h.mu.Unlock()
+				return nil, errf(409, "agent %s is part of active Collaboration Group %s (%s); archive or update the Group first", meta.Name, group.ID, group.Name)
+			}
+		}
+	}
 	rt := h.runtimes[agentID]
 	hasActive := rt != nil && rt.activeTurn != nil && !rt.activeTurn.finished
 	threadID := meta.ThreadID
@@ -854,6 +961,158 @@ type History struct {
 	Status   string        `json:"status"`
 	Total    int           `json:"total"` // total turns in the rollout (for scroll-up paging)
 	Turns    []HistoryTurn `json:"turns"`
+}
+
+type TurnReference struct {
+	Kind    string `json:"kind"`
+	ID      string `json:"id,omitempty"`
+	TopicID string `json:"topicId,omitempty"`
+}
+
+type TurnDetail struct {
+	ID             string              `json:"id"`
+	AgentID        string              `json:"agentId"`
+	Agent          string              `json:"agent"`
+	ThreadID       string              `json:"threadId"`
+	Cwd            string              `json:"cwd"`
+	Status         string              `json:"status"`
+	StartedAt      string              `json:"startedAt,omitempty"`
+	CompletedAt    string              `json:"completedAt,omitempty"`
+	Model          string              `json:"model,omitempty"`
+	Usage          *rollout.TokenUsage `json:"usage,omitempty"`
+	UsageUpdatedAt string              `json:"usageUpdatedAt,omitempty"`
+	Source         *TurnReference      `json:"source,omitempty"`
+	Error          string              `json:"error,omitempty"`
+	Items          []map[string]any    `json:"items"`
+}
+
+// GetTurn locates a Turn globally by its stable Codex Turn ID. Rollout files
+// remain the history source of truth; Loom contributes the owning Agent and
+// any durable work reference that started the Turn.
+func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return TurnDetail{}, errf(400, "turn id is required")
+	}
+
+	h.mu.Lock()
+	agents := make([]AgentView, 0, len(h.agents))
+	for _, agent := range h.agents {
+		if agent.ThreadID != "" {
+			agents = append(agents, h.viewLocked(agent))
+		}
+	}
+	h.mu.Unlock()
+	for i := range agents {
+		applyRolloutStatus(&agents[i])
+	}
+	sort.Slice(agents, func(i, j int) bool {
+		if agents[i].Name != agents[j].Name {
+			return agents[i].Name < agents[j].Name
+		}
+		return agents[i].ID < agents[j].ID
+	})
+
+	var lookupErr error
+	for _, agent := range agents {
+		turn, err := rollout.ReadTurn(agent.ThreadID, turnID)
+		if err != nil {
+			if !errors.Is(err, rollout.ErrTurnNotFound) && !errors.Is(err, rollout.ErrRolloutNotFound) && lookupErr == nil {
+				lookupErr = fmt.Errorf("Agent %s (%s): %w", agent.Name, agent.ThreadID, err)
+			}
+			continue
+		}
+		items := turn.Items
+		if items == nil {
+			items = []map[string]any{}
+		}
+		detail := TurnDetail{
+			ID: turn.ID, AgentID: agent.ID, Agent: agent.Name, ThreadID: agent.ThreadID,
+			Cwd: agent.Cwd, Status: turn.Status, Items: items,
+		}
+		if detail.Status == "running" && (agent.Status != "running" || agent.CurrentTurnID != turnID) {
+			detail.Status = "interrupted"
+		}
+		if report, usageErr := rollout.ReadUsage(agent.ThreadID); usageErr == nil {
+			for _, activity := range report.Activity {
+				if activity.TurnID != turnID {
+					continue
+				}
+				detail.StartedAt = activity.StartedAt
+				detail.CompletedAt = activity.EndedAt
+				if detail.Status == "running" && activity.Status != "running" {
+					detail.Status = activity.Status
+				}
+				break
+			}
+			for _, usage := range report.Turns {
+				if usage.TurnID != turnID {
+					continue
+				}
+				copy := usage.Usage
+				detail.Model = usage.Model
+				detail.Usage = &copy
+				detail.UsageUpdatedAt = usage.LastUpdatedAt
+				break
+			}
+		}
+		if detail.StartedAt == "" && len(items) > 0 {
+			detail.StartedAt, _ = items[0]["timestamp"].(string)
+		}
+		if detail.CompletedAt == "" && detail.Status != "running" && len(items) > 0 {
+			detail.CompletedAt, _ = items[len(items)-1]["timestamp"].(string)
+		}
+		h.mu.Lock()
+		detail.Source, detail.Error = h.turnReferenceLocked(agent.ID, turnID)
+		if detail.Error == "" && agent.LastTurn != nil && agent.LastTurn.TurnID == turnID && agent.LastError != "" {
+			detail.Error = agent.LastError
+		}
+		h.mu.Unlock()
+		return detail, nil
+	}
+	if lookupErr != nil {
+		return TurnDetail{}, errf(500, "turn lookup failed: %v", lookupErr)
+	}
+	return TurnDetail{}, errf(404, "turn not found: %s", turnID)
+}
+
+func (h *Hub) turnReferenceLocked(agentID, turnID string) (*TurnReference, string) {
+	for _, attempt := range h.attempts {
+		if attempt == nil || attempt.AgentID != agentID || attempt.TurnID != turnID {
+			continue
+		}
+		return &TurnReference{Kind: "external", ID: attempt.InboxItemID}, attempt.Error
+	}
+	for _, request := range h.humanRequests {
+		if request != nil && request.AgentID == agentID && request.ResumedTurnID == turnID {
+			return &TurnReference{Kind: "needs_you", ID: request.ID, TopicID: request.TopicID}, request.LastError
+		}
+	}
+	for _, messageID := range h.commOrder {
+		message := h.comms[messageID]
+		if message == nil || message.ToAgentID != agentID {
+			continue
+		}
+		matched := message.DeliveryMode == "turn_start" && message.DeliveredTurnID == turnID
+		for _, attempt := range message.HandlingAttempts {
+			if attempt.TurnID == turnID {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		kind := "internal"
+		switch {
+		case message.TriggerID != "":
+			kind = "trigger"
+		case message.ScheduleID != "":
+			kind = "schedule"
+		}
+		return &TurnReference{Kind: kind, ID: message.ID, TopicID: message.TopicID}, message.LastHandlingError
+	}
+	return nil, ""
 }
 
 func (h *Hub) History(key string, count, offset int) (History, error) {

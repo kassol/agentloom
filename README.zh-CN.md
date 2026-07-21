@@ -37,7 +37,7 @@ CodexLoom 建立在 Codex 之上。它不重新实现 Agent Runtime，也不复�
 - **Agent 间通信**：通过 Messages 发送、排队和回复消息，并保留处理状态与完整历史。
 - **团队结构**：使用 Team List 和可拖拽 Team Map 查看显式关系及真实通信中观察到的协作。
 - **外部组织接入**：通过飞书、Slack 和 Parall 管理外部身份、Conversation Membership、Inbox 和 Outbox。
-- **持续运营**：使用 Schedules、全局运行状态、主动备份和等待 active Turn 的优雅重启。
+- **持续运营**：使用 Schedules 与持久外部 Triggers、全局运行状态、主动备份和等待 active Turn 的优雅重启。
 
 Lead、Internal Agent 和 Interface Agent 目前通过 Profile、显式关系、Messages 和 Conversation Membership 组合表达；专用的层级消息策略和组织模板仍在继续建模。
 
@@ -205,6 +205,8 @@ CodexLoom 建立在 Codex 之上。Codex 继续提供 Agent Runtime、Thread 历
 - [Documentation map (English translation)](docs/README.md)
 - [Agent Profile：如何定义长期身份、Domain 与 Scope](docs/agent-profile.md)
 - [Agent 通信与 `loom` CLI](docs/loom-cli.md)
+- [Topics：跨 Turn、跨 Agent 的持续事项](docs/topics.md)
+- [外部条件与 GitHub Triggers](docs/triggers.md)
 - [外部平台集成设计](docs/agent-platform-integration.md)
 - [Conversation Membership：Agent 在具体会话中的角色](docs/conversation-membership.md)
 - [Codex app-server 协议与适配说明](docs/codex-app-server-protocol.md)

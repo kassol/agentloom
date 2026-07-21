@@ -3,6 +3,7 @@ package hub
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,16 @@ func TestNextCronAfter(t *testing.T) {
 	want := time.Date(2026, 7, 9, 9, 0, 0, 0, time.UTC)
 	if !next.Equal(want) {
 		t.Fatalf("next = %s, want %s", next, want)
+	}
+}
+
+func TestCronSteppedWildcardsRemainRestricted(t *testing.T) {
+	spec, err := parseCron("0 9 */2 * */2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.anyDay || spec.anyWeekday {
+		t.Fatalf("stepped wildcards were treated as bare wildcards: day=%v weekday=%v", spec.anyDay, spec.anyWeekday)
 	}
 }
 
@@ -132,6 +143,25 @@ func TestDueScheduleCreatesOneDurableOccurrenceMessage(t *testing.T) {
 	}
 }
 
+func TestFiredOneShotScheduleCannotBeReenabled(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.schedules["sched-1"] = &Schedule{
+		ID: "sched-1", Name: "once", To: "worker", Subject: "Check", Body: "Do it",
+		At: "2026-07-19T01:00:00Z", LastRunAt: "2026-07-19T01:00:00Z", Enabled: false,
+		CreatedAt: now(), UpdatedAt: now(),
+	}
+	if _, err := h.SetScheduleEnabled("sched-1", true); err == nil || !strings.Contains(err.Error(), "already fired") {
+		t.Fatalf("SetScheduleEnabled error = %v", err)
+	}
+	if h.schedules["sched-1"].Enabled {
+		t.Fatal("fired one-shot schedule was re-enabled")
+	}
+}
+
 func TestCreateScheduleRollsBackWhenPersistenceFails(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -175,18 +205,21 @@ func TestRecomputeScheduleRollsBackWhenPersistenceFails(t *testing.T) {
 
 func testHub(st *store.Store) *Hub {
 	return &Hub{
-		st:                st,
-		agents:            map[string]*Agent{},
-		comms:             map[string]*AgentMessage{},
-		schedules:         map[string]*Schedule{},
-		profiles:          map[string]*AgentProfile{},
-		teamLinks:         map[string]*TeamRelationship{},
-		organizationLinks: map[string]*OrganizationRelationship{},
-		humanRequests:     map[string]*HumanRequest{},
-		goals:             map[string]*ThreadGoal{},
-		seqs:              map[string]int64{},
-		runtimes:          map[string]*runtime{},
-		subs:              map[string]map[*subscriber]struct{}{},
-		globalSubs:        map[*subscriber]struct{}{},
+		st:                  st,
+		agents:              map[string]*Agent{},
+		comms:               map[string]*AgentMessage{},
+		schedules:           map[string]*Schedule{},
+		triggers:            map[string]*Trigger{},
+		profiles:            map[string]*AgentProfile{},
+		teamLinks:           map[string]*TeamRelationship{},
+		organizationLinks:   map[string]*OrganizationRelationship{},
+		collaborationGroups: map[string]*CollaborationGroup{},
+		connections:         map[string]*PlatformConnection{},
+		humanRequests:       map[string]*HumanRequest{},
+		goals:               map[string]*ThreadGoal{},
+		seqs:                map[string]int64{},
+		runtimes:            map[string]*runtime{},
+		subs:                map[string]map[*subscriber]struct{}{},
+		globalSubs:          map[*subscriber]struct{}{},
 	}
 }

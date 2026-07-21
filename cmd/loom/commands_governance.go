@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -166,6 +167,14 @@ func printScheduleDetail(s map[string]any) {
 }
 
 func cmdTeam(a args) {
+	if len(a.positional) > 0 && a.positional[0] == "group" {
+		cmdTeamCollaborationGroup(a, 1)
+		return
+	}
+	if len(a.positional) > 1 && a.positional[0] == "collaboration" && a.positional[1] == "group" {
+		cmdTeamCollaborationGroup(a, 2)
+		return
+	}
 	if len(a.positional) > 0 && (a.positional[0] == "collaboration" || a.positional[0] == "link") {
 		cmdTeamLink(a)
 		return
@@ -244,6 +253,14 @@ func printTeamAgent(team map[string]any, key string) {
 }
 
 func printTeamLinks(team map[string]any, agent string) {
+	agentID := agent
+	for _, value := range anySlice(team["agents"]) {
+		candidate, _ := value.(map[string]any)
+		if str(candidate, "name") == agent || str(candidate, "id") == agent {
+			agentID = str(candidate, "id")
+			break
+		}
+	}
 	fmt.Println(bold("Organization"))
 	organizationCount := 0
 	for _, value := range anySlice(team["organizationLinks"]) {
@@ -274,6 +291,20 @@ func printTeamLinks(team map[string]any, agent string) {
 	}
 	if explicitCount == 0 {
 		fmt.Println("  no collaboration relationships")
+	}
+	fmt.Println()
+	fmt.Println(bold("Collaboration groups"))
+	groupCount := 0
+	for _, value := range anySlice(team["collaborationGroups"]) {
+		group, _ := value.(map[string]any)
+		if str(group, "status") != "active" || !collaborationGroupMatchesAgent(group, agentID) {
+			continue
+		}
+		groupCount++
+		printCollaborationGroupLine(group, "  ")
+	}
+	if groupCount == 0 {
+		fmt.Println("  no active collaboration groups")
 	}
 	fmt.Println()
 	observedLinks, _ := team["observedLinks"].([]any)
@@ -309,6 +340,18 @@ func printTeamLinks(team map[string]any, agent string) {
 	if observedCount == 0 {
 		fmt.Println("  no observed links")
 	}
+}
+
+func collaborationGroupMatchesAgent(group map[string]any, agent string) bool {
+	if agent == "" {
+		return true
+	}
+	for _, value := range anySlice(group["memberAgentIds"]) {
+		if fmt.Sprint(value) == agent {
+			return true
+		}
+	}
+	return false
 }
 
 func matchesOrganizationLink(link map[string]any, agent string) bool {
@@ -355,6 +398,249 @@ func cmdTeamLink(a args) {
 	default:
 		usage("team collaboration add|update|delete ...")
 	}
+}
+
+func cmdTeamCollaborationGroup(a args, offset int) {
+	if len(a.positional) <= offset {
+		usage("team collaboration group list|get|create|update|archive|delete ...")
+	}
+	action := a.positional[offset]
+	argument := func() string {
+		if len(a.positional) <= offset+1 {
+			return ""
+		}
+		return a.positional[offset+1]
+	}
+	switch action {
+	case "list", "ls":
+		status := strings.TrimSpace(a.flags["status"])
+		if status == "" {
+			status = "active"
+		}
+		resp, err := api("GET", "/api/team/collaboration-groups?status="+url.QueryEscape(status), nil)
+		if err != nil {
+			fail(err)
+		}
+		groups := anySlice(resp["groups"])
+		if a.flags["json"] == "true" {
+			printCollaborationGroupJSON(groups)
+			return
+		}
+		if len(groups) == 0 {
+			fmt.Println("no collaboration groups")
+			return
+		}
+		for _, value := range groups {
+			group, _ := value.(map[string]any)
+			printCollaborationGroupLine(group, "")
+		}
+	case "get":
+		id := argument()
+		if id == "" {
+			usage("team collaboration group get <group-id> [--json]")
+		}
+		group := getCollaborationGroup(id)
+		if a.flags["json"] == "true" {
+			printCollaborationGroupJSON(group)
+			return
+		}
+		printCollaborationGroupDetail(group, getTeamSnapshot())
+	case "create":
+		payload := collaborationGroupPayload(a, nil)
+		resp, err := api("POST", "/api/team/collaboration-groups", payload)
+		if err != nil {
+			fail(err)
+		}
+		group, _ := resp["group"].(map[string]any)
+		fmt.Printf("%s %s\n", green("collaboration group created"), str(group, "id"))
+		printCollaborationGroupDetail(group, getTeamSnapshot())
+	case "update":
+		id := argument()
+		if id == "" {
+			usage("team collaboration group update <group-id> [--file group.json|--name TEXT --description TEXT --member AGENT --relationship ID --status active|archived] [--expected-version N]")
+		}
+		current := getCollaborationGroup(id)
+		payload := collaborationGroupPayload(a, current)
+		payload["expectedVersion"] = collaborationGroupExpectedVersion(a, current)
+		resp, err := api("PATCH", "/api/team/collaboration-groups/"+url.PathEscape(id), payload)
+		if err != nil {
+			fail(err)
+		}
+		group, _ := resp["group"].(map[string]any)
+		fmt.Printf("%s %s\n", green("collaboration group updated"), str(group, "id"))
+		printCollaborationGroupDetail(group, getTeamSnapshot())
+	case "archive":
+		id := argument()
+		if id == "" {
+			usage("team collaboration group archive <group-id> [--expected-version N]")
+		}
+		current := getCollaborationGroup(id)
+		payload := collaborationGroupPayload(a, current)
+		payload["status"] = "archived"
+		payload["expectedVersion"] = collaborationGroupExpectedVersion(a, current)
+		resp, err := api("PATCH", "/api/team/collaboration-groups/"+url.PathEscape(id), payload)
+		if err != nil {
+			fail(err)
+		}
+		group, _ := resp["group"].(map[string]any)
+		fmt.Printf("%s %s\n", yellow("collaboration group archived"), str(group, "id"))
+		printCollaborationGroupDetail(group, getTeamSnapshot())
+	case "delete", "rm":
+		id := argument()
+		if id == "" {
+			usage("team collaboration group delete <group-id> [--expected-version N]")
+		}
+		current := getCollaborationGroup(id)
+		version := collaborationGroupExpectedVersion(a, current)
+		resp, err := api("DELETE", "/api/team/collaboration-groups/"+url.PathEscape(id)+"?expectedVersion="+strconv.Itoa(version), nil)
+		if err != nil {
+			fail(err)
+		}
+		group, _ := resp["group"].(map[string]any)
+		fmt.Printf("%s %s (%s)\n", red("collaboration group deleted"), str(group, "name"), str(group, "id"))
+	default:
+		usage("team collaboration group list|get|create|update|archive|delete ...")
+	}
+}
+
+func collaborationGroupPayload(a args, current map[string]any) map[string]any {
+	payload := map[string]any{}
+	if current != nil {
+		for _, key := range []string{"name", "description", "status", "memberAgentIds", "relationshipIds"} {
+			payload[key] = current[key]
+		}
+	}
+	if path := strings.TrimSpace(a.flags["file"]); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fail(err)
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			fail(fmt.Errorf("parse collaboration group JSON: %w", err))
+		}
+	}
+	for _, key := range []string{"name", "description", "status"} {
+		if value, ok := a.flags[key]; ok {
+			payload[key] = value
+		}
+	}
+	if values, ok := a.flagValues["member"]; ok {
+		payload["memberAgentIds"] = values
+	}
+	if values, ok := a.flagValues["relationship"]; ok {
+		payload["relationshipIds"] = values
+	}
+	if strings.TrimSpace(fmt.Sprint(payload["name"])) == "" || strings.TrimSpace(fmt.Sprint(payload["description"])) == "" {
+		usage("team collaboration group create --name TEXT --description TEXT [--member AGENT ...] [--relationship ID ...] [--file group.json]")
+	}
+	if payload["status"] == nil || strings.TrimSpace(fmt.Sprint(payload["status"])) == "" {
+		payload["status"] = "active"
+	}
+	if payload["memberAgentIds"] == nil {
+		payload["memberAgentIds"] = []string{}
+	}
+	if payload["relationshipIds"] == nil {
+		payload["relationshipIds"] = []string{}
+	}
+	return payload
+}
+
+func collaborationGroupExpectedVersion(a args, current map[string]any) int {
+	if raw := strings.TrimSpace(a.flags["expected-version"]); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 {
+			fail(fmt.Errorf("--expected-version must be a positive integer"))
+		}
+		return value
+	}
+	return int(num(current, "version"))
+}
+
+func getCollaborationGroup(id string) map[string]any {
+	resp, err := api("GET", "/api/team/collaboration-groups/"+url.PathEscape(id), nil)
+	if err != nil {
+		fail(err)
+	}
+	group, _ := resp["group"].(map[string]any)
+	return group
+}
+
+func getTeamSnapshot() map[string]any {
+	resp, err := api("GET", "/api/team", nil)
+	if err != nil {
+		fail(err)
+	}
+	team, _ := resp["team"].(map[string]any)
+	return team
+}
+
+func printCollaborationGroupLine(group map[string]any, prefix string) {
+	fmt.Printf("%s%s %s %s members=%d relationships=%d v%.0f\n", prefix, str(group, "id"), bold(str(group, "name")), dim("["+str(group, "status")+"]"), len(anySlice(group["memberAgentIds"])), len(anySlice(group["relationshipIds"])), num(group, "version"))
+}
+
+func printCollaborationGroupDetail(group, team map[string]any) {
+	printCollaborationGroupLine(group, "")
+	fmt.Printf("description:\n%s\n", indent(str(group, "description")))
+	agentNames := map[string]string{}
+	for _, value := range anySlice(team["agents"]) {
+		agent, _ := value.(map[string]any)
+		agentNames[str(agent, "id")] = str(agent, "name")
+	}
+	includedRelationships := map[string]map[string]any{}
+	for _, value := range anySlice(team["collaborationLinks"]) {
+		relationship, _ := value.(map[string]any)
+		includedRelationships[str(relationship, "id")] = relationship
+	}
+	connectedMembers := map[string]bool{}
+	for _, relationshipID := range collaborationGroupStrings(group["relationshipIds"]) {
+		if relationship := includedRelationships[relationshipID]; relationship != nil {
+			connectedMembers[str(relationship, "fromAgentId")] = true
+			connectedMembers[str(relationship, "toAgentId")] = true
+		}
+	}
+	fmt.Println("members:")
+	for _, agentID := range collaborationGroupStrings(group["memberAgentIds"]) {
+		name := agentNames[agentID]
+		if name == "" {
+			name = "unavailable agent"
+		}
+		suffix := ""
+		if !connectedMembers[agentID] {
+			suffix = " " + dim("[no collaboration edge included in this group]")
+		}
+		fmt.Printf("  %s (%s)%s\n", bold(name), agentID, suffix)
+	}
+	relationshipIDs := collaborationGroupStrings(group["relationshipIds"])
+	if len(relationshipIDs) == 0 {
+		fmt.Println("relationships: no collaboration edge included in this group")
+	} else {
+		fmt.Println("relationships:")
+		for _, relationshipID := range relationshipIDs {
+			relationship := includedRelationships[relationshipID]
+			if relationship == nil {
+				fmt.Printf("  %s %s\n", relationshipID, dim("[unavailable historical relationship]"))
+				continue
+			}
+			fmt.Printf("  %s  %s -> %s\n    %s\n", relationshipID, bold(str(relationship, "from")), bold(str(relationship, "to")), indent(str(relationship, "description")))
+		}
+	}
+	fmt.Printf("createdAt: %s\nupdatedAt: %s\n", str(group, "createdAt"), str(group, "updatedAt"))
+}
+
+func collaborationGroupStrings(value any) []string {
+	values := []string{}
+	for _, item := range anySlice(value) {
+		values = append(values, fmt.Sprint(item))
+	}
+	return values
+}
+
+func printCollaborationGroupJSON(value any) {
+	encoded, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		fail(err)
+	}
+	fmt.Println(string(encoded))
 }
 
 func cmdTeamOrganization(a args) {

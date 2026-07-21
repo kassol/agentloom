@@ -6,9 +6,12 @@
 //	sessions.json        compatibility mirror for pre-CodexLoom binaries
 //	profiles.json        long-lived collaboration profiles keyed by agent id
 //	team-links.json      explicit long-lived collaboration relationships
+//	collaboration-groups.json named shared views over collaboration relationships
 //	organization-links.json explicit parent/child organization relationships
 //	comms.ndjson         append-only agent-to-agent communication log
 //	schedules.json       durable scheduler definitions
+//	triggers.json        durable external-condition definitions
+//	topics.json          durable cross-Agent coordination records
 //	integrations.json    platform connections, agent addresses and conversation memberships (no secrets)
 //	messages.ndjson      normalized external communication facts
 //	inbox.ndjson         per-agent inbox item snapshots
@@ -30,6 +33,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,10 +48,11 @@ type Event struct {
 }
 
 type Store struct {
-	dir          string
-	eventMu      sync.Mutex
-	eventPolicy  EventLogPolicy
-	eventLastSeq map[string]int64
+	dir                string
+	eventMu            sync.Mutex
+	eventMaintenanceMu sync.Mutex
+	eventPolicy        EventLogPolicy
+	eventLastSeq       map[string]int64
 }
 
 func DefaultDir() string {
@@ -172,9 +177,17 @@ func (s *Store) commsFile() string { return filepath.Join(s.dir, "comms.ndjson")
 
 func (s *Store) schedulesFile() string { return filepath.Join(s.dir, "schedules.json") }
 
+func (s *Store) triggersFile() string { return filepath.Join(s.dir, "triggers.json") }
+
+func (s *Store) topicsFile() string { return filepath.Join(s.dir, "topics.json") }
+
 func (s *Store) profilesFile() string { return filepath.Join(s.dir, "profiles.json") }
 
 func (s *Store) teamLinksFile() string { return filepath.Join(s.dir, "team-links.json") }
+
+func (s *Store) collaborationGroupsFile() string {
+	return filepath.Join(s.dir, "collaboration-groups.json")
+}
 
 func (s *Store) organizationLinksFile() string {
 	return filepath.Join(s.dir, "organization-links.json")
@@ -252,6 +265,14 @@ func (s *Store) SaveSchedules(v any) error {
 	return saveJSON(s.schedulesFile(), v)
 }
 
+func (s *Store) LoadTriggers(v any) error { return loadJSON(s.triggersFile(), v) }
+
+func (s *Store) SaveTriggers(v any) error { return saveJSON(s.triggersFile(), v) }
+
+func (s *Store) LoadTopics(v any) error { return loadJSON(s.topicsFile(), v) }
+
+func (s *Store) SaveTopics(v any) error { return saveJSON(s.topicsFile(), v) }
+
 func (s *Store) LoadProfiles(v any) error { return loadJSON(s.profilesFile(), v) }
 
 func (s *Store) SaveProfiles(v any) error { return saveJSON(s.profilesFile(), v) }
@@ -259,6 +280,14 @@ func (s *Store) SaveProfiles(v any) error { return saveJSON(s.profilesFile(), v)
 func (s *Store) LoadTeamLinks(v any) error { return loadJSON(s.teamLinksFile(), v) }
 
 func (s *Store) SaveTeamLinks(v any) error { return saveJSON(s.teamLinksFile(), v) }
+
+func (s *Store) LoadCollaborationGroups(v any) error {
+	return loadJSON(s.collaborationGroupsFile(), v)
+}
+
+func (s *Store) SaveCollaborationGroups(v any) error {
+	return saveJSON(s.collaborationGroupsFile(), v)
+}
 
 func (s *Store) LoadOrganizationLinks(v any) error { return loadJSON(s.organizationLinksFile(), v) }
 
@@ -396,21 +425,48 @@ func readNDJSON(path string, fn func(json.RawMessage)) error {
 		return err
 	}
 	defer f.Close()
+	endsWithNewline := true
+	if info, statErr := f.Stat(); statErr != nil {
+		return statErr
+	} else if info.Size() > 0 {
+		last := []byte{0}
+		if _, readErr := f.ReadAt(last, info.Size()-1); readErr != nil {
+			return readErr
+		}
+		endsWithNewline = last[0] == '\n'
+	}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
 	lineNumber := 0
+	invalidLine := 0
 	for sc.Scan() {
 		lineNumber++
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
+		if invalidLine != 0 {
+			return fmt.Errorf("%s:%d: invalid JSON record", path, invalidLine)
+		}
 		if !json.Valid([]byte(line)) {
-			return fmt.Errorf("%s:%d: invalid JSON record", path, lineNumber)
+			// A crash can leave the append-only file with one torn final
+			// record. Defer the error until another non-empty line proves
+			// that the corruption occurred in the middle of the log.
+			invalidLine = lineNumber
+			continue
 		}
 		fn(json.RawMessage(append([]byte(nil), line...)))
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	if invalidLine != 0 && endsWithNewline {
+		return fmt.Errorf("%s:%d: invalid JSON record", path, invalidLine)
+	}
+	if invalidLine != 0 {
+		log.Printf("[codex-loom] ignored torn final NDJSON record %s:%d", path, invalidLine)
+	}
+	return nil
 }
 
 // ReplaceComms atomically compacts the communication index to one current

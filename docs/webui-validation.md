@@ -56,12 +56,13 @@ git status --short
 启动 `5188`，在目标 URL 上反复执行：
 
 1. 打开准确的深链，例如 `#codex-hub-dev`、`#team`、`#integrations`。
-2. 用 automation state 确认数据已加载。
-3. 用 snapshot 获取当前可交互元素。
-4. 执行真实点击、输入、滚动或拖拽。
-5. 再读 state，确认行为结果。
-6. 截图并实际查看图片，不只记录截图路径。
-7. 在桌面与移动 viewport 上重复关键路径。
+2. 先检查浏览器控制台，确认没有运行时异常、未捕获 Promise rejection 或模块加载错误。
+3. 用 automation state 确认数据已加载。
+4. 用 snapshot 获取当前可交互元素。
+5. 执行真实点击、输入、滚动或拖拽。
+6. 再读 state，确认行为结果。
+7. 截图并实际查看图片，不只记录截图路径。
+8. 在桌面与移动 viewport 上重复关键路径。
 
 ### 3. 构建发布产物
 
@@ -107,6 +108,30 @@ CodexLoom 日常使用 `/tmp/pinixc`。创建浏览器资源时必须指定 prof
 ```
 
 页面变化后 ref 可能失效，每轮交互前重新 `snapshot -i`。不要跨 tab 或跨 profile 复用 ref。检查结束后关闭测试 tab，避免以后误操作旧页面。
+
+## 白屏与错误页排查
+
+白屏、错误边界或页面突然消失时，截图只能证明症状，不能用于判断根因。必须按以下顺序排查：
+
+1. **控制台与运行时错误**：先读取错误消息、异常类型和完整 stack，定位最先抛错的源码组件。不要在没有运行时证据时先判断为缓存、响应式布局或旧资源问题。
+2. **网络与构建资源**：再检查入口 JS、动态 chunk、CSS 和 API 请求的状态码、MIME type 与响应体，区分资源版本不一致、API 数据异常和组件代码异常。
+3. **页面结构化状态**：读取 `window.codexLoom.state()` 及目标页面 automation state，确认路由、数据加载和选中对象。
+4. **截图与 DOM**：最后用截图、snapshot 和布局断言判断错误提示是否可读，以及是否仍有遮挡、溢出或空白。
+
+手动浏览器调试时直接使用 DevTools Console。`pinixc browser` 当前没有独立的 console log 命令；CodexLoom 顶层错误边界会把最近一次渲染异常暴露为可读诊断对象，可通过下面的命令读取：
+
+```sh
+/tmp/pinixc browser eval 'window.__codexLoomWorkspaceError || null' --tabid TAB_ID
+```
+
+返回对象中的 `message` 和 `stack` 是第一诊断证据。若它为空但页面仍异常，再读取网络请求：
+
+```sh
+/tmp/pinixc browser requests --tabid TAB_ID
+/tmp/pinixc browser response REQUEST_ID --tabid TAB_ID
+```
+
+错误边界的文案必须区分具体运行时异常和确实可识别的 chunk 加载失败，不能把所有错误统一解释为“旧构建缓存”。修复后要确认诊断对象恢复为 `null`，而不只是错误提示被隐藏。
 
 ## 结构化断言
 
@@ -305,6 +330,7 @@ Residual risk: untested real device, provider, error state or destructive path
 ## 常见误区
 
 - `npm run build` 通过就宣布完成。
+- 遇到白屏先猜缓存或看截图，没有先读控制台错误和 stack。
 - 只截图，不读 `window.codexLoom.state()`。
 - 只读 state，不实际点击和查看截图。
 - 用 `--clip 390×844` 冒充移动 viewport。

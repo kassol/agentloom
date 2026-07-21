@@ -59,6 +59,58 @@ func TestGlobalEventsRequestsReconcileWhenCursorWasCompacted(t *testing.T) {
 	}
 }
 
+func TestAgentEventsRequestReconcileWhenCursorWasCompacted(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAgents(map[string]*hub.Agent{
+		"agent-1": {ID: "agent-1", Name: "worker", ThreadID: "thread-1", Status: "idle", CreatedAt: nowForTest(), UpdatedAt: nowForTest()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendEvent("agent-1", store.Event{Seq: 5, TS: nowForTest(), Type: "item/completed", Data: json.RawMessage(`{"id":"item-1"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := hub.OpenWithOptions(st, hub.OpenOptions{Passive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := readGlobalSSE(t, h, "/api/agents/agent-1/thread/events?since=1", 1)
+	if events[0].Type != "loom/reconcile" {
+		t.Fatalf("first Agent event after compacted cursor = %#v", events[0])
+	}
+}
+
+func TestAgentEventsTailDoesNotMasqueradeAsCompaction(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAgents(map[string]*hub.Agent{
+		"agent-1": {ID: "agent-1", Name: "worker", ThreadID: "thread-1", Status: "idle", CreatedAt: nowForTest(), UpdatedAt: nowForTest()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for seq := int64(2); seq <= 5; seq++ {
+		if err := st.AppendEvent("agent-1", store.Event{Seq: seq, TS: nowForTest(), Type: "item/completed", Data: json.RawMessage(`{"id":"item"}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h, err := hub.OpenWithOptions(st, hub.OpenOptions{Passive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := readGlobalSSE(t, h, "/api/agents/agent-1/thread/events?since=1&tail=2", 1)
+	if events[0].Type == "loom/reconcile" || events[0].Seq != 4 {
+		t.Fatalf("first bounded-tail Agent event = %#v, want seq 4 without reconcile", events[0])
+	}
+}
+
+func nowForTest() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
 func readGlobalSSE(t *testing.T, h *hub.Hub, path string, count int) []store.Event {
 	t.Helper()
 	web := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok"), Mode: fs.FileMode(0o644)}}

@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { Agent, HumanRequest, InboxEntry, PlatformConnection, RemoteSnapshot } from "./types";
 import { api } from "./types";
 import { CapacityPane, UsagePane } from "./UsagePane";
+import { DailyActivityTimeline } from "./DailyActivityTimeline";
 import { summarizeTask } from "./feed";
 import { executionDotClass, executionLabel, isAgentExecuting, oldestWaitingMs } from "./product-state";
 import { Button } from "./components/ui/button";
@@ -119,6 +120,8 @@ function StatusOverview({ agents, requests, entries, remote, onSelectAgent, onOp
           <StatusMetric icon={Inbox} label="Agent Inbox" value={String(activeEntries.length)} detail={oldest ? `Oldest ${formatDuration(oldest)}` : "No queued Agent work"} tone={activeEntries.length ? "text-[var(--loom-teal)]" : "text-muted-foreground"} onClick={onOpenCapacity} />
           <StatusMetric icon={RadioTower} label="External" value={externalStatus.value} detail={externalStatus.detail} tone={externalStatus.tone} onClick={onOpenExternal} />
         </section>
+
+        <DailyActivityTimeline onSelectAgent={onSelectAgent} />
 
         <div className="mt-7 grid gap-7 lg:grid-cols-[minmax(0,1.25fr)_minmax(300px,.75fr)]">
           <section className="min-w-0">

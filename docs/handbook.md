@@ -19,7 +19,7 @@ start 是连续性故障。Domain Agent 可以 idle，但它应通过 Profile、
 
 - 日常使用 Agent：Codex Desktop/Mobile 或 CodexLoom WebUI。
 - 自动化使用 Agent：`loom` CLI 和 HTTP/SSE API。
-- 治理 Agent：Profile、模型配置、Team Map、Relationships、Messages、Schedules、备份。
+- 治理 Agent：Profile、模型配置、Team Map、Relationships、Messages、Schedules、Triggers、备份。
 - 组织集成：同一个 Agent 可以绑定多个飞书、Slack、Parall 或其他 IM Address，并在不同群里拥有
   不同 Conversation Membership；Microsoft Teams adapter 为 TODO。
 
@@ -50,6 +50,7 @@ Profile 定义长期职责与协作契约；Skill 保存可复用方法和固化
 - **Conversation Candidate**：Connector 观察到外部身份已经加入、但尚未获得 Loom 行为授权的会话；它只提供发现和配置入口。
 - **Inbox / Outbox**：跨内部和外部来源的收件处理与发送账本。
 - **Schedule**：以 `scheduler` 系统身份定时生成 Agent Message 的长期规则。
+- **Trigger**：外部事实变化时恢复同一个 Agent 既有工作的 one-shot 持久条件。
 
 `Session`、`chub`、`codex-hub` 只在兼容 API、旧二进制、历史 wire value 或真实旧 launchd
 label 中出现。新代码、UI 文案和文档叙述使用 Agent、Thread、Turn、Item、Loom。
@@ -93,6 +94,19 @@ label 中出现。新代码、UI 文案和文档叙述使用 Agent、Thread、Tu
 - 消息保存发送/接收双方稳定 Agent ID，并保留发送时名称快照。
 - XML envelope 由 Loom 生成，调用方不手写。
 
+### Topic Coordination
+
+Topic 是跨 Turn、跨 Agent 的薄共享协调聚合。它保存 Responsible、Participants、purpose、completion boundary、versioned brief、waiting、links 和有界 activity，但不拥有执行生命周期。专业过程和完整上下文仍属于各 Agent 的 Codex Thread。
+
+不变量：
+
+- 一个 Topic 只有一个 Responsible；普通 Owner 输入统一启动 Responsible 的 Turn。
+- Participant 只能在声明的 topic-scoped responsibility 内接收 Topic work；不能把 Topic Message 发给未加入的 Agent。
+- Message reply、Needs You、Trigger 和它们启动的 Turn 沿确定因果继承 `topicId`。
+- 只有 Responsible 发布的 Brief 版本进入 Owner Results Ready；普通 Participant 输出先回 Responsible。
+- Owner intervention 必须命中 Topic 下的精确 active Turn，底层仍调用 Agent Session 的 steer/interrupt；Topic 只记录事件且不改变自身状态。
+- Topic resolved/archived 不级联关闭 Goal、Message、Trigger、Needs You 或 Turn。
+
 ### Platform Integration
 
 负责 Connection、Address、Conversation Membership、Inbox、Handling Attempt、Outbox 和
@@ -108,13 +122,25 @@ gateway connector protocol。凭据只保存 `env:` / `keychain:` 引用，不�
 
 ### Team
 
-Team 是组合读模型：Agent registry + Profile + Organization Relationship + Collaboration Relationship + Messages Activity。三个 Graph 是各自语义下的关系导航，不是真相源；Activity 也不负责直接编辑原始消息证据。
+Team 是组合读模型：Agent registry + Profile + Organization Relationship + Collaboration Relationship + Collaboration Group + Messages Activity。Collaboration Group 只保存名称、说明、成员引用和明确的 relationship IDs；它不自动创建 pairwise relationship，也不影响路由、上下文或权限。三个 Graph 是各自语义下的关系导航，不是真相源；Activity 也不负责直接编辑原始消息证据。
 
 ### Scheduler
 
 `scheduler` 是稳定系统身份，不是 Codex Agent。Schedule 触发后生成标准 Agent Message，仍走
 目标队列与回复协议，不直接绕过 Communication 调用 Turn。每次触发以
 `(scheduleId, scheduledAt)` 标识一个 durable occurrence：先提交 Message，再推进 Schedule；崩溃后重放会复用同一条 Message，不会跳过或复制 occurrence。
+
+### Triggering
+
+Triggering 负责外部条件定义、初次观察、轮询、匹配、过期和 durable occurrence。它复用 Platform Connection 的 credential reference，但不需要 Address 或 Conversation Membership。Trigger 匹配后生成标准 Agent Message，仍由 Communication 排队；`system:trigger` 是工作来源，不是 Team Agent。
+
+不变量：
+
+- 事件只是回源核验的理由，不是业务事实的最终证明。
+- 创建时立即读取当前状态，避免错过已发生的 level condition。
+- Message 先提交，Trigger 再进入 `triggered`；启动恢复按 `triggerId` 修复中间状态。
+- Trigger 不自动改变 Codex Goal，也不向无关 active Turn 中途 steer。
+- Provider Adapter 保留原生 resource/event vocabulary；Core 不提供任意表达式 DSL。
 
 ### Disaster Recovery
 
@@ -135,7 +161,7 @@ Team 是组合读模型：Agent registry + Profile + Organization Relationship +
 ```sh
 loom agent create|list|get|rename|archive ...
 loom thread send|watch|history|interrupt ...
-loom profile|team|msg|inbox|outbox|integration|prll|conversation|schedule|remote ...
+loom profile|team|topic|msg|inbox|outbox|integration|prll|conversation|trigger|schedule|remote ...
 ```
 
 CLI 不直接启动 Codex，也不读取业务数据文件，全部走 HTTP/SSE。
@@ -150,7 +176,7 @@ Observe 命令分别放在 `commands_*.go`。新增命令必须归入所属领�
 `remoteControl/*` 状态，不再维护第二个 app-server。
 
 核心文件按状态所有权划分：`hub.go` 是共享 runtime/event 基础，`agent.go` 管 Agent 与 Turn，
-`communication.go` 管内部 Agent Message，`integration.go` 管 Connection/Address/Ingress，
+`communication.go` 管内部 Agent Message，`topic.go` 管跨 Agent 协调记录与因果投影，`integration.go` 管 Connection/Address/Ingress，
 `inbox.go` 管入站处理，`outbox.go` 管受治理的外部投递与 claim fencing，
 `external_message.go` 管 envelope、附件与 policy 规范化，`shutdown.go` 管关闭顺序。跨聚合动作
 必须通过明确的 reconciliation/commit helper，不应在一个巨型文件中直接修改多个 projection。
@@ -183,7 +209,10 @@ agents.json                 Agent registry
 sessions.json               旧二进制兼容镜像
 profiles.json
 team-links.json
+collaboration-groups.json
 schedules.json
+triggers.json
+topics.json
 comms.ndjson
 integrations.json
 messages.ndjson
@@ -236,16 +265,15 @@ Events API，也不替代 Loom 的 Connection、Address、Membership 和持续�
 
 ## 构建、运行与配置
 
-前置条件：本机已安装 `codex` CLI，并使用 ChatGPT 身份完成登录。普通开发构建只编译 Go；
-发布构建会先生成并提交 WebUI dist，再构建内嵌静态资源的二进制：
+前置条件：本机已安装 `codex` CLI，并使用 ChatGPT 身份完成登录。受支持的完整构建统一通过
+`make build` 生成 WebUI，再编译内嵌静态资源的二进制并校验嵌入版本：
 
 ```sh
 make build
-make release
 ./bin/codex-loom
 ```
 
-默认服务地址是 <http://localhost:4870>。`make release` 生成规范入口和迁移期兼容入口：
+默认服务地址是 <http://localhost:4870>。`make build`（`make release` 保留为兼容别名）会先构建 WebUI、再编译 Go 二进制，并核验二进制已经嵌入当前 Vite 入口；不要用裸 `go build` 生成待重启的生产服务，否则重启后仍可能加载旧前端。该命令生成规范入口和迁移期兼容入口：
 
 ```text
 bin/codex-loom             bin/codex-hub             compatibility
@@ -275,6 +303,9 @@ CODEX_LOOM_EVENT_REPLAY_MB   active replay window 最大读取量，默认 32 Mi
 CODEX_LOOM_EVENT_ARCHIVES    每个 Agent 保留的压缩诊断段数，默认 2
 CODEX_LOOM_EVENT_ARCHIVE_MB  每个 Agent 压缩诊断段总量上限，默认 128 MiB
 CODEX_LOOM_EVENT_ARCHIVE_DAYS  压缩诊断段最长保留天数，默认 7
+CODEX_LOOM_GITHUB_CLIENT_ID    GitHub OAuth App Client ID；启用 Device Flow 时需要
+CODEX_LOOM_GITHUB_API_URL      GitHub REST API base；测试或 GitHub Enterprise 可覆盖
+CODEX_LOOM_TRIGGER_POLL_INTERVAL  active Trigger 观察间隔，默认 30s，最小 1s
 ```
 
 对应的 `CODEX_HUB_*` 和 `CHUB_URL` 只作为迁移期兼容别名。新脚本、部署文件和文档必须使用
@@ -418,6 +449,17 @@ Agent 内部 XML `<agent_message>` 和外部 `<inbox_message>` 在 Thread 中都
 - 旧调用方把换行写成字面量 `\n` 时，只在 display parser 兼容还原，不改 ledger。
 - 发送按钮在请求开始时立即禁用，成功后立即清空输入，避免网络响应期间重复点击。
 
+### Topic 跨 Agent 协调
+
+1. Owner 或 Agent 从现有工作创建 Topic，选择一个 Responsible 和最小 Participants；`topics.json` 原子保存当前聚合。
+2. Owner 在 Topic 中输入时，Hub 用 `sendTaskWithTopic` 为 Responsible 启动普通 Agent Turn；Topic 自身不产生 runtime。
+3. Responsible 通过 `loom msg --topic` 派发 scoped work。Hub 校验发送方、接收方都属于 Topic，并在目标 Turn 前注入当前 Brief、责任和 activity delta。
+4. Participant 在自己的 Thread 完成专业工作；reply 继承 Topic，结果回到 Responsible。Hub 将 Message、Turn、Needs You、Trigger 和 evidence 作为带 stable ID 的 Topic event/link 投影。
+5. Responsible 使用 optimistic `Topic.version` 更新 Brief、waiting 和阶段结果。Owner 只对 Responsible 发布的 `ResultReadyVersion` 获得 Results Ready。
+6. Owner 从 Topic 下钻 active Participant Turn 时，Hub 校验该 Turn 的 `topicID`，再调用现有 steer/interrupt，并写 intervention event、通知 Responsible。
+
+完整语义见 [topics.md](topics.md)。
+
 ## 数据迁移与兼容
 
 默认启动且仅存在 `~/.codex-hub` 时：原子 rename 到 `~/.codex-loom`，再建立旧路径软链接。
@@ -466,6 +508,7 @@ Event cache 独立轮转：active NDJSON 保留最新 replay window，旧段压�
 - Profile compact 后重注入策略缺少“实际模型请求 history”官方接口，不能保证精确。
 - event log 只用于 live，不保证包含 Desktop 在 Loom 离线期间发生的 Item；刷新后 history 可见。
 - 外部 gateway 各自负责 cursor 和平台 ack，Loom 无法替代平台端的最终投递保证。
+- Trigger v1 只有 GitHub polling Adapter，支持 PR merged/closed/head-changed 与 workflow run completed/success/failure/cancelled；webhook、deployment、approval 和自动 Goal supersede 尚未实现。详见 [Triggers](triggers.md)。
 - Membership 是行为上下文，不是安全沙箱；高权限 Agent 不应绑定不可信外部群。
 - Graph 是 read projection；Organization 以 `organization-links.json` 为准，Collaboration 以 `team-links.json` 为准，Activity 以原始 Message ledger 为准。
 
@@ -535,9 +578,11 @@ make build
 - Organization、Collaboration 和 Activity 必须是三个独立投影，不能靠不同线型混在一张图里让用户猜语义；外部平台连接留在 Integrations。
 - Organization 是持久化的 parent/child 树：每个 Agent 最多一个直接上级并拒绝环路；未进入树的 Agent 放在独立 Unassigned 列表。
 - Collaboration 是声明的长期跨领域关系，不代表上下级；Activity 是 Messages 在明确时间窗口内产生的只读证据，双向通信在画布上聚合成一条边。
+- Collaboration Group 是对明确 member IDs 与 relationship IDs 的命名投影；至少需要一个成员，成员可以没有声明边，同一 Agent 或 edge 可以属于多个组。Group 不能推导 all-to-all、路由、上下文或权限。active Group 会保护其 Agent 和 relationship 引用；archived Group 允许底层对象后续归档或删除，并保留 stable ID 作为只读历史证据。
+- Relationship edge 的完整 description 必须能通过 hover、键盘 focus、click/tap 和 Inspector 读取，不能只依赖鼠标 tooltip。
 - Activity 默认只展示风险优先、消息量较高的有限边数；全量历史留给 Messages 和 Inspector，不能把 ledger 全塞进画布。
 - 布局要 deterministic；用户拖拽位置按 Agent stable ID 持久化，刷新不能随机跳。
-- 不同关系视图的拖拽位置要分别持久化，不能让 Organization 的空间安排污染 Activity。
+- 不同关系视图与 Collaboration Group 的拖拽位置要分别持久化，不能让 Organization 或一个 Group 的空间安排污染其他视图。
 - 节点卡片只显示名称、状态、Domain 摘要和计数；长内容进 Inspector。
 - 默认过滤低权重边；选择节点时突出 1-hop 邻域。
 - 移动端默认 Directory，Graph 是可横向 pan 的工作区，Inspector 用 sheet。
@@ -669,6 +714,16 @@ POST   /api/agents/{key}/thread/approvals/{approvalId}
 
 GET    /api/comms
 POST   /api/comms/messages
+GET    /api/topics
+POST   /api/topics
+GET    /api/topics/{id}
+PATCH  /api/topics/{id}
+POST   /api/topics/{id}/send
+POST   /api/topics/{id}/participants
+DELETE /api/topics/{id}/participants/{agent}
+POST   /api/topics/{id}/links
+POST   /api/topics/{id}/interventions
+POST   /api/topics/{id}/read
 GET    /api/inbox
 GET    /api/outbox
 GET    /api/team
@@ -692,6 +747,7 @@ GET    /api/admin/restart/status
 
 - [codex-app-server-protocol.md](codex-app-server-protocol.md)
 - [agent-profile.md](agent-profile.md)
+- [topics.md](topics.md)
 - [agent-platform-integration.md](agent-platform-integration.md)
 - [conversation-membership.md](conversation-membership.md)
 - [loom-cli.md](loom-cli.md)，包含 `loom` 规范命令与 `chub` 兼容说明

@@ -7,6 +7,7 @@ package backup
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"errors"
@@ -100,10 +101,7 @@ func Create(opts Options) (*Snapshot, error) {
 	if err := os.MkdirAll(backupDir, 0o755); err != nil {
 		return nil, err
 	}
-	pruneReport, err := ApplyRetention(opts.DataDir, policy)
-	if err != nil {
-		return nil, fmt.Errorf("prune snapshots before backup: %w", err)
-	}
+	var pruneReport PruneReport
 
 	created := time.Now().UTC()
 	stamp := created.Format("20060102T150405Z")
@@ -352,22 +350,50 @@ func addFile(tw *tar.Writer, src, dst string) error {
 		return err
 	}
 	defer f.Close()
+	size := info.Size()
+	if strings.HasSuffix(strings.ToLower(src), ".ndjson") {
+		size, err = completeNDJSONSize(f, size)
+		if err != nil {
+			return err
+		}
+	}
 	hdr, err := tar.FileInfoHeader(info, "")
 	if err != nil {
 		return err
 	}
 	hdr.Name = filepath.ToSlash(dst)
+	hdr.Size = size
 	if err := tw.WriteHeader(hdr); err != nil {
 		return err
 	}
-	n, err := io.Copy(tw, io.LimitReader(f, info.Size()))
+	n, err := io.Copy(tw, io.LimitReader(f, size))
 	if err != nil {
 		return err
 	}
-	if n != info.Size() {
+	if n != size {
 		return io.ErrUnexpectedEOF
 	}
 	return err
+}
+
+func completeNDJSONSize(file *os.File, size int64) (int64, error) {
+	const blockSize = int64(64 << 10)
+	buffer := make([]byte, blockSize)
+	for end := size; end > 0; {
+		start := end - blockSize
+		if start < 0 {
+			start = 0
+		}
+		n, err := file.ReadAt(buffer[:end-start], start)
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+		if index := bytes.LastIndexByte(buffer[:n], '\n'); index >= 0 {
+			return start + int64(index) + 1, nil
+		}
+		end = start
+	}
+	return 0, nil
 }
 
 func findRollouts(sessionsDir string, sessions []SessionRef) ([]string, []string) {

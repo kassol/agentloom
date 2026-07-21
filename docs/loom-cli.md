@@ -51,7 +51,7 @@ loom help
 
 ## CodexLoom Skills
 
-CodexLoom 的共享 CodexHost 会自动加载内置的 `loom-communication`、`loom-needs-you`、`domain-agent-coaching`、`loom-integrations`、`loom-external-messaging`、`loom-parall` 和 `loom-feishu`，不同 cwd 的 Agent 不需要各自复制文件。让用户自己的其他 Codex 工作区也能使用它们时，安装到 `$HOME/.agents/skills`：
+CodexLoom 的共享 CodexHost 会自动加载内置的 `loom-communication`、`loom-needs-you`、`domain-agent-coaching`、`loom-integrations`、`loom-external-messaging`、`loom-parall`、`loom-feishu`、`loom-artifacts`、`loom-triggers` 和 `loom-topics`，不同 cwd 的 Agent 不需要各自复制文件。让用户自己的其他 Codex 工作区也能使用它们时，安装到 `$HOME/.agents/skills`：
 
 ```sh
 loom skills list
@@ -170,6 +170,27 @@ Agent 要把生成文件交付回当前 Thread 时使用：
 
 Organization 保证一个 Agent 最多一个直接上级并拒绝环路；Collaboration 不代表上下级。旧的 `loom team link ...` 仍是 Collaboration 的兼容别名。
 
+Collaboration Group（协作组）是对现有 Collaboration relationships 的可命名共享视图。它可以包含没有声明边的成员，但不会据此创建 all-to-all 关系，也不会产生路由、上下文、ACL 或权限：
+
+```sh
+loom team collaboration group list
+loom team collaboration group get cgrp_example
+loom team collaboration group create \
+  --name "Parall Development" \
+  --description "Parall 开发中的稳定横向专业接口" \
+  --member parall-dev-lead \
+  --member parall-platform-dev \
+  --member parall-edge-dev \
+  --relationship rel_platform_edge
+loom team collaboration group update cgrp_example \
+  --description "更新后的组说明" \
+  --expected-version 1
+loom team collaboration group archive cgrp_example --expected-version 2
+loom team collaboration group list --status all
+```
+
+`create` / `update` 也接受 `--file group.json`；`loom team group ...` 是等价短命令。Group 至少需要一个成员，但成员可以没有 included relationship，CLI 会将其标为 `no collaboration edge included in this group`。`update` 中显式提供的 `--member` / `--relationship` 集合会替换对应集合；HTTP `PATCH` 则允许只提交需要修改的字段。默认列表只显示 active，archived 仍可用 `get` 按 ID 只读检查。修改和删除使用版本保护。active Group 引用的 pairwise relationship 或 Agent 不可直接删除或归档，需先更新或归档 Group；archived Group 会保留已删除对象的 stable ID 作为历史证据。
+
 Profile 和显式关系的管理见 [agent-profile.md](agent-profile.md)。
 
 ## Agent 负载观察
@@ -248,6 +269,18 @@ drain、Connector 或调度策略。需要沿 evidence ID 查看必要上下文�
 ```sh
 ./bin/loom thread history cici-research --count 5
 ```
+
+已知稳定 Turn ID 时，可以不先知道所属 Agent，直接读取该 Turn：
+
+```sh
+./bin/loom turn get 019f8298-a45c-7871-9889-15395166a7c4
+./bin/loom turn get 019f8298-a45c-7871-9889-15395166a7c4 --json
+```
+
+结果包含所属 Agent、Thread、状态、起止时间、模型与 token usage、可识别的
+Message / Inbox / Trigger / Schedule / Needs You 来源，以及 rollout 中记录的过程内容。
+它是只读查询，不会恢复、重试或中断 Turn。电脑或 Loom 重启后，可先用该命令核对
+原 Turn 是否为 `interrupted`，再决定是否从对应 Agent 或 Inbox 显式继续。
 
 ## Goal：跨多个 Turn 的当前成果
 
@@ -511,6 +544,12 @@ ID 可以写成裸 ID 或 `prll://` reference；输出为 Parall 原生 JSON。�
 ./bin/loom integration connect lark --account cli_xxx \
   --credential-ref keychain:com.codexloom.feishu.cli_xxx
 ./bin/loom integration connect slack --account T_WORKSPACE --credential-ref env:SLACK_BOT_TOKEN
+# GitHub Trigger source：OAuth Device Flow，或按 Resource Owner 导入独立 PAT。
+./bin/loom integration connect github
+./bin/loom integration connect github --token-file /absolute/path/github.token --resource-owner parall-hq
+./bin/loom integration connect github --credential-ref env:GITHUB_TOKEN --resource-owner parall-hq
+# 同一 GitHub 登录可继续添加另一个 Owner，不会替换 parall-hq。
+./bin/loom integration connect github --token-file /absolute/path/personal.token --resource-owner yan5xu
 ./bin/loom integration bind codex-loom-dev <connection-id> --identity <external-id> \
   --trigger mention --reply-policy final_answer --dm-policy managed --trust-domain pinix \
   --enabled false \
@@ -835,6 +874,119 @@ Agent Thread feed 中的 agent 通信会特殊渲染：
 - `msg` 会生成标准 agent envelope，目标 Agent 里能看出这是 agent 通信。
 
 经验规则：人直接派活用 `thread send`；Agent 找 Agent 协作用 `msg`。
+
+## Topic：跨 Turn、跨 Agent 的持续事项
+
+Topic 是一条有完成边界的薄共享协调记录。它让多个 Agent 保留各自 Thread，同时共享一个 Responsible、明确的 Participant responsibility、versioned brief、waiting condition 和关键证据。
+
+创建并查看：
+
+```sh
+./bin/loom topic create \
+  --title "Parall Clip release closure" \
+  --responsible parall-dev-lead \
+  --purpose "协调本阶段跨 Agent 的验证和交付。" \
+  --completion "Responsible 发布经核验的阶段结果。" \
+  --summary "当前候选需要重新核验。" \
+  --participant 'parall-edge-dev::负责 packaged client 验收。' \
+  --participant 'parall-platform-dev::负责部署与环境证据。'
+
+./bin/loom topic list --agent parall-dev-lead
+./bin/loom topic get tpc_xxx
+```
+
+Responsible 与 Participant 通过 `--topic` 保持因果关联：
+
+```sh
+./bin/loom msg parall-edge-dev --from parall-dev-lead --topic tpc_xxx \
+  --subject "核验 packaged candidate" --body "返回当前证据与限制。"
+./bin/loom ask-user --from parall-dev-lead --topic tpc_xxx \
+	--question "是否批准进入下一阶段？" --blocks "等待 Owner 授权"
+```
+
+Owner 在 Topic 中继续输入始终路由 Responsible：
+
+```sh
+./bin/loom topic send tpc_xxx "请把 iPad packaged smoke 纳入本阶段验收。"
+```
+
+Owner 在创建时确认初始 Participants；创建后的 Brief、waiting 和 Participant 分工由 Responsible 维护。既有 Goal、外部 Inbox / Outbox、Artifact 或 provider 事实可用 `topic link` 显式关联；Goal 建议用 `<thread-id>@<goal-created-at>` 区分版本。
+
+Responsible 更新 Brief、waiting 和结果：
+
+```sh
+./bin/loom topic update tpc_xxx --from parall-dev-lead --if-version 3 \
+  --summary "当前跨域结论" --state "已核验事实" --next "下一动作"
+./bin/loom topic update tpc_xxx --from parall-dev-lead \
+  --waiting "等待 PR merge" --waiting-kind github-pr \
+  --waiting-ref OWNER/REPO#1970 --resume-action "回源核验 main"
+./bin/loom topic update tpc_xxx --from parall-dev-lead --if-version 5 \
+  --summary "阶段结果" --state "Ready for Owner review" --result
+```
+
+对 Participant 当前精确 Turn 的过程纠正使用 `topic intervene`；它只 steer/interrupt Agent Session 的 active Turn，并记录 Topic intervention，不改变 Topic 状态：
+
+```sh
+./bin/loom topic intervene tpc_xxx --agent parall-edge-dev \
+  --action steer --text "请核验当前 HEAD，不要使用旧候选。"
+```
+
+完整产品语义、生命周期和限制见 [topics.md](topics.md)。
+
+## 外部条件 Trigger
+
+Trigger 用于“已有工作正在等待一个外部事实”的场景。它不是新任务，也不是定时轮询：条件变化后，Loom 恢复同一个长期 Agent；Agent 必须重新读取 provider 当前权威状态，再判断原工作是否真的可以继续。
+
+当前 GitHub Adapter 直接调用 GitHub REST API，不依赖 `gh`。先在 Settings > Connectors 或 CLI 连接账号，再检查来源：
+
+```sh
+./bin/loom trigger source list
+```
+
+等待 PR merge 或关闭：
+
+```sh
+./bin/loom trigger add github pull-request OWNER/REPO#1970 \
+  --from parall-dev-lead \
+  --on merged \
+  --on closed \
+  --resume "Fetch main, verify the expected contract, then continue the original delivery flow if valid." \
+  --expires 14d
+```
+
+检测冻结 HEAD 漂移：
+
+```sh
+./bin/loom trigger add github pull-request OWNER/REPO#1971 \
+  --from parall-dev-lead \
+  --on head-changed \
+  --expect-head FULL_SHA \
+  --resume "Re-read the current HEAD and invalidate stale candidate evidence." \
+  --expires 14d
+```
+
+等待 workflow run 终态：
+
+```sh
+./bin/loom trigger add github workflow-run OWNER/REPO/RUN_ID \
+  --from parall-dev-lead \
+  --on success --on failure --on cancelled \
+  --resume "Read the current run and required checks for the candidate SHA before continuing." \
+  --expires 2d
+```
+
+创建时 Loom 立即观察当前状态；条件已满足会直接 `triggered`，否则进入 `armed`。确认后结束当前 Turn，不要 sleep 或自行轮询：
+
+```sh
+./bin/loom trigger wait trg_xxx --timeout 30
+./bin/loom trigger get trg_xxx
+./bin/loom trigger list parall-dev-lead
+./bin/loom trigger pause trg_xxx
+./bin/loom trigger resume trg_xxx
+./bin/loom trigger cancel trg_xxx
+```
+
+Trigger 是 one-shot。Agent busy 时产生的 Trigger Message 保持 queued，到 Turn 边界再投递，不会 steer 无关工作。完整语义、GitHub 权限和当前限制见 [triggers.md](triggers.md)。
 
 ## 定时任务
 

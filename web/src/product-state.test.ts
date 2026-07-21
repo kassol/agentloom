@@ -19,6 +19,12 @@ describe("product state", () => {
     expect(isAgentExecuting(value)).toBe(false);
   });
 
+  it("preserves restart interruption as a distinct non-executing state", () => {
+    const value = agent("interrupted");
+    expect(executionState(value)).toBe("interrupted");
+    expect(isAgentExecuting(value)).toBe(false);
+  });
+
   it("only returns Owner-facing terminal events", () => {
     expect(isOwnerResultEvent({ type: "loom/turn-completed", data: { source: "owner" } })).toBe(true);
     expect(isOwnerResultEvent({ type: "loom/turn-interrupted", data: { source: "remote" } })).toBe(true);

@@ -36,6 +36,15 @@ func TestFormatGoalShowsObjectiveAndNativeAccounting(t *testing.T) {
 	}
 }
 
+func TestClipPreservesUTF8(t *testing.T) {
+	if got := clip("继续核对当前 Turn", 6); got != "继续核对当前" {
+		t.Fatalf("clip() = %q", got)
+	}
+	if got := clip("继续", 0); got != "" {
+		t.Fatalf("clip() with zero limit = %q", got)
+	}
+}
+
 func TestCanonicalWatchEventType(t *testing.T) {
 	tests := map[string]string{
 		"loom/turn-started":       "loom/turn-started",

@@ -51,7 +51,7 @@ func cmdMsg(a args) {
 		response = "required"
 	}
 	if from == "" {
-		usage(`msg <to> [body] --from <agent> --subject <text> [--response required|none]`)
+		usage(`msg <to> [body] --from <agent> --subject <text> [--response required|none] [--topic TOPIC_ID]`)
 	}
 	if response != "required" && response != "none" {
 		fail(fmt.Errorf("--response must be required or none"))
@@ -61,12 +61,12 @@ func cmdMsg(a args) {
 	bodyArgs := a.positional
 	if replyTo == "" {
 		if len(a.positional) < 1 {
-			usage(`msg <to> [body] --from <agent> --subject <text> [--response required|none]`)
+			usage(`msg <to> [body] --from <agent> --subject <text> [--response required|none] [--topic TOPIC_ID]`)
 		}
 		to = a.positional[0]
 		bodyArgs = a.positional[1:]
 		if subject == "" {
-			usage(`msg <to> [body] --from <agent> --subject <text> [--response required|none]`)
+			usage(`msg <to> [body] --from <agent> --subject <text> [--response required|none] [--topic TOPIC_ID]`)
 		}
 	} else if len(a.positional) > 0 {
 		bodyArgs = a.positional
@@ -87,6 +87,7 @@ func cmdMsg(a args) {
 		"body":     body,
 		"response": response,
 		"replyTo":  replyTo,
+		"topicId":  strings.TrimSpace(a.flags["topic"]),
 	}
 	if t := a.flags["timeout"]; t != "" {
 		var sec int

@@ -1,4 +1,4 @@
-.PHONY: all web server cli build release run clean
+.PHONY: all web binaries verify-embedded-web build release run clean
 
 VERSION ?= 0.1.0-dev
 COMMIT := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)$(shell test -z "$$(git status --porcelain 2>/dev/null)" || printf -- -dirty)
@@ -12,9 +12,10 @@ all: build
 web:
 	cd web && npm install && npm run build
 
-# Build CodexLoom binaries. Legacy names remain compatible entry points while
-# existing launchd jobs and Agent scripts migrate.
-build:
+# Build CodexLoom binaries only after refreshing the WebUI. The WebUI is
+# embedded by Go at compile time, so reversing this dependency publishes a
+# binary that keeps serving the previous frontend after restart.
+binaries: web
 	$(GO_BUILD) -o bin/codex-loom ./cmd/codex-loom
 	$(GO_BUILD) -o bin/codex-loom-reloader ./cmd/codex-loom-reloader
 	$(GO_BUILD) -o bin/loom ./cmd/loom
@@ -27,8 +28,20 @@ build:
 	cp bin/loom bin/chub
 	cp bin/loom-gateway bin/chub-gateway
 
-# Full build: web console + binaries.
-release: web build
+# Fail the build if the compiled server does not contain the current Vite
+# entrypoint. This catches stale or manually reordered embed builds.
+verify-embedded-web: binaries
+	@asset=$$(sed -n 's/.*src="\/\([^"?]*\.js\)".*/\1/p' internal/webui/dist/index.html | head -1); \
+		test -n "$$asset" || { echo "cannot identify WebUI entrypoint" >&2; exit 1; }; \
+		strings bin/codex-loom | grep -F "$$asset" >/dev/null || { echo "bin/codex-loom does not embed $$asset" >&2; exit 1; }; \
+		echo "verified embedded WebUI: $$asset"
+
+# Canonical production build. Do not replace this with a bare go build: Go
+# embeds whatever was already present in internal/webui/dist.
+build: verify-embedded-web
+
+# Compatibility alias retained for existing operator instructions.
+release: build
 
 run: build
 	./bin/codex-loom

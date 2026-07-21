@@ -235,7 +235,7 @@ func main() {
 	}
 	cmd := os.Args[1]
 	argv := os.Args[2:]
-	if cmd == "agent" || cmd == "thread" {
+	if cmd == "agent" || cmd == "thread" || cmd == "turn" {
 		if len(argv) == 0 {
 			usage(cmd + " <command> ...")
 		}
@@ -252,12 +252,19 @@ func main() {
 			default:
 				usage("agent create|list|get|rename|archive ...")
 			}
-		} else {
+		} else if cmd == "thread" {
 			switch subcommand {
 			case "send", "watch", "history", "interrupt":
 				cmd = subcommand
 			default:
 				usage("thread send|watch|history|interrupt ...")
+			}
+		} else {
+			switch subcommand {
+			case "get":
+				cmd = "turn-get"
+			default:
+				usage("turn get <turn-id> [--json]")
 			}
 		}
 	}
@@ -294,6 +301,10 @@ func main() {
 		cmdConversation(a)
 	case "schedule":
 		cmdSchedule(a)
+	case "trigger":
+		cmdTrigger(a)
+	case "topic":
+		cmdTopic(a)
 	case "team":
 		cmdTeam(a)
 	case "workload":
@@ -312,6 +323,8 @@ func main() {
 		cmdInterrupt(a)
 	case "history":
 		cmdHistory(a)
+	case "turn-get":
+		cmdTurnGet(a)
 	case "archive":
 		cmdArchive(a)
 	case "kill":
@@ -344,6 +357,7 @@ func printHelp() {
 
   chub agent create|list|get|rename|archive ...
   chub thread send|watch|history|interrupt ...
+  chub turn get <turn-id> [--json]
 
 Compatibility shortcuts:
   chub create <name> --cwd <path> [--approval never|on-request] [--sandbox MODE] [--model gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna|M] [--effort minimal|low|medium|high|xhigh]
@@ -352,7 +366,7 @@ Compatibility shortcuts:
   chub rename <name|id> <new-name>
   chub send <name|id> ["<task>"] [--attachment PATH ...] [--timeout SEC]
   chub artifact publish --from AGENT --file PATH [--file PATH ...]
-  chub msg <to> [body] --from <agent> --subject <text> [--response required|none]
+  chub msg <to> [body] --from <agent> --subject <text> [--response required|none] [--topic TOPIC_ID]
   chub msg --reply-to <message-id> --from <agent> [--subject <text>] [body]
   chub msg --no-reply <message-id> --from <agent>
   chub msg status <message-id>
@@ -360,7 +374,7 @@ Compatibility shortcuts:
   chub msg retry <message-id>
   chub msg cancel <message-id>
   chub msg resolve <message-id> --from <sender> --resolution completed_elsewhere|superseded --reason <text>
-  chub ask-user --from AGENT --question TEXT [--context TEXT] [--blocks TEXT] [--option "Label::description" ...] [--optional]
+  chub ask-user --from AGENT --question TEXT [--context TEXT] [--blocks TEXT] [--topic TOPIC_ID] [--option "Label::description" ...] [--optional]
   chub inbox [list] [agent] [--state queued|handling|deferred|handled|failed] [--origin PROVIDER]
   chub inbox get <inbox-item-id>
   chub inbox reply <inbox-item-id> --agent <agent> [body|--body TEXT] [--attachment PATH]
@@ -372,6 +386,8 @@ Compatibility shortcuts:
   chub outbox retry <outbox-item-id>
   chub integration list
   chub integration send --from AGENT (--reply-to INBOX_ID|--to MEMBERSHIP_ID) [--message-id PROVIDER_MESSAGE_ID] [--thread-id PROVIDER_THREAD_ID] [--body TEXT|--body-file PATH] [--file PATH ...] [--expect-reply none|optional|required] [--idempotency-key KEY] [--async]
+  loom integration connect github [--public-only]
+  loom integration connect github (--token-file PATH|--credential-ref env:NAME) --resource-owner OWNER
   chub integration connect <provider> [--account REF] [--credential-ref env:NAME]
   chub integration import parall --agent AGENT --org-id ORG --external-agent-id USER [--agent-key-file PATH] [--api-url URL] [--trust-domain NAME]
   chub integration bind <agent> <connection-id> --identity EXTERNAL_ID [--display-name NAME] [--trigger mention] [--reply-policy final_answer] [--dm-policy managed] [--trust-domain NAME] [--enabled true|false] [allow/block flags]
@@ -395,6 +411,12 @@ Compatibility shortcuts:
   chub conversation enable|disable <membership-id>
   chub schedule add <name> --to <agent> --subject <text> (--at RFC3339|--cron "M H D M W") [--tz TZ] [--response required|none] [body]
   chub schedule list|get|run|enable|disable|delete ...
+  loom trigger add github pull-request OWNER/REPO#NUMBER --from AGENT --on EVENT [--on EVENT ...] --resume TEXT [--expect-head SHA] [--expires 14d] [--connection ID]
+  loom trigger add github workflow-run OWNER/REPO/RUN_ID --from AGENT --on completed|success|failure|cancelled --resume TEXT [--expires 14d] [--connection ID]
+  loom trigger list [agent] [--state STATE]
+  loom trigger get|wait|pause|resume|cancel <trigger-id>
+  loom trigger source list|status
+  loom topic create|list|get|send|update|link|participant|intervene|read|resolve|archive ...
   chub profile get <agent>
   chub profile set <agent> [--identity TEXT] [--domain TEXT] [--scope TEXT] [--file profile.json]
   chub profile clear <agent>
@@ -420,9 +442,15 @@ Compatibility shortcuts:
   chub team collaboration add <from> <to> --description <text>
   chub team collaboration update <id> --description <text>
   chub team collaboration delete <id>
+  chub team collaboration group list [--status active|archived|all] [--json]
+  chub team collaboration group get <group-id> [--json]
+  chub team collaboration group create [--file group.json|--name TEXT --description TEXT --member AGENT --relationship ID]
+  chub team collaboration group update <group-id> [--file group.json|--name TEXT --description TEXT --member AGENT --relationship ID --status active|archived] [--expected-version N]
+  chub team collaboration group archive|delete <group-id> [--expected-version N]
   chub watch <name|id> [--tail N]
   chub interrupt <name|id>
   chub history <name|id> [--count N]
+  chub turn get <turn-id> [--json]
   chub backup [--reason text]
   chub backups [prune]
   chub version [--running]

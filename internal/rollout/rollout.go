@@ -32,6 +32,7 @@ package rollout
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -83,6 +84,8 @@ type Transcript struct {
 // (rare), the lexically-last one (newest ISO timestamp in the name) wins.
 var rolloutPathCache sync.Map
 
+var ErrRolloutNotFound = errors.New("rollout not found")
+
 func FindRollout(threadID string) (string, error) {
 	if threadID == "" {
 		return "", fmt.Errorf("empty threadId")
@@ -117,7 +120,7 @@ func FindRollout(threadID string) (string, error) {
 		return "", err
 	}
 	if best == "" {
-		return "", fmt.Errorf("no rollout file for threadId %s under %s", threadID, dir)
+		return "", fmt.Errorf("%w for threadId %s under %s", ErrRolloutNotFound, threadID, dir)
 	}
 	rolloutPathCache.Store(cacheKey, best)
 	return best, nil

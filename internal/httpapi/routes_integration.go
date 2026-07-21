@@ -30,6 +30,53 @@ func (s *Server) registerIntegrationRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/integrations/connections", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"connections": s.hub.ListConnections()})
 	})
+	mux.HandleFunc("POST /api/integrations/providers/github/token", func(w http.ResponseWriter, r *http.Request) {
+		var body githubTokenParams
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		connection, login, err := s.connectGitHubToken(r.Context(), body.Token, body.ResourceOwner)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"connection": connection, "login": login})
+	})
+	mux.HandleFunc("POST /api/integrations/providers/github/credential", func(w http.ResponseWriter, r *http.Request) {
+		var body githubCredentialParams
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		connection, login, err := s.connectGitHubCredential(r.Context(), body.CredentialRef, body.ResourceOwner)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"connection": connection, "login": login})
+	})
+	mux.HandleFunc("POST /api/integrations/providers/github/device", func(w http.ResponseWriter, r *http.Request) {
+		var body githubDeviceParams
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		flow, err := s.startGitHubDevice(r.Context(), body)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 201, map[string]any{"device": flow})
+	})
+	mux.HandleFunc("GET /api/integrations/providers/github/device/{id}", func(w http.ResponseWriter, r *http.Request) {
+		flow, err := s.pollGitHubDevice(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"device": flow})
+	})
 	mux.HandleFunc("GET /api/integrations/providers/lark/discovery", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"discovery": s.discoverLark(r.Context(), r.URL.Query().Get("appId"))})
 	})

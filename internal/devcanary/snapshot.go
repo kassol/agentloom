@@ -15,7 +15,7 @@ import (
 
 var jsonFiles = []string{
 	"agents.json", "sessions.json", "profiles.json", "team-links.json",
-	"organization-links.json", "integrations.json", "schedules.json", "remote.json",
+	"organization-links.json", "collaboration-groups.json", "integrations.json", "schedules.json", "remote.json",
 }
 
 var ndjsonFiles = []string{
@@ -140,6 +140,11 @@ func createFilteredSnapshot(source, destination string, agents map[string]json.R
 		}
 		summary.FilesCopied++
 	}
+	if copied, err := filterCollaborationGroups(source, destination, selected); err != nil {
+		return err
+	} else if copied {
+		summary.FilesCopied++
+	}
 
 	related, copied, err := filterIntegrations(filepath.Join(source, "integrations.json"), filepath.Join(destination, "integrations.json"), selected)
 	if err != nil {
@@ -167,6 +172,70 @@ func createFilteredSnapshot(source, destination string, agents map[string]json.R
 		}
 	}
 	return nil
+}
+
+type collaborationGroupRecord struct {
+	MemberAgentIDs  []string `json:"memberAgentIds"`
+	RelationshipIDs []string `json:"relationshipIds"`
+	Status          string   `json:"status"`
+}
+
+type teamRelationshipRecord struct {
+	FromAgentID string `json:"fromAgentId"`
+	ToAgentID   string `json:"toAgentId"`
+}
+
+func filterCollaborationGroups(source, destination string, selected map[string]struct{}) (bool, error) {
+	groups, exists, err := loadObject(filepath.Join(source, "collaboration-groups.json"))
+	if err != nil || !exists {
+		return false, err
+	}
+	relationships, _, err := loadObject(filepath.Join(source, "team-links.json"))
+	if err != nil {
+		return false, err
+	}
+	filtered := map[string]json.RawMessage{}
+	for id, raw := range groups {
+		var group collaborationGroupRecord
+		if err := json.Unmarshal(raw, &group); err != nil {
+			return false, fmt.Errorf("decode collaboration group %s: %w", id, err)
+		}
+		members := make([]string, 0, len(group.MemberAgentIDs))
+		for _, agentID := range group.MemberAgentIDs {
+			if containsKey(selected, agentID) {
+				members = append(members, agentID)
+			}
+		}
+		if len(members) == 0 {
+			continue
+		}
+		includedRelationships := make([]string, 0, len(group.RelationshipIDs))
+		for _, relationshipID := range group.RelationshipIDs {
+			relRaw := relationships[relationshipID]
+			if len(relRaw) == 0 {
+				if group.Status == "archived" {
+					includedRelationships = append(includedRelationships, relationshipID)
+				}
+				continue
+			}
+			var relationship teamRelationshipRecord
+			if json.Unmarshal(relRaw, &relationship) == nil && containsKey(selected, relationship.FromAgentID) && containsKey(selected, relationship.ToAgentID) {
+				includedRelationships = append(includedRelationships, relationshipID)
+			}
+		}
+		var document map[string]any
+		if err := json.Unmarshal(raw, &document); err != nil {
+			return false, fmt.Errorf("decode collaboration group %s: %w", id, err)
+		}
+		document["memberAgentIds"] = members
+		document["relationshipIds"] = includedRelationships
+		projected, err := json.Marshal(document)
+		if err != nil {
+			return false, err
+		}
+		filtered[id] = projected
+	}
+	return true, writeJSON(filepath.Join(destination, "collaboration-groups.json"), filtered)
 }
 
 func filterIntegrations(source, destination string, selected map[string]struct{}) (map[string]struct{}, bool, error) {

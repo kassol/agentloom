@@ -28,6 +28,33 @@ export interface ExternalThreadContext {
   }>;
 }
 
+export interface TopicContextPayload {
+  kind: "ownerInput" | "intervention" | "agentMessage" | "text";
+  label: string;
+  body: string;
+  subject?: string;
+  from?: string;
+  to?: string;
+  variant?: "req" | "res" | "notify";
+  action?: string;
+  turnId?: string;
+  reason?: string;
+}
+
+export interface TopicContextLink {
+  type: string;
+  id: string;
+  relation: string;
+  label: string;
+}
+
+export interface TopicContextEvent {
+  seq: number;
+  type: string;
+  at: string;
+  summary: string;
+}
+
 export type Block =
   | { kind: "user"; ts: string; text: string; attachments: ExternalAttachment[] }
   | {
@@ -68,6 +95,48 @@ export type Block =
       raw: string;
       attachments: ExternalAttachment[];
       threadContext?: ExternalThreadContext;
+    }
+  | {
+      kind: "externalTrigger";
+      id: string;
+      triggerId: string;
+      ts: string;
+      provider: string;
+      connectionId: string;
+      resourceKind: string;
+      subjectKey: string;
+      event: string;
+      eventKey: string;
+      occurredAt?: string;
+      observedAt?: string;
+      summary: string;
+      resumeInstruction: string;
+      instruction: string;
+      observation?: Record<string, unknown>;
+      raw: string;
+    }
+  | {
+      kind: "topicContext";
+      id: string;
+      ts: string;
+      topicId: string;
+      status: string;
+      briefVersion: number;
+      eventSeq: number;
+      title: string;
+      responsibleAgent: string;
+      purpose: string;
+      completionBoundary: string;
+      yourResponsibility: string;
+      briefSummary: string;
+      currentState: string;
+      nextStep: string;
+      limitations: string;
+      instruction: string;
+      links: TopicContextLink[];
+      delta: TopicContextEvent[];
+      payload?: TopicContextPayload;
+      raw: string;
     }
   | { kind: "agent"; id: string; text: string; streaming: boolean }
   | { kind: "think"; id: string; text: string; done: boolean }
@@ -331,6 +400,171 @@ function externalMessageBlock(text: string, ts: string): Block | null {
   }
 }
 
+function externalTriggerBlock(text: string, ts: string): Block | null {
+  const raw = (text || "").trim();
+  if (!raw.startsWith("<external_trigger")) return null;
+  try {
+    const doc = new DOMParser().parseFromString(raw, "application/xml");
+    const root = doc.documentElement;
+    if (!root || root.nodeName !== "external_trigger" || doc.getElementsByTagName("parsererror").length > 0) {
+      return null;
+    }
+    const timing = directChildElement(root, "timing");
+    const source = directChildElement(root, "source");
+    const subject = directChildElement(root, "subject");
+    const event = directChildElement(root, "event");
+    const observationText = directChildText(root, "observation");
+    let observation: Record<string, unknown> | undefined;
+    if (observationText) {
+      try {
+        const parsed = JSON.parse(observationText);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) observation = parsed;
+      } catch {
+        observation = { raw: observationText };
+      }
+    }
+    return {
+      kind: "externalTrigger",
+      id: root.getAttribute("id") || `trigger-${Math.random().toString(16).slice(2)}`,
+      triggerId: root.getAttribute("trigger_id") || "",
+      ts,
+      provider: source?.getAttribute("provider") || "external",
+      connectionId: source?.getAttribute("connection_id") || "",
+      resourceKind: subject?.getAttribute("kind") || "resource",
+      subjectKey: subject?.getAttribute("key") || "",
+      event: event?.getAttribute("name") || "changed",
+      eventKey: event?.getAttribute("key") || "",
+      occurredAt: timing?.getAttribute("occurred_at") || undefined,
+      observedAt: timing?.getAttribute("observed_at") || undefined,
+      summary: directChildText(root, "summary"),
+      resumeInstruction: directChildText(root, "resume_instruction"),
+      instruction: directChildText(root, "instruction"),
+      observation,
+      raw,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function integerAttribute(element: Element | null, name: string): number {
+  const value = Number.parseInt(element?.getAttribute(name) || "", 10);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function stableTextHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function topicContextBlock(text: string, ts: string): Block | null {
+  const raw = (text || "").trim();
+  if (!raw.startsWith("<loom_topic_context") && !raw.startsWith("<owner_topic_")) return null;
+  try {
+    const doc = new DOMParser().parseFromString(`<loom_feed>${raw}</loom_feed>`, "application/xml");
+    if (doc.getElementsByTagName("parsererror").length > 0) return null;
+    const wrapper = doc.documentElement;
+    const context = directChildElement(wrapper, "loom_topic_context");
+    const ownerInput = directChildElement(wrapper, "owner_topic_input");
+    const intervention = directChildElement(wrapper, "owner_topic_intervention");
+    const agentMessage = directChildElement(wrapper, "agent_message");
+    if (!context && !ownerInput && !intervention) return null;
+
+    let payload: TopicContextPayload | undefined;
+    if (ownerInput) {
+      payload = {
+        kind: "ownerInput",
+        label: "OWNER INPUT",
+        body: directChildText(ownerInput, "message"),
+      };
+    } else if (intervention) {
+      const action = intervention.getAttribute("action") || "steer";
+      payload = {
+        kind: "intervention",
+        label: action.toUpperCase(),
+        body: directChildText(intervention, "guidance"),
+        action,
+        turnId: intervention.getAttribute("turn_id") || undefined,
+        reason: directChildText(intervention, "reason") || undefined,
+      };
+    } else if (agentMessage) {
+      const response = agentMessage.getAttribute("response") || "";
+      const replyTo = directChildText(agentMessage, "reply_to");
+      const variant = replyTo ? "res" : response === "required" ? "req" : "notify";
+      payload = {
+        kind: "agentMessage",
+        label: variant.toUpperCase(),
+        body: agentMessageBody(agentMessage),
+        subject: directChildText(agentMessage, "subject") || undefined,
+        from: directChildText(agentMessage, "from") || undefined,
+        to: directChildText(agentMessage, "to") || undefined,
+        variant,
+      };
+    } else {
+      const body = Array.from(wrapper.childNodes)
+        .filter((node) => node.nodeType === 3)
+        .map((node) => node.textContent?.trim() || "")
+        .filter(Boolean)
+        .join("\n\n");
+      if (body) payload = { kind: "text", label: "TOPIC WORK", body };
+    }
+
+    const linksRoot = context ? directChildElement(context, "key_links") : null;
+    const links = linksRoot
+      ? Array.from(linksRoot.children)
+          .filter((child) => child.nodeName === "link")
+          .map((link) => ({
+            type: link.getAttribute("type") || "reference",
+            id: link.getAttribute("id") || "",
+            relation: link.getAttribute("relation") || "reference",
+            label: link.textContent?.trim() || "",
+          }))
+      : [];
+    const deltaRoot = context ? directChildElement(context, "delta") : null;
+    const delta = deltaRoot
+      ? Array.from(deltaRoot.children)
+          .filter((child) => child.nodeName === "event")
+          .map((event) => ({
+            seq: integerAttribute(event, "seq"),
+            type: event.getAttribute("type") || "event",
+            at: event.getAttribute("at") || "",
+            summary: event.textContent?.trim() || "",
+          }))
+      : [];
+    const topicId = context?.getAttribute("topic_id") || ownerInput?.getAttribute("topic_id") || intervention?.getAttribute("topic_id") || "";
+    const eventSeq = integerAttribute(context, "event_seq");
+    return {
+      kind: "topicContext",
+      id: `${topicId || "topic"}:${eventSeq}:${ts}:${stableTextHash(raw)}`,
+      ts,
+      topicId,
+      status: context?.getAttribute("status") || "active",
+      briefVersion: integerAttribute(context, "brief_version"),
+      eventSeq,
+      title: context ? directChildText(context, "title") : "Topic work",
+      responsibleAgent: context ? directChildText(context, "responsible_agent") : "",
+      purpose: context ? directChildText(context, "purpose") : "",
+      completionBoundary: context ? directChildText(context, "completion_boundary") : "",
+      yourResponsibility: context ? directChildText(context, "your_responsibility") : "",
+      briefSummary: context ? directChildText(context, "brief_summary") : "",
+      currentState: context ? directChildText(context, "current_state") : "",
+      nextStep: context ? directChildText(context, "next_step") : "",
+      limitations: context ? directChildText(context, "limitations") : "",
+      instruction: context ? directChildText(context, "instruction") : directChildText(ownerInput || intervention!, "instruction"),
+      links,
+      delta,
+      payload,
+      raw,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function humanInputResponseSummary(text: string): string {
   const raw = (text || "").trim();
   if (!raw.startsWith("<human_input_response")) return "";
@@ -396,7 +630,7 @@ function extractLoomAttachments(text: string): { text: string; attachments: Exte
 
 function userBlock(ts: string, rawText: string, rawAttachments: any[] = []): Block {
   const extracted = extractLoomAttachments(rawText);
-  const special = agentMessageBlock(extracted.text, ts) || externalMessageBlock(extracted.text, ts);
+  const special = topicContextBlock(extracted.text, ts) || externalTriggerBlock(extracted.text, ts) || agentMessageBlock(extracted.text, ts) || externalMessageBlock(extracted.text, ts);
   if (special) return special;
   const attachments = mergeAttachments(extracted.attachments, rawAttachments.map(normalizeAttachment));
   return { kind: "user", ts, text: extracted.text, attachments };
@@ -406,6 +640,15 @@ export function summarizeTask(text: string): string {
   text = extractLoomAttachments(text).text;
   const humanInput = humanInputResponseSummary(text);
   if (humanInput) return humanInput;
+  const topic = topicContextBlock(text, "");
+  if (topic?.kind === "topicContext") {
+    const payload = topic.payload?.subject || topic.payload?.body;
+    return ["TOPIC", topic.title || topic.topicId, payload].filter(Boolean).join(" · ");
+  }
+  const trigger = externalTriggerBlock(text, "");
+  if (trigger?.kind === "externalTrigger") {
+    return ["TRIGGER", trigger.provider.toUpperCase(), trigger.subjectKey, trigger.event].filter(Boolean).join(" · ");
+  }
   const external = externalMessageBlock(text, "");
   if (external?.kind === "externalMessage") {
     const destination = external.membershipName || external.conversationId;
