@@ -287,6 +287,10 @@ func applyMessageDetails(params *hub.IngressParams, message *larkim.Message) {
 		}
 		params.ProviderMetadata["messageAppLink"] = value
 	}
+	msgType := strings.ToLower(strings.TrimSpace(pointerString(message.MsgType)))
+	if msgType == "post" && message.Body != nil {
+		applyFeishuPostContent(params, pointerString(message.Body.Content), "message-details")
+	}
 }
 
 func ingressParams(connectionID, addressID string, msg *channeltypes.NormalizedMessage) hub.IngressParams {
@@ -332,6 +336,9 @@ func ingressParams(connectionID, addressID string, msg *channeltypes.NormalizedM
 		params.Conversation.ThreadID = pointerString(event.Event.Message.ThreadId)
 		if params.Conversation.ThreadID == "" {
 			params.Conversation.ThreadID = pointerString(event.Event.Message.RootId)
+		}
+		if strings.EqualFold(pointerString(event.Event.Message.MessageType), "post") {
+			applyFeishuPostContent(&params, pointerString(event.Event.Message.Content), "receive-event")
 		}
 	}
 	return params

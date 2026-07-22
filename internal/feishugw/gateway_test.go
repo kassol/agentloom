@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -79,6 +80,104 @@ func TestApplyMessageDetailsAddsHumanReadableSender(t *testing.T) {
 	}
 	if params.ProviderMetadata["messageAppLink"] != messageLink {
 		t.Fatalf("provider metadata = %#v", params.ProviderMetadata)
+	}
+}
+
+func TestApplyMessageDetailsNormalizesDirectFeishuPost(t *testing.T) {
+	msgType := "post"
+	content := `{"title":"","content":[[{"tag":"at","user_id":"@_user_1","user_name":"大菠萝"},{"tag":"text","text":" 详细介绍："}],[],[{"tag":"text","text":"- 看好软件接管劳动预算。"},{"tag":"a","href":"https://example.com/source","text":"来源"}],[{"tag":"img","image_key":"img-key"}]],"content_v2":[[{"tag":"at","user_id":"@_user_1","user_name":"大菠萝"},{"tag":"text","text":" 详细介绍："}],[],[{"tag":"text","text":"- 看好软件接管劳动预算。"},{"tag":"a","href":"https://example.com/source","text":"来源"}],[{"tag":"img","image_key":"img-key"}]]}`
+	params := hub.IngressParams{
+		Content: hub.MessageContent{Text: feishuRichTextPlaceholder}, ProviderMetadata: map[string]any{},
+	}
+	applyMessageDetails(&params, &larkim.Message{MsgType: &msgType, Body: &larkim.MessageBody{Content: &content}})
+	for _, want := range []string{"@大菠萝 详细介绍：", "- 看好软件接管劳动预算。", "[来源](https://example.com/source)", "![image](img-key)"} {
+		if !strings.Contains(params.Content.Text, want) {
+			t.Fatalf("normalized text %q does not contain %q", params.Content.Text, want)
+		}
+	}
+	if len(params.Content.Attachments) != 1 || params.Content.Attachments[0].ID != "img-key" || params.Content.Attachments[0].MimeType != "image/*" {
+		t.Fatalf("attachments = %#v", params.Content.Attachments)
+	}
+	metadata, _ := params.ProviderMetadata["contentNormalization"].(map[string]any)
+	if metadata["status"] != "normalized" || metadata["format"] != "direct-post" || metadata["source"] != "message-details" {
+		t.Fatalf("content normalization metadata = %#v", metadata)
+	}
+}
+
+func TestIngressParamsNormalizesLocalizedFeishuPostFromEvent(t *testing.T) {
+	msgType := "post"
+	content := `{"zh_cn":{"title":"标题","content":[[{"tag":"text","text":"正文"}]]}}`
+	event := &larkim.P2MessageReceiveV1{Event: &larkim.P2MessageReceiveV1Data{Message: &larkim.EventMessage{
+		MessageType: &msgType, Content: &content,
+	}}}
+	params := ingressParams("conn-1", "addr-1", &channeltypes.NormalizedMessage{
+		MessageID: "om-1", Content: feishuRichTextPlaceholder, RawContentType: "post", RawEvent: event,
+	})
+	if params.Content.Text != "**标题**\n\n正文" {
+		t.Fatalf("normalized localized post = %q", params.Content.Text)
+	}
+	metadata, _ := params.ProviderMetadata["contentNormalization"].(map[string]any)
+	if metadata["format"] != "localized-post:zh_cn" || metadata["source"] != "receive-event" {
+		t.Fatalf("content normalization metadata = %#v", metadata)
+	}
+}
+
+func TestNormalizeFeishuPostSupportsContentV2Only(t *testing.T) {
+	text, _, format, err := normalizeFeishuPostContent(`{"title":"新版","content_v2":[[{"tag":"text","text":"只有 content_v2"}]]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "**新版**\n\n只有 content_v2" || format != "direct-post" {
+		t.Fatalf("content_v2 normalization = %q / %q", text, format)
+	}
+}
+
+func TestApplyMessageDetailsPreservesMalformedPostAsStructuredFallback(t *testing.T) {
+	msgType := "post"
+	content := `{"title":`
+	params := hub.IngressParams{
+		Content: hub.MessageContent{Text: feishuRichTextPlaceholder}, ProviderMetadata: map[string]any{},
+	}
+	applyMessageDetails(&params, &larkim.Message{MsgType: &msgType, Body: &larkim.MessageBody{Content: &content}})
+	for _, want := range []string{"Feishu post normalization failed", "native content is invalid JSON", "<feishu_native_content", content} {
+		if !strings.Contains(params.Content.Text, want) {
+			t.Fatalf("fallback %q does not contain %q", params.Content.Text, want)
+		}
+	}
+	metadata, _ := params.ProviderMetadata["contentNormalization"].(map[string]any)
+	if metadata["status"] != "fallback" || metadata["error"] == "" {
+		t.Fatalf("content normalization metadata = %#v", metadata)
+	}
+}
+
+func TestFailedMessageDetailsDoNotDegradeNormalizedEventContent(t *testing.T) {
+	msgType := "post"
+	eventContent := `{"title":"","content":[[{"tag":"text","text":"事件正文"}]]}`
+	event := &larkim.P2MessageReceiveV1{Event: &larkim.P2MessageReceiveV1Data{Message: &larkim.EventMessage{
+		MessageType: &msgType, Content: &eventContent,
+	}}}
+	params := ingressParams("conn-1", "addr-1", &channeltypes.NormalizedMessage{
+		MessageID: "om-1", Content: feishuRichTextPlaceholder, RawContentType: "post", RawEvent: event,
+	})
+	beforeText := params.Content.Text
+	beforeMetadata := params.ProviderMetadata["contentNormalization"]
+	invalidDetails := `{"title":`
+	applyMessageDetails(&params, &larkim.Message{MsgType: &msgType, Body: &larkim.MessageBody{Content: &invalidDetails}})
+	if params.Content.Text != beforeText {
+		t.Fatalf("useful event content was degraded: before=%q after=%q", beforeText, params.Content.Text)
+	}
+	if !reflect.DeepEqual(params.ProviderMetadata["contentNormalization"], beforeMetadata) {
+		t.Fatalf("normalization metadata was degraded: before=%#v after=%#v", beforeMetadata, params.ProviderMetadata["contentNormalization"])
+	}
+}
+
+func TestMergeFeishuAttachmentsDeduplicatesFileKey(t *testing.T) {
+	got := mergeFeishuAttachments(
+		[]hub.AttachmentRef{{ID: "img-key", Name: "screenshot.png", MimeType: "application/octet-stream"}},
+		[]hub.AttachmentRef{{ID: "img-key", MimeType: "image/*"}},
+	)
+	if len(got) != 1 || got[0].Name != "screenshot.png" || got[0].MimeType != "image/*" {
+		t.Fatalf("merged attachments = %#v", got)
 	}
 }
 
