@@ -210,7 +210,7 @@ func TestRestoreAgentKeepsStableIdentityAndDoesNotStartRuntime(t *testing.T) {
 	view, err := h.RestoreAgent(RestoreAgentParams{
 		ID: "a07193ea", Name: "parall-edge-dev", Cwd: "/tmp/parall-edge",
 		ThreadID: "019f53a7-5485-7733-87f8-5b513420f62a",
-		Model:    "gpt-5.6-sol", Effort: "high", ProfileVersionSeen: 3,
+		Model:    "gpt-5.6-sol", Effort: "high",
 		CreatedAt: "2026-07-12T00:08:21Z",
 	})
 	if err != nil {

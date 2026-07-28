@@ -132,7 +132,7 @@ CodexLoom 用它注入 Agent Profile：
       "role": "developer",
       "content": [{
         "type": "input_text",
-        "text": "<agent_profile version=\"2\" ...>...</agent_profile>"
+        "text": "<loom_developer_context ...>\n# Loom Agent Prompt\n...\n<loom_agent_profile_data complete=\"true\" ...>...</loom_agent_profile_data>\n</loom_developer_context>"
       }]
     }]
   }
@@ -144,9 +144,12 @@ CodexLoom 用它注入 Agent Profile：
 - 方法名确实是带下划线的 `thread/inject_items`，不是 camelCase。
 - 必须先完成 `initialize`，并声明 `capabilities.experimentalApi:true`。
 - 应在 Agent 空闲、runtime ready 且 `thread/resume` / 回退 `thread/start` 完成后调用。
-- Profile 用 developer role，避免污染用户输入语义；`loom thread history` 的 Turn 投影不会把它显示为用户消息。
-- hub 用 `profileVersionSeen` 保证一个 Profile 版本只在下一个安全 turn 前注入一次；同一 runtime
-  的 ready、注入和 turn reservation 必须串行，防止并发派任务重复注入。
+- Loom Agent Prompt template 与完整 Agent Profile snapshot 渲染为一条原子 developer-role
+  message。Profile 物理嵌入 Prompt、不会再作为 sibling fragment 重复出现，避免污染用户输入语义；
+  `loom thread history` 的 Turn 投影不会把它显示为用户消息。
+- hub 以 context epoch ledger 记录 source revision、完整 delivery SHA、replayable rollout 与同 Turn
+  model event。只有双证据成立才标记 covered；compact 后的新 epoch 会在下一 Turn 重新注入。
+- 同一 runtime 的 ready、注入和 turn reservation 必须串行，防止并发派任务重复注入。
 
 ## 通知流(turn 生命周期,item/* 是 source of truth)
 

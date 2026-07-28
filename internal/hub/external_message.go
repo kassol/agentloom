@@ -36,6 +36,14 @@ func formatInboxEnvelope(message InboxMessage, item InboxItem, address AgentAddr
 }
 
 func formatInboxEnvelopeAt(message InboxMessage, item InboxItem, address AgentAddress, policy string, membership *ConversationMembership, currentTime string) string {
+	return formatInboxEnvelopeModeAt(message, item, address, policy, membership, currentTime, false)
+}
+
+func formatInboxEnvelopeContextAt(message InboxMessage, item InboxItem, address AgentAddress, policy string, membership *ConversationMembership, currentTime string) string {
+	return formatInboxEnvelopeModeAt(message, item, address, policy, membership, currentTime, true)
+}
+
+func formatInboxEnvelopeModeAt(message InboxMessage, item InboxItem, address AgentAddress, policy string, membership *ConversationMembership, currentTime string, originalInputReference bool) string {
 	var b strings.Builder
 	b.WriteString(`<inbox_message version="1" id="` + xmlEscape(message.ID) + `" inbox_item_id="` + xmlEscape(item.ID) + `" expectation="` + xmlEscape(message.ResponseExpectation) + `">` + "\n")
 	b.WriteString("  <timing")
@@ -96,7 +104,11 @@ func formatInboxEnvelopeAt(message InboxMessage, item InboxItem, address AgentAd
 		writeXMLText(&b, "reply_with_attachment_command", command+" integration send --from "+shellCommandArg(item.AgentID)+" --reply-to "+shellCommandArg(item.ID)+" --body \"...\" --file \"/absolute/path/to/file\"")
 		writeXMLText(&b, "no_reply_command", command+" inbox no-reply "+shellCommandArg(item.ID)+" --agent "+shellCommandArg(item.AgentID))
 	}
-	writeXMLCDATA(&b, "body", message.Content.Text)
+	if originalInputReference {
+		b.WriteString("  <body source=\"original_input\" />\n")
+	} else {
+		writeXMLCDATA(&b, "body", message.Content.Text)
+	}
 	writeInboxAttachmentsXML(&b, "  ", message.Content.Attachments)
 	b.WriteString("</inbox_message>")
 	return b.String()

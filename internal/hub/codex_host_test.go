@@ -3,6 +3,7 @@ package hub
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -280,6 +281,10 @@ func TestSendTaskResumesCachedThreadBeforeTurnStart(t *testing.T) {
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		CreatedAt: now(), UpdatedAt: now(),
 	}
+	h.profiles["agent-stale"] = &AgentProfile{
+		AgentID: "agent-stale", Identity: "A durable test Agent.", Domain: "Context migration.",
+		Version: 1, UpdatedAt: now(),
+	}
 
 	h.mu.Lock()
 	rt, err := h.getRuntimeLocked(h.agents["agent-stale"])
@@ -315,12 +320,36 @@ func TestSendTaskResumesCachedThreadBeforeTurnStart(t *testing.T) {
 		t.Fatalf("turn/start sandboxPolicy = %#v, want dangerFullAccess", turn["sandboxPolicy"])
 	}
 	input, ok := turn["input"].([]any)
-	if !ok || len(input) != 1 {
-		t.Fatalf("internal Agent turn input = %#v, want only task text", turn["input"])
+	if !ok || len(input) != 2 {
+		t.Fatalf("internal Agent turn input = %#v, want task text plus Loom context", turn["input"])
 	}
 	text, ok := input[0].(map[string]any)
 	if !ok || text["type"] != "text" || text["text"] != "hello" {
 		t.Fatalf("task text input = %#v", input[0])
+	}
+	context, ok := input[1].(map[string]any)
+	contextText := fmt.Sprint(context["text"])
+	if !ok || context["type"] != "text" || !strings.Contains(contextText, "<loom_context") ||
+		!strings.Contains(contextText, "<loom_agent_relationships") {
+		t.Fatalf("Loom context input = %#v", input[1])
+	}
+	for _, forbidden := range []string{"<loom_agent_prompt", "<loom_agent_profile", "<context_policy", "<coverage_manifest"} {
+		if strings.Contains(contextText, forbidden) {
+			t.Fatalf("Turn input contains Developer-only or obsolete fragment %s: %s", forbidden, contextText)
+		}
+	}
+	if got := countRequestMethod(t, logPath, "thread/inject_items"); got != 1 {
+		t.Fatalf("Developer context injections = %d, want one atomic delivery", got)
+	}
+	developer := injectedDeveloperText(t, lastRequestParams(t, logPath, "thread/inject_items"))
+	if !strings.Contains(developer, "<loom_developer_context") ||
+		!strings.Contains(developer, "# 核心身份") ||
+		strings.Count(developer, "<loom_agent_profile_data ") != 1 ||
+		strings.Contains(developer, "<loom_agent_prompt") ||
+		strings.Contains(developer, "<loom_agent_profile version") ||
+		strings.Contains(developer, "<loom_agent_relationships") ||
+		!strings.HasSuffix(developer, "</loom_developer_context>") {
+		t.Fatalf("atomic Developer context = %s", developer)
 	}
 }
 
@@ -348,12 +377,22 @@ func TestSendTaskDoesNotPinSkillsForExternalFacingAgent(t *testing.T) {
 	}
 	turn := lastRequestParams(t, logPath, "turn/start")
 	input, ok := turn["input"].([]any)
-	if !ok || len(input) != 1 {
-		t.Fatalf("external Agent turn input = %#v, want only task text", turn["input"])
+	if !ok || len(input) != 2 {
+		t.Fatalf("external Agent turn input = %#v, want task text plus Loom context", turn["input"])
 	}
 	text, ok := input[0].(map[string]any)
 	if !ok || text["type"] != "text" || text["text"] != "publish the report" {
 		t.Fatalf("task text input = %#v", input[0])
+	}
+	context, ok := input[1].(map[string]any)
+	if !ok || context["type"] != "text" || !strings.Contains(fmt.Sprint(context["text"]), "<loom_context") {
+		t.Fatalf("Loom context input = %#v", input[1])
+	}
+	developer := injectedDeveloperText(t, lastRequestParams(t, logPath, "thread/inject_items"))
+	if strings.Contains(developer, "loom-needs-you") ||
+		!strings.Contains(developer, "# 核心身份") ||
+		strings.Count(developer, "<loom_agent_profile_data ") != 1 {
+		t.Fatalf("external Agent Developer context pinned skills or lost durable sources: %s", developer)
 	}
 }
 
@@ -366,6 +405,7 @@ func lastRequestParams(t *testing.T, path, method string) map[string]any {
 	defer f.Close()
 	var params map[string]any
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64<<10), 4<<20)
 	for scanner.Scan() {
 		var request struct {
 			Method string         `json:"method"`
@@ -393,6 +433,7 @@ func countRequestMethod(t *testing.T, path, method string) int {
 	defer f.Close()
 	count := 0
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64<<10), 4<<20)
 	for scanner.Scan() {
 		var request struct {
 			Method string `json:"method"`
@@ -406,6 +447,27 @@ func countRequestMethod(t *testing.T, path, method string) int {
 		t.Fatal(err)
 	}
 	return count
+}
+
+func injectedDeveloperText(t *testing.T, params map[string]any) string {
+	t.Helper()
+	items, ok := params["items"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("thread/inject_items items = %#v", params["items"])
+	}
+	item, ok := items[0].(map[string]any)
+	if !ok || item["type"] != "message" || item["role"] != "developer" {
+		t.Fatalf("injected item = %#v", items[0])
+	}
+	content, ok := item["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("injected content = %#v", item["content"])
+	}
+	text, ok := content[0].(map[string]any)
+	if !ok || text["type"] != "input_text" {
+		t.Fatalf("injected text item = %#v", content[0])
+	}
+	return fmt.Sprint(text["text"])
 }
 
 func TestCodexHostEnvAddsConfiguredLoomDirectory(t *testing.T) {

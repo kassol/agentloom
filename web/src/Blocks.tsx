@@ -1,4 +1,6 @@
-import { BarChart3, FileText, GitBranch, Inbox, Paperclip, RadioTower } from "lucide-react";
+import { BarChart3, GitBranch, Inbox, Paperclip, RadioTower } from "lucide-react";
+import { PublishedArtifactCard } from "./components/ArtifactPreview";
+import { RawEnvelope, StructuredContextRow } from "./components/StructuredContext";
 import { UserBubble, AssistantBubble } from "./pages/agent/MessageBubbles";
 import { MarkdownContent } from "./pages/agent/markdown";
 import type { Block, ExternalAttachment, ExternalThreadContext } from "./feed";
@@ -462,19 +464,7 @@ export function BlockView({ block }: { block: Block }) {
       );
 
     case "artifact":
-      return (
-        <div className="my-2 flex items-center gap-3 rounded-md border border-border bg-card px-3 py-2.5 shadow-card">
-          <div className="flex size-8 shrink-0 items-center justify-center rounded-sm bg-secondary text-muted-foreground">
-            <FileText className="size-4" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="font-mono text-[9px] uppercase text-muted-foreground">Published artifact</div>
-            <div className="truncate text-[12px] font-medium text-foreground">{block.artifact.name || block.artifact.id}</div>
-          </div>
-          {block.artifact.size !== undefined && <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">{formatFileSize(block.artifact.size)}</span>}
-          {block.artifact.url && <a href={block.artifact.url} target="_blank" rel="noreferrer" className="shrink-0 text-[11px] font-medium text-primary hover:underline">Open</a>}
-        </div>
-      );
+      return <PublishedArtifactCard artifact={block.artifact} publishedAt={block.ts} />;
 
     // System line — quiet meta with a mono timestamp.
     case "sys":
@@ -518,21 +508,9 @@ function RouteMeta({ label, value }: { label: string; value: string }) {
 function TopicContextRow({ label, value, markdown = false }: { label: string; value: string; markdown?: boolean }) {
   if (!value) return null;
   return (
-    <div className="grid min-w-0 gap-2 py-2.5 sm:grid-cols-[112px_1fr] sm:gap-3">
-      <span className="font-mono text-[9px] font-semibold uppercase">{label}</span>
-      <div className="min-w-0 break-words text-[11.5px] leading-5 text-foreground/75">{markdown ? <MarkdownContent content={value} /> : value}</div>
-    </div>
-  );
-}
-
-function RawEnvelope({ raw }: { raw: string }) {
-  return (
-    <details className="mt-2 text-[10px] text-muted-foreground">
-      <summary className="cursor-pointer select-none font-mono hover:text-foreground">raw envelope</summary>
-      <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words border-t border-border/60 bg-muted/25 px-3 py-2 font-mono text-[10.5px] leading-5 text-foreground/75">
-        {raw}
-      </pre>
-    </details>
+    <StructuredContextRow label={label}>
+      {markdown ? <MarkdownContent content={value} /> : value}
+    </StructuredContextRow>
   );
 }
 

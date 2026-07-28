@@ -311,6 +311,8 @@ func main() {
 		cmdWorkload(a)
 	case "profile":
 		cmdProfile(a)
+	case "context":
+		cmdContext(a)
 	case "goal":
 		cmdGoal(a)
 	case "skills":
@@ -420,6 +422,9 @@ Compatibility shortcuts:
   chub profile get <agent>
   chub profile set <agent> [--identity TEXT] [--domain TEXT] [--scope TEXT] [--file profile.json]
   chub profile clear <agent>
+  loom context prompt get|set|clear ...
+  loom context explain <agent> [--json]
+  loom context coverage <agent> [--json]
   chub goal <agent> [show]
   chub goal <agent> set <objective> [--token-budget N|--clear-token-budget]
   chub goal <agent> pause|resume|clear

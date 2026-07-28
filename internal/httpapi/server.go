@@ -86,6 +86,7 @@ func (s *Server) Handler() http.Handler {
 	s.registerSystemRoutes(mux)
 	s.registerIntegrationRoutes(mux)
 	s.registerAgentRoutes(mux)
+	s.registerContextRoutes(mux)
 	s.registerOrganizationRoutes(mux)
 	s.registerTriggerRoutes(mux)
 	s.registerTopicRoutes(mux)

@@ -215,13 +215,15 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 			writeErr(w, err)
 			return
 		}
-		disposition := "attachment"
-		if strings.HasPrefix(strings.ToLower(artifact.MimeType), "image/") {
-			disposition = "inline"
-		}
+		disposition := threadArtifactDisposition(
+			artifact.MimeType,
+			r.URL.Query().Get("preview") == "1",
+			r.URL.Query().Get("download") == "1",
+		)
 		w.Header().Set("Content-Type", artifact.MimeType)
 		w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": artifact.Name}))
 		w.Header().Set("Cache-Control", "private, max-age=300")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		http.ServeContent(w, r, artifact.Name, info.ModTime(), file)
 	})
@@ -401,5 +403,23 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, 202, result)
 	})
+}
 
+func threadArtifactDisposition(mimeType string, preview, download bool) string {
+	if download {
+		return "attachment"
+	}
+	normalized := strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
+	if preview {
+		switch normalized {
+		case "application/pdf", "image/png", "image/jpeg", "image/gif", "image/webp":
+			return "inline"
+		default:
+			return "attachment"
+		}
+	}
+	if strings.HasPrefix(normalized, "image/") {
+		return "inline"
+	}
+	return "attachment"
 }

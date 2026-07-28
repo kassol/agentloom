@@ -388,7 +388,9 @@ Remote enrollment 以 app-server `clientInfo.name` 为持久 scope。共享 Host
 1. `POST /api/agents/{key}/turns`。
 2. 检查 Agent idle，并在每个 Turn 前幂等执行 `thread/resume`。共享 app-server 可以卸载空闲
    Thread，runtime 存在不代表 Thread 仍驻留；不能复用旧的“每 Thread 一个进程”心智。
-3. Profile 版本尚未注入时，先加入 developer context；空 Profile 不注入。
+3. 当前 epoch 尚未覆盖 Loom Agent Prompt 或 Profile revision 时，把 Prompt template 与完整
+   Profile snapshot 渲染为一条原子 developer-role message。空 Profile 仍以 complete empty
+   snapshot 注入，用于明确撤销旧 Profile。
 4. 外部 Conversation 有有效 Membership 时，加入该会话的 developer context。
 5. `turn/start` 透传 model、effort、approval policy。
 6. Codex 原生通知进入 event log 和 SSE。
@@ -430,11 +432,15 @@ Remote enrollment 以 app-server `clientInfo.name` 为持久 scope。共享 Host
 - CLI watch 可按 seq 回放 live event tail，并用 `Last-Event-ID` 续传。
 - event log 只保留有界 replay window，不是完整历史，不能用它重建上下文；完整历史仍以 rollout 为准。
 
-### Profile 注入
+### Durable Developer Context
 
-Profile 只在用户通过 CLI/UI 显式设置后有版本。新版本在下一个 Turn 前注入 developer role；
-`profileVersionSeen` 防止每轮重复。compact 后是否重注入不能只看 rollout，应以 Codex 实际请求
-上下文能力为准；在 app-server 暂未暴露可靠“本次发给模型的完整 history”前，不要猜测 compact。
+Loom Agent Prompt template 与完整 Agent Profile snapshot 在每个 context epoch 首次需要时
+渲染为一条原子 developer-role message。Profile 物理嵌入 Prompt，但 ledger 仍分别跟踪 Prompt
+version/hash 与 Profile revision/hash；Profile 变化会重渲染组合 payload，不增加 Prompt version，
+也不会产生第二份 sibling Profile。Context coverage ledger 以 source revision、完整 delivery SHA、
+当前 replayable rollout 和同 Turn model event 共同证明 covered；同 epoch 不重复，compact 后下一
+Turn 重新注入。Relationship 与本次 Topic/Message 等 bounded context 仍走 Turn input，不与
+Developer 指令层混合。
 
 完整设计和写作方法见 [agent-profile.md](agent-profile.md)。
 

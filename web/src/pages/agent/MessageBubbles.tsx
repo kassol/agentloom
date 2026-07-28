@@ -21,6 +21,7 @@ import { cn } from "../../lib/utils";
 import { Check, ChevronRight, Copy, Loader2, Wrench } from "lucide-react";
 import type { ChatMessage, TokenUsage } from "../../lib/chat/types";
 import { MarkdownContent } from "./markdown";
+import { LoomContextView, splitTrailingLoomContext } from "./LoomContextView";
 
 /* ================================================================
    CopyButton — appears on hover, copies text content
@@ -616,15 +617,17 @@ export function AssistantBubble({ group, streaming = false }: { group: Assistant
 
 export function UserBubble({ message, children }: { message: ChatMessage; children?: ReactNode }) {
   const { t } = useTranslation();
+  const displayed = useMemo(() => splitTrailingLoomContext(message.content), [message.content]);
   return (
     <div className="flex flex-col items-end py-3">
       <div className="mb-1 flex items-center gap-2">
         <span className="text-[10px] font-semibold uppercase text-muted-foreground">{t("agent.you")}</span>
         <span className="text-[10px] font-mono text-muted-foreground/40">{shortTime(message.created_at)}</span>
       </div>
-      <div className="max-w-[88%] whitespace-pre-wrap break-words rounded-md border border-border bg-secondary px-3 py-2 text-sm leading-6 sm:max-w-[78%]">
-        {message.content ? <div>{message.content}</div> : null}
+      <div className="max-w-[88%] break-words rounded-md border border-border bg-secondary px-3 py-2 text-sm leading-6 sm:max-w-[78%]">
+        {displayed.content ? <div className="whitespace-pre-wrap">{displayed.content}</div> : null}
         {children}
+        {displayed.context ? <LoomContextView context={displayed.context} /> : null}
       </div>
     </div>
   );

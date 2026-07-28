@@ -98,7 +98,11 @@ func (h *Hub) ContinueInterruptedTurn(key string, inactivity time.Duration) (Int
 		if task := strings.TrimSpace(interrupted.Task); task != "" {
 			displayTask += ": " + task
 		}
-		result, err := h.sendTaskWithArtifacts(agentID, prompt, nil, inactivity, "", "", "", "", topicID, displayTask)
+		sourceContext := turnContextSource{
+			Origin: "platform_runtime", Trust: "loom_managed", Authority: "recovery_control",
+			Kind: "restart_recovery", RefID: interrupted.TurnID, TopicID: topicID,
+		}
+		result, err := h.sendTaskWithContext(agentID, prompt, nil, inactivity, "", "", "", topicID, displayTask, sourceContext)
 		if err != nil {
 			return InterruptedTurnAction{}, err
 		}

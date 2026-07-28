@@ -239,22 +239,24 @@ reply 的反向投递关系和当前 name-to-ID 映射推断；无法解析的�
 
 ## 版本与上下文注入
 
-每次 Profile 更新都会递增 `version`。Agent 的 `profileVersionSeen` 记录该 Agent 已经
-读取的版本，它是运行元数据，不属于 Profile。
-
-当 `profile.version > profileVersionSeen` 时，CodexLoom 在下一个安全 Turn 前使用 Codex
-app-server `thread/inject_items` 写入一条 developer context：
+每次 Profile 更新都会递增 `version`。CodexLoom 将当前 Loom Agent Prompt template 与完整
+Profile snapshot 渲染为一个原子 Developer context；Profile 物理嵌入 Prompt，wire payload
+中不会再出现语义等价的 sibling Profile。任一 source 变化都重发完整组合，而不是发送增量片段，
+但 Prompt version 与 Profile revision/hash 仍分别跟踪。
+在每个 context epoch 首次需要时，CodexLoom 在下一个安全 Turn 前使用 Codex app-server
+`thread/inject_items` 写入这条 developer-role message：
 
 - 不打断正在运行的 turn。
 - 不伪装成用户消息。
 - 不出现在 `loom history` 的用户对话中。
-- 同一版本只注入一次。
-- 从未配置过的空 Profile 不产生版本或注入。清空一个已经配置过的 Profile 才产生新版本，
-  使 Agent 知道旧边界已撤销。
+- 同一 source revisions 在同一 epoch 只需覆盖一次。
+- 从未配置或已经清空的 Profile 都以 `complete="true"` 的空 snapshot 参与当前组合，使 Agent
+  明确知道不存在当前 Identity/Domain/Scope，并可靠撤销旧边界；是否更新 Profile version
+  仍由显式 Profile 操作决定。
 
-`profileVersionSeen` 只能证明 Loom 曾注入过该版本，不能证明 compact 后的每次模型请求仍包含
-它。Codex app-server 尚未公开“本次实际发给模型的完整 history”时，不要基于 rollout 猜测；
-未来重注入策略必须建立在官方上下文可见性信号上。
+Context coverage ledger 不把 RPC 成功直接当作模型可见。只有完整 delivery SHA 已进入当前
+epoch 的 replayable rollout，并观察到同一 Turn 的首个 model event，source 才标记为 covered。
+compact 创建新 epoch，下一 Turn 会重新注入；当前版本不处理中途 compact 的同 Turn 恢复。
 
 ## 持久化
 

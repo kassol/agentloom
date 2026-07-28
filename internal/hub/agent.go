@@ -89,16 +89,15 @@ type CreateParams struct {
 // creating a replacement identity or starting a Turn. Profiles and team
 // relationships are stored independently and reconnect through the stable ID.
 type RestoreAgentParams struct {
-	ID                 string `json:"id"`
-	Name               string `json:"name"`
-	Cwd                string `json:"cwd"`
-	ThreadID           string `json:"threadId"`
-	Sandbox            string `json:"sandbox"`
-	ApprovalPolicy     string `json:"approvalPolicy"`
-	Model              string `json:"model"`
-	Effort             string `json:"effort"`
-	ProfileVersionSeen int    `json:"profileVersionSeen"`
-	CreatedAt          string `json:"createdAt"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Cwd            string `json:"cwd"`
+	ThreadID       string `json:"threadId"`
+	Sandbox        string `json:"sandbox"`
+	ApprovalPolicy string `json:"approvalPolicy"`
+	Model          string `json:"model"`
+	Effort         string `json:"effort"`
+	CreatedAt      string `json:"createdAt"`
 }
 
 type ConfigParams struct {
@@ -227,7 +226,7 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	meta := &Agent{
 		ID: p.ID, Name: p.Name, Cwd: p.Cwd, ThreadID: p.ThreadID,
 		Sandbox: p.Sandbox, ApprovalPolicy: p.ApprovalPolicy,
-		Model: p.Model, Effort: p.Effort, ProfileVersionSeen: p.ProfileVersionSeen,
+		Model: p.Model, Effort: p.Effort,
 		Status: "idle", CreatedAt: p.CreatedAt, UpdatedAt: now(),
 	}
 	h.agents[p.ID] = meta
@@ -420,26 +419,31 @@ type SendResult struct {
 }
 
 func (h *Hub) SendTask(key, text string, inactivity time.Duration) (SendResult, error) {
-	return h.sendTask(key, text, inactivity, "", "", "", "")
+	return h.sendTask(key, text, inactivity, "", "", "")
 }
 
 func (h *Hub) SendTaskWithArtifacts(key, text string, artifactIDs []string, inactivity time.Duration) (SendResult, error) {
-	return h.sendTaskWithArtifacts(key, text, artifactIDs, inactivity, "", "", "", "", "", "")
+	return h.sendTaskWithArtifacts(key, text, artifactIDs, inactivity, "", "", "", "", "")
 }
 
-func (h *Hub) sendTask(key, text string, inactivity time.Duration, inboxItemID, attemptID, developerContext, agentMessageID string) (SendResult, error) {
-	return h.sendTaskWithArtifacts(key, text, nil, inactivity, inboxItemID, attemptID, developerContext, agentMessageID, "", "")
+func (h *Hub) sendTask(key, text string, inactivity time.Duration, inboxItemID, attemptID, agentMessageID string) (SendResult, error) {
+	return h.sendTaskWithArtifacts(key, text, nil, inactivity, inboxItemID, attemptID, agentMessageID, "", "")
 }
 
 func (h *Hub) sendTaskWithTopic(key, text string, inactivity time.Duration, topicID string) (SendResult, error) {
-	return h.sendTaskWithArtifacts(key, text, nil, inactivity, "", "", "", "", topicID, "")
+	return h.sendTaskWithArtifacts(key, text, nil, inactivity, "", "", "", topicID, "")
 }
 
 func (h *Hub) sendTaskWithTopicDisplay(key, text, displayTask string, inactivity time.Duration, topicID string) (SendResult, error) {
-	return h.sendTaskWithArtifacts(key, text, nil, inactivity, "", "", "", "", topicID, displayTask)
+	return h.sendTaskWithArtifacts(key, text, nil, inactivity, "", "", "", topicID, displayTask)
 }
 
-func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inactivity time.Duration, inboxItemID, attemptID, developerContext, agentMessageID, topicID, displayTask string) (SendResult, error) {
+func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inactivity time.Duration, inboxItemID, attemptID, agentMessageID, topicID, displayTask string) (SendResult, error) {
+	source := h.inferTurnContextSource(inboxItemID, agentMessageID, topicID, "")
+	return h.sendTaskWithContext(key, text, artifactIDs, inactivity, inboxItemID, attemptID, agentMessageID, topicID, displayTask, source)
+}
+
+func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inactivity time.Duration, inboxItemID, attemptID, agentMessageID, topicID, displayTask string, source turnContextSource) (SendResult, error) {
 	text = strings.TrimSpace(text)
 	if text == "" && len(artifactIDs) == 0 {
 		return SendResult{}, errf(400, "text or an artifact is required")
@@ -489,15 +493,18 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 	if err != nil {
 		return SendResult{}, err
 	}
-	taskText, input := codexArtifactInput(agentID, text, artifacts)
+	taskText := codexTaskText(text, artifacts)
 	visibleText := text
 	if displayTask = strings.TrimSpace(displayTask); displayTask != "" {
 		taskText = displayTask
 		visibleText = displayTask
 	}
+	if displayText := strings.TrimSpace(source.DisplayText); displayText != "" {
+		visibleText = displayText
+	}
 
-	// Serialize readiness, profile injection and turn reservation for one
-	// runtime. Concurrent callers must not inject the same profile version.
+	// Serialize readiness, epoch context injection and turn reservation for one
+	// runtime. Concurrent callers must not inject the same context revisions.
 	rt.startMu.Lock()
 	if err := waitReady(rt); err != nil {
 		rt.startMu.Unlock()
@@ -510,16 +517,18 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 		rt.startMu.Unlock()
 		return SendResult{}, err
 	}
-	if err := h.injectProfileIfNeeded(agentID, rt); err != nil {
+	contextPlan, err := h.prepareTurnContext(agentID, source, artifacts)
+	if err != nil {
 		rt.startMu.Unlock()
 		return SendResult{}, err
 	}
-	if strings.TrimSpace(developerContext) != "" {
-		if err := h.injectDeveloperContext(agentID, rt, developerContext); err != nil {
+	if contextPlan.DeveloperContext != "" {
+		if err := h.injectDeveloperContext(agentID, rt, contextPlan.DeveloperContext); err != nil {
 			rt.startMu.Unlock()
 			return SendResult{}, err
 		}
 	}
+	input := codexArtifactInput(text, contextPlan.InputContext, artifacts)
 	h.mu.Lock()
 	if h.stopping {
 		h.mu.Unlock()
@@ -549,9 +558,21 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 		attemptID:      attemptID,
 		agentMessageID: agentMessageID,
 		topicID:        topicID,
-		startedAt:      time.Now(),
-		lastActivity:   time.Now(),
-		stopWatchdog:   make(chan struct{}),
+		contextAttemptID: func() string {
+			if contextPlan.Attempt == nil {
+				return ""
+			}
+			return contextPlan.Attempt.ID
+		}(),
+		contextEpochID: func() string {
+			if contextPlan.Attempt == nil {
+				return ""
+			}
+			return contextPlan.Attempt.EpochID
+		}(),
+		startedAt:    time.Now(),
+		lastActivity: time.Now(),
+		stopWatchdog: make(chan struct{}),
 	}
 	previous := *meta
 	meta.Source = "" // adopting an edge mirror into CodexLoom's own registry
@@ -642,9 +663,11 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 	if topicID != "" {
 		h.recordTopicWorkEventLocked(topicID, TopicEvent{Type: "turn_started", Actor: meta.Name, AgentID: agentID, Agent: meta.Name, Summary: summarizeTopicText(taskText), Ref: &TopicRef{Type: "turn", ID: turn.turnID, Label: meta.Name}, CreatedAt: now()})
 	}
+	canonicalTurnID := turn.turnID
 	h.mu.Unlock()
 
-	return SendResult{Dispatched: true, AgentID: agentID, SessionID: agentID, TurnID: turnID}, nil
+	h.markContextSubmitted(threadID, contextPlan.Attempt, canonicalTurnID)
+	return SendResult{Dispatched: true, AgentID: agentID, SessionID: agentID, TurnID: canonicalTurnID}, nil
 }
 
 func turnSource(inboxItemID, agentMessageID string) string {
@@ -657,7 +680,7 @@ func turnSource(inboxItemID, agentMessageID string) string {
 	return "owner"
 }
 
-func codexArtifactInput(agentID, text string, artifacts []ThreadArtifact) (string, []map[string]any) {
+func codexTaskText(text string, artifacts []ThreadArtifact) string {
 	taskText := strings.TrimSpace(text)
 	if taskText == "" {
 		names := make([]string, 0, len(artifacts))
@@ -666,31 +689,27 @@ func codexArtifactInput(agentID, text string, artifacts []ThreadArtifact) (strin
 		}
 		taskText = "Attached: " + strings.Join(names, ", ")
 	}
+	return taskText
+}
 
-	prompt := strings.TrimSpace(text)
-	if len(artifacts) > 0 {
-		var manifest strings.Builder
-		manifest.WriteString(`<loom_attachments version="1" agent_id="` + xmlEscape(agentID) + `">` + "\n")
-		for _, artifact := range artifacts {
-			manifest.WriteString(`  <attachment id="` + xmlEscape(artifact.ID) + `" name="` + xmlEscape(artifact.Name) + `" mime_type="` + xmlEscape(artifact.MimeType) + `" size="` + fmt.Sprint(artifact.Size) + `" path="` + xmlEscape(artifact.Path) + `" url="` + xmlEscape(artifact.URL) + `" />` + "\n")
-		}
-		manifest.WriteString(`</loom_attachments>`)
-		if prompt != "" {
-			prompt += "\n\n"
-		}
-		prompt += manifest.String()
+func codexArtifactInput(text, loomContext string, artifacts []ThreadArtifact) []map[string]any {
+	input := make([]map[string]any, 0, len(artifacts)+2)
+	original := strings.TrimSpace(text)
+	if original == "" && len(artifacts) > 0 {
+		original = "Review the attached files."
 	}
-
-	input := make([]map[string]any, 0, len(artifacts)+1)
-	if prompt != "" {
-		input = append(input, map[string]any{"type": "text", "text": prompt})
+	if original != "" {
+		input = append(input, map[string]any{"type": "text", "text": original})
+	}
+	if strings.TrimSpace(loomContext) != "" {
+		input = append(input, map[string]any{"type": "text", "text": loomContext})
 	}
 	for _, artifact := range artifacts {
 		if strings.HasPrefix(strings.ToLower(artifact.MimeType), "image/") {
 			input = append(input, map[string]any{"type": "localImage", "path": artifact.Path})
 		}
 	}
-	return taskText, input
+	return input
 }
 
 func isThreadNotFoundError(err error) bool {

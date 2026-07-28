@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/yan5xu/codex-loom/internal/store"
@@ -154,16 +153,5 @@ func TestCommMigrationInfersRenamedSenderFromReplyDelivery(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(st.Dir(), "comms.v1-name-addressed.ndjson")); err != nil {
 		t.Fatalf("migration backup: %v", err)
-	}
-}
-
-func TestRenderAgentProfileIsLongLivedDomainContext(t *testing.T) {
-	text := renderAgentProfile("hub-dev", AgentProfile{
-		AgentID: "sess_hub", Version: 3, Identity: "Hub maintainer", Domain: "Long-lived agents", Scope: "Owns hub",
-	})
-	for _, want := range []string{"<agent_profile", "Hub maintainer", "Long-lived agents", "across turns"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("rendered profile missing %q: %s", want, text)
-		}
 	}
 }

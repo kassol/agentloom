@@ -57,14 +57,18 @@ func TestThreadArtifactsStageSendAndPublish(t *testing.T) {
 	}
 	turn := lastRequestParams(t, logPath, "turn/start")
 	input, ok := turn["input"].([]any)
-	if !ok || len(input) != 2 {
+	if !ok || len(input) != 3 {
 		t.Fatalf("artifact input = %#v", turn["input"])
 	}
 	text, _ := input[0].(map[string]any)
-	if text["type"] != "text" || !strings.Contains(text["text"].(string), `<loom_attachments version="1"`) || !strings.Contains(text["text"].(string), document.Path) {
-		t.Fatalf("artifact manifest = %#v", text)
+	if text["type"] != "text" || text["text"] != "Review these files" {
+		t.Fatalf("original artifact input = %#v", text)
 	}
-	localImage, _ := input[1].(map[string]any)
+	context, _ := input[1].(map[string]any)
+	if context["type"] != "text" || !strings.Contains(context["text"].(string), `<loom_context`) || !strings.Contains(context["text"].(string), document.Path) {
+		t.Fatalf("artifact context = %#v", context)
+	}
+	localImage, _ := input[2].(map[string]any)
 	if localImage["type"] != "localImage" || localImage["path"] != image.Path {
 		t.Fatalf("local image input = %#v", localImage)
 	}

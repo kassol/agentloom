@@ -390,63 +390,6 @@ func (h *Hub) migrateCommAgentIDsLocked() error {
 	return h.st.ReplaceComms(records)
 }
 
-func renderAgentProfile(name string, profile AgentProfile) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "<agent_profile version=%q agent_id=%q name=%q>\n", fmt.Sprint(profile.Version), profile.AgentID, name)
-	writeXMLCDATA(&b, "identity", profile.Identity)
-	writeXMLCDATA(&b, "domain", profile.Domain)
-	writeXMLCDATA(&b, "scope", profile.Scope)
-	if profile.Identity == "" && profile.Domain == "" && profile.Scope == "" {
-		writeXMLText(&b, "status", "cleared")
-	}
-	b.WriteString("</agent_profile>\n")
-	b.WriteString("This is your durable collaboration profile. Use it to understand your long-term domain and scope across turns.")
-	return b.String()
-}
-
-func (h *Hub) injectProfileIfNeeded(agentID string, rt *runtime) error {
-	h.mu.Lock()
-	meta := h.agents[agentID]
-	if meta == nil {
-		h.mu.Unlock()
-		return errf(404, "agent vanished")
-	}
-	profile := h.profiles[agentID]
-	if profile == nil || profile.Version <= meta.ProfileVersionSeen {
-		h.mu.Unlock()
-		return nil
-	}
-	profileCopy := *profile
-	name := meta.Name
-	threadID := meta.ThreadID
-	h.mu.Unlock()
-
-	_, err := rt.client.Request("thread/inject_items", map[string]any{
-		"threadId": threadID,
-		"items": []map[string]any{{
-			"type": "message", "role": "developer",
-			"content": []map[string]any{{"type": "input_text", "text": renderAgentProfile(name, profileCopy)}},
-		}},
-	}, 30*time.Second)
-	if err != nil {
-		return errf(500, "inject agent profile: %s", err)
-	}
-
-	h.mu.Lock()
-	if meta := h.agents[agentID]; meta != nil && meta.ProfileVersionSeen < profileCopy.Version {
-		previous := *meta
-		meta.ProfileVersionSeen = profileCopy.Version
-		meta.UpdatedAt = now()
-		if err := h.persistAgentsLocked(); err != nil {
-			*meta = previous
-			h.mu.Unlock()
-			return errf(500, "persist injected profile version: %s", err)
-		}
-	}
-	h.mu.Unlock()
-	return nil
-}
-
 func (h *Hub) injectDeveloperContext(agentID string, rt *runtime, content string) error {
 	h.mu.Lock()
 	meta := h.agents[agentID]
@@ -464,7 +407,7 @@ func (h *Hub) injectDeveloperContext(agentID string, rt *runtime, content string
 		}},
 	}, 30*time.Second)
 	if err != nil {
-		return errf(500, "inject conversation context: %s", err)
+		return errf(500, "inject Developer context: %s", err)
 	}
 	return nil
 }

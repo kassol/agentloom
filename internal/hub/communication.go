@@ -643,8 +643,8 @@ func (h *Hub) deliverNextQueuedForTarget(target string, timeout time.Duration) (
 		return nil, false
 	}
 
-	input, topicCursor := h.formatAgentEnvelopeForDelivery(snapshot)
-	result, err := h.sendTaskWithArtifacts(snapshot.ToAgentID, input, nil, timeout, "", "", "", snapshot.ID, snapshot.TopicID, "")
+	input, source, topicCursor := h.agentMessageTurnInput(snapshot)
+	result, err := h.sendTaskWithContext(snapshot.ToAgentID, input, nil, timeout, "", "", snapshot.ID, snapshot.TopicID, "", source)
 	if err == nil && snapshot.TopicID != "" {
 		h.markTopicContextDelivered(snapshot.TopicID, snapshot.ToAgentID, topicCursor)
 	}
@@ -904,9 +904,17 @@ func formatAgentEnvelope(msg *AgentMessage) string {
 }
 
 func formatTriggerEnvelopeAt(msg *AgentMessage, currentTime string) string {
+	return formatTriggerEnvelopeModeAt(msg, currentTime, false)
+}
+
+func formatTriggerEnvelopeContextAt(msg *AgentMessage, currentTime string) string {
+	return formatTriggerEnvelopeModeAt(msg, currentTime, true)
+}
+
+func formatTriggerEnvelopeModeAt(msg *AgentMessage, currentTime string, originalInputReference bool) string {
 	event := msg.TriggerEvent
 	if event == nil {
-		return formatAgentEnvelopeAt(msg, currentTime)
+		return formatAgentEnvelopeModeAt(msg, currentTime, originalInputReference)
 	}
 	var b strings.Builder
 	b.WriteString(`<external_trigger version="1" id="`)
@@ -946,7 +954,11 @@ func formatTriggerEnvelopeAt(msg *AgentMessage, currentTime string) string {
 	}
 	b.WriteString(" />\n")
 	writeXMLCDATA(&b, "summary", event.Summary)
-	writeXMLCDATA(&b, "resume_instruction", event.ResumeInstruction)
+	if originalInputReference {
+		b.WriteString("  <resume_instruction source=\"original_input\" />\n")
+	} else {
+		writeXMLCDATA(&b, "resume_instruction", event.ResumeInstruction)
+	}
 	writeXMLText(&b, "instruction", "Treat this event as a reason to re-check current authoritative state, not as proof that the original waiting condition is satisfied.")
 	if len(event.Snapshot) > 0 {
 		if raw, err := json.Marshal(event.Snapshot); err == nil {
@@ -958,6 +970,14 @@ func formatTriggerEnvelopeAt(msg *AgentMessage, currentTime string) string {
 }
 
 func formatAgentEnvelopeAt(msg *AgentMessage, currentTime string) string {
+	return formatAgentEnvelopeModeAt(msg, currentTime, false)
+}
+
+func formatAgentEnvelopeContextAt(msg *AgentMessage, currentTime string) string {
+	return formatAgentEnvelopeModeAt(msg, currentTime, true)
+}
+
+func formatAgentEnvelopeModeAt(msg *AgentMessage, currentTime string, originalInputReference bool) string {
 	var b strings.Builder
 	b.WriteString(`<agent_message version="1" id="`)
 	b.WriteString(xmlEscape(msg.ID))
@@ -983,7 +1003,11 @@ func formatAgentEnvelopeAt(msg *AgentMessage, currentTime string) string {
 	if msg.Response == "required" {
 		writeXMLText(&b, "reply_command", "loom msg --reply-to "+msg.ID+" --from "+msg.To+" --body \"...\"")
 	}
-	writeXMLCDATA(&b, "body", msg.Body)
+	if originalInputReference {
+		b.WriteString("  <body source=\"original_input\" />\n")
+	} else {
+		writeXMLCDATA(&b, "body", msg.Body)
+	}
 	b.WriteString("</agent_message>")
 	return b.String()
 }

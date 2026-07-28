@@ -2,6 +2,7 @@
 // Items are keyed by itemId so streamed deltas, item/updated and
 // item/completed all land on the same block.
 import type { LoomEvent } from "./types";
+import { splitTrailingLoomContext } from "./pages/agent/LoomContextView";
 
 export interface ExternalAttachment {
   id?: string;
@@ -315,15 +316,20 @@ function externalThreadContext(root: Element): ExternalThreadContext | undefined
   };
 }
 
-function agentMessageBody(root: Element): string {
+function agentMessageBody(root: Element, originalInput = ""): string {
   const body = childText(root, "body");
+  const bodyElement = directChildElement(root, "body");
+  const resolvedBody =
+    !body && bodyElement?.getAttribute("source") === "original_input"
+      ? originalInput
+      : body;
   // Older chub callers commonly passed multiline text as literal `\\n` sequences.
   // Interpret that legacy shape for display only; raw keeps the exact envelope.
-  if (body.includes("\n") || !body.includes("\\n")) return body;
-  return body.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n");
+  if (resolvedBody.includes("\n") || !resolvedBody.includes("\\n")) return resolvedBody;
+  return resolvedBody.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n");
 }
 
-function agentMessageBlock(text: string, ts: string): Block | null {
+function agentMessageBlock(text: string, ts: string, originalInput = ""): Block | null {
   const raw = (text || "").trim();
   if (!raw.startsWith("<agent_message")) return null;
   try {
@@ -343,7 +349,7 @@ function agentMessageBlock(text: string, ts: string): Block | null {
       from: childText(root, "from"),
       to: childText(root, "to"),
       subject: childText(root, "subject"),
-      body: agentMessageBody(root),
+      body: agentMessageBody(root, originalInput),
       raw,
       response,
       replyTo: replyTo || undefined,
@@ -354,12 +360,17 @@ function agentMessageBlock(text: string, ts: string): Block | null {
   }
 }
 
-function externalMessageBlock(text: string, ts: string): Block | null {
+function externalMessageBlock(text: string, ts: string, originalInput = ""): Block | null {
   const raw = (text || "").trim();
-  if (!raw.startsWith("<inbox_message")) return null;
+  if (!raw.includes("<inbox_message")) return null;
   try {
-    const doc = new DOMParser().parseFromString(raw, "application/xml");
-    const root = doc.documentElement;
+    const wrapped = raw.startsWith("<inbox_message")
+      ? raw
+      : `<loom_external_payload>${raw}</loom_external_payload>`;
+    const doc = new DOMParser().parseFromString(wrapped, "application/xml");
+    const root = doc.documentElement.nodeName === "inbox_message"
+      ? doc.documentElement
+      : directChildElement(doc.documentElement, "inbox_message");
     if (!root || root.nodeName !== "inbox_message" || doc.getElementsByTagName("parsererror").length > 0) {
       return null;
     }
@@ -390,7 +401,11 @@ function externalMessageBlock(text: string, ts: string): Block | null {
       replyInstruction: directChildText(root, "reply_instruction") || undefined,
       replyCommand: directChildText(root, "reply_command") || undefined,
       noReplyCommand: directChildText(root, "no_reply_command") || undefined,
-      body: directChildText(root, "body"),
+      body:
+        directChildText(root, "body") ||
+        (directChildElement(root, "body")?.getAttribute("source") === "original_input"
+          ? originalInput
+          : ""),
       raw,
       attachments,
       threadContext: externalThreadContext(root),
@@ -461,7 +476,7 @@ function stableTextHash(value: string): string {
   return (hash >>> 0).toString(36);
 }
 
-function topicContextBlock(text: string, ts: string): Block | null {
+function topicContextBlock(text: string, ts: string, originalInput = ""): Block | null {
   const raw = (text || "").trim();
   if (!raw.startsWith("<loom_topic_context") && !raw.startsWith("<owner_topic_")) return null;
   try {
@@ -498,7 +513,7 @@ function topicContextBlock(text: string, ts: string): Block | null {
       payload = {
         kind: "agentMessage",
         label: variant.toUpperCase(),
-        body: agentMessageBody(agentMessage),
+        body: agentMessageBody(agentMessage, originalInput),
         subject: directChildText(agentMessage, "subject") || undefined,
         from: directChildText(agentMessage, "from") || undefined,
         to: directChildText(agentMessage, "to") || undefined,
@@ -628,9 +643,35 @@ function extractLoomAttachments(text: string): { text: string; attachments: Exte
   return { text: text.slice(0, match.index).trimEnd(), attachments };
 }
 
+function loomManagedWorkBlock(text: string, ts: string): Block | null {
+  const split = splitTrailingLoomContext(text);
+  if (!split.context) return null;
+  try {
+    const document = new DOMParser().parseFromString(split.context.raw, "application/xml");
+    if (document.getElementsByTagName("parsererror").length > 0) return null;
+    const turn = directChildElement(document.documentElement, "loom_turn_context");
+    if (!turn || turn.getAttribute("origin") === "owner") return null;
+    const payload = directChildText(turn, "payload");
+    if (!payload) return null;
+    return (
+      topicContextBlock(payload, ts, split.content) ||
+      externalTriggerBlock(payload, ts) ||
+      agentMessageBlock(payload, ts, split.content) ||
+      externalMessageBlock(payload, ts, split.content)
+    );
+  } catch {
+    return null;
+  }
+}
+
 function userBlock(ts: string, rawText: string, rawAttachments: any[] = []): Block {
   const extracted = extractLoomAttachments(rawText);
-  const special = topicContextBlock(extracted.text, ts) || externalTriggerBlock(extracted.text, ts) || agentMessageBlock(extracted.text, ts) || externalMessageBlock(extracted.text, ts);
+  const special =
+    loomManagedWorkBlock(extracted.text, ts) ||
+    topicContextBlock(extracted.text, ts) ||
+    externalTriggerBlock(extracted.text, ts) ||
+    agentMessageBlock(extracted.text, ts) ||
+    externalMessageBlock(extracted.text, ts);
   if (special) return special;
   const attachments = mergeAttachments(extracted.attachments, rawAttachments.map(normalizeAttachment));
   return { kind: "user", ts, text: extracted.text, attachments };

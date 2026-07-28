@@ -938,6 +938,40 @@ func (h *Hub) formatAgentEnvelopeForDelivery(message *AgentMessage) (string, int
 	return context + "\n" + base, cursor
 }
 
+func (h *Hub) agentMessageTurnInput(message *AgentMessage) (string, turnContextSource, int64) {
+	if message == nil {
+		return "", internalBusinessContext("internal_agent", "agent_message", "", "", ""), 0
+	}
+	originalInput := message.Body
+	workContext := formatAgentEnvelopeContextAt(message, now())
+	displayText := formatAgentEnvelope(message)
+	origin := "internal_agent"
+	kind := "agent_message"
+	if message.TriggerID != "" && message.TriggerEvent != nil {
+		origin = "external_trigger"
+		kind = "trigger"
+		workContext = formatTriggerEnvelopeContextAt(message, now())
+		displayText = formatTriggerEnvelopeAt(message, now())
+		if strings.TrimSpace(message.TriggerEvent.ResumeInstruction) != "" {
+			originalInput = message.TriggerEvent.ResumeInstruction
+		}
+	} else if message.ScheduleID != "" {
+		origin = "schedule"
+		kind = "schedule"
+	}
+	cursor := int64(0)
+	if message.TopicID != "" {
+		if topicContext, topicCursor, err := h.topicContextEnvelope(message.TopicID, message.ToAgentID); err == nil {
+			workContext = topicContext + "\n" + workContext
+			displayText = topicContext + "\n" + displayText
+			cursor = topicCursor
+		}
+	}
+	source := internalBusinessContext(origin, kind, message.ID, message.TopicID, workContext)
+	source.DisplayText = displayText
+	return originalInput, source, cursor
+}
+
 func (h *Hub) SendTopicInput(id string, params TopicInputParams) (SendResult, error) {
 	params.Text = strings.TrimSpace(params.Text)
 	if params.Text == "" {
@@ -965,10 +999,11 @@ func (h *Hub) SendTopicInput(id string, params TopicInputParams) (SendResult, er
 	b.WriteString("\n<owner_topic_input version=\"1\" topic_id=\"")
 	b.WriteString(xmlEscape(topicID))
 	b.WriteString("\">\n")
-	writeXMLCDATA(&b, "message", params.Text)
+	b.WriteString("  <message source=\"original_input\" />\n")
 	writeXMLText(&b, "instruction", "Treat this as Owner input for the Topic. If it changes scope, responsibility, or completion criteria, the responsible Agent must update and re-plan the shared Topic before downstream work continues.")
 	b.WriteString("</owner_topic_input>")
-	result, err := h.sendTaskWithTopicDisplay(targetID, b.String(), summarizeTopicText(params.Text), time.Duration(params.TimeoutSec)*time.Second, topicID)
+	source := authenticatedOwnerContext("topic_input", topicID, topicID, b.String())
+	result, err := h.sendTaskWithContext(targetID, params.Text, nil, time.Duration(params.TimeoutSec)*time.Second, "", "", "", topicID, summarizeTopicText(params.Text), source)
 	if err != nil {
 		return SendResult{}, err
 	}

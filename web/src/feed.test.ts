@@ -110,6 +110,110 @@ describe("rollout history projection", () => {
     expect(summarizeTask(text)).toBe("TOPIC · Release candidate · Validate package");
   });
 
+  it("restores a v2 Agent Message from original input plus trailing Loom context", () => {
+    const text = `Check the current implementation.<loom_context version="1" epoch_id="window:test">
+  <loom_turn_context origin="internal_agent" trust="loom_managed" authority="business_input" kind="agent_message" ref_id="msg_v2">
+    <original_input location="preceding_turn_input_item" />
+    <payload><![CDATA[<agent_message version="1" id="msg_v2" response="required" status="open">
+  <from>loom-coach</from><to>loom-product</to><subject>Implementation check</subject>
+  <body source="original_input" />
+</agent_message>]]></payload>
+  </loom_turn_context>
+</loom_context>`;
+    const state = reduceFeed(emptyFeed, {
+      seq: 0,
+      ts: "",
+      type: "__history__",
+      data: { turns: [{ items: [{ type: "user", timestamp: "2026-07-28T01:00:00Z", text }] }] },
+    });
+    expect(state.blocks).toHaveLength(1);
+    expect(state.blocks[0]).toMatchObject({
+      kind: "agentMessage",
+      id: "msg_v2",
+      variant: "req",
+      from: "loom-coach",
+      to: "loom-product",
+      subject: "Implementation check",
+      body: "Check the current implementation.",
+    });
+  });
+
+  it("restores a v2 External Inbox payload with preceding Conversation context", () => {
+    const text = `Review https://example.test/pr/8<loom_context version="1" epoch_id="window:test">
+  <loom_turn_context origin="external_connector" trust="managed_external" authority="business_input" kind="inbox_message" ref_id="inb_1">
+    <original_input location="preceding_turn_input_item" />
+    <payload><![CDATA[<conversation_context version="1" membership_id="mem_1" provider="parall">
+  <display_name><![CDATA[Parall dev]]]]><![CDATA[></display_name>
+</conversation_context>
+This trusted context applies only to the immediately following inbox message.
+<inbox_message version="1" id="imsg_1" inbox_item_id="inb_1" expectation="optional">
+  <origin provider="parall" address_id="addr_1" />
+  <membership id="mem_1" name="Parall dev" version="4" />
+  <sender id="usr_1">zzh</sender>
+  <conversation id="chat_1" thread_id="thread_1" type="thread" />
+  <reply_policy>final_answer</reply_policy>
+  <body source="original_input" />
+</inbox_message>]]></payload>
+  </loom_turn_context>
+</loom_context>`;
+    const project = (type: "__history__" | "loom/user-message") =>
+      reduceFeed(emptyFeed, {
+        seq: 1,
+        ts: "2026-07-28T09:32:50Z",
+        type,
+        data: type === "__history__"
+          ? { turns: [{ items: [{ type: "user", timestamp: "2026-07-28T09:32:50Z", text }] }] }
+          : { text },
+      }).blocks[0];
+
+    for (const block of [project("__history__"), project("loom/user-message")]) {
+      expect(block).toMatchObject({
+        kind: "externalMessage",
+        id: "imsg_1",
+        inboxItemId: "inb_1",
+        provider: "parall",
+        sender: "zzh",
+        membershipName: "Parall dev",
+        conversationId: "chat_1",
+        body: "Review https://example.test/pr/8",
+      });
+    }
+  });
+
+  it("restores a v2 Topic Agent Message without treating it as Owner input", () => {
+    const text = `Run the packaged smoke.<loom_context version="1" epoch_id="window:test">
+  <loom_turn_context origin="internal_agent" trust="loom_managed" authority="business_input" kind="agent_message" ref_id="msg_topic" topic_id="tpc_v2">
+    <original_input location="preceding_turn_input_item" />
+    <payload><![CDATA[<loom_topic_context version="1" topic_id="tpc_v2" status="active" brief_version="2" event_seq="4">
+  <title>Release candidate</title>
+  <responsible_agent>release-lead</responsible_agent>
+  <your_responsibility>Validate the package.</your_responsibility>
+</loom_topic_context>
+<agent_message version="1" id="msg_topic" response="required" status="open" topic_id="tpc_v2">
+  <from>release-lead</from><to>edge</to><subject>Validate package</subject>
+  <body source="original_input" />
+</agent_message>]]></payload>
+  </loom_turn_context>
+</loom_context>`;
+    const state = reduceFeed(emptyFeed, {
+      seq: 0,
+      ts: "",
+      type: "__history__",
+      data: { turns: [{ items: [{ type: "user", text }] }] },
+    });
+    expect(state.blocks[0]).toMatchObject({
+      kind: "topicContext",
+      topicId: "tpc_v2",
+      payload: {
+        kind: "agentMessage",
+        from: "release-lead",
+        to: "edge",
+        subject: "Validate package",
+        body: "Run the packaged smoke.",
+      },
+    });
+  });
+
   it("distinguishes Owner Topic input from a Turn intervention", () => {
     const context = `<loom_topic_context version="1" topic_id="tpc_2" status="active" brief_version="1" event_seq="2"><title>Canary</title><responsible_agent>lead</responsible_agent></loom_topic_context>`;
     const ownerInput = `${context}<owner_topic_input version="1" topic_id="tpc_2"><message><![CDATA[Keep this **read-only**.]]></message></owner_topic_input>`;

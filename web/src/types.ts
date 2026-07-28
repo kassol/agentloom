@@ -21,7 +21,6 @@ export interface Agent {
   approvalPolicy: string;
   model?: string;
   effort?: string;
-  profileVersionSeen?: number;
   status: string;
   currentTask: string;
   currentTurnId: string;

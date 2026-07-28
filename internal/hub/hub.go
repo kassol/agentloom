@@ -64,22 +64,21 @@ type TurnSummary struct {
 // execution binding; Profile, links and external addresses remain attached to
 // the Agent even if that binding is migrated later.
 type Agent struct {
-	ID                 string       `json:"id"`
-	Name               string       `json:"name"`
-	Cwd                string       `json:"cwd"`
-	ThreadID           string       `json:"threadId"`
-	Sandbox            string       `json:"sandbox"`
-	ApprovalPolicy     string       `json:"approvalPolicy"`
-	Model              string       `json:"model,omitempty"`
-	Effort             string       `json:"effort,omitempty"`
-	ProfileVersionSeen int          `json:"profileVersionSeen,omitempty"`
-	Status             string       `json:"status"`
-	CurrentTask        string       `json:"currentTask"`
-	CurrentTurnID      string       `json:"currentTurnId"`
-	LastError          string       `json:"lastError"`
-	LastTurn           *TurnSummary `json:"lastTurn"`
-	CreatedAt          string       `json:"createdAt"`
-	UpdatedAt          string       `json:"updatedAt"`
+	ID             string       `json:"id"`
+	Name           string       `json:"name"`
+	Cwd            string       `json:"cwd"`
+	ThreadID       string       `json:"threadId"`
+	Sandbox        string       `json:"sandbox"`
+	ApprovalPolicy string       `json:"approvalPolicy"`
+	Model          string       `json:"model,omitempty"`
+	Effort         string       `json:"effort,omitempty"`
+	Status         string       `json:"status"`
+	CurrentTask    string       `json:"currentTask"`
+	CurrentTurnID  string       `json:"currentTurnId"`
+	LastError      string       `json:"lastError"`
+	LastTurn       *TurnSummary `json:"lastTurn"`
+	CreatedAt      string       `json:"createdAt"`
+	UpdatedAt      string       `json:"updatedAt"`
 	// Source is "edge" for Agents mirrored read-only from pinix-edge's
 	// registry (they are re-imported each startup and never persisted here);
 	// empty for Agents CodexLoom owns. Starting a Turn promotes an edge mirror
@@ -237,6 +236,8 @@ type turnState struct {
 	agentMessageID    string
 	topicID           string
 	handlingAttemptID string
+	contextAttemptID  string
+	contextEpochID    string
 	finalAnswer       string
 	startedAt         time.Time
 	lastActivity      time.Time
@@ -270,6 +271,7 @@ type Hub struct {
 	st *store.Store
 
 	mu                      sync.Mutex
+	contextCoverageMu       sync.Mutex
 	agents                  map[string]*Agent
 	comms                   map[string]*AgentMessage
 	commOrder               []string
@@ -278,6 +280,7 @@ type Hub struct {
 	topics                  map[string]*Topic
 	profiles                map[string]*AgentProfile
 	teamLinks               map[string]*TeamRelationship
+	loomAgentPrompt         *LoomAgentPrompt
 	collaborationGroups     map[string]*CollaborationGroup
 	organizationLinks       map[string]*OrganizationRelationship
 	connections             map[string]*PlatformConnection
@@ -321,6 +324,7 @@ type Hub struct {
 	steerTurn               func(threadID, expectedTurnID, input string, timeout time.Duration) (string, error)
 	dispatchHumanAnswer     func(key, text string) (SendResult, error)
 	observeTrigger          triggerObserver
+	contextHistoryProbe     contextHistoryProbeFunc
 }
 
 // New is retained for in-process callers that cannot recover from an invalid
@@ -390,6 +394,9 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	}
 	if h.profiles == nil {
 		h.profiles = map[string]*AgentProfile{}
+	}
+	if err := h.loadLoomAgentPrompt(); err != nil {
+		return nil, fmt.Errorf("load Loom Agent Prompt: %w", err)
 	}
 	if err := h.st.LoadTeamLinks(&h.teamLinks); err != nil {
 		return nil, fmt.Errorf("load team links: %w", err)
@@ -1141,6 +1148,7 @@ func (h *Hub) rebindActiveTurnIDLocked(meta *Agent, turn *turnState, turnID stri
 	}
 	previousTurnID := turn.turnID
 	turn.turnID = turnID
+	h.rebindContextAttemptTurn(meta.ThreadID, turn.contextAttemptID, previousTurnID, turnID)
 
 	// Establish records that are still at the pre-start boundary first.
 	h.markInboxAttemptRunningLocked(turn)
@@ -1255,6 +1263,9 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 		}
 		if turnID != "" && rt.activeTurn.turnID == "" {
 			h.rebindActiveTurnIDLocked(meta, rt.activeTurn, turnID)
+		}
+		if isModelProducedNotification(method) {
+			h.observeContextModelEventLocked(meta, rt.activeTurn)
 		}
 	}
 

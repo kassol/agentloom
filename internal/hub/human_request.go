@@ -380,10 +380,12 @@ func (h *Hub) deliverAnsweredHumanRequest(agentID string) (HumanRequest, bool) {
 	input := formatHumanInputResponse(request)
 	topicCursor := int64(0)
 	topicContextIncluded := false
+	topicContext := ""
 	if request.TopicID != "" {
 		context, cursor, contextErr := h.topicContextEnvelope(request.TopicID, request.AgentID)
 		if contextErr == nil {
 			input = context + "\n" + input
+			topicContext = context
 			topicCursor = cursor
 			topicContextIncluded = true
 		}
@@ -393,11 +395,12 @@ func (h *Hub) deliverAnsweredHumanRequest(agentID string) (HumanRequest, bool) {
 	if dispatch != nil {
 		result, err = dispatch(request.AgentID, input)
 	} else {
+		workContext := formatHumanInputResponseContext(request)
 		if topicContextIncluded {
-			result, err = h.sendTaskWithTopic(request.AgentID, input, defaultInactivity, request.TopicID)
-		} else {
-			result, err = h.SendTask(request.AgentID, input, defaultInactivity)
+			workContext = topicContext + "\n" + workContext
 		}
+		source := authenticatedOwnerContext("needs_you_answer", request.ID, request.TopicID, workContext)
+		result, err = h.sendTaskWithContext(request.AgentID, request.Answer, nil, defaultInactivity, "", "", "", request.TopicID, "", source)
 	}
 	if err == nil && topicContextIncluded {
 		h.markTopicContextDelivered(request.TopicID, request.AgentID, topicCursor)
@@ -448,6 +451,31 @@ func formatHumanInputResponse(request HumanRequest) string {
 	b.WriteString(">\n")
 	writeXMLCDATA(&b, "question", request.Question)
 	writeXMLCDATA(&b, "answer", request.Answer)
+	if request.BlockedWork != "" {
+		writeXMLCDATA(&b, "blocked_work", request.BlockedWork)
+	}
+	b.WriteString("  <instruction>Use this answer to continue the related work if it is still relevant. Do not ask the same question again unless the answer is materially ambiguous.</instruction>\n")
+	b.WriteString("</human_input_response>")
+	return b.String()
+}
+
+func formatHumanInputResponseContext(request HumanRequest) string {
+	var b strings.Builder
+	b.WriteString(`<human_input_response version="1" request_id="`)
+	b.WriteString(xmlEscape(request.ID))
+	b.WriteString(`" source_turn_id="`)
+	b.WriteString(xmlEscape(request.SourceTurnID))
+	b.WriteString(`" expectation="`)
+	b.WriteString(xmlEscape(request.Expectation))
+	b.WriteString(`"`)
+	if request.TopicID != "" {
+		b.WriteString(` topic_id="`)
+		b.WriteString(xmlEscape(request.TopicID))
+		b.WriteString(`"`)
+	}
+	b.WriteString(">\n")
+	writeXMLCDATA(&b, "question", request.Question)
+	b.WriteString("  <answer source=\"original_input\" />\n")
 	if request.BlockedWork != "" {
 		writeXMLCDATA(&b, "blocked_work", request.BlockedWork)
 	}
