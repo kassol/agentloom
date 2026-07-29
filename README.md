@@ -222,6 +222,15 @@ system, or operating system for the Owner's company.
 
 CodexLoom is built on Codex. Codex continues to provide the agent runtime, thread history, and daily clients such as Desktop and Mobile. CodexLoom provides durable agent identity, long-term responsibility, organizational communication, external boundaries, and governance. Tasks and workflows can still run inside an agent, but they are not the primary objects governed by CodexLoom.
 
+## License
+
+CodexLoom is source-available under the
+[Elastic License 2.0 (ELv2)](LICENSE). It is not open source under the Open
+Source Initiative definition.
+
+Copyright 2026 yan5xu. Third-party dependencies and components remain subject
+to their respective license terms and copyright notices.
+
 ## Documentation
 
 - [Owner Guide（简体中文，权威版本）](docs/owner-guide.zh-CN.md)

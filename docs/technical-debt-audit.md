@@ -62,7 +62,7 @@ table is the current status and should be updated when later work changes it.
 | F-13 | Remediated for current domains | Runtime, Agent lifecycle, internal Communication, Integration/Ingress, Inbox, Outbox, external-message policy, and shutdown have focused Hub files. HTTP routes and CLI commands are registered by domain instead of one cross-domain function. Future domains should preserve these boundaries. |
 | F-14 | Remediated | Global SSE has durable IDs/replay; compacted cursors emit `loom/reconcile`, and every open WebUI pane refetches its authoritative projection/history. |
 | F-15 | Open | Tagged frontend contracts and automated component/E2E coverage remain missing. |
-| F-16 | Open | Required CI/release/restore gates remain missing. |
+| F-16 | Open | The repository license is now explicit; required CI/release/restore gates and the other public policy files remain missing. |
 
 ## Severity Model
 
@@ -570,8 +570,8 @@ state changes harder to reason about.
 - At audit time the working tree spans 124 changed files with 9,314 insertions
   and 4,751 deletions. This is not itself a bug, but it demonstrates that the
   current release unit is too broad for reliable rollback and review.
-- A public repository policy surface such as `SECURITY.md`, contribution rules,
-  and a license is absent.
+- At audit time, a public repository policy surface such as `SECURITY.md`,
+  contribution rules, and a license was absent.
 
 **Required remediation**
 

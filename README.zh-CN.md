@@ -197,6 +197,13 @@ CodexLoom 的治理对象不是一组模型参数，而是一个持续工作的 
 
 CodexLoom 建立在 Codex 之上。Codex 继续提供 Agent Runtime、Thread 历史以及 Desktop、Mobile 等日常客户端；CodexLoom 负责稳定 Agent 身份、长期职责、组织通信、外部边界和治理。Task 与 Workflow 仍可在 Agent 内部运行，但不是 CodexLoom 的核心治理对象。
 
+## License
+
+CodexLoom 以 [Elastic License 2.0（ELv2）](LICENSE) 采用
+source-available 方式提供源代码；它不是 Open Source Initiative 定义下的开源软件。
+
+Copyright 2026 yan5xu。第三方依赖和组件继续适用其各自的许可证条款与版权声明。
+
 ## Documentation
 
 - [Owner Guide：建立并使用长期 Codex Agent Team（权威版本）](docs/owner-guide.zh-CN.md)
