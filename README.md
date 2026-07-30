@@ -22,7 +22,7 @@ clear service surface while the responsible Domain Agents complete professional
 work within explicit identity, Conversation, authorization, and information
 boundaries.
 
-[Website](https://codexloom.ai/en/) · [中文官网](https://codexloom.ai/zh-cn/) · [Owner guide（简体中文，canonical）](docs/owner-guide.zh-CN.md) · [English guide](docs/owner-guide.md) · [Get started](#quick-start) · [Documentation](#documentation)
+[Website](https://codexloom.ai/en/) · [中文官网](https://codexloom.ai/zh-cn/) · [Owner guide（简体中文，canonical）](docs/owner-guide.zh-CN.md) · [English guide](docs/owner-guide.md) · [Get started](#quick-start) · [Community](#community) · [Documentation](#documentation)
 
 ## What Is CodexLoom
 
@@ -126,6 +126,17 @@ The same initial setup can be performed from the local CLI:
   --scope "Answer domain questions, preserve conclusions, and advise related agents"
 ./bin/loom thread send research "Establish a baseline for the current state of this domain"
 ```
+
+## Community
+
+Join the **CodexLoom Feishu community** to discuss the product and share
+experience with long-running Agent Teams.
+
+[Open the community directly in Feishu](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=871u698d-485a-4320-b23e-2a7f4b35f872&qr_code=true)
+
+<a href="https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=871u698d-485a-4320-b23e-2a7f4b35f872&amp;qr_code=true"><img src="docs/assets/codexloom-feishu-community-qr.png" alt="QR code for the CodexLoom Feishu community" width="240"></a>
+
+Scan the QR code with Feishu, or use the direct link on mobile.
 
 ## Why Long-Lived Domain Agents
 

@@ -18,7 +18,7 @@ Interface Agent 把成熟能力交付给客户、社区与协作者。
 对内，持续管理一支长期协作的 Agent Team；对外，由一个明确的服务入口承接关系，
 背后的 Domain Agents 在身份、Conversation、授权与信息边界内完成专业工作。
 
-[中文官网](https://codexloom.ai/zh-cn/) · [English website](https://codexloom.ai/en/) · [Owner Guide（权威版本）](docs/owner-guide.zh-CN.md) · [开始使用](#quick-start) · [完整文档](#documentation)
+[中文官网](https://codexloom.ai/zh-cn/) · [English website](https://codexloom.ai/en/) · [Owner Guide（权威版本）](docs/owner-guide.zh-CN.md) · [开始使用](#quick-start) · [社区](#社区) · [完整文档](#documentation)
 
 ## What Is CodexLoom
 
@@ -103,6 +103,16 @@ make release
   --scope "回答领域问题，沉淀结论，并向相关 Agent 提供建议"
 ./bin/loom thread send research "建立这个领域的现状基线"
 ```
+
+## 社区
+
+加入 **CodexLoom 飞书交流群**，交流产品使用和长期 Agent Team 的实践经验。
+
+[在飞书中直接打开交流群](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=871u698d-485a-4320-b23e-2a7f4b35f872&qr_code=true)
+
+<a href="https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=871u698d-485a-4320-b23e-2a7f4b35f872&amp;qr_code=true"><img src="docs/assets/codexloom-feishu-community-qr.png" alt="CodexLoom 飞书交流群二维码" width="240"></a>
+
+请使用飞书扫描二维码，或在手机端点击上方链接直接打开。
 
 ## Why Long-Lived Domain Agents
 
