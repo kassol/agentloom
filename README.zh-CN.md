@@ -4,7 +4,7 @@
 
 > **Loom your Codex.**
 
-**面向高级个人用户的长期 Codex Agent Team 工作环境**
+**一个面向长期 Codex Agent 的工作环境**
 
 [English](README.md) · **简体中文**
 
@@ -12,17 +12,25 @@
 > Owner-facing 正文的权威版本与主要审阅文本。英文 README 与 Guide 是译本，
 > 不应独立引入新的产品含义。
 
-CodexLoom 帮助一个人把持续发生的工作交给一支持续在岗的领域 Agent 团队。
+让同一个 Agent 持续负责一个 Domain，让多个 Agent 组成一支受治理的 Team，并通过
+Interface Agent 把成熟能力交付给客户、社区与协作者。
 
-它通过 Profile 明确 Agent 的长期领域与职责，以 Codex Thread 延续工作上下文，并让这些 Agent 通过通信、分工和清晰的对外边界形成一个持续协作的组织。
+对内，持续管理一支长期协作的 Agent Team；对外，由一个明确的服务入口承接关系，
+背后的 Domain Agents 在身份、Conversation、授权与信息边界内完成专业工作。
 
-[Owner Guide（权威版本）](docs/owner-guide.zh-CN.md) · [为什么是长期 Agent](#why-long-lived-domain-agents) · [开始使用](#quick-start) · [完整文档](#documentation)
+[中文官网](https://codexloom.ai/zh-cn/) · [English website](https://codexloom.ai/en/) · [Owner Guide（权威版本）](docs/owner-guide.zh-CN.md) · [开始使用](#quick-start) · [完整文档](#documentation)
 
 ## What Is CodexLoom
 
-CodexLoom 建立在 Codex 之上。它不重新实现 Agent Runtime，也不复制 Thread 历史，而是在 Codex 提供的 Thread、Turn、工具和客户端之上增加稳定的 Agent 身份、Profile、组织关系、通信、外部平台集成和治理能力。
+CodexLoom 建立在 Codex 之上。它不重新实现 Agent Runtime，也不复制 Thread 历史；
+它让一条 Codex Thread 成为长期 Domain Agent 的持续工作空间，并在此之上增加稳定
+身份、Profile、Team 关系、有界协作、Human 治理与受治理的对外交付。
 
-在 CodexLoom 中，一个 Agent 拥有稳定 ID、名称、Profile 和主要 Thread。用户可以通过 Codex Desktop、Mobile 或 CodexLoom WebUI 继续同一个 Thread；其他 Agent 通过 `loom` CLI 找到它并发送消息；外部协作者则可以在飞书、Slack、Parall 等原有工作环境中与它协作。
+在 CodexLoom 中，一个 Agent 拥有稳定 ID、名称、Profile 和主要 Thread。同一个
+Agent 可以通过 Codex Desktop、Mobile 或 CodexLoom WebUI 恢复当前工作；其他
+Agent 通过有界的 Message 与 Topic 协作，并消费明确交接的受管 Artifact，不会恢复
+这个 Agent 的主要 Thread。外部协作者则可以通过受治理的 Interface Agent，在飞书、
+Slack、Parall 等原有工作环境中协作。
 
 先让一个长期 Agent 持续负责一项工作。当真实工作反复暴露稳定的负载、上下文或专业判断边界时，Owner 再把责任分给更多 Agent，并声明它们如何协作。需要进入外部组织时，Owner 可以为 Agent 建立受治理的外部身份，并在每个 Conversation 中定义不同角色。Lead、Internal Agent 和 Interface Agent 是可选的组织模式，不是系统硬编码的 Agent 类型。
 
@@ -35,8 +43,14 @@ CodexLoom 建立在 Codex 之上。它不重新实现 Agent Runtime，也不复�
 - **长期 Agent**：为 Agent 维护稳定身份、可修改名称、主要 Thread、Profile 和模型配置。
 - **一个 Thread，多种入口**：从 Codex Desktop、Mobile、WebUI 和 CLI 操作同一个 Thread，并实时同步状态与消息。
 - **Agent 间通信**：通过 Messages 发送、排队和回复消息，并保留处理状态与完整历史。
-- **团队结构**：使用 Team List 和可拖拽 Team Map 查看显式关系及真实通信中观察到的协作。
-- **外部组织接入**：通过飞书、Slack 和 Parall 管理外部身份、Conversation Membership、Inbox 和 Outbox。
+- **有界协作与 Human 决定**：通过 Topics 协调跨 Agent 工作，通过 Needs You
+  请求 Owner 作出明确决定，并通过受管 Artifacts 交接最终文件。
+- **团队结构**：通过可拖拽的 Organization、Collaboration 和 Activity 视图分别查看
+  正式责任、声明的跨 Domain 协作与 Message 证据；Directory 保留精确的 Agent 清单。
+- **Overview 与治理证据**：查看 Status、Daily Activity、Capacity signals，以及
+  token/context/cache/model usage，但不把这些指标当成员工绩效、利用率或自动组织结论。
+- **受治理的对外交付**：通过飞书、Slack 和 Parall 管理外部身份、Conversation
+  Membership、Inbox 和 Outbox，并由 Interface Agent 承担明确的组织边界。
 - **持续运营**：使用 Schedules 与持久外部 Triggers、全局运行状态、主动备份和等待 active Turn 的优雅重启。
 
 Lead、Internal Agent 和 Interface Agent 目前通过 Profile、显式关系、Messages 和 Conversation Membership 组合表达；专用的层级消息策略和组织模板仍在继续建模。
@@ -159,13 +173,20 @@ Product Lead
 
 > **IM 集成不是把 Agent 简单绑定到外部账号，而是允许 Agent 组织设计自己的对外边界。**
 
-高级用户会把长期协作的 Agent 作为伙伴带入原有工作环境。Agent 组织可以设置专门负责外部沟通的 Interface Agent：它持续维护外部关系和沟通上下文，需要领域判断时向 Lead 询问，取得结论后面向外部回应，并将重要反馈带回内部组织。
+高级用户可以通过 Interface Agent，把成熟的 Domain 能力带入已有工作环境。它从受治理的
+Conversation Membership 接收工作，澄清请求与边界，把有界工作交给对应 Domain
+Agents，并在决定或承诺需要授权时请求 Human 介入。当 Membership policy、provider
+能力与真实授权允许时，它把结果送回原 Conversation，并保留 provider receipt。
 
 ```text
-飞书 / Slack / Parall  <->  Interface Agent  <->  Lead  <->  Internal Agents
+飞书 / Slack / Parall  <->  Interface Agent  <->  Domain Agent Team
 ```
 
 一个 Agent 可以拥有多个平台身份，也可以进入多个群聊。外部身份说明 Agent 在哪里可达；Conversation Membership 则定义它在具体会话中的角色，包括应该关注什么、什么时候发言、什么不能说，以及何时必须向内部负责人确认。同一个 Agent 因而可以在不同 Channel 中承担不同职责，而不必复制成多个彼此割裂的 Agent。
+
+Interface Agent 是一种组织模式，不是硬编码的 Agent 类型，也不是自动 Gateway。
+External Membership 不会自动向外部主体开放内部 Agent、Thread、工具、凭证或决策权；
+内部路由与信息披露仍受明确授权和信息边界约束。
 
 | 状态 | 平台 |
 |---|---|

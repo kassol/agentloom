@@ -4,7 +4,7 @@
 
 > **Loom your Codex.**
 
-**A work environment for advanced individuals who run a long-lived Codex Agent Team.**
+**A working environment for long-running Codex Agents.**
 
 **English** · [简体中文](README.zh-CN.md)
 
@@ -13,18 +13,31 @@
 > README and Guide are translations and must not introduce independent product
 > meaning.
 
-CodexLoom helps one person turn continuing work into a team of domain agents
-that stay on the job.
+Give each Agent a durable Domain responsibility, organize them into a governed
+Team, and deliver mature capabilities to customers, communities, and
+collaborators through Interface Agents.
 
-It uses Profiles to define long-term domains and responsibilities, preserves working context in Codex threads, and connects agents through communication, division of responsibility, and explicit external boundaries.
+Inside, continuously govern a long-running Agent Team. Outside, provide one
+clear service surface while the responsible Domain Agents complete professional
+work within explicit identity, Conversation, authorization, and information
+boundaries.
 
-[Owner guide（简体中文，canonical）](docs/owner-guide.zh-CN.md) · [English translation](docs/owner-guide.md) · [Why long-lived agents](#why-long-lived-domain-agents) · [Get started](#quick-start) · [Documentation](#documentation)
+[Website](https://codexloom.ai/en/) · [中文官网](https://codexloom.ai/zh-cn/) · [Owner guide（简体中文，canonical）](docs/owner-guide.zh-CN.md) · [English guide](docs/owner-guide.md) · [Get started](#quick-start) · [Documentation](#documentation)
 
 ## What Is CodexLoom
 
-CodexLoom is built on Codex. It does not reimplement the agent runtime or duplicate thread history. Instead, it adds durable agent identities, Profiles, organizational relationships, communication, external platform integrations, and governance on top of the threads, turns, tools, and clients provided by Codex.
+CodexLoom is built on Codex. It does not reimplement the agent runtime or
+duplicate thread history. Instead, it turns a Codex thread into the continuing
+workspace of a long-running Domain Agent, then adds durable identity, Profile,
+Team relationships, bounded coordination, human governance, and governed
+external delivery.
 
-In CodexLoom, an agent has a stable ID, name, Profile, and primary thread. A person can continue that thread through Codex Desktop, Mobile, or the CodexLoom WebUI. Other agents can find it and send messages through the `loom` CLI. External collaborators can work with it from existing environments such as Feishu (Lark), Slack, and Parall.
+In CodexLoom, an Agent has a stable ID, name, Profile, and primary Thread. The
+same Agent can resume its current work through Codex Desktop, Mobile, or the
+CodexLoom WebUI. Other Agents collaborate through bounded Messages and Topics
+and consume explicit managed Artifact handoffs; they do not resume that Agent's
+primary Thread. External collaborators can work through governed Interface
+Agents from existing environments such as Feishu (Lark), Slack, and Parall.
 
 Start with one long-lived Agent for a continuing responsibility. When repeated
 work reveals stable load, context, or professional judgment boundaries, the
@@ -43,8 +56,16 @@ The name `Loom` describes this organizing process: every thread keeps its own hi
 - **Long-lived agents:** Maintain a stable identity, editable name, primary thread, Profile, and model configuration for each agent.
 - **One thread, multiple surfaces:** Work on the same thread from Codex Desktop, Mobile, the WebUI, and the CLI, with live message and status synchronization.
 - **Agent-to-agent communication:** Send, queue, and reply to Messages while preserving delivery state, response relationships, and complete history.
+- **Bounded coordination and human decisions:** Coordinate cross-Agent work
+  through Topics, request explicit Owner decisions through Needs You, and hand
+  off final files through managed Artifacts.
 - **Team structure:** Separate draggable Organization, Collaboration, and Activity maps keep formal responsibility, declared cross-domain work, and Message evidence distinct; Directory remains the precise view of every Agent.
-- **External organization integration:** Manage external identities, Conversation Memberships, Inbox, and Outbox through Feishu (Lark), Slack, and Parall.
+- **Overview and governance evidence:** Inspect current Status, Daily Activity,
+  Capacity signals, and token/context/cache/model usage without treating them as
+  performance scores or automatic organization decisions.
+- **Governed external delivery:** Manage external identities, Conversation
+  Memberships, Inbox, and Outbox through Feishu (Lark), Slack, and Parall, with
+  Interface Agents acting as explicit organizational boundaries.
 - **Continuous operations:** Run Schedules, resume existing work through durable external Triggers, inspect global runtime state, create backups on demand, and restart gracefully after active turns finish.
 
 Lead, Internal Agent, and Interface Agent are currently expressed through Profiles, declared relationships, Messages, and Conversation Memberships. Dedicated hierarchical messaging policies and organization templates are still being modeled.
@@ -177,13 +198,30 @@ This resembles a human organization: members have stable responsibilities, growi
 
 > **IM integration is not simply binding an internal agent to an external account. It lets the agent organization design its own external boundary.**
 
-Advanced users may bring long-term agent collaborators into existing work environments. An agent organization can establish a dedicated Interface Agent for external communication. It maintains external relationships and conversational context, asks the Lead for domain judgment when needed, responds externally with the resulting decision, and brings important feedback back into the internal organization.
+Advanced users may bring mature Domain capabilities into existing work
+environments through an Interface Agent. It receives work from a governed
+Conversation Membership, clarifies the request and its boundary, routes scoped
+work to the responsible Domain Agents, and asks for human authorization when a
+decision or commitment requires it. When Membership policy, provider capability,
+and real authorization allow, it returns the result to the original
+Conversation and preserves the provider receipt.
 
 ```text
-Feishu (Lark) / Slack / Parall  <->  Interface Agent  <->  Lead  <->  Internal Agents
+Feishu (Lark) / Slack / Parall  <->  Interface Agent  <->  Domain Agent Team
 ```
 
-An agent can have identities on multiple platforms and participate in multiple group conversations. An external identity states where the agent is reachable. A Conversation Membership defines its role in a specific conversation: what to pay attention to, when to speak, what it must not disclose, and when it must consult an internal owner. The same agent can therefore perform different roles in different channels without being copied into separate, disconnected agents.
+An Agent can have identities on multiple platforms and participate in multiple
+group conversations. An external identity states where the Agent is reachable.
+A Conversation Membership defines its role in a specific conversation: what to
+pay attention to, when to speak, what it must not disclose, and when it must
+consult an internal owner. The same Agent can therefore perform different roles
+in different channels without being copied into separate, disconnected Agents.
+
+Interface Agent is an organizational pattern, not a hard-coded Agent type or an
+automatic gateway. External Membership does not grant an external actor direct
+access to internal Agents, Threads, tools, credentials, or decision authority.
+Internal routing and disclosure remain governed by explicit authorization and
+information boundaries.
 
 | Status | Platforms |
 |---|---|
