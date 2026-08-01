@@ -1,7 +1,7 @@
 import { Activity, Archive, BookOpen, Bot, Cable, ChevronRight, CircleHelp, CirclePause, Inbox as InboxIcon, Info, Menu, Network, PanelLeftClose, PanelLeftOpen, Plus, RotateCw, Settings2, X } from "lucide-react";
 import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type ModelProvider, type RemoteSnapshot, type Topic } from "./types";
+import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type ModelProvider, type ModelProviderResponse, type RemoteSnapshot, type Topic } from "./types";
 import { summarizeTask } from "./feed";
 import { BrandLockup, BrandMark } from "./components/BrandMark";
 import { Button } from "./components/ui/button";
@@ -519,7 +519,7 @@ export default function App() {
     queryFn: async () => (await api("GET", "/api/remote")).remote,
     retry: false,
   });
-  const providersQuery = useQuery<{ providers: ModelProvider[] }>({
+  const providersQuery = useQuery<ModelProviderResponse>({
     queryKey: ["model-providers"],
     queryFn: () => api("GET", "/api/model-providers"),
     retry: false,
@@ -551,9 +551,9 @@ export default function App() {
     ? modelProviders.filter((provider) => provider.configured && provider.credentialConfigured)
     : [{
         id: "openai", name: "OpenAI / ChatGPT login", source: "builtin", configured: true,
-        credentialSource: "codex-auth", credentialConfigured: true, models: [], boundAgentCount: 0,
+        credentialSource: "codex-auth", credentialConfigured: true, models: [], modelDetails: [], boundAgentCount: 0,
       } as ModelProvider];
-  const creatableProviderKey = creatableProviders.map((provider) => provider.id).join("\n");
+  const creatableProviderKey = creatableProviders.map((provider) => `${provider.id}:${provider.models.join(",")}`).join("\n");
   const backupStatus = backupQuery.data || { backups: [], dir: "", count: 0, totalBytes: 0, retention: { minCount: 2, maxCount: 5, maxBytes: 2 * 1024 ** 3, maxAgeDays: 30 } };
   const setAgents = (next: Agent[] | ((previous: Agent[]) => Agent[])) => {
     queryClient.setQueryData<{ agents: Agent[] }>(["agents"], (current) => {
@@ -581,6 +581,7 @@ export default function App() {
   const [newDomain, setNewDomain] = useState("");
   const [newProviderId, setNewProviderId] = useState("openai");
   const [newModel, setNewModel] = useState("");
+  const [newEffort, setNewEffort] = useState("");
   const [creatingAgent, setCreatingAgent] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [restarting, setRestarting] = useState(false);
@@ -589,7 +590,8 @@ export default function App() {
     if (!newAgentOpen || creatableProviders.length === 0 || creatableProviders.some((provider) => provider.id === newProviderId)) return;
     const provider = creatableProviders[0];
     setNewProviderId(provider.id);
-    setNewModel(provider.models?.[0] || "");
+    setNewModel(provider.id === "openai" ? "" : provider.models?.[0] || "");
+    setNewEffort("");
   }, [creatableProviderKey, newAgentOpen, newProviderId]);
   const [restartStatus, setRestartStatus] = useState<any>({ state: "idle" });
   const [backingUp, setBackingUp] = useState(false);
@@ -784,6 +786,7 @@ export default function App() {
         name: newName.trim(), cwd: newCwd.trim(),
         providerId: newProviderId === "openai" ? "" : newProviderId,
         model: newModel.trim(),
+        effort: newEffort,
       });
       if (newDomain.trim()) {
         await api("PUT", `/api/agents/${encodeURIComponent(data.agent.id)}/profile`, { identity: "", domain: newDomain.trim(), scope: "", expectedVersion: 0 });
@@ -793,6 +796,7 @@ export default function App() {
       setNewDomain("");
       setNewProviderId("openai");
       setNewModel("");
+      setNewEffort("");
       setNewAgentOpen(false);
       await refresh();
       setOpenAgentIds((ids) => (ids.includes(data.agent.id) ? ids : [...ids, data.agent.id]));
@@ -1525,7 +1529,8 @@ export default function App() {
                     const providerId = event.target.value;
                     const provider = modelProviders.find((item) => item.id === providerId);
                     setNewProviderId(providerId);
-                    setNewModel(provider?.models?.[0] || "");
+                    setNewModel(providerId === "openai" ? "" : provider?.models?.[0] || "");
+                    setNewEffort("");
                   }}
                   disabled={creatableProviders.length === 0}
                   className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px] outline-none focus:border-ring focus:ring-2 focus:ring-ring/15 disabled:opacity-60"
@@ -1535,9 +1540,22 @@ export default function App() {
               </label>
               <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
                 Model
-                <Input value={newModel} onChange={(event) => setNewModel(event.target.value)} readOnly={newProviderId === "deepseek"} placeholder={newProviderId === "openai" ? "Codex default" : "model id"} spellCheck={false} className="font-mono text-[12px] read-only:bg-muted/40" />
+                {(modelProviders.find((provider) => provider.id === newProviderId)?.models.length || 0) > 0 ? <select value={newModel} onChange={(event) => { setNewModel(event.target.value); setNewEffort(""); }} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px] outline-none focus:border-ring focus:ring-2 focus:ring-ring/15">
+                  {newProviderId === "openai" ? <option value="">Codex default</option> : null}
+                  {(modelProviders.find((provider) => provider.id === newProviderId)?.modelDetails || []).map((model) => <option key={model.id} value={model.id}>{model.displayName || model.id}</option>)}
+                </select> : <Input value={newModel} onChange={(event) => setNewModel(event.target.value)} placeholder={newProviderId === "openai" ? "Codex default" : "model id"} spellCheck={false} className="font-mono text-[12px]" />}
               </label>
             </div>
+            {(() => {
+              const model = modelProviders.find((provider) => provider.id === newProviderId)?.modelDetails.find((item) => item.id === newModel);
+              if (!model?.reasoningEfforts.length) return null;
+              return <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">Thinking effort
+                <select value={newEffort} onChange={(event) => setNewEffort(event.target.value)} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px] outline-none focus:border-ring focus:ring-2 focus:ring-ring/15">
+                  <option value="">Default ({model.defaultReasoningEffort || "provider"})</option>
+                  {model.reasoningEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+                </select>
+              </label>;
+            })()}
             <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
               Domain <span className="font-normal text-muted-foreground/70">optional</span>
               <textarea value={newDomain} onChange={(event) => setNewDomain(event.target.value)} placeholder="The enduring subject this Agent will maintain" rows={3} className="w-full resize-y rounded-sm border border-input bg-background px-3 py-2 text-[12px] leading-5 outline-none focus:border-ring focus:ring-2 focus:ring-ring/15" />

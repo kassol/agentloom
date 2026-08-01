@@ -8,6 +8,7 @@ package codex
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +78,9 @@ type Client struct {
 type SpawnOptions struct {
 	Bin string
 	Env map[string]string
+	// Args are appended after `app-server`. They are intended for stable
+	// process-level Codex configuration overrides such as model_catalog_json.
+	Args []string
 }
 
 type ClientInfo struct {
@@ -93,18 +97,12 @@ func Spawn() (*Client, error) {
 // SpawnWithOptions starts an app-server with process-local environment
 // overrides. CodexLoom uses one such client as its shared CodexHost.
 func SpawnWithOptions(options SpawnOptions) (*Client, error) {
-	codexBin := strings.TrimSpace(options.Bin)
-	if codexBin == "" {
-		codexBin = os.Getenv("CODEX_BIN")
+	codexBin, err := ResolveBin(options.Bin)
+	if err != nil {
+		return nil, err
 	}
-	if codexBin == "" {
-		var err error
-		codexBin, err = exec.LookPath("codex")
-		if err != nil {
-			return nil, fmt.Errorf("codex not found in PATH; set CODEX_BIN env or install @openai/codex globally")
-		}
-	}
-	cmd := exec.Command(codexBin, "app-server")
+	args := append([]string{"app-server"}, options.Args...)
+	cmd := exec.Command(codexBin, args...)
 	env := os.Environ()
 	filtered := env[:0]
 	for _, kv := range env {
@@ -146,6 +144,35 @@ func SpawnWithOptions(options SpawnOptions) (*Client, error) {
 	go c.readStderr(stderr)
 	go c.readLoop(stdout)
 	return c, nil
+}
+
+func ResolveBin(bin string) (string, error) {
+	codexBin := strings.TrimSpace(bin)
+	if codexBin == "" {
+		codexBin = strings.TrimSpace(os.Getenv("CODEX_BIN"))
+	}
+	if codexBin != "" {
+		return codexBin, nil
+	}
+	resolved, err := exec.LookPath("codex")
+	if err != nil {
+		return "", fmt.Errorf("codex not found in PATH; set CODEX_BIN env or install @openai/codex globally")
+	}
+	return resolved, nil
+}
+
+func Version(bin string) (string, error) {
+	codexBin, err := ResolveBin(bin)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, codexBin, "--version").Output()
+	if err != nil {
+		return "", fmt.Errorf("read Codex version: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 func (c *Client) readStderr(r io.Reader) {

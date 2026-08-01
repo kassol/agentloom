@@ -13,7 +13,12 @@ func (s *Server) registerModelProviderRoutes(mux *http.ServeMux) {
 			writeErr(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"providers": providers})
+		catalog, err := s.hub.ModelCatalogStatus()
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"providers": providers, "catalog": catalog})
 	})
 	mux.HandleFunc("GET /api/model-providers/{id}", func(w http.ResponseWriter, r *http.Request) {
 		provider, err := s.hub.GetModelProvider(r.PathValue("id"))
