@@ -847,6 +847,26 @@ export interface Topic {
   activeTurns: TopicActiveTurn[];
 }
 
+export interface TopicSummary {
+  id: string;
+  title: string;
+  purpose?: string;
+  status: TopicStatus;
+  responsibleAgentId: string;
+  responsibleAgent: string;
+  currentBrief: TopicBrief;
+  waitingOn?: TopicWaitingOn;
+  resultReadyVersion?: number;
+  ownerSeenBriefVersion?: number;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+  needsMeCount: number;
+  resultsReady: boolean;
+  activeTurns: TopicActiveTurn[];
+}
+
 export interface GitHubDeviceFlow {
   id: string;
   status: "pending" | "connected" | "failed" | "expired";

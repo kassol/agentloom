@@ -12,6 +12,10 @@ import (
 
 func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/agents", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("view") == "summary" {
+			writeJSON(w, 200, map[string]any{"agents": s.hub.ListAgentSummaries()})
+			return
+		}
 		writeJSON(w, 200, map[string]any{"agents": s.hub.ListAgents()})
 	})
 	mux.HandleFunc("POST /api/agents", func(w http.ResponseWriter, r *http.Request) {

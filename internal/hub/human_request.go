@@ -44,6 +44,23 @@ type HumanRequest struct {
 	DeliveredAt    string               `json:"deliveredAt,omitempty"`
 }
 
+// HumanRequestSummary is safe for workspace lists. Source tasks, full context,
+// answer bodies and delivery errors remain available from the detail endpoint.
+type HumanRequestSummary struct {
+	ID             string `json:"id"`
+	AgentID        string `json:"agentId"`
+	AgentName      string `json:"agentName"`
+	TopicID        string `json:"topicId,omitempty"`
+	Expectation    string `json:"expectation"`
+	Question       string `json:"question"`
+	State          string `json:"state"`
+	DeliveryStatus string `json:"deliveryStatus"`
+	CreatedAt      string `json:"createdAt"`
+	UpdatedAt      string `json:"updatedAt"`
+	AnsweredAt     string `json:"answeredAt,omitempty"`
+	DeliveredAt    string `json:"deliveredAt,omitempty"`
+}
+
 type CreateHumanRequestParams struct {
 	Agent       string               `json:"agent"`
 	Expectation string               `json:"expectation"`
@@ -228,6 +245,24 @@ func (h *Hub) ListHumanRequests(agentKey, state string) ([]HumanRequest, error) 
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].CreatedAt > out[j].CreatedAt
 	})
+	return out, nil
+}
+
+func (h *Hub) ListHumanRequestSummaries(agentKey, state string) ([]HumanRequestSummary, error) {
+	requests, err := h.ListHumanRequests(agentKey, state)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]HumanRequestSummary, 0, len(requests))
+	for _, request := range requests {
+		out = append(out, HumanRequestSummary{
+			ID: request.ID, AgentID: request.AgentID, AgentName: request.AgentName, TopicID: request.TopicID,
+			Expectation: request.Expectation, Question: boundedDisplayTask(request.Question, 500),
+			State: request.State, DeliveryStatus: request.DeliveryStatus,
+			CreatedAt: request.CreatedAt, UpdatedAt: request.UpdatedAt,
+			AnsweredAt: request.AnsweredAt, DeliveredAt: request.DeliveredAt,
+		})
+	}
 	return out, nil
 }
 

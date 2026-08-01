@@ -249,7 +249,7 @@ func (s *Server) globalEvents(w http.ResponseWriter, r *http.Request) {
 			replayMax = event.Seq
 		}
 	}
-	agents := s.hub.ListAgents()
+	agents := s.hub.ListAgentSummaries()
 	loomSnapshot, _ := json.Marshal(map[string]any{"agents": agents})
 	writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "loom/agents", Data: loomSnapshot})
 	legacySnapshot, _ := json.Marshal(map[string]any{"sessions": agents})

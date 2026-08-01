@@ -1,4 +1,5 @@
 import { ArrowLeft, Check, ChevronRight, CircleHelp, Clock3, Loader2, RotateCcw, Send, X } from "lucide-react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MarkdownContent } from "./pages/agent/markdown";
 import { api, type HumanRequest } from "./types";
@@ -16,6 +17,17 @@ export function NeedsYouPane({
   onOpenAgent: (agentID: string) => void;
   onError: (message: string) => void;
 }) {
+  const queryClient = useQueryClient();
+  const summariesQuery = useQuery<{ requests: HumanRequest[] }>({
+    queryKey: ["human-requests", "summary"],
+    queryFn: () => api("GET", "/api/human-requests?view=summary"),
+    refetchInterval: 30_000,
+  });
+  const allRequests = useMemo(() => {
+    const byID = new Map((summariesQuery.data?.requests || requests).map((request) => [request.id, request]));
+    for (const request of requests) byID.set(request.id, request);
+    return Array.from(byID.values());
+  }, [requests, summariesQuery.data?.requests]);
   const [filter, setFilter] = useState<Filter>("open");
   const [selectedID, setSelectedID] = useState("");
   const [answer, setAnswer] = useState("");
@@ -23,19 +35,27 @@ export function NeedsYouPane({
   const stateRef = useRef<Record<string, unknown>>({});
 
   const counts = useMemo(() => ({
-    open: requests.filter((request) => request.state === "open").length,
-    answered: requests.filter((request) => request.state === "answered").length,
-    all: requests.length,
-  }), [requests]);
+    open: allRequests.filter((request) => request.state === "open").length,
+    answered: allRequests.filter((request) => request.state === "answered").length,
+    all: allRequests.length,
+  }), [allRequests]);
 
   const visible = useMemo(() => {
-    const filtered = filter === "all" ? requests : requests.filter((request) => request.state === filter);
+    const filtered = filter === "all" ? allRequests : allRequests.filter((request) => request.state === filter);
     return [...filtered].sort((a, b) => {
       if (filter === "open" && a.expectation !== b.expectation) return a.expectation === "required" ? -1 : 1;
       return b.createdAt.localeCompare(a.createdAt);
     });
-  }, [filter, requests]);
-  const selected = requests.find((request) => request.id === selectedID) || null;
+  }, [allRequests, filter]);
+  const selectedSummary = allRequests.find((request) => request.id === selectedID) || null;
+  const selectedQuery = useQuery<{ request: HumanRequest }>({
+    queryKey: ["human-request", selectedID],
+    queryFn: () => api("GET", `/api/human-requests/${encodeURIComponent(selectedID)}`),
+    enabled: Boolean(selectedID),
+  });
+  const selected = selectedQuery.data?.request
+    || requests.find((request) => request.id === selectedID)
+    || null;
 
   useEffect(() => {
     const syncFromHash = () => {
@@ -49,8 +69,8 @@ export function NeedsYouPane({
   }, []);
 
   useEffect(() => {
-    if (selectedID && !requests.some((request) => request.id === selectedID)) setSelectedID("");
-  }, [requests, selectedID]);
+    if (selectedID && summariesQuery.isFetched && !allRequests.some((request) => request.id === selectedID)) setSelectedID("");
+  }, [allRequests, selectedID, summariesQuery.isFetched]);
 
   const selectRequest = (id: string) => {
     setSelectedID(id);
@@ -64,6 +84,10 @@ export function NeedsYouPane({
     try {
       await task();
       await onChanged();
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["human-requests"] }),
+        selectedID ? queryClient.invalidateQueries({ queryKey: ["human-request", selectedID] }) : Promise.resolve(),
+      ]);
     } catch (error: any) {
       onError(error.message);
     } finally {
@@ -96,7 +120,7 @@ export function NeedsYouPane({
   };
 
   stateRef.current = {
-    requestsCount: requests.length,
+    requestsCount: allRequests.length,
     openCount: counts.open,
     answeredCount: counts.answered,
     visibleCount: visible.length,
@@ -122,7 +146,7 @@ export function NeedsYouPane({
     return () => {
       if (root.needsYou) delete root.needsYou;
     };
-  }, [requests, selectedID, filter, visible.length]);
+  }, [allRequests.length, selectedID, filter, visible.length]);
 
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-background">
@@ -149,7 +173,7 @@ export function NeedsYouPane({
       </header>
 
       <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[360px_minmax(0,1fr)]">
-        <section className={`${selected ? "hidden lg:flex" : "flex"} min-h-0 flex-col border-r border-border bg-card/35`} aria-label="Human requests">
+        <section className={`${selectedID ? "hidden lg:flex" : "flex"} min-h-0 flex-col border-r border-border bg-card/35`} aria-label="Human requests">
           <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3">
             <span className="text-[11px] font-semibold">{filter === "open" ? "Waiting for you" : filter === "answered" ? "Answered" : "Request history"}</span>
             <span className="font-mono text-[9.5px] text-muted-foreground">{visible.length}</span>
@@ -184,7 +208,7 @@ export function NeedsYouPane({
           </div>
         </section>
 
-        <section className={`${selected ? "flex" : "hidden lg:flex"} min-h-0 min-w-0 flex-col bg-background`} aria-label="Human request detail">
+        <section className={`${selectedID ? "flex" : "hidden lg:flex"} min-h-0 min-w-0 flex-col bg-background`} aria-label="Human request detail">
           {selected ? (
             <>
               <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3 md:px-5">
@@ -252,6 +276,8 @@ export function NeedsYouPane({
                 </div>
               </div>
             </>
+          ) : selectedID && selectedSummary ? (
+            <div className="flex flex-1 items-center justify-center text-muted-foreground"><Loader2 className="size-5 animate-spin" /><span className="ml-2 text-[11px]">Loading request detail…</span></div>
           ) : (
             <div className="flex flex-1 flex-col items-center justify-center text-center text-muted-foreground">
               <CircleHelp className="size-6 opacity-45" />

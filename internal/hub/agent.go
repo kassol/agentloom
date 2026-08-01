@@ -38,6 +38,44 @@ func (h *Hub) ListAgents() []AgentView {
 	return out
 }
 
+// ListAgentSummaries returns the live fields needed by the Web workspace
+// without copying unbounded task envelopes or Provider audit history into
+// every reconciliation snapshot. The canonical Agent detail endpoint remains
+// the source for the complete record.
+func (h *Hub) ListAgentSummaries() []AgentView {
+	views := h.ListAgents()
+	for i := range views {
+		views[i].CurrentTask = boundedDisplayTask(views[i].CurrentTask, 320)
+		views[i].ProviderHistory = nil
+		if views[i].LastTurn != nil {
+			last := *views[i].LastTurn
+			last.Task = boundedDisplayTask(last.Task, 320)
+			views[i].LastTurn = &last
+		}
+		if views[i].Goal != nil {
+			goal := *views[i].Goal
+			goal.Objective = boundedDisplayTask(goal.Objective, 320)
+			views[i].Goal = &goal
+		}
+	}
+	return views
+}
+
+func boundedDisplayTask(text string, limit int) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	text = displayUserTask(text)
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return strings.TrimSpace(string(runes[:limit])) + "…"
+}
+
 // ListSessions is the pre-CodexLoom compatibility method.
 func (h *Hub) ListSessions() []SessionView { return h.ListAgents() }
 

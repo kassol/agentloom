@@ -1110,12 +1110,20 @@ func displayUserTask(text string) string {
 	if task, ok := displayLoomControlTask(text); ok {
 		return task
 	}
+	managedContext := false
+	if index := strings.Index(text, "<loom_context"); index >= 0 {
+		managedContext = true
+		text = strings.TrimSpace(text[:index])
+	}
 	if index := strings.Index(text, "\n\n<loom_attachments"); index >= 0 {
 		text = strings.TrimSpace(text[:index])
 	} else if strings.HasPrefix(text, "<loom_attachments") {
 		text = ""
 	}
 	if text == "" {
+		if managedContext {
+			return "CodexLoom managed work"
+		}
 		return "Attached files"
 	}
 	return text

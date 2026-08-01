@@ -1,7 +1,7 @@
 import { Activity, Archive, BookOpen, Bot, Cable, ChevronRight, CircleHelp, CirclePause, Inbox as InboxIcon, Info, Menu, Network, PanelLeftClose, PanelLeftOpen, Plus, RotateCw, Settings2, X } from "lucide-react";
 import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type ModelProvider, type ModelProviderResponse, type RemoteSnapshot, type Topic } from "./types";
+import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type ModelProvider, type ModelProviderResponse, type RemoteSnapshot, type TopicSummary } from "./types";
 import { summarizeTask } from "./feed";
 import { BrandLockup, BrandMark } from "./components/BrandMark";
 import { Button } from "./components/ui/button";
@@ -512,7 +512,7 @@ export default function App() {
   const queryClient = useQueryClient();
   const agentsQuery = useQuery<{ agents: Agent[] }>({
     queryKey: ["agents"],
-    queryFn: () => api("GET", "/api/agents"),
+    queryFn: () => api("GET", "/api/agents?view=summary"),
   });
   const remoteQuery = useQuery<RemoteSnapshot | null>({
     queryKey: ["remote"],
@@ -536,12 +536,12 @@ export default function App() {
   });
   const humanRequestsQuery = useQuery<{ requests: HumanRequest[] }>({
     queryKey: ["human-requests"],
-    queryFn: () => api("GET", "/api/human-requests"),
+    queryFn: () => api("GET", "/api/human-requests?state=open"),
     refetchInterval: 30_000,
   });
-  const topicsQuery = useQuery<{ topics: Topic[] }>({
+  const topicsQuery = useQuery<{ topics: TopicSummary[] }>({
     queryKey: ["topics"],
-    queryFn: () => api("GET", "/api/topics"),
+    queryFn: () => api("GET", "/api/topics?view=summary"),
     refetchInterval: 30_000,
   });
   const agents = agentsQuery.data?.agents || [];
@@ -644,7 +644,7 @@ export default function App() {
 
   const reconcileAgents = async () => {
     try {
-      const snapshot = await api("GET", "/api/agents") as { agents: Agent[] };
+      const snapshot = await api("GET", "/api/agents?view=summary") as { agents: Agent[] };
       setAgents((previous) => mergeAgentSnapshot(previous, snapshot.agents || []));
     } catch {
       /* The live stream reconnects independently; the next reconciliation retries. */
@@ -662,9 +662,6 @@ export default function App() {
   // CodexLoom-level live status stream (also delivers the initial snapshot).
   useEffect(() => {
     const es = new EventSource("/api/events");
-    es.onopen = () => {
-      void reconcileAgents();
-    };
     es.onmessage = (e) => {
       try {
         const evt = JSON.parse(e.data);
@@ -754,14 +751,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const reconcile = () => void reconcileAgents();
-    const timer = window.setInterval(reconcile, 10_000);
     const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") reconcile();
+      if (document.visibilityState === "visible") void reconcileAgents();
     };
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
-      window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, []);
