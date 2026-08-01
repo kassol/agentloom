@@ -42,6 +42,7 @@ import {
 import { stableTeamGraphNodeGeometry } from "./team-graph-node";
 import { EDGE_CONTROL_SIZE_TOLERANCE, edgeControlMeetsMinimum } from "./team-graph-controls";
 import { projectCollaborationGroup, relationshipContractAriaLabel } from "./collaboration-groups";
+import { subscribeGlobalEvents } from "./global-events";
 import {
   api,
   type AgentProfile,
@@ -172,10 +173,8 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
 
   useEffect(() => {
     refresh(activityDays).catch((err: Error) => onError(err.message));
-    const es = new EventSource("/api/events");
-    es.onmessage = (event) => {
+    const unsubscribe = subscribeGlobalEvents((value) => {
       try {
-        const value = JSON.parse(event.data);
         if (
           value.type === "loom/reconcile" ||
           value.type === "loom/comms-message" ||
@@ -194,8 +193,8 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
       } catch {
         // Ignore malformed SSE values; the next snapshot refresh repairs state.
       }
-    };
-    return () => es.close();
+    });
+    return unsubscribe;
   }, [activityDays]);
 
   const resolveAgentId = (key: string) => team.agents.find((agent) => agent.id === key || agent.name === key)?.id || key;

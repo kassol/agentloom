@@ -168,6 +168,7 @@ export function AgentPane({
     })),
   ], [feed.approvals, feed.blocks]);
   const feedVirtualizer = useVirtualizer({
+    enabled: active,
     count: feedRows.length,
     getScrollElement: () => feedRef.current,
     getItemKey: (index) => feedRows[index]?.key || index,
@@ -205,6 +206,26 @@ export function AgentPane({
       }, sync ? 180 : 0);
     },
   });
+  useEffect(() => {
+    if (!active) return;
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      feedVirtualizer.measure();
+      secondFrame = window.requestAnimationFrame(() => {
+        feedVirtualizer.measure();
+        const el = feedRef.current;
+        if (!el) return;
+        el.dispatchEvent(new Event("scroll"));
+        if ((needsInitialBottomRef.current || stickRef.current) && feedRows.length > 0) {
+          feedVirtualizer.scrollToIndex(feedRows.length - 1, { align: "end" });
+        }
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
+  }, [active, agent.id, feedRows.length]);
   const measureFeedRow = useCallback((node: HTMLDivElement | null) => {
     feedVirtualizer.measureElement(node);
     if (!node) return;

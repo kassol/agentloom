@@ -1,6 +1,7 @@
 import { Bot, Cable, Check, ChevronDown, CircleCheck, Copy, Link2, LoaderCircle, MessageSquare, Pencil, Plus, RefreshCw, Search, Send, ShieldCheck, Terminal, Unplug, Users, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type AgentAddress, type PlatformConnection, type Agent, type ConversationCandidate, type ConversationMembership, type InboxEntry, type LarkDiscovery, type SlackDiscovery, type ParallDiscovery } from "./types";
+import { subscribeGlobalEvents } from "./global-events";
 
 export function IntegrationsPane({ agents, onError }: { agents: Agent[]; onError: (message: string) => void }) {
   const [connections, setConnections] = useState<PlatformConnection[]>([]);
@@ -235,10 +236,8 @@ export function IntegrationsPane({ agents, onError }: { agents: Agent[]; onError
       setParallSetupOpen(true);
       discoverParall();
     }
-    const es = new EventSource("/api/events");
-    es.onmessage = (event) => {
+    const unsubscribe = subscribeGlobalEvents((value) => {
       try {
-        const value = JSON.parse(event.data);
         const data = value.data || {};
         if (value.type === "loom/integration-connection" && data.connection?.id) {
           setConnections((current) => upsertByID(current, data.connection));
@@ -263,9 +262,9 @@ export function IntegrationsPane({ agents, onError }: { agents: Agent[]; onError
       } catch {
         // Ignore malformed global events.
       }
-    };
+    });
     return () => {
-      es.close();
+      unsubscribe();
       if (coreRefreshTimerRef.current !== null) window.clearTimeout(coreRefreshTimerRef.current);
       if (inboxRefreshTimerRef.current !== null) window.clearTimeout(inboxRefreshTimerRef.current);
     };

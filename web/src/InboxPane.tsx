@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MarkdownContent } from "./pages/agent/markdown";
+import { subscribeGlobalEvents } from "./global-events";
 import {
   api,
   type AgentAddress,
@@ -60,18 +61,16 @@ export function InboxPane({ agents, onError }: { agents: Agent[]; onError: (mess
 
   useEffect(() => {
     refresh().catch((error: Error) => onError(error.message));
-    const es = new EventSource("/api/events");
-    es.onmessage = (event) => {
+    const unsubscribe = subscribeGlobalEvents((value) => {
       try {
-        const value = JSON.parse(event.data);
         if (value.type === "loom/reconcile" || ["loom/inbox-message", "loom/inbox-item", "loom/outbox-item", "loom/comms-message"].includes(value.type)) {
           refresh().catch(() => {});
         }
       } catch {
         // Ignore malformed global events; EventSource will continue.
       }
-    };
-    return () => es.close();
+    });
+    return unsubscribe;
   }, []);
 
   useEffect(() => {
