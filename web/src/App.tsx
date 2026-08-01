@@ -9,6 +9,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "./components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "./components/ui/popover";
 import { publishThreadEvent, threadEventSubscriberCount } from "./thread-events";
+import { globalEventState, subscribeGlobalEvents, subscribeGlobalEventState, type GlobalEventState } from "./global-events";
 import { executionDotClass, executionLabel, isAgentExecuting, isOwnerResultEvent } from "./product-state";
 import { NeedsYouPane } from "./NeedsYouPane";
 import { TopicsPane } from "./TopicsPane";
@@ -563,6 +564,7 @@ export default function App() {
   };
   const setRemote = (next: RemoteSnapshot | null) => queryClient.setQueryData(["remote"], next);
   const [current, setCurrent] = useState<string | null>(() => sessionStorage.getItem("codexloom-active-agent"));
+  const [liveStreamState, setLiveStreamState] = useState<GlobalEventState>(() => globalEventState());
   const [openAgentIds, setOpenAgentIds] = useState<string[]>(readAgentTabs);
   const [unseenAgentIds, setUnseenAgentIds] = useState<Set<string>>(() => new Set());
   const [view, setView] = useState<"agents" | "needs-you" | "topics" | "inbox" | "integrations" | "messages" | "schedules" | "team" | "status" | "capacity" | "usage" | "settings" | "remote" | "design">("agents");
@@ -661,10 +663,8 @@ export default function App() {
 
   // CodexLoom-level live status stream (also delivers the initial snapshot).
   useEffect(() => {
-    const es = new EventSource("/api/events");
-    es.onmessage = (e) => {
+    return subscribeGlobalEvents((evt) => {
       try {
-        const evt = JSON.parse(e.data);
         if (evt.type === "loom/reconcile") {
           void reconcileAgents();
           void queryClient.invalidateQueries({ queryKey: ["pending-work"] });
@@ -746,9 +746,10 @@ export default function App() {
       } catch {
         /* ignore */
       }
-    };
-    return () => es.close();
+    });
   }, []);
+
+  useEffect(() => subscribeGlobalEventState(setLiveStreamState), []);
 
   useEffect(() => {
     const onVisibilityChange = () => {
@@ -1395,6 +1396,12 @@ export default function App() {
       >
         <div className="relative flex h-12 shrink-0 items-center border-b border-sidebar-border/80 px-3 md:h-9">
           <div className="min-w-0"><BrandLockup compact /></div>
+          <span
+            role="status"
+            aria-label={`Live updates: ${liveStreamState}`}
+            title={`Live updates: ${liveStreamState}`}
+            className={`ml-2 size-1.5 shrink-0 rounded-full ${liveStreamState === "live" ? "bg-success" : liveStreamState === "paused" ? "bg-muted-foreground/35" : "animate-pulse bg-warning"}`}
+          />
           <Button
             variant="ghost"
             size="icon-sm"

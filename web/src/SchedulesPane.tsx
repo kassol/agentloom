@@ -1,6 +1,7 @@
 import { CalendarClock, Pause, Play, Plus, RotateCw, Trash2, Zap } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, type Schedule, type Agent } from "./types";
+import { subscribeGlobalEvents } from "./global-events";
 
 interface Props {
   agents: Agent[];
@@ -36,18 +37,16 @@ export function SchedulesPane({ agents, onError, initialTo }: Props) {
 
   useEffect(() => {
     refresh().catch((err: any) => onError(err.message));
-    const es = new EventSource("/api/events");
-    es.onmessage = (e) => {
+    const unsubscribe = subscribeGlobalEvents((evt) => {
       try {
-        const evt = JSON.parse(e.data);
         if (evt.type === "loom/reconcile" || evt.type === "loom/schedule" || evt.type === "loom/schedule-deleted") {
           refresh().catch(() => {});
         }
       } catch {
         /* ignore */
       }
-    };
-    return () => es.close();
+    });
+    return unsubscribe;
   }, []);
 
   useEffect(() => {

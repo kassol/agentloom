@@ -2,6 +2,7 @@ import { CheckCircle2, Clock3, MessageSquare, Reply, RotateCcw, Send, SkipForwar
 import { useEffect, useMemo, useState } from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "./components/ui/popover";
 import { api, type AgentMessage, type Agent } from "./types";
+import { subscribeGlobalEvents } from "./global-events";
 
 const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 
@@ -45,16 +46,14 @@ export function MessagesPane({ agents, onError, initialTo, participants, onClear
 
   useEffect(() => {
     refresh().catch((err: any) => onError(err.message));
-    const es = new EventSource("/api/events");
-    es.onmessage = (e) => {
+    const unsubscribe = subscribeGlobalEvents((evt) => {
       try {
-        const evt = JSON.parse(e.data);
         if (evt.type === "loom/reconcile" || evt.type === "loom/comms-message") refresh().catch(() => {});
       } catch {
         /* ignore */
       }
-    };
-    return () => es.close();
+    });
+    return unsubscribe;
   }, []);
 
   useEffect(() => {
