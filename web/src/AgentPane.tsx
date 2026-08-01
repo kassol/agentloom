@@ -12,14 +12,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "./components/ui/popover
 import { subscribeThreadEvents } from "./thread-events";
 import { oldestWaitingMs } from "./product-state";
 
-const MODEL_PRESETS = [
-  { value: "", label: "Default (Codex)" },
-  { value: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
-  { value: "gpt-5.6-terra", label: "GPT-5.6 Terra" },
-  { value: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
-];
-
 const CUSTOM_MODEL_VALUE = "__custom";
+const FALLBACK_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 function readableRuntimeError(value: string) {
   const trimmed = value.trim();
@@ -871,12 +865,15 @@ export function AgentPane({
     ? modelProviders
     : [{
         id: currentProviderId, name: currentProviderId, source: "missing", configured: false,
-        credentialSource: "missing", credentialConfigured: false, models: agent.model ? [agent.model] : [], boundAgentCount: 1,
+        credentialSource: "missing", credentialConfigured: false, models: agent.model ? [agent.model] : [], modelDetails: [], boundAgentCount: 1,
       } as ModelProvider, ...modelProviders];
   const selectedProvider = selectableProviders.find((provider) => provider.id === providerDraft);
-  const providerModelPresets = providerDraft === "openai"
-    ? MODEL_PRESETS
-    : (selectedProvider?.models || []).map((model) => ({ value: model, label: model }));
+  const providerModelPresets = [
+    ...(providerDraft === "openai" ? [{ value: "", label: "Default (Codex)" }] : []),
+    ...(selectedProvider?.modelDetails || []).map((model) => ({ value: model.id, label: model.displayName || model.id })),
+  ];
+  const selectedModelDetail = selectedProvider?.modelDetails?.find((model) => model.id === modelDraft);
+  const reasoningEfforts = selectedModelDetail?.reasoningEfforts?.length ? selectedModelDetail.reasoningEfforts : FALLBACK_REASONING_EFFORTS;
   const modelPresetValue = modelCustomOpen || isCustomModel(modelDraft, providerDraft, selectableProviders) ? CUSTOM_MODEL_VALUE : modelDraft;
   const providerChanged = providerDraft !== (agent.providerId || "openai");
   const profileDirty = Boolean(
@@ -994,9 +991,10 @@ export function AgentPane({
                       onChange={(event) => {
                         const nextProvider = event.target.value;
                         const provider = selectableProviders.find((item) => item.id === nextProvider);
-                        const nextModel = provider?.models?.[0] || "";
+                        const nextModel = nextProvider === "openai" ? "" : provider?.models?.[0] || "";
                         setProviderDraft(nextProvider);
                         setModelDraft(nextModel);
+                        setEffortDraft("");
                         setModelCustomOpen(nextProvider !== "openai" && nextModel === "");
                       }}
                       disabled={running}
@@ -1040,7 +1038,8 @@ export function AgentPane({
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Thinking Effort</span>
                     <select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
-                      <option value="">default</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">extra high</option>
+                      <option value="">default{selectedModelDetail?.defaultReasoningEffort ? ` (${selectedModelDetail.defaultReasoningEffort})` : ""}</option>
+                      {reasoningEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
                     </select>
                   </label>
                   <label className="mb-2 block">
@@ -2022,8 +2021,6 @@ function MembershipTextarea({ label, value, onChange, rows }: {
 
 function isCustomModel(model: string, providerId?: string, providers: ModelProvider[] = []) {
   if (model === "") return false;
-  const models = providerId && providerId !== "openai"
-    ? providers.find((provider) => provider.id === providerId)?.models || []
-    : MODEL_PRESETS.map((option) => option.value);
+  const models = providers.find((provider) => provider.id === (providerId || "openai"))?.models || [];
   return !models.includes(model);
 }

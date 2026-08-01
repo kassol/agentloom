@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { DesignPane } from "./DesignPane";
 import { RemotePane } from "./RemotePane";
-import { api, type BackupStatus, type GitHubDeviceFlow, type ModelProvider, type PlatformConnection, type RemoteSnapshot } from "./types";
+import { api, type BackupStatus, type GitHubDeviceFlow, type ModelProvider, type ModelProviderResponse, type PlatformConnection, type RemoteSnapshot } from "./types";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 
@@ -75,8 +75,10 @@ export function SettingsPane({ section, remote, backupStatus, backingUp, restart
 
 function ProviderSettings({ onError }: { onError: (message: string) => void }) {
   const queryClient = useQueryClient();
-  const query = useQuery<{ providers: ModelProvider[] }>({ queryKey: ["model-providers"], queryFn: () => api("GET", "/api/model-providers") });
+  const query = useQuery<ModelProviderResponse>({ queryKey: ["model-providers"], queryFn: () => api("GET", "/api/model-providers") });
   const providers = query.data?.providers || [];
+  const catalog = query.data?.catalog;
+  const visibleModels = catalog?.models.filter((model) => model.visible) || [];
   const [editing, setEditing] = useState(false);
   const [providerId, setProviderId] = useState("deepseek");
   const [name, setName] = useState("DeepSeek");
@@ -149,8 +151,27 @@ function ProviderSettings({ onError }: { onError: (message: string) => void }) {
     }
   };
 
-  return <SettingsBody title="Model Providers" description="Provider definitions and credentials are written to the active Codex configuration.">
+  return <SettingsBody title="Model Providers" description="Provider credentials stay in Codex configuration; the shared runtime reads model capabilities from one managed catalog.">
     <div className="flex items-center justify-between border-y border-border py-3">
+      <div className="flex items-center gap-2"><DatabaseBackup className="size-4 text-primary" /><span className="text-[12px] font-semibold">Runtime model catalog</span></div>
+      {catalog ? <span className={`font-mono text-[9px] uppercase ${catalog.compatibility === "verified" && catalog.applied ? "text-success" : catalog.compatibility === "unsupported" ? "text-destructive" : "text-warning"}`}>{catalog.restartRequired ? "restart required" : catalog.applied ? catalog.compatibility : "next host start"}</span> : null}
+    </div>
+    {catalog ? <>
+      <dl className="grid gap-x-5 gap-y-3 border-b border-border py-3 text-[10px] sm:grid-cols-3">
+        <SettingFact label="Source" value={`${catalog.source} · ${catalog.version} · ${catalog.sha256.slice(0, 12)}`} />
+        <SettingFact label="Codex" value={`${catalog.codexVersion || "unavailable"} · baseline ${catalog.codexBaseline}`} />
+        <SettingFact label="Models" value={`${visibleModels.length} visible · ${catalog.modelCount} total`} />
+      </dl>
+      {catalog.compatibility !== "verified" || catalog.restartRequired ? <div className="border-b border-border bg-warning/5 px-3 py-2 text-[10px] leading-4 text-warning">{catalog.restartRequired ? "The catalog changed after CodexHost started. Restart CodexLoom before relying on the new metadata." : "This catalog snapshot was verified with Codex 0.144.1. Regenerate and test it when the Codex runtime changes."}</div> : null}
+      <div className="divide-y divide-border border-b border-border">
+        {visibleModels.map((model) => <div key={`${model.providerId}:${model.id}`} className="grid min-w-0 gap-1 py-2 sm:grid-cols-[minmax(0,1fr)_7rem_12rem] sm:items-center sm:gap-3">
+          <div className="min-w-0"><div className="truncate text-[11px] font-medium">{model.displayName || model.id}</div><div className="truncate font-mono text-[9px] text-muted-foreground">{model.providerId} · {model.id}</div></div>
+          <span className="font-mono text-[9px] text-muted-foreground">{formatContextWindow(model.contextWindow)}</span>
+          <span className="truncate font-mono text-[9px] text-muted-foreground">{model.reasoningEfforts.length ? model.reasoningEfforts.join(" · ") : "provider default"}</span>
+        </div>)}
+      </div>
+    </> : query.isLoading ? <div className="border-b border-border py-5 text-center text-[10px] text-muted-foreground">Loading model catalog...</div> : null}
+    <div className="mt-6 flex items-center justify-between border-y border-border py-3">
       <div className="flex items-center gap-2"><Cpu className="size-4 text-primary" /><span className="text-[12px] font-semibold">Configured providers</span></div>
       <Button size="sm" onClick={() => editProvider()}><Plus />Add provider</Button>
     </div>
@@ -181,6 +202,12 @@ function ProviderSettings({ onError }: { onError: (message: string) => void }) {
       <div className="mt-4 flex justify-end gap-2"><Button type="button" variant="outline" onClick={() => setEditing(false)}>Cancel</Button><Button type="submit" disabled={working || !providerId.trim() || !name.trim() || !baseUrl.trim() || !wireApi.trim()}>{working ? <Loader2 className="animate-spin" /> : <Save />}Save Provider</Button></div>
     </form> : null}
   </SettingsBody>;
+}
+
+function formatContextWindow(value?: number) {
+  if (!value) return "context unknown";
+  if (value >= 1_000_000) return `${(value / 1_048_576).toFixed(value % 1_048_576 === 0 ? 0 : 1)}M context`;
+  return `${Math.round(value / 1000)}K context`;
 }
 
 function ConnectorSettings({ onOpenExternal, onError }: { onOpenExternal: () => void; onError: (message: string) => void }) {

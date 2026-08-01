@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/modelcatalog"
 	"github.com/yan5xu/codex-loom/internal/rollout"
 )
 
@@ -148,10 +150,8 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 		}
 	}
 	p.Effort = normalizeEffort(strings.TrimSpace(p.Effort))
-	if p.Effort != "" {
-		if !validEffort(p.Effort) {
-			return AgentView{}, errf(400, "effort must be one of: minimal, low, medium, high, xhigh")
-		}
+	if err := validateModelEffort(p.ProviderID, p.Model, p.Effort); err != nil {
+		return AgentView{}, err
 	}
 	idBytes := make([]byte, 4)
 	_, _ = rand.Read(idBytes)
@@ -239,8 +239,8 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	if p.ProviderID != "" && p.Model == "" {
 		return AgentView{}, errf(400, "model is required for a custom Provider")
 	}
-	if p.Effort != "" && !validEffort(p.Effort) {
-		return AgentView{}, errf(400, "effort must be one of: minimal, low, medium, high, xhigh")
+	if err := validateModelEffort(p.ProviderID, p.Model, p.Effort); err != nil {
+		return AgentView{}, err
 	}
 	if p.CreatedAt == "" {
 		p.CreatedAt = now()
@@ -353,8 +353,12 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 			nextEffort = effort
 		} else {
 			h.mu.Unlock()
-			return AgentView{}, errf(400, "effort must be one of: minimal, low, medium, high, xhigh")
+			return AgentView{}, errf(400, "effort must be one of: minimal, low, medium, high, xhigh, max, ultra")
 		}
+	}
+	if err := validateModelEffort(nextProviderID, nextModel, nextEffort); err != nil {
+		h.mu.Unlock()
+		return AgentView{}, err
 	}
 	if p.Sandbox != nil {
 		nextSandbox = strings.TrimSpace(*p.Sandbox)
@@ -464,11 +468,37 @@ func normalizeEffort(effort string) string {
 
 func validEffort(effort string) bool {
 	switch effort {
-	case "minimal", "low", "medium", "high", "xhigh":
+	case "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
 		return true
 	default:
 		return false
 	}
+}
+
+func validateModelEffort(providerID, model, effort string) error {
+	if effort == "" {
+		return nil
+	}
+	if !validEffort(effort) {
+		return errf(400, "effort must be one of: minimal, low, medium, high, xhigh, max, ultra")
+	}
+	providerID = normalizePublicProviderID(providerID)
+	snapshot, err := modelcatalog.Describe(os.Getenv("CODEX_LOOM_MODEL_CATALOG"))
+	if err != nil {
+		return errf(500, "read Codex model catalog: %s", err)
+	}
+	for _, candidate := range snapshot.PublicModels() {
+		if candidate.ProviderID != providerID || candidate.ID != model || len(candidate.ReasoningEfforts) == 0 {
+			continue
+		}
+		for _, supported := range candidate.ReasoningEfforts {
+			if effort == supported {
+				return nil
+			}
+		}
+		return errf(400, "effort for model %s must be one of: %s", model, strings.Join(candidate.ReasoningEfforts, ", "))
+	}
+	return nil
 }
 
 func normalizeProviderID(providerID string) string {

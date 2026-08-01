@@ -37,11 +37,27 @@ func cmdDoctor(a args) {
 	}
 	running, _ := versionResponse["build"].(map[string]any)
 	local := buildMap(buildinfo.Current(nil, buildinfo.Runtime{}))
+	providerResponse, providerErr := api("GET", "/api/model-providers", nil)
 
 	fmt.Printf("CodexLoom doctor\n")
 	fmt.Printf("endpoint: %s\n", base)
 	fmt.Print(formatBuild("running", running))
 	fmt.Printf("health: ok · %.0f agents\n", num(health, "agents"))
+	if providerErr != nil {
+		fmt.Printf("catalog: %s\n", yellow("unavailable: "+providerErr.Error()))
+	} else if catalog, ok := providerResponse["catalog"].(map[string]any); ok {
+		compatibility := value(catalog, "compatibility", "unverified")
+		status := compatibility
+		if boolean(catalog, "restartRequired") {
+			status = "restart required"
+		}
+		line := fmt.Sprintf("%s · Codex %s · baseline %s · %.0f models", value(catalog, "version", "unknown"), value(catalog, "codexVersion", "unknown"), value(catalog, "codexBaseline", "unknown"), num(catalog, "modelCount"))
+		if compatibility == "verified" && !boolean(catalog, "restartRequired") {
+			fmt.Printf("catalog: %s · %s\n", line, green(status))
+		} else {
+			fmt.Printf("catalog: %s · %s\n", line, yellow(status))
+		}
+	}
 	if mismatch := buildMismatch(local, running); mismatch != "" {
 		fmt.Printf("status: %s\n", yellow(mismatch))
 	} else {

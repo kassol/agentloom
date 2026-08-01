@@ -50,10 +50,41 @@ export interface ModelProvider {
   credentialSource: "codex-auth" | "toml" | "environment" | "command" | "missing" | string;
   credentialConfigured: boolean;
   models: string[];
+  modelDetails: ModelCatalogModel[];
   boundAgentCount: number;
   publicBeta?: boolean;
   textOnly?: boolean;
   limitations?: string[];
+}
+
+export interface ModelCatalogModel {
+  id: string;
+  displayName: string;
+  providerId: string;
+  contextWindow?: number;
+  maxContextWindow?: number;
+  reasoningEfforts: string[];
+  defaultReasoningEffort?: string;
+  inputModalities?: string[];
+  visible: boolean;
+}
+
+export interface ModelCatalogStatus {
+  source: "managed" | "override" | string;
+  version: string;
+  sha256: string;
+  codexBaseline: string;
+  codexVersion?: string;
+  compatibility: "verified" | "unverified" | "unsupported" | string;
+  modelCount: number;
+  models: ModelCatalogModel[];
+  applied: boolean;
+  restartRequired: boolean;
+}
+
+export interface ModelProviderResponse {
+  providers: ModelProvider[];
+  catalog: ModelCatalogStatus;
 }
 
 export interface ThreadArtifact {

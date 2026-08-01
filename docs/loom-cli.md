@@ -114,7 +114,8 @@ Agent 是稳定治理实体，Codex Thread 是它的主要上下文绑定。新�
 常用参数：
 
 - `--model`：使用的模型。
-- `--effort`：thinking effort，可用 `minimal` / `low` / `medium` / `high` / `xhigh`。
+- `--effort`：thinking effort。可选值由模型目录声明；当前总集为 `minimal` / `low` /
+  `medium` / `high` / `xhigh` / `max` / `ultra`，具体模型只接受其支持的子集。
 - `--sandbox`：沙箱策略，例如 `danger-full-access`。
 - `--approval`：审批策略，例如 `never` 或 `on-request`。
 
@@ -149,9 +150,21 @@ loom agent create deepseek-worker \
   --model deepseek-v4-flash
 ```
 
-Provider 会绑定到新 Agent 的 primary Thread，并在 cold resume 时继续显式传入。已有 primary
-Thread 的 Agent 不允许切换 Provider；失败时不会自动回退到 ChatGPT。DeepSeek Responses 当前为
-public beta 且只接受文本输入，Loom 会在 `turn/start` 前拒绝图片或文件 Artifact。
+Provider 会绑定到新 Agent 的 primary Thread，并在 cold resume 时继续显式传入。已有 Agent 可在
+所有 Agent 空闲且没有 pending approval 或 active Goal 时显式切换：
+
+```sh
+loom agent provider deepseek-worker --provider openai --model gpt-5.6-sol
+```
+
+切换会短暂重启共享 CodexHost，并 cold-resume 同一个 primary Thread；失败时按持久 pending binding
+回滚，不会因请求失败自动切换 Provider。DeepSeek Responses 当前为 public beta 且只接受文本输入，
+Loom 会在 `turn/start` 前拒绝图片或文件 Artifact。
+
+共享 CodexHost 启动时加载 CodexLoom 受管的 OpenAI + DeepSeek 完整模型目录。它不会写入用户的
+`~/.codex/models.json`，也不会修改 TOML 中的全局默认模型或认证。目录是进程级、启动时加载；
+`loom doctor` 和 Settings → Model Providers 会显示目录版本、Codex 基线与兼容状态。当前目录以
+Codex `0.144.1` 为验证基线；升级 Codex 后必须重新生成和验收，不能把静态目录视为自动更新。
 
 创建出来的 agent 立刻可以收普通任务：
 

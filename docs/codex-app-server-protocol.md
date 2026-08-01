@@ -41,8 +41,15 @@ CodexLoom 只 spawn 一个共享 app-server。Agent runtime 保存 `agentId -> t
 
 共享 app-server 只有一份 OpenAI 主认证，但 Codex TOML 可以同时声明多个 custom model
 provider。Loom 在 Agent 第一次 `thread/start` 和每次冷 `thread/resume` 时显式传入同一
-`modelProvider` 与 `model`。Provider 是 primary Thread 绑定，不是 Turn 级路由；已有 primary
-Thread 的 Agent 不允许修改 Provider，也不会在认证或请求失败时回退到默认 OpenAI Provider。
+`modelProvider` 与 `model`。Provider 是 primary Thread 绑定，不是 Turn 级路由。已有 Agent
+可通过受管 Provider switch 在全局空闲门禁后重启共享 Host，并用新 binding cold-resume 同一个
+primary Thread；认证或请求失败不会自动回退到默认 OpenAI Provider。
+
+共享 Host 还通过进程参数 `-c model_catalog_json=<managed snapshot>` 加载一份完整静态目录。
+Codex 对该字段采用全量替换而不是增量合并，因此受管目录保留目标 Codex 版本的完整 OpenAI
+条目，并追加已验收的 DeepSeek Flash 条目。目录只在 app-server 启动时读取，不依赖 config
+热刷新，也不写用户 `~/.codex/models.json`。环境变量 `CODEX_LOOM_MODEL_CATALOG` 可为隔离验收
+提供显式完整目录覆盖；它仍必须是完整 catalog，并需要重启 Host 生效。
 
 app-server 为每个初始化 transport connection 维护独立 connection state。Thread 被 start/load
 后会把 listener 附着到当前 initialized connections；Remote client 的 Turn 因此也会出现在 Loom
@@ -95,6 +102,10 @@ Provider 定义与 credential 的唯一事实源是当前 `CODEX_HOME` 的 activ
 该 Thread。验证成功只证明配置可解析、credential 被 Provider 接受且该最小请求完成，不证明
 模型能力、工具行为或业务结果正确。`reloadUserConfig` 不会改变已加载 Thread 的 Provider，
 所以 Provider 变更只供新 Thread 或之后的 cold resume 使用。
+
+模型能力与 Provider credential 是两层事实：Provider TOML 回答请求发往哪里、怎样认证；受管
+catalog 回答 model slug、context window、reasoning effort、输入模态与工具相关 metadata。
+Settings 和 Agent 配置只读取 catalog 的白名单投影，不提供 raw JSON 编辑或 secret 入口。
 
 ## 原生 Thread Goal
 

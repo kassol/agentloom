@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
+	"github.com/yan5xu/codex-loom/internal/modelcatalog"
 )
 
 const (
@@ -20,19 +21,20 @@ const (
 // model_providers entry. Raw config/read responses never leave the Hub because
 // Codex may return literal bearer tokens and static HTTP headers unchanged.
 type ModelProvider struct {
-	ID                   string   `json:"id"`
-	Name                 string   `json:"name"`
-	BaseURL              string   `json:"baseUrl,omitempty"`
-	WireAPI              string   `json:"wireApi,omitempty"`
-	Source               string   `json:"source"`
-	Configured           bool     `json:"configured"`
-	CredentialSource     string   `json:"credentialSource"`
-	CredentialConfigured bool     `json:"credentialConfigured"`
-	Models               []string `json:"models"`
-	BoundAgentCount      int      `json:"boundAgentCount"`
-	PublicBeta           bool     `json:"publicBeta,omitempty"`
-	TextOnly             bool     `json:"textOnly,omitempty"`
-	Limitations          []string `json:"limitations,omitempty"`
+	ID                   string                     `json:"id"`
+	Name                 string                     `json:"name"`
+	BaseURL              string                     `json:"baseUrl,omitempty"`
+	WireAPI              string                     `json:"wireApi,omitempty"`
+	Source               string                     `json:"source"`
+	Configured           bool                       `json:"configured"`
+	CredentialSource     string                     `json:"credentialSource"`
+	CredentialConfigured bool                       `json:"credentialConfigured"`
+	Models               []string                   `json:"models"`
+	ModelDetails         []modelcatalog.PublicModel `json:"modelDetails"`
+	BoundAgentCount      int                        `json:"boundAgentCount"`
+	PublicBeta           bool                       `json:"publicBeta,omitempty"`
+	TextOnly             bool                       `json:"textOnly,omitempty"`
+	Limitations          []string                   `json:"limitations,omitempty"`
 }
 
 type ModelProviderUpsertParams struct {
@@ -75,6 +77,10 @@ func (h *Hub) ListModelProviders() ([]ModelProvider, error) {
 }
 
 func (h *Hub) listModelProvidersLocked() ([]ModelProvider, error) {
+	catalog, err := modelcatalog.Describe(os.Getenv("CODEX_LOOM_MODEL_CATALOG"))
+	if err != nil {
+		return nil, errf(500, "read Codex model catalog: %s", err)
+	}
 	snapshot, err := h.readCodexConfig()
 	if err != nil {
 		return nil, err
@@ -85,7 +91,7 @@ func (h *Hub) listModelProvidersLocked() ([]ModelProvider, error) {
 	providers := []ModelProvider{{
 		ID: "openai", Name: "OpenAI / ChatGPT login", Source: "builtin",
 		Configured: true, CredentialSource: "codex-auth", CredentialConfigured: openAIAuthConfigured,
-		Models: []string{}, BoundAgentCount: bound[""],
+		Models: catalogModelIDs(catalog, "openai"), ModelDetails: catalogModels(catalog, "openai"), BoundAgentCount: bound[""],
 	}}
 	seen := map[string]bool{"openai": true}
 	for id, raw := range anyMap(snapshot.Config["model_providers"]) {
@@ -93,7 +99,7 @@ func (h *Hub) listModelProvidersLocked() ([]ModelProvider, error) {
 			continue
 		}
 		definition := anyMap(raw)
-		provider := sanitizeModelProvider(id, definition)
+		provider := sanitizeModelProvider(id, definition, catalog)
 		provider.BoundAgentCount = bound[id]
 		providers = append(providers, provider)
 		seen[id] = true
@@ -110,6 +116,25 @@ func (h *Hub) listModelProvidersLocked() ([]ModelProvider, error) {
 	}
 	sort.Slice(providers[1:], func(i, j int) bool { return providers[i+1].ID < providers[j+1].ID })
 	return providers, nil
+}
+
+func (h *Hub) ModelCatalogStatus() (modelcatalog.Status, error) {
+	snapshot, err := modelcatalog.Describe(os.Getenv("CODEX_LOOM_MODEL_CATALOG"))
+	if err != nil {
+		return modelcatalog.Status{}, errf(500, "read Codex model catalog: %s", err)
+	}
+	version, _ := codex.Version(codexHostBin())
+	h.mu.Lock()
+	host := h.codexHost
+	applied := host != nil && !host.client.Closed() && host.catalogSHA == snapshot.SHA256
+	restartRequired := host != nil && !host.client.Closed() && host.catalogSHA != snapshot.SHA256
+	h.mu.Unlock()
+	return modelcatalog.Status{
+		Source: snapshot.Source, Version: snapshot.Version, SHA256: snapshot.SHA256,
+		CodexBaseline: modelcatalog.CodexBaseline, CodexVersion: version,
+		Compatibility: modelcatalog.Compatibility(version), ModelCount: len(snapshot.Catalog.Models),
+		Models: snapshot.PublicModels(), Applied: applied, RestartRequired: restartRequired,
+	}, nil
 }
 
 func (h *Hub) codexAuthConfigured() bool {
@@ -263,14 +288,14 @@ func (h *Hub) VerifyModelProvider(id, model string) (ModelProviderVerification, 
 	if model == "" && len(provider.Models) > 0 {
 		model = provider.Models[0]
 	}
-	requestStatus, authStatus, message := verifyProviderRequest(provider.ID, model)
+	requestStatus, authStatus, message := h.verifyProviderRequest(provider.ID, model)
 	verification.MinimalRequest = requestStatus
 	verification.Authentication = authStatus
 	verification.Message = message
 	return verification, nil
 }
 
-func verifyProviderRequest(providerID, model string) (requestStatus, authStatus, message string) {
+func (h *Hub) verifyProviderRequest(providerID, model string) (requestStatus, authStatus, message string) {
 	if providerID != "openai" && strings.TrimSpace(model) == "" {
 		return "not_run", "configured", "A model id is required to run a custom Provider canary"
 	}
@@ -280,7 +305,13 @@ func verifyProviderRequest(providerID, model string) (requestStatus, authStatus,
 	}
 	defer os.RemoveAll(cwd)
 
-	client, err := codex.SpawnWithOptions(codex.SpawnOptions{Bin: codexHostBin(), Env: codexHostEnv()})
+	catalog, err := h.materializeModelCatalog()
+	if err != nil {
+		return "failed", "configured", "Prepare model catalog: " + err.Error()
+	}
+	client, err := codex.SpawnWithOptions(codex.SpawnOptions{
+		Bin: codexHostBin(), Env: codexHostEnv(), Args: modelcatalog.SpawnArgs(catalog.Path),
+	})
 	if err != nil {
 		return "failed", "configured", "Start Codex verification runtime: " + err.Error()
 	}
@@ -465,11 +496,11 @@ func (h *Hub) modelProviderBindings() map[string]int {
 	return bound
 }
 
-func sanitizeModelProvider(id string, definition map[string]any) ModelProvider {
+func sanitizeModelProvider(id string, definition map[string]any, catalog modelcatalog.Snapshot) ModelProvider {
 	provider := ModelProvider{
 		ID: id, Name: stringValue(definition["name"]), BaseURL: stringValue(definition["base_url"]),
 		WireAPI: stringValue(definition["wire_api"]), Source: "custom", Configured: true,
-		Models: []string{}, CredentialSource: "missing",
+		Models: catalogModelIDs(catalog, id), ModelDetails: catalogModels(catalog, id), CredentialSource: "missing",
 	}
 	if provider.Name == "" {
 		provider.Name = id
@@ -496,7 +527,6 @@ func sanitizeModelProvider(id string, definition map[string]any) ModelProvider {
 		}
 	}
 	if id == deepSeekProviderID {
-		provider.Models = []string{deepSeekModel}
 		provider.PublicBeta = true
 		provider.TextOnly = true
 		provider.Limitations = []string{
@@ -506,6 +536,25 @@ func sanitizeModelProvider(id string, definition map[string]any) ModelProvider {
 		}
 	}
 	return provider
+}
+
+func catalogModels(catalog modelcatalog.Snapshot, providerID string) []modelcatalog.PublicModel {
+	models := make([]modelcatalog.PublicModel, 0)
+	for _, model := range catalog.PublicModels() {
+		if model.ProviderID == providerID && model.Visible {
+			models = append(models, model)
+		}
+	}
+	return models
+}
+
+func catalogModelIDs(catalog modelcatalog.Snapshot, providerID string) []string {
+	models := catalogModels(catalog, providerID)
+	ids := make([]string, 0, len(models))
+	for _, model := range models {
+		ids = append(ids, model.ID)
+	}
+	return ids
 }
 
 func configEdit(keyPath string, value any) map[string]any {

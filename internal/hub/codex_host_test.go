@@ -553,6 +553,7 @@ func installFakeSharedCodexHost(t *testing.T) string {
 	logPath := filepath.Join(dir, "requests.ndjson")
 	resumeMarker := filepath.Join(dir, "resumed")
 	script := `#!/bin/sh
+printf '%s\n' "$@" > "$CODEX_HOST_ARGS_LOG"
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_HOST_LOG"
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -618,8 +619,37 @@ done
 	}
 	t.Setenv("CODEX_REMOTE_BIN", binPath)
 	t.Setenv("CODEX_HOST_LOG", logPath)
+	t.Setenv("CODEX_HOST_ARGS_LOG", filepath.Join(dir, "args.txt"))
 	t.Setenv("CODEX_HOST_RESUMED", resumeMarker)
 	return logPath
+}
+
+func TestSharedCodexHostLoadsManagedModelCatalog(t *testing.T) {
+	logPath := installFakeSharedCodexHost(t)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	defer h.Shutdown()
+	if _, err := h.ensureCodexHost(); err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(filepath.Join(filepath.Dir(logPath), "args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := string(args)
+	if !strings.Contains(value, "app-server\n-c\nmodel_catalog_json=\"") || !strings.Contains(value, "codex-0.144.1+deepseek-v4-flash-0731.json") {
+		t.Fatalf("CodexHost args = %q", value)
+	}
+	status, err := h.ModelCatalogStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Applied || status.RestartRequired || status.ModelCount != 9 {
+		t.Fatalf("model catalog status = %#v", status)
+	}
 }
 
 func TestModelProviderProjectionRedactsSecretsAndUsesVersionedBatchWrite(t *testing.T) {
@@ -644,6 +674,9 @@ func TestModelProviderProjectionRedactsSecretsAndUsesVersionedBatchWrite(t *test
 	}
 	if len(providers) != 2 || providers[1].ID != "deepseek" || providers[1].CredentialSource != "toml" || !providers[1].CredentialConfigured {
 		t.Fatalf("Provider projection = %#v", providers)
+	}
+	if len(providers[0].Models) != 7 || len(providers[1].Models) != 1 || providers[1].Models[0] != deepSeekModel {
+		t.Fatalf("Provider catalog projection = %#v", providers)
 	}
 
 	provider, err := h.UpsertModelProvider("deepseek", ModelProviderUpsertParams{APIKey: "replacement-fixture-secret"})
