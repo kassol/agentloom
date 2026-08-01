@@ -139,11 +139,12 @@ export type Block =
       payload?: TopicContextPayload;
       raw: string;
     }
-  | { kind: "agent"; id: string; text: string; streaming: boolean }
-  | { kind: "think"; id: string; text: string; done: boolean }
+  | { kind: "agent"; id: string; ts?: string; text: string; streaming: boolean }
+  | { kind: "think"; id: string; ts?: string; text: string; done: boolean }
   | {
       kind: "command";
       id: string;
+      ts?: string;
       command: string;
       status: string;
       exitCode: number | null;
@@ -153,15 +154,17 @@ export type Block =
   | {
       kind: "file";
       id: string;
+      ts?: string;
       status: string;
       changes: { path: string; kind: string; diff: string }[];
     }
   | { kind: "sys"; ts: string; cls: "ok" | "warn" | "err" | "dim"; text: string }
-  | { kind: "image"; id: string; data: string; path?: string }
+  | { kind: "image"; id: string; ts?: string; data: string; path?: string }
   | { kind: "artifact"; id: string; ts: string; artifact: ExternalAttachment }
   | {
       kind: "usage";
       id: string;
+      ts?: string;
       model?: string;
       inputTokens: number;
       cachedInputTokens: number;
@@ -170,7 +173,7 @@ export type Block =
       totalTokens: number;
       calls: number;
     }
-  | { kind: "raw"; id: string; type: string; json: string };
+  | { kind: "raw"; id: string; ts?: string; type: string; json: string };
 
 export interface FeedState {
   blocks: Block[];
@@ -192,6 +195,48 @@ function update(state: FeedState, key: string, fn: (b: Block) => Block): FeedSta
   const blocks = [...state.blocks];
   blocks[idx] = fn(blocks[idx]);
   return { ...state, blocks };
+}
+
+function blockTimestamp(block: Block): number | null {
+  const value = "ts" in block ? block.ts : undefined;
+  if (!value) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function interleaveArtifacts(blocks: Block[]): Block[] {
+  const trajectory: Block[] = blocks.filter((block) => block.kind !== "artifact");
+  const artifacts = blocks
+    .map((block, position) => ({ block, position, timestamp: blockTimestamp(block) }))
+    .filter((entry) => entry.block.kind === "artifact")
+    .sort((a, b) => {
+      if (a.timestamp === null && b.timestamp === null) return a.position - b.position;
+      if (a.timestamp === null) return 1;
+      if (b.timestamp === null) return -1;
+      return a.timestamp - b.timestamp || a.position - b.position;
+    });
+
+  for (const artifact of artifacts) {
+    const index = artifact.timestamp === null
+      ? -1
+      : trajectory.findIndex((block) => {
+        const timestamp = blockTimestamp(block);
+        return timestamp !== null && timestamp > artifact.timestamp!;
+      });
+    if (index < 0) trajectory.push(artifact.block);
+    else trajectory.splice(index, 0, artifact.block);
+  }
+  return trajectory;
+}
+
+function reorderBlocks(state: FeedState, blocks: Block[]): FeedState {
+  const keyedBlocks = Object.entries(state.index).map(([key, index]) => [key, state.blocks[index]] as const);
+  const index: Record<string, number> = {};
+  for (const [key, block] of keyedBlocks) {
+    const next = blocks.indexOf(block);
+    if (next >= 0) index[key] = next;
+  }
+  return { ...state, blocks, index };
 }
 
 function sys(state: FeedState, ts: string, cls: "ok" | "warn" | "err" | "dim", text: string) {
@@ -720,18 +765,18 @@ function buildHistoryBlocks(turns: any[], keyPrefix: string): Block[] {
           blocks.push(userBlock(timestamp, structuredText(it.text), Array.isArray(it.attachments) ? it.attachments : []));
           break;
         case "answer":
-          blocks.push({ kind: "agent", id, text: structuredText(it.text), streaming: false });
+          blocks.push({ kind: "agent", id, ts: timestamp, text: structuredText(it.text), streaming: false });
           break;
         case "thinking": {
           const text = structuredText(it.text) || structuredText(it.summary) || structuredText(it.content);
           if (text.trim()) {
-            blocks.push({ kind: "think", id, text, done: true });
+            blocks.push({ kind: "think", id, ts: timestamp, text, done: true });
           }
           break;
         }
         case "command":
           blocks.push({
-            kind: "command", id,
+            kind: "command", id, ts: timestamp,
             command: it.command || "",
             status: it.status || "completed",
             exitCode: it.exitCode ?? null,
@@ -740,12 +785,12 @@ function buildHistoryBlocks(turns: any[], keyPrefix: string): Block[] {
           });
           break;
         case "file_change":
-          blocks.push({ kind: "file", id, status: "completed", changes: it.changes || [] });
+          blocks.push({ kind: "file", id, ts: timestamp, status: "completed", changes: it.changes || [] });
           break;
         case "image":
           {
             const image = imageSrc(it);
-            if (image) blocks.push({ kind: "image", id, ...image });
+            if (image) blocks.push({ kind: "image", id, ts: timestamp, ...image });
           }
           break;
       }
@@ -754,6 +799,7 @@ function buildHistoryBlocks(turns: any[], keyPrefix: string): Block[] {
       blocks.push({
         kind: "usage",
         id: turn.id || `${keyPrefix}-turn-${i}`,
+        ts: turn.completedAt || turn.updatedAt || items.at(-1)?.timestamp || turn.startedAt || "",
         model: turn.model,
         inputTokens: turn.usage.inputTokens || 0,
         cachedInputTokens: turn.usage.cachedInputTokens || 0,
@@ -789,8 +835,8 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
     }
     case "__history_reconcile__": {
       const blocks = buildHistoryBlocks((d as any).turns || [], "r");
-	  const artifacts = state.blocks.filter((block) => block.kind === "artifact");
-	  return { blocks: [...blocks, ...artifacts], index: {}, approvals: {} };
+      const artifacts = state.blocks.filter((block) => block.kind === "artifact");
+	  return { blocks: interleaveArtifacts([...blocks, ...artifacts]), index: {}, approvals: {} };
     }
 	case "__published_artifacts__": {
 	  let next = state;
@@ -800,12 +846,12 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
 		if (!id || next.blocks.some((block) => block.kind === "artifact" && block.id === id)) continue;
 		next = push(next, { kind: "artifact", id, ts: raw.publishedAt || raw.createdAt || ev.ts, artifact });
 	  }
-	  return next;
+	  return reorderBlocks(next, interleaveArtifacts(next.blocks));
 	}
     case "__history_prepend__": {
       // Scroll-up lazy load: older turns prepended before the current feed.
       const older = buildHistoryBlocks((d as any).turns || [], `p${(d as any).offset || 0}`);
-      return { ...state, blocks: [...older, ...state.blocks] };
+      return reorderBlocks(state, interleaveArtifacts([...older, ...state.blocks]));
     }
     case "__turn_usage__": {
       const turn = (d as any).turn;
@@ -813,6 +859,7 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
       return push(state, {
         kind: "usage",
         id: turn.id,
+        ts: ev.ts,
         model: turn.model,
         inputTokens: turn.usage.inputTokens || 0,
         cachedInputTokens: turn.usage.cachedInputTokens || 0,
@@ -877,14 +924,14 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
       const key = `t:${itemId}`;
       if (state.index[key] === undefined) {
         if (!text.trim()) return state;
-        return push(state, { kind: "think", id: itemId, text, done: false }, key);
+        return push(state, { kind: "think", id: itemId, ts: ev.ts, text, done: false }, key);
       }
       return update(state, key, (b) => (b.kind === "think" ? { ...b, text: b.text + text } : b));
     }
     if (t.includes("agentMessage")) {
       const key = `a:${itemId}`;
       if (state.index[key] === undefined) {
-        return push(state, { kind: "agent", id: itemId, text, streaming: true }, key);
+        return push(state, { kind: "agent", id: itemId, ts: ev.ts, text, streaming: true }, key);
       }
       return update(state, key, (b) => (b.kind === "agent" ? { ...b, text: b.text + text } : b));
     }
@@ -904,8 +951,8 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
           if (!done || !text) return state;
           const isFinal = item.phase === "final_answer" || !item.phase;
           return isFinal
-            ? push(state, { kind: "agent", id: itemId, text, streaming: false }, key)
-            : push(state, { kind: "think", id: itemId, text, done: true }, `t:${itemId}`);
+            ? push(state, { kind: "agent", id: itemId, ts: ev.ts, text, streaming: false }, key)
+            : push(state, { kind: "think", id: itemId, ts: ev.ts, text, done: true }, `t:${itemId}`);
         }
         return update(state, key, (b) =>
           b.kind === "agent" ? { ...b, text: text || b.text, streaming: !done } : b,
@@ -917,7 +964,7 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
           structuredText(item.text) || structuredText(item.summary) || structuredText(item.content);
         if (state.index[key] === undefined) {
           if (!text.trim()) return state;
-          return push(state, { kind: "think", id: itemId, text, done: t === "item/completed" }, key);
+          return push(state, { kind: "think", id: itemId, ts: ev.ts, text, done: t === "item/completed" }, key);
         }
         return update(state, key, (b) =>
           b.kind === "think"
@@ -935,7 +982,7 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
           output: item.aggregatedOutput || item.output || "",
         };
         if (state.index[key] === undefined) {
-          return push(state, { kind: "command", id: itemId, ...patch }, key);
+          return push(state, { kind: "command", id: itemId, ts: ev.ts, ...patch }, key);
         }
         return update(state, key, (b) => (b.kind === "command" ? { ...b, ...patch } : b));
       }
@@ -948,7 +995,7 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
         }));
         const status = item.status || (t === "item/completed" ? "done" : "editing");
         if (state.index[key] === undefined) {
-          return push(state, { kind: "file", id: itemId, status, changes }, key);
+          return push(state, { kind: "file", id: itemId, ts: ev.ts, status, changes }, key);
         }
         return update(state, key, (b) => (b.kind === "file" ? { ...b, status, changes } : b));
       }
@@ -959,7 +1006,7 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
         const image = imageSrc(item);
         if (!image) return state;
         if (state.index[key] === undefined) {
-          return push(state, { kind: "image", id: itemId, ...image }, key);
+          return push(state, { kind: "image", id: itemId, ts: ev.ts, ...image }, key);
         }
         return update(state, key, (b) => (b.kind === "image" ? { ...b, ...image } : b));
       }
@@ -970,7 +1017,7 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
         if (state.index[key] !== undefined) return state;
         return push(
           state,
-          { kind: "raw", id: itemId, type: item.type, json: JSON.stringify(item, null, 2) },
+          { kind: "raw", id: itemId, ts: ev.ts, type: item.type, json: JSON.stringify(item, null, 2) },
           key,
         );
       }

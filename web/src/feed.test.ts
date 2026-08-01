@@ -308,4 +308,57 @@ This trusted context applies only to the immediately following inbox message.
 	const reconciled = reduceFeed(restored, { seq: 0, ts: "", type: "__history_reconcile__", data: { turns: [] } });
 	expect(reconciled.blocks).toEqual(restored.blocks);
   });
+
+  it("restores published artifacts at their chronological position", () => {
+    const history = {
+      turns: [
+        {
+          id: "turn-1",
+          items: [
+            { type: "user", timestamp: "2026-07-16T05:00:00Z", text: "first request" },
+            { type: "answer", timestamp: "2026-07-16T05:01:00Z", text: "first answer" },
+          ],
+        },
+        {
+          id: "turn-2",
+          items: [{ type: "user", timestamp: "2026-07-16T05:10:00Z", text: "second request" }],
+        },
+      ],
+    };
+    const seeded = reduceFeed(emptyFeed, { seq: 0, ts: "", type: "__history__", data: history });
+    const restored = reduceFeed(seeded, {
+      seq: 0,
+      ts: "",
+      type: "__published_artifacts__",
+      data: { artifacts: [{ id: "art_between", name: "result.png", publishedAt: "2026-07-16T05:05:00Z" }] },
+    });
+
+    expect(restored.blocks.map((block) => block.kind)).toEqual(["user", "agent", "artifact", "user"]);
+
+    const reconciled = reduceFeed(restored, { seq: 0, ts: "", type: "__history_reconcile__", data: history });
+    expect(reconciled.blocks.map((block) => block.kind)).toEqual(["user", "agent", "artifact", "user"]);
+  });
+
+  it("keeps restored artifacts chronological when older history is prepended", () => {
+    const current = reduceFeed(emptyFeed, {
+      seq: 0,
+      ts: "",
+      type: "__history__",
+      data: { turns: [{ items: [{ type: "user", timestamp: "2026-07-16T05:10:00Z", text: "current" }] }] },
+    });
+    const restored = reduceFeed(current, {
+      seq: 0,
+      ts: "",
+      type: "__published_artifacts__",
+      data: { artifacts: [{ id: "art_between", publishedAt: "2026-07-16T05:05:00Z" }] },
+    });
+    const prepended = reduceFeed(restored, {
+      seq: 0,
+      ts: "",
+      type: "__history_prepend__",
+      data: { offset: 25, turns: [{ items: [{ type: "answer", timestamp: "2026-07-16T05:01:00Z", text: "older" }] }] },
+    });
+
+    expect(prepended.blocks.map((block) => block.kind)).toEqual(["agent", "artifact", "user"]);
+  });
 });

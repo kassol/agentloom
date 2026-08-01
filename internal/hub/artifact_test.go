@@ -126,6 +126,16 @@ func TestDisplayUserTaskStripsAttachmentManifest(t *testing.T) {
 	}
 }
 
+func TestDisplayUserTaskStripsManagedLoomContext(t *testing.T) {
+	context := `<loom_context version="1"><payload>private managed context</payload></loom_context>`
+	if got := displayUserTask("Review the candidate\n\n" + context); got != "Review the candidate" {
+		t.Fatalf("display task with managed context = %q", got)
+	}
+	if got := displayUserTask(context); got != "CodexLoom managed work" {
+		t.Fatalf("context-only display task = %q", got)
+	}
+}
+
 func TestDisplayUserTaskSummarizesTopicControlEnvelopes(t *testing.T) {
 	ownerInput := `<loom_topic_context version="1"><brief><summary>Internal state</summary></brief></loom_topic_context>
 <owner_topic_input version="1"><message><![CDATA[Review the current candidate.]]></message></owner_topic_input>`

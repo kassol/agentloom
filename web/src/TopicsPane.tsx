@@ -20,7 +20,7 @@ import { MarkdownContent } from "./pages/agent/markdown";
 import { Button } from "./components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./components/ui/dialog";
 import { Input } from "./components/ui/input";
-import { api, type Agent, type Topic, type TopicActiveTurn, type TopicStatus } from "./types";
+import { api, type Agent, type Topic, type TopicActiveTurn, type TopicStatus, type TopicSummary } from "./types";
 import { topicAuditSummary, topicBriefTimeline } from "./topics-view";
 
 type TopicFilter = "attention" | "active" | "waiting" | "resolved" | "all";
@@ -62,9 +62,9 @@ export function TopicsPane({
   onError: (message: string) => void;
 }) {
   const queryClient = useQueryClient();
-  const topicsQuery = useQuery<{ topics: Topic[] }>({
+  const topicsQuery = useQuery<{ topics: TopicSummary[] }>({
     queryKey: ["topics"],
-    queryFn: () => api("GET", "/api/topics"),
+    queryFn: () => api("GET", "/api/topics?view=summary"),
     refetchInterval: 30_000,
   });
   const topics = topicsQuery.data?.topics || [];
@@ -82,7 +82,13 @@ export function TopicsPane({
   const [evidenceDraft, setEvidenceDraft] = useState({ type: "message", id: "", label: "" });
   const [interventionDraft, setInterventionDraft] = useState({ text: "", reason: "" });
 
-  const selected = topics.find((topic) => topic.id === selectedID) || null;
+  const selectedSummary = topics.find((topic) => topic.id === selectedID) || null;
+  const selectedQuery = useQuery<{ topic: Topic }>({
+    queryKey: ["topic", selectedID],
+    queryFn: () => api("GET", `/api/topics/${encodeURIComponent(selectedID)}`),
+    enabled: Boolean(selectedID),
+  });
+  const selected = selectedQuery.data?.topic || null;
   const selectedParticipants = selected?.participants || [];
   const selectedActiveTurns = selected?.activeTurns || [];
   const evidenceLinks = useMemo(() => (selected?.links || []).filter((link) => link.relation !== "activity"), [selected?.links]);
@@ -107,7 +113,12 @@ export function TopicsPane({
     });
   }, [filter, topics]);
 
-  const refresh = async () => queryClient.invalidateQueries({ queryKey: ["topics"] });
+  const refresh = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["topics"] }),
+      selectedID ? queryClient.invalidateQueries({ queryKey: ["topic", selectedID] }) : Promise.resolve(),
+    ]);
+  };
   const run = async (task: () => Promise<unknown>) => {
     if (working) return;
     setWorking(true);
@@ -140,9 +151,9 @@ export function TopicsPane({
   }, [selectedID, topics, topicsQuery.isFetched]);
 
   useEffect(() => {
-    if (!selected || topicMatchesFilter(selected, filter)) return;
-    setFilter(selected.status === "archived" ? "all" : selected.status);
-  }, [selected?.id]);
+    if (!selectedSummary || topicMatchesFilter(selectedSummary, filter)) return;
+    setFilter(selectedSummary.status === "archived" ? "all" : selectedSummary.status);
+  }, [selectedSummary?.id]);
 
   useEffect(() => {
     if (!createRequest) return;
@@ -153,13 +164,13 @@ export function TopicsPane({
   }, [createRequest?.nonce]);
 
   useEffect(() => {
-    if (!selected?.resultsReady) return;
+    if (!selectedSummary?.resultsReady) return;
     let active = true;
     let requested = false;
     const markRead = () => {
       if (!active || requested || document.visibilityState !== "visible") return;
       requested = true;
-      void api("POST", `/api/topics/${encodeURIComponent(selected.id)}/read`, {})
+      void api("POST", `/api/topics/${encodeURIComponent(selectedSummary.id)}/read`, {})
         .then(refresh)
         .catch(() => { requested = false; });
     };
@@ -169,7 +180,7 @@ export function TopicsPane({
       active = false;
       document.removeEventListener("visibilitychange", markRead);
     };
-  }, [selected?.id, selected?.resultsReady]);
+  }, [selectedSummary?.id, selectedSummary?.resultsReady]);
 
   useEffect(() => {
     const root = (((window as any).codexLoom ||= (window as any).codexHub || {}) as Record<string, any>);
@@ -181,7 +192,7 @@ export function TopicsPane({
       needsMe: topics.filter((topic) => topic.needsMeCount > 0).map((topic) => topic.id),
       resultsReady: topics.filter((topic) => topic.resultsReady).map((topic) => topic.id),
       visibleTopicIds: visible.map((topic) => topic.id),
-      activeTurns: selected?.activeTurns || [],
+      activeTurns: selected?.activeTurns || selectedSummary?.activeTurns || [],
     });
     automationRef.current = { state };
     root.topics = {
@@ -211,7 +222,7 @@ export function TopicsPane({
         return state();
       },
     };
-  }, [agents, detailView, filter, selected, selectedID, topics, visible]);
+  }, [agents, detailView, filter, selected, selectedID, selectedSummary, topics, visible]);
 
   const selectTopic = (id: string) => {
     setSelectedID(id);
@@ -271,7 +282,7 @@ export function TopicsPane({
   return (
     <main className="flex min-h-0 min-w-0 flex-1 bg-background" aria-label="Topics workspace">
       <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)]">
-        <section className={`${selected ? "hidden lg:flex" : "flex"} min-h-0 flex-col border-r border-border bg-sidebar/25`} aria-label="Topics list">
+        <section className={`${selectedID ? "hidden lg:flex" : "flex"} min-h-0 flex-col border-r border-border bg-sidebar/25`} aria-label="Topics list">
           <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
             <GitBranch className="size-4 text-primary" />
             <div className="min-w-0 flex-1">
@@ -299,7 +310,7 @@ export function TopicsPane({
           </div>
         </section>
 
-        <section className={`${selected ? "flex" : "hidden lg:flex"} min-h-0 min-w-0 flex-col`} aria-label="Topic detail">
+        <section className={`${selectedID ? "flex" : "hidden lg:flex"} min-h-0 min-w-0 flex-col`} aria-label="Topic detail">
           {selected ? (
             <>
               <header className="flex min-h-12 shrink-0 items-center gap-2 border-b border-border px-3 md:px-5">
@@ -439,6 +450,8 @@ export function TopicsPane({
                 </div>
               </footer>
             </>
+          ) : selectedID ? (
+            <div className="flex flex-1 items-center justify-center text-muted-foreground"><Loader2 className="size-5 animate-spin" /><span className="ml-2 text-[11px]">Loading Topic detail…</span></div>
           ) : (
             <div className="flex flex-1 flex-col items-center justify-center text-center text-muted-foreground"><GitBranch className="size-7 opacity-35" /><div className="mt-2 text-[12px] font-medium text-foreground/70">Select a Topic</div><p className="mt-1 text-[10.5px]">Recover the shared state without joining every Agent Thread.</p></div>
           )}
@@ -495,7 +508,7 @@ function CreateTopicDialog({ open, agents, draft, working, onOpenChange, onChang
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="max-h-[min(88dvh,760px)] overflow-y-auto sm:max-w-xl"><DialogHeader><DialogTitle>Track this as a Topic</DialogTitle><DialogDescription>Create the smallest shared record needed to recover work across Turns, waiting periods, and Agent handoffs.</DialogDescription></DialogHeader><div className="space-y-3"><Field label="Title"><Input value={draft.title} onChange={(e) => onChange({ ...draft, title: e.target.value })} placeholder="A bounded stage with a clear finish" /></Field><Field label="Responsible Agent"><select value={draft.responsibleAgent} onChange={(e) => onChange({ ...draft, responsibleAgent: e.target.value, participants: draft.participants.filter((participant) => participant.agent !== e.target.value) })} className={selectClass}><option value="">Select the Agent accountable for the whole</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></Field><Field label="Purpose"><textarea rows={3} value={draft.purpose} onChange={(e) => onChange({ ...draft, purpose: e.target.value })} placeholder="Why this work needs continuity" className={textareaClass} /></Field><Field label="Complete when"><textarea rows={3} value={draft.completionBoundary} onChange={(e) => onChange({ ...draft, completionBoundary: e.target.value })} placeholder="The observable boundary that closes this Topic" className={textareaClass} /></Field><Field label="Current brief (optional)"><textarea rows={3} value={draft.summary} onChange={(e) => onChange({ ...draft, summary: e.target.value })} placeholder="What is already known now; not a full history import" className={textareaClass} /></Field><div className="space-y-2"><div className="flex items-center"><span className="text-[10px] font-medium uppercase text-muted-foreground">Participants (optional)</span><Button type="button" variant="outline" size="sm" className="ml-auto" onClick={() => onChange({ ...draft, participants: [...draft.participants, { agent: "", responsibility: "" }] })}><Plus />Participant</Button></div>{draft.participants.map((participant, index) => <div key={index} className="grid grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)_auto] gap-2"><select value={participant.agent} onChange={(event) => updateParticipant(index, { agent: event.target.value })} className={selectClass}><option value="">Select an Agent</option>{agents.filter((agent) => agent.id !== draft.responsibleAgent && (!selectedParticipants.has(agent.id) || agent.id === participant.agent)).map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select><Input value={participant.responsibility} onChange={(event) => updateParticipant(index, { responsibility: event.target.value })} placeholder="Topic-scoped responsibility" /><Button type="button" variant="ghost" size="icon-sm" onClick={() => onChange({ ...draft, participants: draft.participants.filter((_, candidate) => candidate !== index) })} aria-label="Remove participant"><X /></Button></div>)}</div></div><DialogFooter showCloseButton><Button onClick={onCreate} disabled={working || !draft.title.trim() || !draft.responsibleAgent || !draft.purpose.trim() || !draft.completionBoundary.trim() || draft.participants.some((participant) => !participant.agent || !participant.responsibility.trim())}>{working ? <Loader2 className="animate-spin" /> : <Plus />}Create Topic</Button></DialogFooter></DialogContent></Dialog>;
 }
 
-function TopicListItem({ topic, selected, onSelect }: { topic: Topic; selected: boolean; onSelect: () => void }) {
+function TopicListItem({ topic, selected, onSelect }: { topic: TopicSummary; selected: boolean; onSelect: () => void }) {
   const activeTurns = topic.activeTurns || [];
   return <button type="button" onClick={onSelect} className={`group flex w-full min-w-0 items-start gap-3 border-b border-border/70 px-3 py-3 text-left outline-none transition hover:bg-muted/55 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 ${selected ? "bg-selection" : ""}`}><StatusMark status={topic.status} /><span className="min-w-0 flex-1"><span className="flex min-w-0 items-center gap-2"><span className="truncate text-[12px] font-semibold">{topic.title}</span>{topic.needsMeCount > 0 ? <span className="shrink-0 rounded-sm bg-warning/15 px-1 font-mono text-[8px] font-semibold text-warning">{topic.needsMeCount} need you</span> : null}{topic.resultsReady ? <span className="size-1.5 shrink-0 rounded-full bg-success" title="Result ready" /> : null}</span><span className="mt-1 block truncate text-[10px] text-muted-foreground">{topic.responsibleAgent} · {topic.currentBrief.nextStep || topic.currentBrief.summary || topic.purpose}</span><span className="mt-1.5 block font-mono text-[8.5px] uppercase text-muted-foreground">{topic.status}{activeTurns.length ? ` · ${activeTurns.length} active` : ""} · {relativeTime(topic.updatedAt)}</span></span><ChevronRight className="mt-1 size-3.5 shrink-0 text-muted-foreground/45 group-hover:text-muted-foreground" /></button>;
 }
@@ -512,7 +525,7 @@ function TextSection({ label, text }: { label: string; text: string }) { return 
 function SectionTitle({ children }: { children: ReactNode }) { return <h3 className="font-mono text-[9px] font-semibold uppercase text-muted-foreground">{children}</h3>; }
 function BriefField({ label, value }: { label: string; value: string }) { return <div><dt className="font-mono text-[8.5px] uppercase text-muted-foreground">{label}</dt><dd className="mt-1 whitespace-pre-wrap leading-5 text-foreground/85">{value}</dd></div>; }
 function Field({ label, children }: { label: string; children: ReactNode }) { return <label className="block space-y-1.5 text-[10px] font-medium uppercase text-muted-foreground">{label}{children}</label>; }
-function topicMatchesFilter(topic: Topic, filter: TopicFilter) { if (filter === "attention") return topic.needsMeCount > 0 || topic.resultsReady; if (filter === "all") return topic.status !== "archived"; return topic.status === filter; }
+function topicMatchesFilter(topic: TopicSummary, filter: TopicFilter) { if (filter === "attention") return topic.needsMeCount > 0 || topic.resultsReady; if (filter === "all") return topic.status !== "archived"; return topic.status === filter; }
 function eventLabel(value: string) { return value.replaceAll("_", " "); }
 function formatDate(value: string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString(); }
 function relativeTime(value: string) { const ms = Date.now() - Date.parse(value); if (!Number.isFinite(ms)) return value; const minutes = Math.max(0, Math.floor(ms / 60_000)); if (minutes < 1) return "now"; if (minutes < 60) return `${minutes}m`; const hours = Math.floor(minutes / 60); if (hours < 24) return `${hours}h`; return `${Math.floor(hours / 24)}d`; }

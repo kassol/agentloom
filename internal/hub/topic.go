@@ -114,6 +114,29 @@ type TopicView struct {
 	ActiveTurns  []TopicActiveTurn `json:"activeTurns"`
 }
 
+// TopicSummaryView is the bounded list projection used by the Web workspace.
+// Audit events, brief history, evidence links and participant detail remain on
+// GET /api/topics/{id} and are loaded only for the selected Topic.
+type TopicSummaryView struct {
+	ID                    string            `json:"id"`
+	Title                 string            `json:"title"`
+	Purpose               string            `json:"purpose,omitempty"`
+	Status                string            `json:"status"`
+	ResponsibleAgentID    string            `json:"responsibleAgentId"`
+	ResponsibleAgent      string            `json:"responsibleAgent"`
+	CurrentBrief          TopicBrief        `json:"currentBrief"`
+	WaitingOn             *TopicWaitingOn   `json:"waitingOn,omitempty"`
+	ResultReadyVersion    int               `json:"resultReadyVersion,omitempty"`
+	OwnerSeenBriefVersion int               `json:"ownerSeenBriefVersion,omitempty"`
+	Version               int               `json:"version"`
+	CreatedAt             string            `json:"createdAt"`
+	UpdatedAt             string            `json:"updatedAt"`
+	ResolvedAt            string            `json:"resolvedAt,omitempty"`
+	NeedsMeCount          int               `json:"needsMeCount"`
+	ResultsReady          bool              `json:"resultsReady"`
+	ActiveTurns           []TopicActiveTurn `json:"activeTurns"`
+}
+
 type TopicParticipantParams struct {
 	Agent          string `json:"agent"`
 	Responsibility string `json:"responsibility"`
@@ -419,6 +442,53 @@ func (h *Hub) ListTopics(status, agentKey string) []TopicView {
 	return out
 }
 
+func (h *Hub) ListTopicSummaries(status, agentKey string) []TopicSummaryView {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	status = strings.TrimSpace(status)
+	agentID := ""
+	if agent := h.resolveLocked(strings.TrimSpace(agentKey)); agent != nil {
+		agentID = agent.ID
+	}
+	out := make([]TopicSummaryView, 0, len(h.topics))
+	for _, topic := range h.topics {
+		if topic == nil || status != "" && status != "all" && topic.Status != status {
+			continue
+		}
+		if agentKey != "" && !topicHasAgent(topic, agentID, agentKey) {
+			continue
+		}
+		out = append(out, h.topicSummaryViewLocked(topic))
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		left, right := topicSummaryOrder(out[i]), topicSummaryOrder(out[j])
+		if left != right {
+			return left < right
+		}
+		return out[i].UpdatedAt > out[j].UpdatedAt
+	})
+	return out
+}
+
+func topicSummaryOrder(view TopicSummaryView) int {
+	if view.NeedsMeCount > 0 {
+		return 0
+	}
+	if view.ResultsReady {
+		return 1
+	}
+	switch view.Status {
+	case TopicStatusActive:
+		return 2
+	case TopicStatusWaiting:
+		return 3
+	case TopicStatusResolved:
+		return 4
+	default:
+		return 5
+	}
+}
+
 func topicViewOrder(view TopicView) int {
 	if view.NeedsMeCount > 0 {
 		return 0
@@ -464,7 +534,6 @@ func (h *Hub) topicViewLocked(topic *Topic) TopicView {
 	view := TopicView{
 		Topic:        cloneTopic(*topic),
 		ResultsReady: topic.ResultReadyVersion > topic.OwnerSeenBriefVersion,
-		ActiveTurns:  make([]TopicActiveTurn, 0),
 	}
 	if responsible := h.agents[view.ResponsibleAgentID]; responsible != nil {
 		view.ResponsibleAgent = responsible.Name
@@ -474,26 +543,66 @@ func (h *Hub) topicViewLocked(topic *Topic) TopicView {
 			view.Participants[index].Agent = participant.Name
 		}
 	}
+	view.NeedsMeCount, view.ActiveTurns = h.topicRuntimeStateLocked(topic.ID, 0)
+	return view
+}
+
+func (h *Hub) topicSummaryViewLocked(topic *Topic) TopicSummaryView {
+	brief := topic.CurrentBrief
+	brief.Summary = boundedDisplayTask(brief.Summary, 1_000)
+	brief.CurrentState = ""
+	brief.NextStep = boundedDisplayTask(brief.NextStep, 1_000)
+	brief.Limitations = ""
+	brief.Evidence = nil
+	var waiting *TopicWaitingOn
+	if topic.WaitingOn != nil {
+		copy := *topic.WaitingOn
+		waiting = &copy
+	}
+	needsMe, activeTurns := h.topicRuntimeStateLocked(topic.ID, 320)
+	responsible := topic.ResponsibleAgent
+	if agent := h.agents[topic.ResponsibleAgentID]; agent != nil {
+		responsible = agent.Name
+	}
+	return TopicSummaryView{
+		ID: topic.ID, Title: topic.Title, Purpose: boundedDisplayTask(topic.Purpose, 500), Status: topic.Status,
+		ResponsibleAgentID: topic.ResponsibleAgentID, ResponsibleAgent: responsible,
+		CurrentBrief: brief, WaitingOn: waiting,
+		ResultReadyVersion: topic.ResultReadyVersion, OwnerSeenBriefVersion: topic.OwnerSeenBriefVersion,
+		Version: topic.Version, CreatedAt: topic.CreatedAt, UpdatedAt: topic.UpdatedAt, ResolvedAt: topic.ResolvedAt,
+		NeedsMeCount: needsMe, ResultsReady: topic.ResultReadyVersion > topic.OwnerSeenBriefVersion,
+		ActiveTurns: activeTurns,
+	}
+}
+
+func (h *Hub) topicRuntimeStateLocked(topicID string, taskLimit int) (int, []TopicActiveTurn) {
+	needsMe := 0
 	for _, request := range h.humanRequests {
-		if request != nil && request.TopicID == topic.ID && request.State == "open" {
-			view.NeedsMeCount++
+		if request != nil && request.TopicID == topicID && request.State == "open" {
+			needsMe++
 		}
 	}
+	activeTurns := make([]TopicActiveTurn, 0)
 	for agentID, rt := range h.runtimes {
-		if rt == nil || rt.activeTurn == nil || rt.activeTurn.finished || rt.activeTurn.topicID != topic.ID {
+		if rt == nil || rt.activeTurn == nil || rt.activeTurn.finished || rt.activeTurn.topicID != topicID {
 			continue
 		}
 		agent := h.agents[agentID]
 		if agent == nil {
 			continue
 		}
-		view.ActiveTurns = append(view.ActiveTurns, TopicActiveTurn{
-			AgentID: agent.ID, Agent: agent.Name, TurnID: rt.activeTurn.turnID, Task: rt.activeTurn.task,
-			Source: rt.activeTurn.source, StartedAt: rt.activeTurn.startedAt.UTC().Format(time.RFC3339Nano),
+		task := rt.activeTurn.task
+		if taskLimit > 0 {
+			task = boundedDisplayTask(task, taskLimit)
+		}
+		activeTurns = append(activeTurns, TopicActiveTurn{
+			AgentID: agent.ID, Agent: agent.Name, TurnID: rt.activeTurn.turnID,
+			Task: task, Source: rt.activeTurn.source,
+			StartedAt: rt.activeTurn.startedAt.UTC().Format(time.RFC3339Nano),
 		})
 	}
-	sort.SliceStable(view.ActiveTurns, func(i, j int) bool { return view.ActiveTurns[i].StartedAt < view.ActiveTurns[j].StartedAt })
-	return view
+	sort.SliceStable(activeTurns, func(i, j int) bool { return activeTurns[i].StartedAt < activeTurns[j].StartedAt })
+	return needsMe, activeTurns
 }
 
 func (h *Hub) UpdateTopic(id string, params UpdateTopicParams) (TopicView, error) {

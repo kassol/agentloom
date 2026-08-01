@@ -460,6 +460,15 @@ func (s *Server) registerIntegrationRoutes(mux *http.ServeMux) {
 		writeJSON(w, status, result)
 	})
 	mux.HandleFunc("GET /api/human-requests", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("view") == "summary" {
+			requests, err := s.hub.ListHumanRequestSummaries(r.URL.Query().Get("agent"), r.URL.Query().Get("state"))
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			writeJSON(w, 200, map[string]any{"requests": requests})
+			return
+		}
 		requests, err := s.hub.ListHumanRequests(r.URL.Query().Get("agent"), r.URL.Query().Get("state"))
 		if err != nil {
 			writeErr(w, err)

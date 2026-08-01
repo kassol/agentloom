@@ -9,6 +9,10 @@ import (
 
 func (s *Server) registerTopicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/topics", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("view") == "summary" {
+			writeJSON(w, 200, map[string]any{"topics": s.hub.ListTopicSummaries(r.URL.Query().Get("status"), r.URL.Query().Get("agent"))})
+			return
+		}
 		writeJSON(w, 200, map[string]any{"topics": s.hub.ListTopics(r.URL.Query().Get("status"), r.URL.Query().Get("agent"))})
 	})
 	mux.HandleFunc("POST /api/topics", func(w http.ResponseWriter, r *http.Request) {
