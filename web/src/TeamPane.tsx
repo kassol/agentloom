@@ -248,7 +248,7 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
   );
 
   useEffect(() => {
-    if (viewMode === "directory" || graphMode === "activity" || baseGraph.nodes.length === 0) return;
+    if (viewMode === "directory" || baseGraph.nodes.length === 0) return;
     let cancelled = false;
     const edges = baseGraph.edges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target }));
     layoutTeamGraph(baseGraph.visibleAgentIds, edges, graphMode as TeamGraphLayoutMode)
@@ -271,7 +271,7 @@ export function TeamPane({ onError, onMessageAgent, onScheduleAgent, onOpenMessa
 
   useEffect(() => {
     if (viewMode === "directory" || !flowInstance || graph.nodes.length === 0) return;
-    if ((graphMode === "organization" || graphMode === "collaboration") && !graph.layout?.ready) return;
+    if (!graph.layout?.ready) return;
     const timer = window.setTimeout(() => flowInstance.fitView({ padding: 0.14, duration: 240 }), 80);
     return () => window.clearTimeout(timer);
   }, [flowInstance, graphFitKey, graphMode, viewMode]);
@@ -1798,7 +1798,6 @@ function applyTeamGraphLayout(
   mode: GraphViewMode,
   groupID: string,
 ): TeamGraph {
-  if (mode === "activity") return graph;
   if (!layout) {
     return {
       ...graph,

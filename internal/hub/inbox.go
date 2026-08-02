@@ -361,7 +361,9 @@ func (h *Hub) deliverNextInboxForAgent(agentID string) {
 		h.mu.Unlock()
 		return
 	}
-	envelope := formatInboxEnvelopeContextAt(*message, nextItem, *address, policy, membership, now())
+	currentTime := now()
+	envelope := formatInboxEnvelopeContextAt(*message, nextItem, *address, policy, membership, currentTime)
+	displayEnvelope := formatInboxEnvelopeAt(*message, nextItem, *address, policy, membership, currentTime)
 	originalInput := message.Content.Text
 	if strings.TrimSpace(originalInput) == "" && len(message.Content.Attachments) > 0 {
 		originalInput = "Review the attached external message files."
@@ -374,6 +376,7 @@ func (h *Hub) deliverNextInboxForAgent(agentID string) {
 		workContext = context + "\n" + envelope
 	}
 	source := externalBusinessContext("inbox_message", itemID, workContext)
+	source.DisplayText = displayEnvelope
 	_, err := h.sendTaskWithContext(agentID, originalInput, nil, defaultInactivity, itemID, attemptID, "", "", "", source)
 	if err == nil {
 		return

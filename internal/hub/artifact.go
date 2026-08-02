@@ -194,6 +194,90 @@ func (h *Hub) PublishedThreadArtifacts(key string) ([]ThreadArtifact, error) {
 	return artifacts, nil
 }
 
+// TopicArtifacts resolves published Thread artifacts explicitly linked from a
+// Topic. Artifact IDs are content-addressed, so the Topic does not need to
+// persist a second copy of mutable file metadata.
+func (h *Hub) TopicArtifacts(topicID string) ([]ThreadArtifact, error) {
+	artifactIDs, agentIDs, err := h.topicArtifactLookup(topicID)
+	if err != nil {
+		return nil, err
+	}
+	artifacts := make([]ThreadArtifact, 0, len(artifactIDs))
+	for _, artifactID := range artifactIDs {
+		artifact, found := h.findPublishedThreadArtifact(agentIDs, artifactID)
+		if found {
+			artifacts = append(artifacts, artifact)
+		}
+	}
+	return artifacts, nil
+}
+
+// OpenTopicArtifact opens a published artifact only when the Topic contains an
+// explicit artifact link for the requested ID.
+func (h *Hub) OpenTopicArtifact(topicID, artifactID string) (ThreadArtifact, *os.File, error) {
+	artifactIDs, agentIDs, err := h.topicArtifactLookup(topicID)
+	if err != nil {
+		return ThreadArtifact{}, nil, err
+	}
+	linked := false
+	for _, candidate := range artifactIDs {
+		if candidate == artifactID {
+			linked = true
+			break
+		}
+	}
+	if !linked {
+		return ThreadArtifact{}, nil, errf(404, "artifact is not linked from Topic: %s", artifactID)
+	}
+	artifact, found := h.findPublishedThreadArtifact(agentIDs, artifactID)
+	if !found {
+		return ThreadArtifact{}, nil, errf(404, "published Topic artifact not found: %s", artifactID)
+	}
+	file, err := os.Open(artifact.Path)
+	if err != nil {
+		return ThreadArtifact{}, nil, errf(404, "Thread artifact content is unavailable")
+	}
+	return artifact, file, nil
+}
+
+func (h *Hub) topicArtifactLookup(topicID string) ([]string, []string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	topic := h.topics[strings.TrimSpace(topicID)]
+	if topic == nil {
+		return nil, nil, errf(404, "Topic not found: %s", topicID)
+	}
+	seen := map[string]bool{}
+	artifactIDs := make([]string, 0, len(topic.Links))
+	for _, link := range topic.Links {
+		if !strings.EqualFold(strings.TrimSpace(link.Type), "artifact") {
+			continue
+		}
+		artifactID := strings.TrimSpace(link.ID)
+		if artifactID == "" || seen[artifactID] {
+			continue
+		}
+		seen[artifactID] = true
+		artifactIDs = append(artifactIDs, artifactID)
+	}
+	agentIDs := make([]string, 0, len(h.agents))
+	for agentID := range h.agents {
+		agentIDs = append(agentIDs, agentID)
+	}
+	sort.Strings(agentIDs)
+	return artifactIDs, agentIDs, nil
+}
+
+func (h *Hub) findPublishedThreadArtifact(agentIDs []string, artifactID string) (ThreadArtifact, bool) {
+	for _, agentID := range agentIDs {
+		artifact, err := h.loadThreadArtifact(agentID, artifactID)
+		if err == nil && artifact.PublishedAt != "" {
+			return artifact, true
+		}
+	}
+	return ThreadArtifact{}, false
+}
+
 func (h *Hub) resolveThreadArtifacts(agentID string, artifactIDs []string) ([]ThreadArtifact, error) {
 	if len(artifactIDs) > MaxThreadArtifacts {
 		return nil, errf(400, "a Turn supports at most %d artifacts", MaxThreadArtifacts)

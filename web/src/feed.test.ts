@@ -139,7 +139,7 @@ describe("rollout history projection", () => {
   });
 
   it("restores a v2 External Inbox payload with preceding Conversation context", () => {
-    const text = `Review https://example.test/pr/8<loom_context version="1" epoch_id="window:test">
+    const historyText = `Review https://example.test/pr/8<loom_context version="1" epoch_id="window:test">
   <loom_turn_context origin="external_connector" trust="managed_external" authority="business_input" kind="inbox_message" ref_id="inb_1">
     <original_input location="preceding_turn_input_item" />
     <payload><![CDATA[<conversation_context version="1" membership_id="mem_1" provider="parall">
@@ -156,14 +156,22 @@ This trusted context applies only to the immediately following inbox message.
 </inbox_message>]]></payload>
   </loom_turn_context>
 </loom_context>`;
+    const liveText = `<inbox_message version="1" id="imsg_1" inbox_item_id="inb_1" expectation="optional">
+  <origin provider="parall" address_id="addr_1" />
+  <membership id="mem_1" name="Parall dev" version="4" />
+  <sender id="usr_1">zzh</sender>
+  <conversation id="chat_1" thread_id="thread_1" type="thread" />
+  <reply_policy>final_answer</reply_policy>
+  <body><![CDATA[Review https://example.test/pr/8]]></body>
+</inbox_message>`;
     const project = (type: "__history__" | "loom/user-message") =>
       reduceFeed(emptyFeed, {
         seq: 1,
         ts: "2026-07-28T09:32:50Z",
         type,
         data: type === "__history__"
-          ? { turns: [{ items: [{ type: "user", timestamp: "2026-07-28T09:32:50Z", text }] }] }
-          : { text },
+          ? { turns: [{ items: [{ type: "user", timestamp: "2026-07-28T09:32:50Z", text: historyText }] }] }
+          : { text: liveText },
       }).blocks[0];
 
     for (const block of [project("__history__"), project("loom/user-message")]) {
