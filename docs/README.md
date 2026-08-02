@@ -52,10 +52,16 @@ should be verified against the current build before publication.
 | Document | Role |
 |---|---|
 | [Development handbook](handbook.md) | Architecture, storage, APIs, migration, build, and operations |
+| [HTTP/SSE API reference](http-api.md) | Current REST and SSE route contract, grouped by domain |
+| [Documentation coverage matrix](documentation-coverage.md) | Code-area to owning-document audit and remaining gaps |
+| [Model Provider and catalog](model-provider.md) | Per-Agent Provider switching and static model catalog operations |
 | [Codex app-server protocol](codex-app-server-protocol.md) | Adapter and protocol observations |
+| [Epoch Context Coverage (Chinese)](epoch-context-coverage.md) | Developer/input layering, epoch ledger, compaction recovery, and production validation |
 | [Agent platform integration design](agent-platform-integration.md) | Connector architecture and design rationale |
 | [WebUI validation](webui-validation.md) | Browser and mobile verification practice |
+| [WebUI pane reference](webui-panes.md) | Page-level data sources, writes, SSE subscriptions, and key state |
 | [Technical debt audit](technical-debt-audit.md) | Engineering audit and remediation record |
+| [Operations checklist](operations.md) | Release, restart, rollback, backup, and restore drill |
 | [Markdown rendering fixture](markdown-rendering-fixture.md) | Renderer test content |
 | [chub compatibility](chub-communication.md) | Legacy compatibility notes |
 

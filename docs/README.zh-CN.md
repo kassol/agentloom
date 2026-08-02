@@ -50,10 +50,16 @@ Owner Guide 是主要的用户旅程文档。它说明何时使用某个 Loom �
 | 文档 | 角色 |
 |---|---|
 | [Development handbook](handbook.md) | 架构、存储、API、迁移、构建与运维 |
+| [HTTP/SSE API reference](http-api.md) | 当前 REST 与 SSE 路由契约，按领域分组 |
+| [Documentation coverage matrix](documentation-coverage.md) | 代码区域与权威文档的覆盖审计与剩余缺口 |
+| [Model Provider 与模型目录](model-provider.md) | per-Agent Provider 切换与静态模型目录运维 |
 | [Codex app-server protocol](codex-app-server-protocol.md) | 适配器与协议观察记录 |
+| [Epoch Context Coverage](epoch-context-coverage.md) | Developer／Input 分层、epoch ledger、compaction 恢复与生产验收 |
 | [Agent platform integration design](agent-platform-integration.md) | Connector 架构与设计依据 |
 | [WebUI validation](webui-validation.md) | 浏览器与移动端验证实践 |
+| [WebUI pane reference](webui-panes.md) | 页面级数据源、写操作、SSE 订阅与关键状态 |
 | [Technical debt audit](technical-debt-audit.md) | 工程审计与修复记录 |
+| [Operations checklist](operations.md) | 发布、重启、回滚、备份与恢复演练 |
 | [Markdown rendering fixture](markdown-rendering-fixture.md) | 渲染器测试内容 |
 | [chub compatibility](chub-communication.md) | 历史兼容说明 |
 

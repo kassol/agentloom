@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -416,4 +417,55 @@ func TestParseArgsPreservesRepeatedFiles(t *testing.T) {
 	if got := a.flagValues["file"]; len(got) != 2 || got[0] != "one.png" || got[1] != "two.pdf" {
 		t.Fatalf("file flags = %#v", got)
 	}
+}
+
+func TestCmdSkillsWithoutPositionalDefaultsToStatus(t *testing.T) {
+	output := captureStdout(t, func() {
+		cmdSkills(args{
+			flags:      map[string]string{"root": t.TempDir()},
+			flagValues: map[string][]string{},
+		})
+	})
+	if strings.TrimSpace(output) == "" {
+		t.Fatal("loom skills produced no status output")
+	}
+}
+
+func TestCmdSkillsHelpReturnsWithoutInspecting(t *testing.T) {
+	for _, input := range []args{
+		{flags: map[string]string{"help": "true"}, flagValues: map[string][]string{}},
+		{positional: []string{"help"}, flags: map[string]string{}, flagValues: map[string][]string{}},
+		{positional: []string{"-h"}, flags: map[string]string{}, flagValues: map[string][]string{}},
+	} {
+		output := captureStdout(t, func() { cmdSkills(input) })
+		if !strings.Contains(output, "usage: loom skills") || !strings.Contains(output, "With no subcommand") {
+			t.Fatalf("skills help output = %q", output)
+		}
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdout
+	os.Stdout = write
+	defer func() {
+		os.Stdout = previous
+		_ = read.Close()
+		_ = write.Close()
+	}()
+
+	fn()
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = previous
+	output, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }

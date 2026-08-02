@@ -237,6 +237,53 @@ loom prll messages replies msg_root --address addr_xxx
 
 旧的环境变量模式仍可直接运行 `gateway/parall.mjs`，使用 `PRLL_API_URL`、`PRLL_API_KEY` 和 `PRLL_ORG_ID`。它只作为迁移和诊断入口；新配置应使用 Integrations 向导和托管 Gateway。
 
+## Connector 运行契约
+
+托管 Gateway 通过一个长期 SSE command stream 领取工作，而不是由 Hub 主动向平台
+发送 HTTP 回调：
+
+```text
+GET /api/integrations/connections/{id}/commands
+```
+
+- 请求必须携带 Connector token 或来自 loopback；同一 Connection 同时只允许一个
+  command stream，冲突返回 `409`。
+- 建立 stream 后，Hub 会先写入 `connected` heartbeat，并重排队该 Connection 的
+  Outbox 与 ProviderOperation。
+- 每个待处理项以 `connector/command` SSE event 下发，类型为 `send` 或
+  `provider_operation`。
+- stream 关闭时 Hub 把 Connection 标为 `disconnected`。
+
+Heartbeat 使用：
+
+```text
+POST /api/integrations/connections/{id}/heartbeat
+```
+
+支持 `status`（`disconnected` / `connecting` / `connected` / `degraded`）、
+`cursor`、`capabilities` 和 `error`。Heartbeat 会持久化并发出全局
+`loom/integration-connection` 事件。
+
+Outbox 与 ProviderOperation 使用同一个 claim 语义：
+
+- 领取时生成随机 `attemptToken`，lease 为 2 分钟。
+- 结果必须回传 `attemptToken`；过期 claim 会被重排，旧 token 的迟到结果会被拒绝。
+- ProviderOperation 结果上限为 768 KiB；`success=false` 时返回 `error`。
+- 重启会把遗留 `running` claim 恢复为 `pending`，不会把未确认的外部副作用当作成功。
+
+ProviderOperation 是 credential-mediated 的只读 provider 调用：
+
+- 当前白名单：Parall `chats/*` 与 `messages/*` 读操作；飞书 `messages` 的
+  `list` / `get` / `replies`。
+- 创建入口是各 Provider 的 `.../operations` 路由，状态持久化在
+  `provider-operations.ndjson`。
+- 状态机为 `pending` → `running` → `succeeded|failed`；失败后可重试领取。
+- 结果回传路由为
+  `POST /api/integrations/connections/{id}/provider-operations/{operationId}/result`。
+
+Hub 进入 graceful drain 后不会再向 Connector 领取新的 Outbox 或 ProviderOperation，
+避免重启期间旧进程和新进程同时处理同一外部副作用。
+
 ## 故障检查
 
 ```sh

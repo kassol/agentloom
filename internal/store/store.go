@@ -4,6 +4,7 @@
 //
 //	agents.json          Agent registry: stable identity plus primary Codex thread binding
 //	sessions.json        compatibility mirror for pre-CodexLoom binaries
+//	agent-skill-config.json per-Agent disabled Skill paths
 //	profiles.json        long-lived collaboration profiles keyed by agent id
 //	team-links.json      explicit long-lived collaboration relationships
 //	collaboration-groups.json named shared views over collaboration relationships
@@ -173,6 +174,10 @@ func (s *Store) sessionsFile() string { return filepath.Join(s.dir, "sessions.js
 
 func (s *Store) agentsFile() string { return filepath.Join(s.dir, "agents.json") }
 
+func (s *Store) agentSkillConfigFile() string {
+	return filepath.Join(s.dir, "agent-skill-config.json")
+}
+
 func (s *Store) commsFile() string { return filepath.Join(s.dir, "comms.ndjson") }
 
 func (s *Store) schedulesFile() string { return filepath.Join(s.dir, "schedules.json") }
@@ -243,6 +248,14 @@ func (s *Store) SaveAgents(v any) error {
 		return err
 	}
 	return saveJSON(s.agentsFile(), v)
+}
+
+func (s *Store) LoadAgentSkillConfigs(v any) error {
+	return loadJSON(s.agentSkillConfigFile(), v)
+}
+
+func (s *Store) SaveAgentSkillConfigs(v any) error {
+	return saveJSON(s.agentSkillConfigFile(), v)
 }
 
 // Deprecated compatibility names.

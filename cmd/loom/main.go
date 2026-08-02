@@ -444,6 +444,7 @@ Compatibility shortcuts:
   chub skills status [name]
   chub skills install [name] [--force]
   chub skills reload
+  chub skills agent <agent> [disable|enable <absolute SKILL.md path>]
   chub remote [status]
   chub remote enable
   chub remote disable

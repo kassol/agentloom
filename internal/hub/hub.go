@@ -249,12 +249,14 @@ type turnState struct {
 }
 
 type runtime struct {
-	agentID        string
-	client         *codex.Client
-	hostGeneration uint64
-	ready          chan struct{}
-	initErr        error
-	startMu        sync.Mutex
+	agentID           string
+	client            *codex.Client
+	hostGeneration    uint64
+	skillConfigHash   string
+	skillConfigLoaded bool
+	ready             chan struct{}
+	initErr           error
+	startMu           sync.Mutex
 
 	activeTurn *turnState           // guarded by Hub.mu
 	approvals  map[string]*approval // guarded by Hub.mu
@@ -277,6 +279,7 @@ type Hub struct {
 	contextCoverageMu       sync.Mutex
 	modelProviderMu         sync.Mutex
 	agents                  map[string]*Agent
+	agentSkillConfigs       map[string]*AgentSkillConfig
 	comms                   map[string]*AgentMessage
 	commOrder               []string
 	schedules               map[string]*Schedule
@@ -360,6 +363,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	h := &Hub{
 		st:                     st,
 		agents:                 map[string]*Agent{},
+		agentSkillConfigs:      map[string]*AgentSkillConfig{},
 		comms:                  map[string]*AgentMessage{},
 		schedules:              map[string]*Schedule{},
 		triggers:               map[string]*Trigger{},
@@ -408,6 +412,12 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		if err := h.persistAgentsLocked(); err != nil {
 			return nil, fmt.Errorf("recover interrupted Provider switch: %w", err)
 		}
+	}
+	if err := h.st.LoadAgentSkillConfigs(&h.agentSkillConfigs); err != nil {
+		return nil, fmt.Errorf("load Agent Skill config: %w", err)
+	}
+	if h.agentSkillConfigs == nil {
+		h.agentSkillConfigs = map[string]*AgentSkillConfig{}
 	}
 	if err := h.st.LoadProfiles(&h.profiles); err != nil {
 		return nil, fmt.Errorf("load profiles: %w", err)
@@ -582,6 +592,7 @@ func (h *Hub) loadComms() error {
 	}); err != nil {
 		return err
 	}
+	h.reconcileDeliveredReplyRoots(repairLatest)
 	for _, id := range h.commOrder {
 		if !repairLatest[id] {
 			continue
@@ -592,6 +603,37 @@ func (h *Hub) loadComms() error {
 		}
 	}
 	return nil
+}
+
+func (h *Hub) reconcileDeliveredReplyRoots(repairLatest map[string]bool) {
+	for _, id := range h.commOrder {
+		reply := h.comms[id]
+		if reply == nil || reply.ReplyTo == "" || reply.Resolution != "reply" || reply.DeliveryStatus != "delivered" {
+			continue
+		}
+		root := h.comms[reply.ReplyTo]
+		if root == nil || root.Status != "open" || root.Response != "required" {
+			continue
+		}
+		resolvedAt := reply.DeliveredAt
+		if resolvedAt == "" {
+			resolvedAt = reply.UpdatedAt
+		}
+		if resolvedAt == "" {
+			resolvedAt = reply.CreatedAt
+		}
+		if resolvedAt == "" {
+			resolvedAt = now()
+		}
+		next := *root
+		next.Status = "answered"
+		next.Resolution = "reply"
+		next.ResolvedBy = reply.From
+		next.ResolvedAt = resolvedAt
+		next.UpdatedAt = resolvedAt
+		h.comms[root.ID] = &next
+		repairLatest[root.ID] = true
+	}
 }
 
 func normalizeAgentMessage(msg *AgentMessage) bool {
@@ -928,6 +970,8 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 	}
 	threadID, threadName, sandbox, cwd := meta.ThreadID, meta.Name, meta.Sandbox, meta.Cwd
 	providerID, model := effectiveProviderBinding(meta)
+	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
+	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
 	h.mu.Unlock()
 
 	h.mu.Lock()
@@ -942,7 +986,7 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		return
 	}
 	startThread := func() error {
-		params := threadBindingParams(sandbox, cwd, providerID, model)
+		params := threadBindingParams(sandbox, cwd, providerID, model, disabledSkillPaths)
 		result, err := rt.client.Request("thread/start", params, 30*time.Second)
 		if err != nil {
 			return err
@@ -971,13 +1015,19 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		if err := setThreadName(rt.client, threadID, threadName); err != nil {
 			log.Printf("[codex-loom] set thread name %s to %q: %v", threadID, threadName, err)
 		}
+		h.mu.Lock()
+		if h.runtimes[agentID] == rt {
+			rt.skillConfigHash = skillConfigHash
+			rt.skillConfigLoaded = true
+		}
+		h.mu.Unlock()
 		return nil
 	}
 	if threadID == "" {
 		rt.initErr = startThread()
 		return
 	}
-	err := resumeThread(rt.client, threadID, sandbox, cwd, providerID, model)
+	err := resumeThread(rt.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths)
 	if err != nil {
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "no rollout") || strings.Contains(msg, "not found") {
@@ -990,9 +1040,15 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 	if err := setThreadName(rt.client, threadID, threadName); err != nil {
 		log.Printf("[codex-loom] set thread name %s to %q: %v", threadID, threadName, err)
 	}
+	h.mu.Lock()
+	if h.runtimes[agentID] == rt {
+		rt.skillConfigHash = skillConfigHash
+		rt.skillConfigLoaded = true
+	}
+	h.mu.Unlock()
 }
 
-func threadBindingParams(sandbox, cwd, providerID, model string) map[string]any {
+func threadBindingParams(sandbox, cwd, providerID, model string, disabledSkillPaths []string) map[string]any {
 	params := map[string]any{"sandbox": sandbox, "cwd": cwd}
 	if providerID = strings.TrimSpace(providerID); providerID != "" {
 		params["modelProvider"] = providerID
@@ -1000,11 +1056,12 @@ func threadBindingParams(sandbox, cwd, providerID, model string) map[string]any 
 	if model = strings.TrimSpace(model); model != "" {
 		params["model"] = model
 	}
+	params["config"] = codexAgentSkillConfig(disabledSkillPaths)
 	return params
 }
 
-func resumeThread(client *codex.Client, threadID, sandbox, cwd, providerID, model string) error {
-	params := threadBindingParams(sandbox, cwd, providerID, model)
+func resumeThread(client *codex.Client, threadID, sandbox, cwd, providerID, model string, disabledSkillPaths []string) error {
+	params := threadBindingParams(sandbox, cwd, providerID, model, disabledSkillPaths)
 	params["threadId"] = threadID
 	_, err := client.Request("thread/resume", params, 60*time.Second)
 	return err
@@ -1036,13 +1093,25 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 	}
 	threadID, sandbox, cwd := meta.ThreadID, meta.Sandbox, meta.Cwd
 	providerID, model := effectiveProviderBinding(meta)
+	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
+	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
+	if rt.skillConfigLoaded && rt.skillConfigHash != skillConfigHash {
+		h.mu.Unlock()
+		return errf(409, "Agent Skill policy changed for a loaded Codex Thread; restart CodexLoom before starting the next Turn")
+	}
 	h.mu.Unlock()
 	if strings.TrimSpace(threadID) == "" {
 		return errf(409, "agent has no Codex Thread binding")
 	}
-	if err := resumeThread(rt.client, threadID, sandbox, cwd, providerID, model); err != nil {
+	if err := resumeThread(rt.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths); err != nil {
 		return errf(500, "resume Codex Thread: %s", err)
 	}
+	h.mu.Lock()
+	if h.runtimes[agentID] == rt {
+		rt.skillConfigHash = skillConfigHash
+		rt.skillConfigLoaded = true
+	}
+	h.mu.Unlock()
 	return nil
 }
 

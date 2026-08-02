@@ -50,7 +50,8 @@ type SkillInventoryEntry struct {
 }
 
 type SkillInventory struct {
-	Data []SkillInventoryEntry `json:"data"`
+	Data   []SkillInventoryEntry      `json:"data"`
+	Agents []AgentSkillInventoryEntry `json:"agents"`
 }
 
 func (h *Hub) ensureCodexHostLocked() (*codexHostRuntime, error) {
@@ -235,6 +236,7 @@ func (h *Hub) requestSkillInventory(host *codexHostRuntime) (SkillInventory, err
 	if err := json.Unmarshal(raw, &inventory); err != nil {
 		return SkillInventory{}, fmt.Errorf("decode skills/list: %w", err)
 	}
+	h.projectAgentSkillInventory(&inventory)
 	return inventory, nil
 }
 
