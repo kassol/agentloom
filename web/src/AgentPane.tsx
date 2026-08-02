@@ -208,11 +208,12 @@ export function AgentPane({
   });
   useEffect(() => {
     if (!active) return;
+    // Virtualizer.measure() clears every cached row size. Existing tall rows
+    // may not emit a new ResizeObserver entry, so clearing here makes later
+    // rows overlap them at the estimate. Remounted refs perform real sizing.
     let secondFrame = 0;
     const firstFrame = window.requestAnimationFrame(() => {
-      feedVirtualizer.measure();
       secondFrame = window.requestAnimationFrame(() => {
-        feedVirtualizer.measure();
         const el = feedRef.current;
         if (!el) return;
         el.dispatchEvent(new Event("scroll"));
@@ -225,7 +226,7 @@ export function AgentPane({
       window.cancelAnimationFrame(firstFrame);
       if (secondFrame) window.cancelAnimationFrame(secondFrame);
     };
-  }, [active, agent.id, feedRows.length]);
+  }, [active, agent.id]);
   const measureFeedRow = useCallback((node: HTMLDivElement | null) => {
     feedVirtualizer.measureElement(node);
     if (!node) return;
