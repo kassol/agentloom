@@ -107,7 +107,7 @@ export function AgentPane({
   const [heldActionID, setHeldActionID] = useState("");
   const [interruptedAction, setInterruptedAction] = useState<"continue" | "dismiss" | "">("");
   const [sendStatus, setSendStatus] = useState<"idle" | "sending" | "sent" | "failed">("idle");
-  const [sendKind, setSendKind] = useState<"task" | "answer">("task");
+  const [sendKind, setSendKind] = useState<"task" | "answer" | "compact">("task");
   const [configOpen, setConfigOpen] = useState(false);
   const [configSection, setConfigSection] = useState<"profile" | "team" | "external" | "triggers" | "runtime" | "usage">("profile");
   const [nameDraft, setNameDraft] = useState(agent.name);
@@ -618,15 +618,22 @@ export function AgentPane({
       onError("Attachments cannot be added while answering a Needs You request");
       return;
     }
+    const isCompact = !request && text === "/compact";
+    if (isCompact && draftAttachments.length > 0) {
+      onError("/compact does not accept attachments");
+      return;
+    }
     sendingRef.current = true;
     setSending(true);
     setSendingAttachmentCount(draftAttachments.length);
-    setSendKind(request ? "answer" : "task");
+    setSendKind(request ? "answer" : isCompact ? "compact" : "task");
     setSendStatus("sending");
     setInput("");
     setAttachments([]);
     try {
-      if (request) {
+      if (isCompact) {
+        await api("POST", `/api/agents/${agent.id}/compact`, {});
+      } else if (request) {
         await api("POST", `/api/human-requests/${encodeURIComponent(request.id)}/answer`, { answer: text });
         setAnsweringRequest(null);
         await onHumanRequestChanged();
@@ -1369,8 +1376,8 @@ export function AgentPane({
                 <button type="button" onClick={() => fileInputRef.current?.click()} disabled={sending || !!answeringRequest || attachments.length >= MAX_TURN_ARTIFACTS} className="flex size-8 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35" aria-label="Attach files" title={answeringRequest ? "Attachments are unavailable while answering a request" : "Attach files or images"}><Paperclip className="size-4" /></button>
                 {!answeringRequest ? <button type="button" onClick={onTrackTopic} disabled={sending} className="flex size-8 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-35" aria-label="Track this work as a Topic" title="Track this work as a Topic"><GitBranch className="size-4" /></button> : null}
                 <div className="min-w-0 truncate font-mono text-[10px] text-muted-foreground" aria-live="polite">
-                {sendStatus === "sending" && <span className="inline-flex items-center gap-1.5"><Loader2 className="size-3 animate-spin" />{sendKind === "answer" ? "Submitting answer" : sendingAttachmentCount > 0 ? `Uploading ${sendingAttachmentCount} attachment${sendingAttachmentCount === 1 ? "" : "s"}` : "Sending to thread"}</span>}
-                {sendStatus === "sent" && <span className="inline-flex items-center gap-1.5 text-success"><Check className="size-3" />{sendKind === "answer" ? "Answer queued" : "Sent to thread"}</span>}
+                {sendStatus === "sending" && <span className="inline-flex items-center gap-1.5"><Loader2 className="size-3 animate-spin" />{sendKind === "answer" ? "Submitting answer" : sendKind === "compact" ? "Compacting context" : sendingAttachmentCount > 0 ? `Uploading ${sendingAttachmentCount} attachment${sendingAttachmentCount === 1 ? "" : "s"}` : "Sending to thread"}</span>}
+                {sendStatus === "sent" && <span className="inline-flex items-center gap-1.5 text-success"><Check className="size-3" />{sendKind === "answer" ? "Answer queued" : sendKind === "compact" ? "Compaction started" : "Sent to thread"}</span>}
                 {sendStatus === "failed" && <span className="text-destructive">Send failed · draft restored</span>}
                 {sendStatus === "idle" && <span className="hidden sm:inline">Enter to send · Shift+Enter for new line</span>}
                 </div>

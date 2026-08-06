@@ -259,10 +259,10 @@ func main() {
 			}
 		} else if cmd == "thread" {
 			switch subcommand {
-			case "send", "watch", "history", "interrupt":
+			case "send", "watch", "history", "interrupt", "compact":
 				cmd = subcommand
 			default:
-				usage("thread send|watch|history|interrupt ...")
+				usage("thread send|watch|history|interrupt|compact ...")
 			}
 		} else {
 			switch subcommand {
@@ -332,6 +332,8 @@ func main() {
 		cmdWatch(a)
 	case "interrupt":
 		cmdInterrupt(a)
+	case "compact":
+		cmdCompact(a)
 	case "history":
 		cmdHistory(a)
 	case "turn-get":
@@ -367,7 +369,7 @@ func printHelp() {
 	help := fmt.Sprintf(`chub — CodexLoom CLI (service: %s)
 
   chub agent create|list|get|rename|provider|archive ...
-  chub thread send|watch|history|interrupt ...
+  chub thread send|watch|history|interrupt|compact ...
   chub turn get <turn-id> [--json]
 
 Compatibility shortcuts:
@@ -440,6 +442,7 @@ Compatibility shortcuts:
   chub goal <agent> [show]
   chub goal <agent> set <objective> [--token-budget N|--clear-token-budget]
   chub goal <agent> pause|resume|clear
+  chub compact <agent>
   chub skills list
   chub skills status [name]
   chub skills install [name] [--force]

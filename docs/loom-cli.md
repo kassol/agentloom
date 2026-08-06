@@ -282,6 +282,22 @@ Message / Inbox / Trigger / Schedule / Needs You 来源，以及 rollout 中记�
 它是只读查询，不会恢复、重试或中断 Turn。电脑或 Loom 重启后，可先用该命令核对
 原 Turn 是否为 `interrupted`，再决定是否从对应 Agent 或 Inbox 显式继续。
 
+## Compaction：主动压缩长 Thread
+
+长期 Agent 的 Thread 可能积累很多历史，尤其是 DeepSeek 等长上下文模型会继续写入
+reasoning 和工具轨迹。CodexLoom 支持显式请求 Codex 压缩一个 Agent 的 primary Thread：
+
+```sh
+./bin/loom compact cici-research
+./bin/loom thread compact cici-research
+```
+
+- 仅允许 Agent 空闲、无 active Turn、无 pending approval、无 active Goal 时执行。
+- 命令调用 Codex `thread/compact/start`，Codex 异步完成压缩；请求成功只表示已开始。
+- compaction 会开启新的 context epoch；下一 Turn 启动时，Loom 会重新注入当前
+  Agent Prompt、Profile 和 Relationships，避免压缩摘要吞掉 durable context。
+- 长历史压缩可能耗时，不应与运行中的 Turn 并行触发。
+
 ## Model Provider 与模型目录
 
 `provider` 管理共享 CodexHost 可用的 custom model provider，`agent provider` 切换

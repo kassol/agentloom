@@ -64,6 +64,7 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 | GET | `/api/agents/{key}/goal` | Get active Goal |
 | PUT | `/api/agents/{key}/goal` | Set or update Goal |
 | DELETE | `/api/agents/{key}/goal` | Clear Goal |
+| POST | `/api/agents/{key}/compact` | Start manual Codex Thread compaction |
 | DELETE | `/api/agents/{key}` | Archive Agent |
 | GET | `/api/turns/{turnId}` | Get one Turn by stable ID |
 | POST | `/api/agents/{key}/turns` | Start a Turn; body `{text, artifactIds, timeoutSec}` |
