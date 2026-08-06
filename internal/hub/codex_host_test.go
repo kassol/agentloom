@@ -800,6 +800,29 @@ while IFS= read -r line; do
 	*'"method":"thread/resume"'*)
 	  : > "$CODEX_HOST_RESUMED"
 	  printf '{"id":%s,"result":{"thread":{"id":"thr-stale"}}}\n' "$id" ;;
+	*'"method":"turn/start"'*'"model":"Example-Model"'*'"threadId":"thr-stale"'*)
+	  printf '{"id":%s,"result":{"turn":{"id":"turn-model-route"}}}\n' "$id"
+	  printf '{"method":"turn/started","params":{"threadId":"thr-stale","turn":{"id":"turn-model-route","status":"inProgress"}}}\n'
+	  printf '{"method":"error","params":{"threadId":"thr-stale","turnId":"turn-model-route","willRetry":true,"error":{"message":"unexpected status 503 Service Unavailable: No available channel for model Example-Model under group default (distributor)"}}}\n' ;;
+	*'"method":"turn/interrupt"'*'"turnId":"turn-model-route"'*)
+	  printf '{"id":%s,"result":{}}\n' "$id"
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-stale","turn":{"id":"turn-model-route","status":"interrupted"}}}\n' ;;
+	*'"method":"turn/start"'*'"model":"Vendor/Model-X"'*'"threadId":"thr-stale"'*)
+	  printf '{"id":%s,"result":{"turn":{"id":"turn-provider-outage"}}}\n' "$id"
+	  printf '{"method":"turn/started","params":{"threadId":"thr-stale","turn":{"id":"turn-provider-outage","status":"inProgress"}}}\n'
+	  printf '{"method":"error","params":{"threadId":"thr-stale","turnId":"turn-provider-outage","willRetry":true,"error":{"message":"unexpected status 503 Service Unavailable: upstream temporarily unavailable"}}}\n'
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-stale","turn":{"id":"turn-provider-outage","status":"failed","error":{"message":"unexpected status 503 Service Unavailable: upstream temporarily unavailable"}}}}\n' ;;
+	*'"method":"turn/start"'*'"model":"Vendor/CaseSensitive-ID"'*'"threadId":"thr-stale"'*)
+	  printf '{"id":%s,"result":{"turn":{"id":"turn-provider-success"}}}\n' "$id"
+	  printf '{"method":"turn/started","params":{"threadId":"thr-stale","turn":{"id":"turn-provider-success","status":"inProgress"}}}\n'
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-stale","turn":{"id":"turn-provider-success","status":"completed"}}}\n' ;;
+	*'"method":"turn/start"'*'"model":"example-model"'*'"threadId":"thr-stale"'*)
+	  printf '{"id":%s,"result":{"turn":{"id":"turn-corrected-model"}}}\n' "$id"
+	  printf '{"method":"turn/started","params":{"threadId":"thr-stale","turn":{"id":"turn-corrected-model","status":"inProgress"}}}\n'
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-stale","turn":{"id":"turn-corrected-model","status":"completed"}}}\n' ;;
+	*'"method":"turn/interrupt"'*'"threadId":"thr-model-route-fence"'*'"turnId":"turn-successor"'*)
+	  printf '{"id":%s,"result":{}}\n' "$id"
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-model-route-fence","turn":{"id":"turn-successor","status":"interrupted"}}}\n' ;;
 	*'"method":"turn/start"'*'"threadId":"thr-stale"'*)
 	  if [ -f "$CODEX_HOST_RESUMED" ]; then
 	    printf '{"id":%s,"result":{"turn":{"id":"turn-stale"}}}\n' "$id"
