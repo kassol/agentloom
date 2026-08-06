@@ -242,6 +242,7 @@ type turnState struct {
 	contextAttemptID  string
 	contextEpochID    string
 	finalAnswer       string
+	forcedFailure     string
 	startedAt         time.Time
 	lastActivity      time.Time
 	finished          bool
@@ -1379,6 +1380,14 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 		if isModelProducedNotification(method) {
 			h.observeContextModelEventLocked(meta, rt.activeTurn)
 		}
+		if method == "error" && rt.activeTurn.forcedFailure == "" {
+			if failure, interrupt := customProviderModelRouteFailure(meta.ProviderID, meta.Model, params); failure != "" {
+				rt.activeTurn.forcedFailure = failure
+				if interrupt {
+					h.scheduleModelRouteInterruptLocked(meta.ID, rt.activeTurn, failure)
+				}
+			}
+		}
 	}
 
 	h.emitLocked(meta.ID, method, params)
@@ -1401,6 +1410,9 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 			errMsg = tp.Turn.Error.Message
 		} else if tp.Error != nil {
 			errMsg = tp.Error.Message
+		}
+		if rt.activeTurn.forcedFailure == "" {
+			rt.activeTurn.forcedFailure = customProviderModelRouteFailureDetail(meta.ProviderID, meta.Model, errMsg)
 		}
 		switch {
 		case method == "turn/failed", tp.Turn.Status == "failed":
@@ -1477,6 +1489,10 @@ func (h *Hub) finishTurnLocked(meta *Agent, rt *runtime, status, errMsg string) 
 	turn := rt.activeTurn
 	if turn == nil || turn.finished {
 		return
+	}
+	if turn.forcedFailure != "" {
+		status = "failed"
+		errMsg = turn.forcedFailure
 	}
 	turn.finished = true
 	close(turn.stopWatchdog)
