@@ -161,6 +161,43 @@ func TestTypedIntegrationFlags(t *testing.T) {
 	}
 }
 
+func TestFormatAddressLifecyclePreflightShowsOwnershipAndBlockers(t *testing.T) {
+	useColor = false
+	preflight := map[string]any{
+		"action": "transfer", "addressId": "addr_1", "currentVersion": 4.0,
+		"fromAgentId": "agent-a", "toAgentId": "agent-b", "allowed": false,
+		"membershipCount": 2.0, "enabledMembershipCount": 1.0,
+		"blockers": []any{map[string]any{"kind": "outbox", "id": "out_1", "message": "Outbox delivery is still active"}},
+		"warnings": []any{"address is disabled"}, "catchUp": "cursor is preserved",
+	}
+	got := formatAddressLifecyclePreflight(preflight)
+	for _, fragment := range []string{"transfer addr_1", "blocked", "v4", "agent-a -> agent-b", "2 total, 1 enabled", "outbox out_1", "address is disabled", "cursor is preserved"} {
+		if !strings.Contains(got, fragment) {
+			t.Fatalf("preflight output missing %q: %s", fragment, got)
+		}
+	}
+}
+
+func TestFormatAddressLifecycleOperationShowsDurableReceipt(t *testing.T) {
+	useColor = false
+	got := formatAddressLifecycleOperation(map[string]any{
+		"id": "aop_1", "action": "rollback_transfer", "addressId": "addr_1",
+		"fromAgentId": "agent-b", "toAgentId": "agent-a", "sourceOperationId": "aop_transfer",
+		"addressVersionBefore": 2.0, "addressVersionAfter": 3.0,
+	})
+	for _, fragment := range []string{"completed aop_1", "rollback_transfer", "address=addr_1", "v2->v3", "agent-b -> agent-a", "source: aop_transfer"} {
+		if !strings.Contains(got, fragment) {
+			t.Fatalf("operation output missing %q: %s", fragment, got)
+		}
+	}
+}
+
+func TestLifecycleDryRunFlagIsExplicit(t *testing.T) {
+	if !lifecycleDryRun(map[string]string{"dry-run": "true"}) || lifecycleDryRun(map[string]string{}) || lifecycleDryRun(map[string]string{"dry-run": "false"}) {
+		t.Fatal("dry-run flag parsing is not explicit")
+	}
+}
+
 func TestParallImportRequestReadsOwnerOnlyKeyFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.key")
 	if err := os.WriteFile(path, []byte("secret-agent-key\n"), 0o600); err != nil {

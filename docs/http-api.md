@@ -189,6 +189,10 @@ Origin 嵌入，其他类型保持 `same-origin`。
 | POST | `/api/integrations/connections/{id}/provider-operations/{operationId}/result` | Connector operation result |
 | GET | `/api/integrations/addresses` | List addresses |
 | PATCH | `/api/integrations/addresses/{id}` | Update address |
+| POST | `/api/integrations/addresses/{id}/lifecycle` | Preflight/apply archive, restore, delete, or transfer |
+| GET | `/api/integrations/address-operations` | List lifecycle receipts; optional `?address=addr_...` |
+| GET | `/api/integrations/address-operations/{id}` | Get lifecycle receipt |
+| POST | `/api/integrations/address-operations/{id}/rollback` | Preflight/apply clean transfer rollback |
 | GET | `/api/agents/{agent}/addresses` | Agent addresses |
 | POST | `/api/agents/{agent}/addresses` | Add Agent address |
 | GET | `/api/integrations/conversations` | List conversations |
@@ -215,6 +219,23 @@ Origin 嵌入，其他类型保持 `same-origin`。
 | POST | `/api/outbox` | Create external send |
 | POST | `/api/outbox/{id}/retry` | Retry external send |
 | POST | `/api/integrations/send` | Alias/send path for external send |
+
+`POST /api/integrations/addresses/{id}/lifecycle` 接受：
+
+```json
+{
+  "action": "archive|restore|delete|transfer",
+  "targetAgent": "required-for-transfer",
+  "dryRun": true,
+  "expectedVersion": 3,
+  "confirm": "addr_..."
+}
+```
+
+`dryRun=true` 不需要 `confirm`，返回 `preflight.allowed`、blockers、warnings、当前 version、Membership
+计数和 catch-up 边界。实际写操作必须提交当前 `expectedVersion`，且 `confirm` 必须精确等于 Address ID。
+Transfer rollback 使用原 transfer receipt ID：dry-run 时只传 `dryRun=true`；实际写入必须传当前 Address
+version，并让 `confirm` 精确等于 `aop_*` ID。成功结果包含变更后的 Address 和持久 operation receipt。
 
 ### Provider Setup Routes
 

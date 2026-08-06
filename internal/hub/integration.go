@@ -69,6 +69,8 @@ type AgentAddress struct {
 	Enabled            bool     `json:"enabled"`
 	SupersededBy       string   `json:"supersededBy,omitempty"`
 	ArchivedAt         string   `json:"archivedAt,omitempty"`
+	DeletedAt          string   `json:"deletedAt,omitempty"`
+	Version            int      `json:"version"`
 	CreatedAt          string   `json:"createdAt"`
 	UpdatedAt          string   `json:"updatedAt"`
 }
@@ -250,10 +252,11 @@ type OutboxDeliveryReceipt struct {
 }
 
 type integrationConfig struct {
-	Connections            map[string]*PlatformConnection     `json:"connections"`
-	Addresses              map[string]*AgentAddress           `json:"addresses"`
-	Memberships            map[string]*ConversationMembership `json:"memberships,omitempty"`
-	ConversationCandidates map[string]*ConversationCandidate  `json:"conversationCandidates,omitempty"`
+	Connections            map[string]*PlatformConnection        `json:"connections"`
+	Addresses              map[string]*AgentAddress              `json:"addresses"`
+	Memberships            map[string]*ConversationMembership    `json:"memberships,omitempty"`
+	ConversationCandidates map[string]*ConversationCandidate     `json:"conversationCandidates,omitempty"`
+	AddressOperations      map[string]*AddressLifecycleOperation `json:"addressOperations,omitempty"`
 }
 
 type ConnectionParams struct {
@@ -436,7 +439,11 @@ func (h *Hub) loadIntegrations() error {
 	if cfg.ConversationCandidates != nil {
 		h.conversationCandidates = cfg.ConversationCandidates
 	}
-	changed := h.migrateAllowedConversationsLocked()
+	if cfg.AddressOperations != nil {
+		h.addressOperations = cfg.AddressOperations
+	}
+	changed := h.normalizeAddressLifecycleLocked()
+	changed = h.migrateAllowedConversationsLocked() || changed
 	if changed {
 		return h.persistIntegrationsLocked()
 	}
@@ -446,7 +453,7 @@ func (h *Hub) loadIntegrations() error {
 func (h *Hub) persistIntegrationsLocked() error {
 	return h.st.SaveIntegrations(integrationConfig{
 		Connections: h.connections, Addresses: h.addresses, Memberships: h.memberships,
-		ConversationCandidates: h.conversationCandidates,
+		ConversationCandidates: h.conversationCandidates, AddressOperations: h.addressOperations,
 	})
 }
 
@@ -915,6 +922,7 @@ func (h *Hub) ConsolidateIntegrationIdentity(canonicalConnectionID, canonicalAdd
 		candidate.SupersededBy = address.ID
 		candidate.ArchivedAt = ts
 		candidate.UpdatedAt = ts
+		candidate.Version++
 		result.ArchivedAddressIDs = append(result.ArchivedAddressIDs, id)
 	}
 	for id := range retiredConnections {
@@ -1185,10 +1193,10 @@ func (h *Hub) CreateAddress(p AddressParams) (AgentAddress, error) {
 		return AgentAddress{}, errf(404, "agent not found: %s", p.Agent)
 	}
 	for _, address := range h.addresses {
-		if address.ConnectionID == connectionID && address.ExternalIdentity == externalIdentity {
+		if address.DeletedAt == "" && address.ConnectionID == connectionID && address.ExternalIdentity == externalIdentity {
 			return AgentAddress{}, errf(409, "external identity is already bound to %s", address.AgentID)
 		}
-		if address.AgentID == agent.ID && address.TrustDomain != trustDomain {
+		if address.DeletedAt == "" && address.AgentID == agent.ID && address.TrustDomain != trustDomain {
 			return AgentAddress{}, errf(409, "agent addresses must share trustDomain %q", address.TrustDomain)
 		}
 	}
@@ -1199,7 +1207,7 @@ func (h *Hub) CreateAddress(p AddressParams) (AgentAddress, error) {
 		TriggerPolicy: trigger, ReplyPolicy: reply, DMPolicy: dmPolicy, TrustDomain: trustDomain,
 		AllowActors: normalizeIdentityList(p.AllowActors), AllowConversations: normalizeIdentityList(p.AllowConversations),
 		BlockActors: normalizeIdentityList(p.BlockActors), BlockConversations: normalizeIdentityList(p.BlockConversations),
-		Enabled: enabled, CreatedAt: ts, UpdatedAt: ts,
+		Enabled: enabled, Version: 1, CreatedAt: ts, UpdatedAt: ts,
 	}
 	h.addresses[address.ID] = &address
 	createdMemberships := h.ensureAllowedConversationMembershipsLocked(&address)
@@ -1242,8 +1250,11 @@ func (h *Hub) UpdateAddress(id string, p AddressParams) (AgentAddress, error) {
 	if address == nil {
 		return AgentAddress{}, errf(404, "agent address not found: %s", id)
 	}
+	if address.DeletedAt != "" {
+		return AgentAddress{}, errf(409, "address was deleted at %s", address.DeletedAt)
+	}
 	if address.ArchivedAt != "" {
-		return AgentAddress{}, errf(409, "archived address is superseded by %s", address.SupersededBy)
+		return AgentAddress{}, errf(409, "archived address requires an explicit managed restore")
 	}
 	next := *address
 	next.AllowActors = append([]string(nil), address.AllowActors...)
@@ -1252,7 +1263,7 @@ func (h *Hub) UpdateAddress(id string, p AddressParams) (AgentAddress, error) {
 	next.BlockConversations = append([]string(nil), address.BlockConversations...)
 	if value := strings.TrimSpace(p.ExternalIdentity); value != "" && value != next.ExternalIdentity {
 		for otherID, other := range h.addresses {
-			if otherID != id && other.ConnectionID == next.ConnectionID && other.ExternalIdentity == value {
+			if otherID != id && other.DeletedAt == "" && other.ConnectionID == next.ConnectionID && other.ExternalIdentity == value {
 				return AgentAddress{}, errf(409, "external identity is already bound to %s", other.AgentID)
 			}
 		}
@@ -1283,7 +1294,7 @@ func (h *Hub) UpdateAddress(id string, p AddressParams) (AgentAddress, error) {
 	trustChanged := false
 	if value := strings.TrimSpace(p.TrustDomain); value != "" && value != next.TrustDomain {
 		for otherID, other := range h.addresses {
-			if otherID != id && other.AgentID == next.AgentID && other.TrustDomain != value {
+			if otherID != id && other.DeletedAt == "" && other.AgentID == next.AgentID && other.TrustDomain != value {
 				return AgentAddress{}, errf(409, "agent addresses must share trustDomain %q", other.TrustDomain)
 			}
 		}
@@ -1306,6 +1317,7 @@ func (h *Hub) UpdateAddress(id string, p AddressParams) (AgentAddress, error) {
 		next.BlockConversations = normalizeIdentityList(p.BlockConversations)
 	}
 	next.UpdatedAt = now()
+	next.Version++
 	previousMemberships := h.memberships
 	h.memberships = cloneMemberships(h.memberships)
 	h.addresses[id] = &next
@@ -1366,7 +1378,7 @@ func (h *Hub) IngestMessage(p IngressParams) (IngressResult, error) {
 		return IngressResult{}, errf(404, "enabled connection not found: %s", connectionID)
 	}
 	address := h.addresses[addressID]
-	if address == nil || !address.Enabled || address.ConnectionID != connectionID {
+	if address == nil || !address.Enabled || address.ArchivedAt != "" || address.DeletedAt != "" || address.ConnectionID != connectionID {
 		return IngressResult{}, errf(404, "enabled address not found for connection: %s", addressID)
 	}
 	if h.agents[address.AgentID] == nil {
@@ -1375,7 +1387,13 @@ func (h *Hub) IngestMessage(p IngressParams) (IngressResult, error) {
 	externalKey := connectionID + ":" + externalID
 	if messageID := h.externalMessages[externalKey]; messageID != "" {
 		message := h.messages[messageID]
-		item := h.findInboxForMessageLocked(messageID, address.AgentID)
+		item := h.findInboxForMessageAddressLocked(messageID, address.ID)
+		if item == nil {
+			item = h.findInboxForMessageLocked(messageID, address.AgentID)
+		}
+		if item == nil {
+			item = h.findInboxForMessageLocked(messageID, "")
+		}
 		if message != nil && item != nil {
 			messageCopy, itemCopy := *message, *item
 			pendingAccess := item.State == "pending_access"
@@ -1558,7 +1576,17 @@ func (h *Hub) ignoreIngressLocked(connection *PlatformConnection, address *Agent
 func (h *Hub) findInboxForMessageLocked(messageID, agentID string) *InboxItem {
 	for _, id := range h.inboxOrder {
 		item := h.inbox[id]
-		if item != nil && item.MessageID == messageID && item.AgentID == agentID {
+		if item != nil && item.MessageID == messageID && (agentID == "" || item.AgentID == agentID) {
+			return item
+		}
+	}
+	return nil
+}
+
+func (h *Hub) findInboxForMessageAddressLocked(messageID, addressID string) *InboxItem {
+	for _, id := range h.inboxOrder {
+		item := h.inbox[id]
+		if item != nil && item.MessageID == messageID && item.AddressID == addressID {
 			return item
 		}
 	}

@@ -276,7 +276,7 @@ func (h *Hub) deliverNextInboxForAgent(agentID string) {
 	}
 	message := h.messages[item.MessageID]
 	address := h.addresses[item.AddressID]
-	if message == nil || address == nil || !address.Enabled {
+	if message == nil || address == nil || !address.Enabled || address.ArchivedAt != "" || address.DeletedAt != "" || address.AgentID != agentID {
 		next := *item
 		next.State = "failed"
 		next.LastError = "message or enabled address is unavailable"
@@ -636,6 +636,10 @@ func (h *Hub) DeferInboxItem(id string, p InboxActionParams) (InboxItem, error) 
 	if item.State == "handled" || item.State == "cancelled" {
 		return InboxItem{}, errf(409, "inbox item is already %s", item.State)
 	}
+	address := h.addresses[item.AddressID]
+	if address == nil || !address.Enabled || address.ArchivedAt != "" || address.DeletedAt != "" || address.AgentID != item.AgentID {
+		return InboxItem{}, errf(409, "inbox item address is no longer active for its original Agent")
+	}
 	next := *item
 	next.State = "deferred"
 	next.Outcome = ""
@@ -660,10 +664,13 @@ func (h *Hub) RetryInboxItem(id string) (InboxItem, error) {
 	if item.State != "failed" && item.State != "deferred" && item.State != "pending_access" && item.State != "interrupted" {
 		return InboxItem{}, errf(409, "only interrupted, failed, deferred, or pending-access inbox items can be retried")
 	}
+	address := h.addresses[item.AddressID]
+	if address == nil || !address.Enabled || address.ArchivedAt != "" || address.DeletedAt != "" || address.AgentID != item.AgentID {
+		return InboxItem{}, errf(409, "inbox item address is no longer active for its original Agent")
+	}
 	next := *item
 	if item.State == "pending_access" {
 		message := h.messages[item.MessageID]
-		address := h.addresses[item.AddressID]
 		if message == nil || address == nil {
 			return InboxItem{}, errf(409, "pending direct message is unavailable")
 		}
@@ -712,7 +719,7 @@ func (h *Hub) createReplyOutboxLocked(item *InboxItem, content MessageContent, r
 	}
 	address := h.addresses[item.AddressID]
 	membership := h.memberships[item.MembershipID]
-	if address == nil || effectiveReplyPolicy(message, address, membership) == "none" ||
+	if address == nil || !address.Enabled || address.ArchivedAt != "" || address.DeletedAt != "" || address.AgentID != item.AgentID || effectiveReplyPolicy(message, address, membership) == "none" ||
 		(membership != nil && (!membership.Enabled || normalizeOutboundPolicy(membership.OutboundPolicy) == "none")) {
 		return OutboxItem{}, errf(409, "inbox item does not allow a reply")
 	}
