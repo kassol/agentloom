@@ -182,6 +182,27 @@ Slack 附件使用官方 `files.getUploadURLExternal` + `files.completeUploadExt
 
 Slack CLI 适合创建、安装和部署 Slack App，但不是运行时消息通道。Slack MCP 以用户 OAuth 身份为 Agent 提供搜索、读取和发送等工具，也不负责 Events API 或 Socket Mode 的持续事件接收。两者以后都可以成为可选辅助能力，但不替代当前 Connection、Address、Membership 和 gateway 模型。
 
+## Address lifecycle 与跨 Agent 迁移
+
+Address 是稳定外部身份，不应通过手工改 `integrations.json`、替换 identity 或数据库占位来迁移。
+CodexLoom 提供四种受管操作，并为每次成功写入持久 `aop_*` receipt：
+
+- `archive`：关闭 Address 和其 active Membership，保留 canonical identity、历史引用及恢复快照。普通
+  `integration enable` 不能恢复；只能由显式 `restore` 在 version、identity、Membership 和在途检查通过后恢复。
+- `restore`：恢复同一次受管 archive 前的 Address/Membership enabled 状态。Candidate 不恢复旧的
+  available 快照，等待 Connector 重新发现，避免把冻结前目录冒充当前事实。
+- `delete`：不可逆 tombstone。记录保留 AddressID、外部身份和 Inbox/Outbox 审计引用，但释放 canonical
+  identity 供新 Address 使用；不存在普通 restore。
+- `transfer`：在 Hub 锁和单次 integrations 持久化事务中修改同一个 Address 的 `agentId`。Connection、
+  cursor、AddressID、Membership、Credential 和 gateway 配置保持不变，因此不会出现新旧 Address 双 dispatch。
+
+生命周期 preflight 将包含 `failed` 在内的未收口 Inbox、pending/sending Outbox、pending/running
+provider operation 视为 blocker。`failed` Inbox 必须先明确 retry 或 no-reply；历史 failed Outbox 保留，
+但迁移或删除后不能沿旧 Agent retry。Transfer rollback 只覆盖“切换后
+尚未产生任何目标侧活动”的失败窗口；目标侧一旦收到 Inbox、创建 Outbox/provider operation，或 Address/
+Membership version 变化，回滚会 fail closed。Connection cursor 始终保留；Address disabled 期间是否存在
+Provider catch-up 取决于具体 Connector，transfer 本身不会伪造或主动补拉历史。
+
 ## Parall
 
 Parall 是一等 Connector。外部身份运行和 Organization 管理是两项独立能力：

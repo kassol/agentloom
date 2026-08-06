@@ -292,6 +292,7 @@ type Hub struct {
 	organizationLinks       map[string]*OrganizationRelationship
 	connections             map[string]*PlatformConnection
 	addresses               map[string]*AgentAddress
+	addressOperations       map[string]*AddressLifecycleOperation
 	memberships             map[string]*ConversationMembership
 	conversationCandidates  map[string]*ConversationCandidate
 	messages                map[string]*InboxMessage
@@ -374,6 +375,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		organizationLinks:      map[string]*OrganizationRelationship{},
 		connections:            map[string]*PlatformConnection{},
 		addresses:              map[string]*AgentAddress{},
+		addressOperations:      map[string]*AddressLifecycleOperation{},
 		memberships:            map[string]*ConversationMembership{},
 		conversationCandidates: map[string]*ConversationCandidate{},
 		messages:               map[string]*InboxMessage{},

@@ -676,6 +676,40 @@ ID 可以写成裸 ID 或 `prll://` reference；输出为 Parall 原生 JSON。�
 ./bin/loom integration enable <connection-id-or-address-id>
 ```
 
+单个 Address 的生命周期和跨 Agent 迁移必须使用受管命令。所有写操作都会先执行同一份
+preflight；`--dry-run` 只显示结果，实际执行必须提供刚读取到的 version 和精确确认值。CLI 在未显式
+提供 `--expected-version` 时，会使用本次 preflight 返回的 version：
+
+```sh
+# 可逆归档；Address 继续保留 canonical identity。
+loom integration archive addr_xxx --dry-run
+loom integration archive addr_xxx --confirm addr_xxx
+loom integration restore addr_xxx --dry-run
+loom integration restore addr_xxx --confirm addr_xxx
+
+# 不可逆 tombstone delete；保留历史 AddressID，但释放 canonical identity。
+loom integration delete-address addr_xxx --dry-run
+loom integration delete-address addr_xxx --confirm addr_xxx
+
+# 原子变更同一个 Address 的 Agent 所有者；Connection、cursor、AddressID 和 Membership ID 不变。
+loom integration transfer addr_xxx --to-agent target-agent --dry-run
+loom integration transfer addr_xxx --to-agent target-agent --confirm addr_xxx
+
+# 只有目标侧尚未产生新 Inbox/Outbox/provider activity 且 Address/Membership 未变化时才允许回滚。
+loom integration rollback-transfer aop_xxx --dry-run
+loom integration rollback-transfer aop_xxx --confirm aop_xxx
+
+loom integration operations [addr_xxx]
+loom integration operation aop_xxx
+```
+
+preflight 会阻止 queued/handling/deferred/pending-access/awaiting-delivery/failed Inbox、pending/sending
+Outbox 和 pending/running provider operation。`failed` Inbox 必须先明确 retry 或 no-reply；历史 failed
+Outbox 保留可读，但 Address 删除或迁移到其他 Agent 后不能重新 retry。Transfer 的切换点是
+integrations.json 的单次原子提交：提交前 ingress
+属于旧 Agent，提交后属于新 Agent，不存在两个 Address 同时 dispatch。Transfer 保留 Connection cursor，
+但 disabled 期间 Provider 是否重放消息仍取决于 Connector，本操作不声称主动补拉。
+
 `integration import parall` 会先验证 Agent key 与 `--external-agent-id` 是否匹配，并确认 WebSocket ticket
 可用；随后把 key 写入系统 Keychain、创建或复用 Connection/Address，并安装 managed Gateway。它不要求
 Owner key，也不会创建或改名 Parall Agent。重复执行会复用同一稳定身份；失败时会恢复原 credential，

@@ -177,6 +177,7 @@ Observe 命令分别放在 `commands_*.go`。新增命令必须归入所属领�
 
 核心文件按状态所有权划分：`hub.go` 是共享 runtime/event 基础，`agent.go` 管 Agent 与 Turn，
 `communication.go` 管内部 Agent Message，`topic.go` 管跨 Agent 协调记录与因果投影，`integration.go` 管 Connection/Address/Ingress，
+`address_lifecycle.go` 管 Address archive/restore/delete、跨 Agent transfer、preflight 与持久操作回执，
 `inbox.go` 管入站处理，`outbox.go` 管受治理的外部投递与 claim fencing，
 `external_message.go` 管 envelope、附件与 policy 规范化，`shutdown.go` 管关闭顺序。跨聚合动作
 必须通过明确的 reconciliation/commit helper，不应在一个巨型文件中直接修改多个 projection。

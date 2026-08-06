@@ -73,7 +73,7 @@ func (h *Hub) SendExternal(p ExternalSendParams) (OutboxItem, error) {
 		return OutboxItem{}, errf(403, "conversation membership %s does not allow proactive sends", membershipID)
 	}
 	address := h.addresses[membership.AddressID]
-	if address == nil || !address.Enabled || address.AgentID != agent.ID {
+	if address == nil || !address.Enabled || address.ArchivedAt != "" || address.DeletedAt != "" || address.AgentID != agent.ID {
 		return OutboxItem{}, errf(403, "agent does not own the enabled address for membership %s", membershipID)
 	}
 	connection := h.connections[address.ConnectionID]
@@ -169,7 +169,7 @@ func (h *Hub) CreateOutbox(p OutboxParams) (OutboxItem, error) {
 		return OutboxItem{}, errf(404, "agent not found: %s", p.Agent)
 	}
 	address := h.addresses[strings.TrimSpace(p.AddressID)]
-	if address == nil || !address.Enabled || address.AgentID != agent.ID {
+	if address == nil || !address.Enabled || address.ArchivedAt != "" || address.DeletedAt != "" || address.AgentID != agent.ID {
 		return OutboxItem{}, errf(404, "enabled agent address not found: %s", p.AddressID)
 	}
 	connection := h.connections[address.ConnectionID]
@@ -280,7 +280,7 @@ func (h *Hub) ClaimNextOutbox(connectionID string) (*ConnectorCommand, error) {
 			continue
 		}
 		address := h.addresses[item.AddressID]
-		if address == nil || !address.Enabled || address.ConnectionID != connectionID {
+		if address == nil || !address.Enabled || address.ArchivedAt != "" || address.DeletedAt != "" || address.AgentID != item.AgentID || address.ConnectionID != connectionID {
 			continue
 		}
 		next := *item
@@ -418,6 +418,10 @@ func (h *Hub) RetryOutboxItem(id string) (OutboxItem, error) {
 	}
 	if item.State != "failed" {
 		return OutboxItem{}, errf(409, "only failed outbox items can be retried")
+	}
+	address := h.addresses[item.AddressID]
+	if address == nil || !address.Enabled || address.ArchivedAt != "" || address.DeletedAt != "" || address.AgentID != item.AgentID {
+		return OutboxItem{}, errf(409, "outbox item address is no longer active for its original Agent")
 	}
 	next := *item
 	next.State = "pending"

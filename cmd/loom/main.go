@@ -409,6 +409,11 @@ Compatibility shortcuts:
   chub integration bind <agent> <connection-id> --identity EXTERNAL_ID [--display-name NAME] [--trigger mention] [--reply-policy final_answer] [--dm-policy managed] [--trust-domain NAME] [--enabled true|false] [allow/block flags]
   chub integration update-address <address-id> [--identity ID] [--display-name NAME] [--trigger mention] [--reply-policy final_answer] [--dm-policy managed] [--trust-domain NAME] [--enabled true|false] [allow/block flags]
   chub integration enable|disable <connection-id|address-id>
+  loom integration archive|restore|delete-address <address-id> [--dry-run] [--expected-version N] [--confirm ADDRESS_ID]
+  loom integration transfer <address-id> --to-agent AGENT [--dry-run] [--expected-version N] [--confirm ADDRESS_ID]
+  loom integration rollback-transfer <operation-id> [--dry-run] [--expected-version N] [--confirm OPERATION_ID]
+  loom integration operations [address-id]
+  loom integration operation <operation-id>
   chub integration status [connection-id]
   loom prll chats list --address ADDRESS_ID [--limit N] [--cursor CURSOR]
   loom prll chats get CHAT_ID --address ADDRESS_ID
