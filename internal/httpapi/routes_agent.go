@@ -86,6 +86,14 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, 200, map[string]any{"agent": agent})
 	})
+	mux.HandleFunc("POST /api/agents/{key}/compact", func(w http.ResponseWriter, r *http.Request) {
+		result, err := s.hub.CompactAgentThread(r.PathValue("key"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"compaction": result})
+	})
 	mux.HandleFunc("GET /api/agents/{key}/skills", func(w http.ResponseWriter, r *http.Request) {
 		config, err := s.hub.GetAgentSkillConfig(r.PathValue("key"))
 		if err != nil {
