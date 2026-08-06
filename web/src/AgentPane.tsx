@@ -169,6 +169,9 @@ export function AgentPane({
   ], [feed.approvals, feed.blocks]);
   const feedVirtualizer = useVirtualizer({
     enabled: active,
+    // Disabled hidden tabs lose virtual-core's internal offset. Seed the
+    // re-enabled range from this pane before the browser is scrolled again.
+    initialOffset: () => savedScrollTopRef.current,
     count: feedRows.length,
     getScrollElement: () => feedRef.current,
     getItemKey: (index) => feedRows[index]?.key || index,
