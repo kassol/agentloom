@@ -67,7 +67,7 @@ Restart Loom 会同时重启已启用的 managed Feishu、Slack 和 Parall gatew
 
 ## 飞书 / Lark
 
-推荐从 WebUI 的 **Integrations → Add integration** 开始。飞书使用 CodexLoom 内置的原生 Go
+推荐从 WebUI 侧边栏的集成管理入口 **External → Add integration** 开始。飞书使用 CodexLoom 内置的原生 Go
 gateway 和飞书官方 SDK，不依赖 `lark-cli`。首次连接需要从飞书开发者后台复制 App ID 和 App
 Secret；CodexLoom 验证身份后将 Secret 写入操作系统 Keychain，并自动识别 Bot 身份及已加入的群。
 
@@ -127,7 +127,7 @@ Connection 的旧 launchd 服务，避免一条飞书事件被重复消费；确
 
 ## Slack
 
-推荐从 WebUI 的 **Integrations → Add integration → Slack** 开始。Slack 使用 Socket Mode，因此不需要公网域名或 webhook；CodexLoom 直接管理 Socket Mode gateway，也不依赖 Slack CLI 或 Slack MCP。
+推荐从 WebUI 侧边栏的集成管理入口 **External → Add integration → Slack** 开始。Slack 使用 Socket Mode，因此不需要公网域名或 webhook；CodexLoom 直接管理 Socket Mode gateway，也不依赖 Slack CLI 或 Slack MCP。
 
 首次连接需要先在 Slack App 管理页导入：
 
