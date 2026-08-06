@@ -335,6 +335,8 @@ type Hub struct {
 	dispatchHumanAnswer     func(key, text string) (SendResult, error)
 	observeTrigger          triggerObserver
 	contextHistoryProbe     contextHistoryProbeFunc
+	threadResumeTimeout     time.Duration
+	developerContextTimeout time.Duration
 }
 
 // New is retained for in-process callers that cannot recover from an invalid
@@ -932,6 +934,9 @@ func (h *Hub) LastSeq(key string) int64 {
 
 // getRuntimeLocked returns an Agent binding to the shared CodexHost.
 func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
+	if err := h.threadControlFailureLocked(meta.ThreadID); err != nil {
+		return nil, err
+	}
 	if rt, ok := h.runtimes[meta.ID]; ok && !rt.client.Closed() {
 		select {
 		case <-rt.ready:
@@ -1030,8 +1035,11 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		rt.initErr = startThread()
 		return
 	}
-	err := resumeThread(rt.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths)
+	err := resumeThreadWithTimeout(rt.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths, h.effectiveThreadResumeTimeout())
 	if err != nil {
+		if codex.IsRequestTimeout(err) {
+			h.markThreadControlIndeterminate(rt, threadID, "thread/resume")
+		}
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "no rollout") || strings.Contains(msg, "not found") {
 			rt.initErr = startThread()
@@ -1064,10 +1072,21 @@ func threadBindingParams(sandbox, cwd, providerID, model string, disabledSkillPa
 }
 
 func resumeThread(client *codex.Client, threadID, sandbox, cwd, providerID, model string, disabledSkillPaths []string) error {
+	return resumeThreadWithTimeout(client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths, 60*time.Second)
+}
+
+func resumeThreadWithTimeout(client *codex.Client, threadID, sandbox, cwd, providerID, model string, disabledSkillPaths []string, timeout time.Duration) error {
 	params := threadBindingParams(sandbox, cwd, providerID, model, disabledSkillPaths)
 	params["threadId"] = threadID
-	_, err := client.Request("thread/resume", params, 60*time.Second)
+	_, err := client.Request("thread/resume", params, timeout)
 	return err
+}
+
+func (h *Hub) effectiveThreadResumeTimeout() time.Duration {
+	if h.threadResumeTimeout > 0 {
+		return h.threadResumeTimeout
+	}
+	return 60 * time.Second
 }
 
 func codexSandboxMode(sandbox string) string {
@@ -1106,7 +1125,10 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 	if strings.TrimSpace(threadID) == "" {
 		return errf(409, "agent has no Codex Thread binding")
 	}
-	if err := resumeThread(rt.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths); err != nil {
+	if err := resumeThreadWithTimeout(rt.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths, h.effectiveThreadResumeTimeout()); err != nil {
+		if codex.IsRequestTimeout(err) {
+			h.markThreadControlIndeterminate(rt, threadID, "thread/resume")
+		}
 		return errf(500, "resume Codex Thread: %s", err)
 	}
 	h.mu.Lock()
