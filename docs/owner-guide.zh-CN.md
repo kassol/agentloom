@@ -164,7 +164,8 @@ Agent workspace 是默认界面。Overview 是观察界面，不是公司仪表�
 1. 在 Agent workspace 中给出目标、问题或具体工作。
 2. Agent 在自己的 Thread 中工作、使用工具，并在需要其他 Agent 的判断时与其联系。
 3. 普通的内部回复和外部交互回到直接负责的 Agent，而不是回到 Owner。
-4. 真正需要人来决定的事项出现在 Needs You。
+4. Agent 显式识别出确需人的事实、选择或授权，并通过 `loom ask-user` 创建请求
+   后，该事项进入 Needs You。
 5. Agent 把可读的结果返回给发起这项工作的那段关系。
 
 关键区分是因果关系：
@@ -172,7 +173,8 @@ Agent workspace 是默认界面。Overview 是观察界面，不是公司仪表�
 > 不要问每一条输出看起来是否重要，而要问它完成了谁的工作、这个结果应该回到哪里。
 
 Agent Inbox 属于 Agent 自己。它可以作为负载、路由或工具问题的有用证据，但不是
-Owner 的第二份任务清单。Needs You 才包含需要 Owner 采取行动的事项。
+Owner 的第二份任务清单。Needs You 汇集 Agent 已通过 `loom ask-user` 显式创建
+的 Owner 请求，但不是全部待批、待决或异常状态的完备清单。
 
 **已验证实践：** 普通的 Agent 间回复应当回到发起请求的 Agent，由它完成整合。
 把每一条中间回复都发给 Owner，会重新制造出这支团队本应减少的转发负担。
@@ -271,9 +273,14 @@ Owner 处，出现异常或需要复盘时可以沿证据链接逐层下钻。
 
 ### Needs You 用于人的决定
 
-只有当工作在缺少 Owner 的某个事实、选择或授权时无法负责任地继续，才使用
-Needs You。说明什么被阻塞、确切的问题是什么，以及每个可选项的后果。Owner 回应
-之后，原来的 Agent 应当继续同一项工作，而不是要求 Owner 重新陈述上下文。
+只有当工作在缺少 Owner 的某个事实、选择或授权时无法负责任地继续，Agent 才应通过
+`loom ask-user` 显式创建 Needs You。请求应说明什么被阻塞、确切的问题是什么，
+以及每个可选项的后果。Owner 回应之后，原来的 Agent 应当继续同一项工作，而不是要求
+Owner 重新陈述上下文。
+
+**当前行为：** silent stall 不会自动创建 Needs You；Codex tool approval 使用独立的
+pending-approval 入口。因此，没有 Needs You 不证明没有待批或待决事项，也不证明系统
+健康。当前产品也不会从 Activity 自动推断并补建这些请求。
 
 ### Topic 用于有边界的共享连续性
 

@@ -199,7 +199,9 @@ The normal loop is:
    their judgment is required.
 3. Ordinary internal replies and external interactions return to the directly
    responsible Agent rather than to the Owner.
-4. A decision that genuinely requires a human appears in Needs You.
+4. After the Agent explicitly identifies a required human fact, choice, or
+   authorization and creates a request with `loom ask-user`, the item
+   enters Needs You.
 5. The Agent returns a readable result to the relationship that initiated the
    work.
 
@@ -210,7 +212,9 @@ The important distinction is causal:
 
 Agent Inbox belongs to the Agent. It can be useful evidence of workload,
 routing, or a tooling problem, but it is not a second Owner task list. Needs You
-contains the items that require the Owner to act.
+collects Owner requests the Agent explicitly created with `loom ask-user`;
+it is not a complete list of every pending decision, approval, or abnormal
+state.
 
 **Validated practice:** ordinary Agent-to-Agent replies should return to the
 requesting Agent for integration. Sending every intermediate reply to the Owner
@@ -338,11 +342,18 @@ from quality, waiting, rework, and context loss; it is not a model guarantee.
 
 ### Needs You is for a human decision
 
-Use Needs You only when work cannot responsibly continue without an Owner fact,
-choice, or authorization. Include what is blocked, the exact question, and the
+Only when work cannot responsibly continue without an Owner fact, choice, or
+authorization should the Agent explicitly create Needs You with
+`loom ask-user`. Include what is blocked, the exact question, and the
 consequence of each available choice. After the Owner responds, the original
 Agent should continue the same work rather than requiring the Owner to restate
 the context.
+
+**Current behavior:** a silent stall does not create Needs You automatically.
+Codex tool approval uses a separate pending-approval entry. Therefore, no Needs
+You does not prove that no decision or approval is pending, and it does not
+prove system health. The current product also does not infer and create these
+requests automatically from Activity.
 
 ### Topics are for bounded shared continuity
 
