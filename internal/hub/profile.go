@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/codex"
 )
 
 const schedulerAgentID = "system:scheduler"
@@ -405,9 +407,19 @@ func (h *Hub) injectDeveloperContext(agentID string, rt *runtime, content string
 			"type": "message", "role": "developer",
 			"content": []map[string]any{{"type": "input_text", "text": content}},
 		}},
-	}, 30*time.Second)
+	}, h.effectiveDeveloperContextTimeout())
 	if err != nil {
+		if codex.IsRequestTimeout(err) {
+			h.markThreadControlIndeterminate(rt, threadID, "thread/inject_items")
+		}
 		return errf(500, "inject Developer context: %s", err)
 	}
 	return nil
+}
+
+func (h *Hub) effectiveDeveloperContextTimeout() time.Duration {
+	if h.developerContextTimeout > 0 {
+		return h.developerContextTimeout
+	}
+	return 30 * time.Second
 }
