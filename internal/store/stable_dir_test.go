@@ -104,6 +104,53 @@ func TestS0SingleWriterCoversAliasesAndReleases(t *testing.T) {
 	_ = reopened.Close()
 }
 
+func TestS0FailedWriterClaimReleasesOwnershipForRetry(t *testing.T) {
+	parent := t.TempDir()
+	firstDir := filepath.Join(parent, "first")
+	secondDir := filepath.Join(parent, "second")
+	if err := os.Mkdir(firstDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(secondDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "current")
+	if err := os.Symlink(firstDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	secondBefore := snapshotDirectory(t, secondDir)
+	opened, err := openStableDataDirWithClaimHook(alias, false, func() {
+		if removeErr := os.Remove(alias); removeErr != nil {
+			t.Fatal(removeErr)
+		}
+		if linkErr := os.Symlink(secondDir, alias); linkErr != nil {
+			t.Fatal(linkErr)
+		}
+	})
+	if err == nil {
+		_ = opened.close()
+		t.Fatal("writer claim accepted a retargeted bootstrap path")
+	}
+	if after := snapshotDirectory(t, secondDir); fmt.Sprint(after) != fmt.Sprint(secondBefore) {
+		t.Fatalf("failed claim mutated retarget directory: before=%v after=%v", secondBefore, after)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(firstDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := Open(alias)
+	if err != nil {
+		t.Fatalf("restored path could not retry after failed claim: %v", err)
+	}
+	defer retried.Close()
+	if duplicate, err := Open(firstDir); err == nil {
+		_ = duplicate.Close()
+		t.Fatal("retry admitted a second writer")
+	}
+}
+
 func TestS0WriterLeaseIsProcessWide(t *testing.T) {
 	if mode := os.Getenv("CODEX_LOOM_S0_LEASE_HELPER"); mode != "" {
 		st, err := Open(os.Getenv("CODEX_LOOM_S0_LEASE_DIR"))

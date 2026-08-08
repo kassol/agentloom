@@ -44,6 +44,13 @@ var processWriters = struct {
 }{held: map[string]struct{}{}}
 
 func openStableDataDir(path string, readOnly bool) (_ *stableDataDir, err error) {
+	return openStableDataDirWithClaimHook(path, readOnly, nil)
+}
+
+// openStableDataDirWithClaimHook keeps the production open path identical
+// while allowing a deterministic identity change immediately after the OS
+// writer lock is acquired. Production always passes a nil hook.
+func openStableDataDirWithClaimHook(path string, readOnly bool, afterWriterLock func()) (_ *stableDataDir, err error) {
 	requested, err := filepath.Abs(filepath.Clean(path))
 	if err != nil {
 		return nil, fmt.Errorf("resolve data directory: %w", err)
@@ -106,7 +113,7 @@ func openStableDataDir(path string, readOnly bool) (_ *stableDataDir, err error)
 		return nil, err
 	}
 	if !readOnly {
-		if err = d.claimWriter(); err != nil {
+		if err = d.claimWriter(afterWriterLock); err != nil {
 			return nil, err
 		}
 	}
@@ -237,7 +244,7 @@ func requireJSONEOF(dec *json.Decoder) error {
 	return err
 }
 
-func (d *stableDataDir) claimWriter() error {
+func (d *stableDataDir) claimWriter(afterWriterLock func()) (err error) {
 	processWriters.Lock()
 	if _, exists := processWriters.held[d.identity]; exists {
 		processWriters.Unlock()
@@ -245,12 +252,26 @@ func (d *stableDataDir) claimWriter() error {
 	}
 	processWriters.held[d.identity] = struct{}{}
 	processWriters.Unlock()
-	release := true
+	claimComplete := false
+	var lock *os.File
+	lockHeld := false
 	defer func() {
-		if release {
-			processWriters.Lock()
-			delete(processWriters.held, d.identity)
-			processWriters.Unlock()
+		if claimComplete {
+			return
+		}
+		var cleanupErr error
+		if lockHeld {
+			cleanupErr = unlockWriterFile(lock)
+		}
+		if lock != nil {
+			cleanupErr = errors.Join(cleanupErr, lock.Close())
+		}
+		d.lock = nil
+		processWriters.Lock()
+		delete(processWriters.held, d.identity)
+		processWriters.Unlock()
+		if cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("release failed data directory writer claim: %w", cleanupErr))
 		}
 	}()
 	if info, err := d.root.Lstat(".codex-loom-writer.lock"); err == nil {
@@ -260,17 +281,23 @@ func (d *stableDataDir) claimWriter() error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect data directory writer lease: %w", err)
 	}
-	lock, err := d.root.OpenFile(".codex-loom-writer.lock", os.O_CREATE|os.O_RDWR, 0o600)
+	lock, err = d.root.OpenFile(".codex-loom-writer.lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("open data directory writer lease: %w", err)
 	}
 	if err := lockWriterFile(lock); err != nil {
-		_ = lock.Close()
 		return fmt.Errorf("data directory already has a writable CodexLoom process: %s: %w", d.canonical, err)
 	}
+	lockHeld = true
 	d.lock = lock
-	release = false
-	return d.verifyIdentity()
+	if afterWriterLock != nil {
+		afterWriterLock()
+	}
+	if err := d.verifyIdentity(); err != nil {
+		return err
+	}
+	claimComplete = true
+	return nil
 }
 
 func (d *stableDataDir) verifyIdentity() error {
