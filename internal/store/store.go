@@ -656,7 +656,7 @@ func (s *Store) LoadIntegrations(v any) error { return s.loadJSON(s.integrations
 
 func (s *Store) SaveIntegrations(v any) error { return s.saveJSON(s.integrationsFile(), v) }
 
-// LoadRuntimeGatewayState reads the private R0b payload. Absence and the S0
+// LoadRuntimeGatewayState reads the private R0b/R1 payload. Absence and the S0
 // empty envelope both mean that no Gateway control has ever been adopted.
 // The stable directory open path has already validated the envelope from the
 // same directory handle before any writable Hub mutation was possible.
@@ -689,7 +689,18 @@ func (s *Store) LoadRuntimeGatewayState(v any) (bool, error) {
 	if state.Version == 1 {
 		return false, nil
 	}
-	if envelope.SchemaVersion != runtimeFoundationSchemaVersion || envelope.MinimumWriter != runtimeWriterFloorGatewayState || state.Version != 2 || len(state.GatewayState) == 0 {
+	if envelope.SchemaVersion != runtimeFoundationSchemaVersion || state.Version != 2 || len(state.GatewayState) == 0 {
+		return false, fmt.Errorf("unsupported Runtime Gateway foundation")
+	}
+	gatewayVersion, err := validateGatewayFoundationState(state.GatewayState)
+	if err != nil {
+		return false, err
+	}
+	expectedFloor := runtimeWriterFloorGatewayState
+	if gatewayVersion == 2 {
+		expectedFloor = runtimeWriterFloorGatewayProcess
+	}
+	if envelope.MinimumWriter != expectedFloor {
 		return false, fmt.Errorf("unsupported Runtime Gateway foundation")
 	}
 	gatewayDecoder := json.NewDecoder(strings.NewReader(string(state.GatewayState)))
@@ -703,9 +714,10 @@ func (s *Store) LoadRuntimeGatewayState(v any) (bool, error) {
 	return true, nil
 }
 
-// SaveRuntimeGatewayState is the only R0b writer-floor transition. The state
-// and minimum writer are encoded in one atomic file replacement; ordinary
-// Store/Hub open, Passive mode, and shutdown never call it.
+// SaveRuntimeGatewayState is the only Gateway writer-floor transition. The
+// state version and matching minimum writer are encoded in one atomic file
+// replacement; ordinary Store/Hub open, Passive mode, and shutdown never call
+// it.
 func (s *Store) SaveRuntimeGatewayState(v any) error {
 	if s == nil {
 		return fmt.Errorf("store is unavailable")
@@ -720,7 +732,8 @@ func (s *Store) SaveRuntimeGatewayState(v any) error {
 	if err != nil {
 		return err
 	}
-	if err := validateGatewayFoundationState(gateway); err != nil {
+	gatewayVersion, err := validateGatewayFoundationState(gateway)
+	if err != nil {
 		return err
 	}
 	state, err := json.Marshal(foundationState{Version: 2, GatewayState: gateway})
@@ -731,6 +744,9 @@ func (s *Store) SaveRuntimeGatewayState(v any) error {
 		SchemaVersion: runtimeFoundationSchemaVersion,
 		MinimumWriter: runtimeWriterFloorGatewayState,
 		State:         state,
+	}
+	if gatewayVersion == 2 {
+		envelope.MinimumWriter = runtimeWriterFloorGatewayProcess
 	}
 	data, err := json.MarshalIndent(envelope, "", "  ")
 	if err != nil {

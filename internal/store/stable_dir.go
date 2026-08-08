@@ -1,14 +1,19 @@
 package store
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 const foundationFileName = "runtime-foundation.json"
@@ -16,16 +21,17 @@ const foundationFileName = "runtime-foundation.json"
 const runtimeFoundationMaxBytes = 1 << 20
 
 const (
-	runtimeFoundationSchemaVersion = 1
-	runtimeWriterFloorS0           = 1
-	runtimeWriterFloorGatewayState = 2
+	runtimeFoundationSchemaVersion   = 1
+	runtimeWriterFloorS0             = 1
+	runtimeWriterFloorGatewayState   = 2
+	runtimeWriterFloorGatewayProcess = 3
 )
 
 // runtimeFoundationEnvelope is private Runtime persistence shared by Store
 // and Hub. It is not an API or provider wire contract. S0 recognizes version
-// 1 as the empty foundation. R0b uses version 2 only when an internal caller
-// explicitly creates the first dormant Gateway control; that same write raises
-// the minimum writer floor atomically.
+// 1 as the empty foundation. Foundation state version 2 contains Gateway state:
+// Gateway v1/floor 2 is R0b control, while Gateway v2/floor 3 adds an explicit
+// R1 launch plan or attempt. Each first write raises its floor atomically.
 type runtimeFoundationEnvelope struct {
 	SchemaVersion int             `json:"schemaVersion"`
 	MinimumWriter int             `json:"minimumWriter"`
@@ -41,16 +47,73 @@ type gatewayFoundationStateShape struct {
 	Version      int                                           `json:"version"`
 	Controls     map[string]*gatewayFoundationControlShape     `json:"controls"`
 	Observations map[string]*gatewayFoundationObservationShape `json:"observations"`
+	LaunchPlans  map[string]*gatewayFoundationLaunchPlanShape  `json:"launchPlans,omitempty"`
+	Attempts     map[string]*gatewayFoundationAttemptShape     `json:"attempts,omitempty"`
 }
 
 type gatewayFoundationControlShape struct {
-	ConnectionID string                        `json:"connectionId"`
-	Epoch        uint64                        `json:"epoch"`
-	Lifecycle    string                        `json:"lifecycle"`
-	Recovery     string                        `json:"recovery"`
-	Reason       string                        `json:"reason,omitempty"`
-	Binding      gatewayFoundationBindingShape `json:"binding"`
-	UpdatedAt    string                        `json:"updatedAt"`
+	ConnectionID    string                        `json:"connectionId"`
+	Epoch           uint64                        `json:"epoch"`
+	Lifecycle       string                        `json:"lifecycle"`
+	Recovery        string                        `json:"recovery"`
+	Reason          string                        `json:"reason,omitempty"`
+	Binding         gatewayFoundationBindingShape `json:"binding"`
+	ActiveAttemptID string                        `json:"activeAttemptId,omitempty"`
+	UpdatedAt       string                        `json:"updatedAt"`
+}
+
+type gatewayFoundationLaunchDescriptorShape struct {
+	Manager          string `json:"manager"`
+	ConnectionID     string `json:"connectionId"`
+	ServiceID        string `json:"serviceId"`
+	UnitPath         string `json:"unitPath"`
+	Executable       string `json:"executable"`
+	WorkingDirectory string `json:"workingDirectory"`
+	HubURL           string `json:"hubUrl"`
+	DataDir          string `json:"dataDir"`
+	LogPath          string `json:"logPath"`
+	Build            string `json:"build"`
+	ExecutableDigest string `json:"executableDigest"`
+}
+
+type gatewayFoundationAnchorShape struct {
+	Descriptor      gatewayFoundationLaunchDescriptorShape `json:"descriptor"`
+	Generation      string                                 `json:"generation,omitempty"`
+	IntegritySHA256 string                                 `json:"integritySha256"`
+}
+
+type gatewayFoundationLaunchPlanShape struct {
+	ConnectionID string                                 `json:"connectionId"`
+	Target       gatewayFoundationLaunchDescriptorShape `json:"target"`
+	Anchor       gatewayFoundationAnchorShape           `json:"anchor"`
+}
+
+type gatewayFoundationProofShape struct {
+	AttemptID        string `json:"attemptId"`
+	Generation       string `json:"generation"`
+	Build            string `json:"build"`
+	ExecutableDigest string `json:"executableDigest"`
+	ObservedAt       string `json:"observedAt"`
+}
+
+type gatewayFoundationAttemptShape struct {
+	ID                 string                           `json:"id"`
+	ConnectionID       string                           `json:"connectionId"`
+	Kind               string                           `json:"kind"`
+	Phase              string                           `json:"phase"`
+	BindingEpoch       uint64                           `json:"bindingEpoch"`
+	Binding            gatewayFoundationBindingShape    `json:"binding"`
+	Plan               gatewayFoundationLaunchPlanShape `json:"plan"`
+	TargetGeneration   string                           `json:"targetGeneration"`
+	RecoveryGeneration string                           `json:"recoveryGeneration"`
+	EffectStartedAt    string                           `json:"effectStartedAt"`
+	RecoveryStartedAt  string                           `json:"recoveryStartedAt,omitempty"`
+	ProofDeadline      string                           `json:"proofDeadline,omitempty"`
+	UpdatedAt          string                           `json:"updatedAt"`
+	CompletedAt        string                           `json:"completedAt,omitempty"`
+	LastError          string                           `json:"lastError,omitempty"`
+	ReconcileEffect    string                           `json:"reconcileEffect,omitempty"`
+	AcceptedProof      *gatewayFoundationProofShape     `json:"acceptedProof,omitempty"`
 }
 
 type gatewayFoundationBindingShape struct {
@@ -314,11 +377,19 @@ func validateFoundation(root *os.Root) error {
 			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
 		}
 	case 2:
-		if envelope.MinimumWriter != runtimeWriterFloorGatewayState || len(state.GatewayState) == 0 {
+		if len(state.GatewayState) == 0 {
 			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
 		}
-		if err := validateGatewayFoundationState(state.GatewayState); err != nil {
+		gatewayVersion, err := validateGatewayFoundationState(state.GatewayState)
+		if err != nil {
 			return err
+		}
+		expectedFloor := runtimeWriterFloorGatewayState
+		if gatewayVersion == 2 {
+			expectedFloor = runtimeWriterFloorGatewayProcess
+		}
+		if envelope.MinimumWriter != expectedFloor {
+			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
 		}
 	default:
 		return fmt.Errorf("invalid Runtime foundation state version %d", state.Version)
@@ -326,45 +397,295 @@ func validateFoundation(root *os.Root) error {
 	return nil
 }
 
-func validateGatewayFoundationState(raw json.RawMessage) error {
+func validateGatewayFoundationState(raw json.RawMessage) (int, error) {
 	gatewayDec := json.NewDecoder(strings.NewReader(string(raw)))
 	gatewayDec.DisallowUnknownFields()
 	var gateway gatewayFoundationStateShape
 	if err := gatewayDec.Decode(&gateway); err != nil {
-		return fmt.Errorf("invalid Runtime Gateway foundation state")
+		return 0, fmt.Errorf("invalid Runtime Gateway foundation state")
 	}
 	if err := requireJSONEOF(gatewayDec); err != nil {
-		return fmt.Errorf("invalid Runtime Gateway foundation state: %w", err)
+		return 0, fmt.Errorf("invalid Runtime Gateway foundation state: %w", err)
 	}
-	if gateway.Version != 1 || gateway.Controls == nil || gateway.Observations == nil {
-		return fmt.Errorf("invalid Runtime Gateway foundation state version")
+	if (gateway.Version != 1 && gateway.Version != 2) || gateway.Controls == nil || gateway.Observations == nil {
+		return 0, fmt.Errorf("invalid Runtime Gateway foundation state version")
+	}
+	if gateway.Version == 1 && (len(gateway.LaunchPlans) != 0 || len(gateway.Attempts) != 0) {
+		return 0, fmt.Errorf("R0b Gateway foundation contains R1 process state")
+	}
+	if gateway.Version == 2 && len(gateway.LaunchPlans) == 0 {
+		return 0, fmt.Errorf("R1 Gateway process foundation has no explicit launch plan")
 	}
 	for id, control := range gateway.Controls {
 		if id == "" || control == nil || control.ConnectionID != id || control.Epoch == 0 ||
 			(control.Lifecycle != "provisioning" && control.Lifecycle != "adopted") ||
 			(control.Recovery != "none" && control.Recovery != "needs_reconcile" && control.Recovery != "manual_recovery_required") ||
-			control.Binding.Connection.ID != id || control.Binding.Connection.Provider == "" ||
-			!foundationStringsCanonical(control.Binding.Connection.Capabilities, true) {
-			return fmt.Errorf("invalid Runtime Gateway control %q", id)
-		}
-		previousAddressID := ""
-		for _, address := range control.Binding.Addresses {
-			if address.ID == "" || address.ID <= previousAddressID || address.ConnectionID != id || address.AgentID == "" || address.ExternalIdentity == "" || address.Version < 1 ||
-				!foundationStringsCanonical(address.AllowActors, false) || !foundationStringsCanonical(address.AllowConversations, false) ||
-				!foundationStringsCanonical(address.BlockActors, false) || !foundationStringsCanonical(address.BlockConversations, false) {
-				return fmt.Errorf("invalid Runtime Gateway Address binding %q", address.ID)
-			}
-			previousAddressID = address.ID
+			!validateGatewayFoundationBinding(id, control.Binding) {
+			return 0, fmt.Errorf("invalid Runtime Gateway control %q", id)
 		}
 	}
 	for id, observation := range gateway.Observations {
 		if id == "" || observation == nil || observation.ConnectionID != id || observation.Sequence == 0 || gateway.Controls[id] == nil ||
 			(observation.Status != "disconnected" && observation.Status != "connecting" && observation.Status != "connected" && observation.Status != "degraded") ||
 			!foundationStringsCanonical(observation.ObservedCapabilities, true) {
-			return fmt.Errorf("invalid Runtime Gateway observation %q", id)
+			return 0, fmt.Errorf("invalid Runtime Gateway observation %q", id)
+		}
+	}
+	for id, plan := range gateway.LaunchPlans {
+		if plan == nil || plan.ConnectionID != id || gateway.Controls[id] == nil {
+			return 0, fmt.Errorf("invalid Runtime Gateway launch plan %q", id)
+		}
+		if err := validateGatewayFoundationLaunchPlan(*plan); err != nil {
+			return 0, fmt.Errorf("invalid Runtime Gateway launch plan %q: %w", id, err)
+		}
+	}
+	for id, attempt := range gateway.Attempts {
+		if attempt == nil || attempt.ConnectionID != id || gateway.Controls[id] == nil || gateway.LaunchPlans[id] == nil ||
+			attempt.ID == "" || attempt.BindingEpoch == 0 || !validateGatewayFoundationBinding(id, attempt.Binding) ||
+			attempt.TargetGeneration == "" || attempt.RecoveryGeneration == "" || attempt.TargetGeneration == attempt.RecoveryGeneration ||
+			(attempt.Plan.Anchor.Generation != "" && (attempt.TargetGeneration == attempt.Plan.Anchor.Generation || attempt.RecoveryGeneration == attempt.Plan.Anchor.Generation)) ||
+			!foundationAttemptKind(attempt.Kind) || !foundationAttemptPhase(attempt.Phase) {
+			return 0, fmt.Errorf("invalid Runtime Gateway attempt %q", id)
+		}
+		for _, value := range []string{attempt.ID, attempt.ConnectionID, attempt.TargetGeneration, attempt.RecoveryGeneration} {
+			if len(value) > 4096 || strings.ContainsAny(value, "\r\n\x00") || foundationStringMayContainSecret(value) {
+				return 0, fmt.Errorf("unbounded Runtime Gateway attempt %q", id)
+			}
+		}
+		if err := validateGatewayFoundationLaunchPlan(attempt.Plan); err != nil {
+			return 0, fmt.Errorf("invalid Runtime Gateway attempt plan %q", id)
+		}
+		effectStartedAt, err := time.Parse(time.RFC3339Nano, attempt.EffectStartedAt)
+		if err != nil {
+			return 0, fmt.Errorf("invalid Runtime Gateway attempt time %q", id)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, attempt.UpdatedAt); err != nil || len(attempt.LastError) > 1024 || foundationStringMayContainSecret(attempt.LastError) {
+			return 0, fmt.Errorf("invalid Runtime Gateway attempt update %q", id)
+		}
+		var recoveryStartedAt time.Time
+		if attempt.RecoveryStartedAt != "" {
+			recoveryStartedAt, err = time.Parse(time.RFC3339Nano, attempt.RecoveryStartedAt)
+			if err != nil {
+				return 0, fmt.Errorf("invalid Runtime Gateway recovery time %q", id)
+			}
+		}
+		awaitingProof := attempt.Phase == "awaiting_target_proof" || attempt.Phase == "awaiting_recovery_proof"
+		if awaitingProof != (attempt.ProofDeadline != "") {
+			return 0, fmt.Errorf("invalid Runtime Gateway proof deadline %q", id)
+		}
+		if attempt.ProofDeadline != "" {
+			deadline, err := time.Parse(time.RFC3339Nano, attempt.ProofDeadline)
+			if err != nil {
+				return 0, fmt.Errorf("invalid Runtime Gateway proof deadline time %q", id)
+			}
+			base := effectStartedAt
+			if attempt.Phase == "awaiting_recovery_proof" {
+				if recoveryStartedAt.IsZero() {
+					return 0, fmt.Errorf("Runtime Gateway recovery proof has no start %q", id)
+				}
+				base = recoveryStartedAt
+			}
+			if !deadline.After(base) || deadline.Sub(base) > 30*time.Second {
+				return 0, fmt.Errorf("Runtime Gateway proof deadline is unbounded %q", id)
+			}
+		}
+		terminal := attempt.Phase == "succeeded" || attempt.Phase == "recovered" || attempt.Phase == "manual_recovery_required"
+		if terminal != (attempt.CompletedAt != "") || (!terminal && attempt.AcceptedProof != nil) {
+			return 0, fmt.Errorf("invalid Runtime Gateway terminal attempt %q", id)
+		}
+		if terminal {
+			if _, err := time.Parse(time.RFC3339Nano, attempt.CompletedAt); err != nil {
+				return 0, fmt.Errorf("invalid Runtime Gateway completion time %q", id)
+			}
+		}
+		if (attempt.Phase == "reconcile_required") != (attempt.ReconcileEffect == "target" || attempt.ReconcileEffect == "recovery") {
+			return 0, fmt.Errorf("invalid Runtime Gateway reconcile effect %q", id)
+		}
+		if attempt.AcceptedProof != nil {
+			if attempt.AcceptedProof.AttemptID != attempt.ID || attempt.AcceptedProof.Generation == "" || attempt.AcceptedProof.Build == "" ||
+				!foundationSHA256(attempt.AcceptedProof.ExecutableDigest) {
+				return 0, fmt.Errorf("invalid Runtime Gateway proof %q", id)
+			}
+			for _, value := range []string{attempt.AcceptedProof.AttemptID, attempt.AcceptedProof.Generation, attempt.AcceptedProof.Build} {
+				if len(value) > 4096 || strings.ContainsAny(value, "\r\n\x00") || foundationStringMayContainSecret(value) {
+					return 0, fmt.Errorf("unbounded Runtime Gateway proof %q", id)
+				}
+			}
+			if _, err := time.Parse(time.RFC3339Nano, attempt.AcceptedProof.ObservedAt); err != nil {
+				return 0, fmt.Errorf("invalid Runtime Gateway proof time %q", id)
+			}
+			expectedGeneration, expectedBuild, expectedDigest := attempt.TargetGeneration, attempt.Plan.Target.Build, attempt.Plan.Target.ExecutableDigest
+			if attempt.Phase == "recovered" {
+				expectedGeneration, expectedBuild, expectedDigest = attempt.RecoveryGeneration, attempt.Plan.Anchor.Descriptor.Build, attempt.Plan.Anchor.Descriptor.ExecutableDigest
+			}
+			if attempt.AcceptedProof.Generation != expectedGeneration || attempt.AcceptedProof.Build != expectedBuild || attempt.AcceptedProof.ExecutableDigest != expectedDigest {
+				return 0, fmt.Errorf("mismatched Runtime Gateway proof %q", id)
+			}
+		}
+		control := gateway.Controls[id]
+		attemptPlanJSON, _ := json.Marshal(attempt.Plan)
+		configuredPlanJSON, _ := json.Marshal(gateway.LaunchPlans[id])
+		if !bytes.Equal(attemptPlanJSON, configuredPlanJSON) {
+			return 0, fmt.Errorf("Runtime Gateway attempt plan drifted %q", id)
+		}
+		if terminal {
+			if control.ActiveAttemptID != "" {
+				return 0, fmt.Errorf("terminal Runtime Gateway attempt remains active %q", id)
+			}
+		} else if control.ActiveAttemptID != attempt.ID || control.Recovery == "none" {
+			return 0, fmt.Errorf("active Runtime Gateway attempt is not fenced %q", id)
+		} else {
+			bindingJSON, _ := json.Marshal(attempt.Binding)
+			controlBindingJSON, _ := json.Marshal(control.Binding)
+			if control.Epoch != attempt.BindingEpoch || !bytes.Equal(bindingJSON, controlBindingJSON) || !bytes.Equal(attemptPlanJSON, configuredPlanJSON) {
+				return 0, fmt.Errorf("active Runtime Gateway attempt drifted %q", id)
+			}
+		}
+	}
+	for id, control := range gateway.Controls {
+		if control.ActiveAttemptID == "" {
+			continue
+		}
+		attempt := gateway.Attempts[id]
+		if attempt == nil || attempt.ID != control.ActiveAttemptID {
+			return 0, fmt.Errorf("Runtime Gateway control lost active attempt %q", id)
+		}
+	}
+	return gateway.Version, nil
+}
+
+func validateGatewayFoundationBinding(id string, binding gatewayFoundationBindingShape) bool {
+	if binding.Connection.ID != id || binding.Connection.Provider == "" || !foundationStringsCanonical(binding.Connection.Capabilities, true) {
+		return false
+	}
+	previousAddressID := ""
+	for _, address := range binding.Addresses {
+		if address.ID == "" || address.ID <= previousAddressID || address.ConnectionID != id || address.AgentID == "" || address.ExternalIdentity == "" || address.Version < 1 ||
+			!foundationStringsCanonical(address.AllowActors, false) || !foundationStringsCanonical(address.AllowConversations, false) ||
+			!foundationStringsCanonical(address.BlockActors, false) || !foundationStringsCanonical(address.BlockConversations, false) {
+			return false
+		}
+		previousAddressID = address.ID
+	}
+	return true
+}
+
+func validateGatewayFoundationLaunchPlan(plan gatewayFoundationLaunchPlanShape) error {
+	if plan.ConnectionID == "" || plan.Target.ConnectionID != plan.ConnectionID || plan.Anchor.Descriptor.ConnectionID != plan.ConnectionID {
+		return fmt.Errorf("launch plan Connection mismatch")
+	}
+	if err := validateGatewayFoundationLaunchDescriptor(plan.Target); err != nil {
+		return err
+	}
+	if err := validateGatewayFoundationLaunchDescriptor(plan.Anchor.Descriptor); err != nil {
+		return err
+	}
+	if len(plan.Anchor.Generation) > 4096 || strings.ContainsAny(plan.Anchor.Generation, "\r\n\x00") || foundationStringMayContainSecret(plan.Anchor.Generation) {
+		return fmt.Errorf("invalid registration anchor generation")
+	}
+	anchor := plan.Anchor.Descriptor
+	if plan.Target.Manager != anchor.Manager || plan.Target.ServiceID != anchor.ServiceID || plan.Target.UnitPath != anchor.UnitPath ||
+		plan.Target.HubURL != anchor.HubURL || plan.Target.DataDir != anchor.DataDir || plan.Target.LogPath != anchor.LogPath {
+		return fmt.Errorf("launch plan registration mismatch")
+	}
+	payload := struct {
+		Descriptor gatewayFoundationLaunchDescriptorShape `json:"descriptor"`
+		Generation string                                 `json:"generation,omitempty"`
+	}{Descriptor: anchor, Generation: plan.Anchor.Generation}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(data)
+	if plan.Anchor.IntegritySHA256 != hex.EncodeToString(digest[:]) {
+		return fmt.Errorf("registration anchor integrity mismatch")
+	}
+	planJSON, err := json.Marshal(plan)
+	if err != nil || len(planJSON) > 32<<10 {
+		return fmt.Errorf("registration plan is unbounded")
+	}
+	return nil
+}
+
+func validateGatewayFoundationLaunchDescriptor(value gatewayFoundationLaunchDescriptorShape) error {
+	if value.Manager != "launchd" && value.Manager != "systemd" && value.Manager != "fake" {
+		return fmt.Errorf("unsupported service manager")
+	}
+	fields := []string{value.ConnectionID, value.ServiceID, value.UnitPath, value.Executable, value.WorkingDirectory, value.HubURL, value.DataDir, value.LogPath, value.Build}
+	for _, field := range fields {
+		if field == "" || field != strings.TrimSpace(field) || len(field) > 4096 || strings.ContainsAny(field, "\r\n\x00") {
+			return fmt.Errorf("invalid launch descriptor field")
+		}
+	}
+	if !foundationGatewayServiceIdentifier(value.ConnectionID) || !foundationGatewayServiceIdentifier(value.ServiceID) {
+		return fmt.Errorf("invalid launch descriptor identifier")
+	}
+	for _, path := range []string{value.UnitPath, value.Executable, value.WorkingDirectory, value.DataDir, value.LogPath} {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return fmt.Errorf("invalid launch descriptor path")
+		}
+	}
+	if (value.Manager == "launchd" && filepath.Ext(value.UnitPath) != ".plist") || (value.Manager == "systemd" && filepath.Ext(value.UnitPath) != ".service") {
+		return fmt.Errorf("launch descriptor unit suffix mismatch")
+	}
+	parsed, err := url.Parse(value.HubURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("invalid launch descriptor Hub URL")
+	}
+	if !foundationSHA256(value.ExecutableDigest) {
+		return fmt.Errorf("invalid launch descriptor digest")
+	}
+	for _, field := range fields {
+		if foundationStringMayContainSecret(field) {
+			return fmt.Errorf("launch descriptor may contain secret material")
 		}
 	}
 	return nil
+}
+
+func foundationGatewayServiceIdentifier(value string) bool {
+	if value == "" || len(value) > 255 {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') ||
+			char == '-' || char == '_' || char == '.' || char == ':' || char == '@' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func foundationStringMayContainSecret(value string) bool {
+	lower := strings.ToLower(value)
+	for _, marker := range []string{"authorization:", "bearer ", "password=", "passwd=", "secret=", "token=", "api_key=", "apikey="} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func foundationSHA256(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func foundationAttemptKind(value string) bool {
+	return value == "automatic_restart" || value == "manual_repair" || value == "migration_activation" || value == "rollback"
+}
+
+func foundationAttemptPhase(value string) bool {
+	switch value {
+	case "target_intent", "awaiting_target_proof", "reconcile_required", "recovery_intent", "awaiting_recovery_proof", "succeeded", "recovered", "manual_recovery_required":
+		return true
+	default:
+		return false
+	}
 }
 
 func foundationStringsCanonical(values []string, lower bool) bool {

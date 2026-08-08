@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -70,13 +71,14 @@ type gatewayConfiguredBinding struct {
 }
 
 type gatewayControl struct {
-	ConnectionID string                     `json:"connectionId"`
-	Epoch        uint64                     `json:"epoch"`
-	Lifecycle    gatewayBindingLifecycle    `json:"lifecycle"`
-	Recovery     gatewayRecoveryDisposition `json:"recovery"`
-	Reason       string                     `json:"reason,omitempty"`
-	Binding      gatewayConfiguredBinding   `json:"binding"`
-	UpdatedAt    string                     `json:"updatedAt"`
+	ConnectionID    string                     `json:"connectionId"`
+	Epoch           uint64                     `json:"epoch"`
+	Lifecycle       gatewayBindingLifecycle    `json:"lifecycle"`
+	Recovery        gatewayRecoveryDisposition `json:"recovery"`
+	Reason          string                     `json:"reason,omitempty"`
+	Binding         gatewayConfiguredBinding   `json:"binding"`
+	ActiveAttemptID string                     `json:"activeAttemptId,omitempty"`
+	UpdatedAt       string                     `json:"updatedAt"`
 }
 
 type gatewayProcessObservation struct {
@@ -95,6 +97,8 @@ type gatewayState struct {
 	Version      int                                   `json:"version"`
 	Controls     map[string]*gatewayControl            `json:"controls"`
 	Observations map[string]*gatewayProcessObservation `json:"observations"`
+	LaunchPlans  map[string]*gatewayLaunchPlan         `json:"launchPlans,omitempty"`
+	Attempts     map[string]*gatewayTransitionAttempt  `json:"attempts,omitempty"`
 }
 
 // gatewayBindingSnapshot is a private authorization token for a future R1
@@ -247,7 +251,10 @@ func emptyGatewayState() gatewayState {
 }
 
 func cloneGatewayState(value gatewayState) gatewayState {
-	result := emptyGatewayState()
+	result := gatewayState{Version: value.Version, Controls: map[string]*gatewayControl{}, Observations: map[string]*gatewayProcessObservation{}}
+	if result.Version == 0 {
+		result.Version = gatewayStateVersion
+	}
 	for id, control := range value.Controls {
 		if control == nil {
 			continue
@@ -263,6 +270,43 @@ func cloneGatewayState(value gatewayState) gatewayState {
 		copy := *observation
 		copy.ObservedCapabilities = append([]string(nil), observation.ObservedCapabilities...)
 		result.Observations[id] = &copy
+	}
+	if value.LaunchPlans != nil {
+		result.LaunchPlans = make(map[string]*gatewayLaunchPlan, len(value.LaunchPlans))
+		for id, plan := range value.LaunchPlans {
+			if plan == nil {
+				continue
+			}
+			copy := *plan
+			result.LaunchPlans[id] = &copy
+		}
+	}
+	if value.Attempts != nil {
+		result.Attempts = make(map[string]*gatewayTransitionAttempt, len(value.Attempts))
+		for id, attempt := range value.Attempts {
+			if attempt == nil {
+				continue
+			}
+			copy := *attempt
+			copy.Binding = cloneGatewayBinding(attempt.Binding)
+			if attempt.AcceptedProof != nil {
+				proof := *attempt.AcceptedProof
+				copy.AcceptedProof = &proof
+			}
+			result.Attempts[id] = &copy
+		}
+	}
+	return result
+}
+
+func upgradeGatewayStateForProcess(value gatewayState) gatewayState {
+	result := cloneGatewayState(value)
+	result.Version = gatewayProcessStateVersion
+	if result.LaunchPlans == nil {
+		result.LaunchPlans = map[string]*gatewayLaunchPlan{}
+	}
+	if result.Attempts == nil {
+		result.Attempts = map[string]*gatewayTransitionAttempt{}
 	}
 	return result
 }
@@ -302,8 +346,14 @@ func (h *Hub) loadGatewayState() error {
 }
 
 func (h *Hub) validateGatewayStateLocked(state gatewayState) error {
-	if state.Version != gatewayStateVersion || state.Controls == nil || state.Observations == nil {
+	if (state.Version != gatewayStateVersion && state.Version != gatewayProcessStateVersion) || state.Controls == nil || state.Observations == nil {
 		return fmt.Errorf("unsupported Gateway state version %d", state.Version)
+	}
+	if state.Version == gatewayStateVersion && (len(state.LaunchPlans) != 0 || len(state.Attempts) != 0) {
+		return fmt.Errorf("R0b Gateway state contains R1 process records")
+	}
+	if state.Version == gatewayProcessStateVersion && len(state.LaunchPlans) == 0 {
+		return fmt.Errorf("R1 Gateway process state has no explicit launch plan")
 	}
 	for id, control := range state.Controls {
 		if control == nil || strings.TrimSpace(id) == "" || control.ConnectionID != id || control.Epoch == 0 ||
@@ -323,11 +373,54 @@ func (h *Hub) validateGatewayStateLocked(state gatewayState) error {
 		if control.Recovery == gatewayRecoveryNone && !gatewayBindingsEqual(current, control.Binding) {
 			return fmt.Errorf("Gateway binding drift requires reconciliation for %q", id)
 		}
+		attempt := state.Attempts[id]
+		if control.ActiveAttemptID == "" {
+			if attempt != nil && !gatewayAttemptTerminal(attempt.Phase) {
+				return fmt.Errorf("Gateway control %q lost its active attempt", id)
+			}
+		} else if attempt == nil || attempt.ID != control.ActiveAttemptID || gatewayAttemptTerminal(attempt.Phase) || control.Recovery == gatewayRecoveryNone {
+			return fmt.Errorf("Gateway control %q has invalid active attempt", id)
+		}
 	}
 	for id, observation := range state.Observations {
 		if observation == nil || observation.ConnectionID != id || state.Controls[id] == nil || observation.Sequence == 0 ||
 			!validGatewayHealthStatus(observation.Status) || !gatewayStringSlicesEqual(observation.ObservedCapabilities, normalizeCapabilities(observation.ObservedCapabilities)) {
 			return fmt.Errorf("invalid Gateway observation %q", id)
+		}
+	}
+	for id, plan := range state.LaunchPlans {
+		if plan == nil || plan.ConnectionID != id || state.Controls[id] == nil {
+			return fmt.Errorf("invalid Gateway launch plan %q", id)
+		}
+		if err := validateGatewayLaunchPlan(*plan); err != nil {
+			return fmt.Errorf("invalid Gateway launch plan %q: %w", id, err)
+		}
+		if h.st == nil || filepath.Clean(plan.Target.DataDir) != filepath.Clean(h.st.Dir()) {
+			return fmt.Errorf("Gateway launch plan %q targets another Runtime data directory", id)
+		}
+	}
+	for id, attempt := range state.Attempts {
+		if attempt == nil || attempt.ConnectionID != id || state.Controls[id] == nil || state.LaunchPlans[id] == nil {
+			return fmt.Errorf("invalid Gateway transition attempt %q", id)
+		}
+		if err := validateGatewayTransitionAttempt(*attempt); err != nil {
+			return fmt.Errorf("invalid Gateway transition attempt %q: %w", id, err)
+		}
+		control := state.Controls[id]
+		if !gatewayLaunchPlansEqual(*state.LaunchPlans[id], attempt.Plan) {
+			return fmt.Errorf("Gateway attempt %q drifted from its launch plan", id)
+		}
+		if gatewayAttemptTerminal(attempt.Phase) {
+			continue
+		}
+		if control.Epoch != attempt.BindingEpoch || !gatewayBindingsEqual(control.Binding, attempt.Binding) {
+			return fmt.Errorf("active Gateway attempt %q drifted from its frozen control", id)
+		}
+		connection := h.connections[id]
+		current, currentErr := h.gatewayBindingLocked(id)
+		if control.Lifecycle != gatewayBindingAdopted || connection == nil || !connection.Enabled || connection.ArchivedAt != "" || connection.SupersededBy != "" ||
+			currentErr != nil || !gatewayBindingsEqual(current, attempt.Binding) || !gatewayBindingEligible(current) {
+			return fmt.Errorf("active Gateway attempt %q is no longer eligible", id)
 		}
 	}
 	return nil
@@ -710,6 +803,9 @@ func (h *Hub) setGatewayRecovery(connectionID string, expectedEpoch uint64, reco
 	if control.Epoch != expectedEpoch {
 		return gatewayControl{}, errf(409, "Gateway control epoch changed")
 	}
+	if control.ActiveAttemptID != "" {
+		return gatewayControl{}, errf(409, "Gateway process attempt is active")
+	}
 	if control.Recovery == gatewayRecoveryManual && recovery != gatewayRecoveryManual {
 		return gatewayControl{}, errf(409, "manual Gateway recovery requires an accepted process proof")
 	}
@@ -945,8 +1041,13 @@ func (h *Hub) finishGatewayMutationLocked(ticket *gatewayMutationTicket) error {
 			continue
 		}
 		control.Binding = binding
-		control.Recovery = gatewayRecoveryNone
-		control.Reason = ""
+		if next.LaunchPlans[id] != nil {
+			control.Recovery = gatewayRecoveryReconcile
+			control.Reason = "configured binding changed; typed Gateway launch plan requires exact process reconciliation"
+		} else {
+			control.Recovery = gatewayRecoveryNone
+			control.Reason = ""
+		}
 		control.UpdatedAt = now()
 	}
 	if err := h.saveGatewayStateLocked(next); err != nil {
