@@ -444,7 +444,7 @@ func (h *Hub) loadIntegrations() error {
 	}
 	changed := h.normalizeAddressLifecycleLocked()
 	changed = h.migrateAllowedConversationsLocked() || changed
-	if changed {
+	if changed && !h.passive {
 		return h.persistIntegrationsLocked()
 	}
 	return nil
@@ -519,8 +519,10 @@ func (h *Hub) loadInboxState() error {
 			repaired = true
 		}
 		if repaired {
-			if err := h.st.AppendInbox(item); err != nil {
-				return fmt.Errorf("persist recovered inbox item %s: %w", item.ID, err)
+			if !h.passive {
+				if err := h.st.AppendInbox(item); err != nil {
+					return fmt.Errorf("persist recovered inbox item %s: %w", item.ID, err)
+				}
 			}
 			copy := item
 			h.inbox[id] = &copy
@@ -558,8 +560,10 @@ func (h *Hub) loadInboxState() error {
 			repaired = true
 		}
 		if repaired {
-			if err := h.st.AppendAttempt(attempt); err != nil {
-				return fmt.Errorf("persist recovered inbox attempt %s: %w", attempt.ID, err)
+			if !h.passive {
+				if err := h.st.AppendAttempt(attempt); err != nil {
+					return fmt.Errorf("persist recovered inbox attempt %s: %w", attempt.ID, err)
+				}
 			}
 			copy := attempt
 			h.attempts[id] = &copy
@@ -586,8 +590,10 @@ func (h *Hub) loadInboxState() error {
 		item := *current
 		if staleOutbox[id] {
 			item.UpdatedAt = now()
-			if err := h.st.AppendOutbox(item); err != nil {
-				return fmt.Errorf("persist terminal outbox item %s: %w", item.ID, err)
+			if !h.passive {
+				if err := h.st.AppendOutbox(item); err != nil {
+					return fmt.Errorf("persist terminal outbox item %s: %w", item.ID, err)
+				}
 			}
 			copy := item
 			h.outbox[id] = &copy
@@ -599,8 +605,10 @@ func (h *Hub) loadInboxState() error {
 			item.ClaimExpiresAt = ""
 			item.LastError = "recovered legacy delivery claim after CodexLoom restart"
 			item.UpdatedAt = now()
-			if err := h.st.AppendOutbox(item); err != nil {
-				return fmt.Errorf("persist recovered outbox item %s: %w", item.ID, err)
+			if !h.passive {
+				if err := h.st.AppendOutbox(item); err != nil {
+					return fmt.Errorf("persist recovered outbox item %s: %w", item.ID, err)
+				}
 			}
 			copy := item
 			h.outbox[id] = &copy
@@ -625,8 +633,10 @@ func (h *Hub) loadInboxState() error {
 		}
 	}
 	for _, item := range reconciledInbox {
-		if err := h.st.AppendInbox(item); err != nil {
-			return fmt.Errorf("persist reconciled inbox item %s: %w", item.ID, err)
+		if !h.passive {
+			if err := h.st.AppendInbox(item); err != nil {
+				return fmt.Errorf("persist reconciled inbox item %s: %w", item.ID, err)
+			}
 		}
 	}
 	return nil

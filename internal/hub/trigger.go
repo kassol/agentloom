@@ -878,6 +878,9 @@ func (h *Hub) reconcileTriggersLocked() error {
 	if !changed {
 		return nil
 	}
+	if h.passive {
+		return nil
+	}
 	if err := h.persistTriggersLocked(); err != nil {
 		return fmt.Errorf("persist reconciled triggers: %w", err)
 	}
