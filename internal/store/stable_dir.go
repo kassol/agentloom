@@ -13,17 +13,96 @@ import (
 
 const foundationFileName = "runtime-foundation.json"
 
-// S0 recognizes the empty foundation envelope only. It never creates or
-// advances this file; later Runtime layers must atomically commit their state
-// and writer floor together.
-type foundationEnvelope struct {
+const runtimeFoundationMaxBytes = 1 << 20
+
+const (
+	runtimeFoundationSchemaVersion = 1
+	runtimeWriterFloorS0           = 1
+	runtimeWriterFloorGatewayState = 2
+)
+
+// runtimeFoundationEnvelope is private Runtime persistence shared by Store
+// and Hub. It is not an API or provider wire contract. S0 recognizes version
+// 1 as the empty foundation. R0b uses version 2 only when an internal caller
+// explicitly creates the first dormant Gateway control; that same write raises
+// the minimum writer floor atomically.
+type runtimeFoundationEnvelope struct {
 	SchemaVersion int             `json:"schemaVersion"`
 	MinimumWriter int             `json:"minimumWriter"`
 	State         json.RawMessage `json:"state"`
 }
 
 type foundationState struct {
-	Version int `json:"version"`
+	Version      int             `json:"version"`
+	GatewayState json.RawMessage `json:"gatewayState,omitempty"`
+}
+
+type gatewayFoundationStateShape struct {
+	Version      int                                           `json:"version"`
+	Controls     map[string]*gatewayFoundationControlShape     `json:"controls"`
+	Observations map[string]*gatewayFoundationObservationShape `json:"observations"`
+}
+
+type gatewayFoundationControlShape struct {
+	ConnectionID string                        `json:"connectionId"`
+	Epoch        uint64                        `json:"epoch"`
+	Lifecycle    string                        `json:"lifecycle"`
+	Recovery     string                        `json:"recovery"`
+	Reason       string                        `json:"reason,omitempty"`
+	Binding      gatewayFoundationBindingShape `json:"binding"`
+	UpdatedAt    string                        `json:"updatedAt"`
+}
+
+type gatewayFoundationBindingShape struct {
+	Connection gatewayFoundationConnectionShape `json:"connection"`
+	Addresses  []gatewayFoundationAddressShape  `json:"addresses"`
+}
+
+type gatewayFoundationConnectionShape struct {
+	ID            string   `json:"id"`
+	Provider      string   `json:"provider"`
+	AccountRef    string   `json:"accountRef,omitempty"`
+	ScopeRef      string   `json:"scopeRef,omitempty"`
+	CredentialRef string   `json:"credentialRef,omitempty"`
+	Capabilities  []string `json:"capabilities,omitempty"`
+	Enabled       bool     `json:"enabled"`
+	SupersededBy  string   `json:"supersededBy,omitempty"`
+	ArchivedAt    string   `json:"archivedAt,omitempty"`
+	CreatedAt     string   `json:"createdAt"`
+}
+
+type gatewayFoundationAddressShape struct {
+	ID                 string   `json:"id"`
+	AgentID            string   `json:"agentId"`
+	ConnectionID       string   `json:"connectionId"`
+	ExternalIdentity   string   `json:"externalIdentity"`
+	DisplayName        string   `json:"displayName,omitempty"`
+	TriggerPolicy      string   `json:"triggerPolicy"`
+	ReplyPolicy        string   `json:"replyPolicy"`
+	DMPolicy           string   `json:"dmPolicy,omitempty"`
+	TrustDomain        string   `json:"trustDomain"`
+	AllowActors        []string `json:"allowActors,omitempty"`
+	AllowConversations []string `json:"allowConversations,omitempty"`
+	BlockActors        []string `json:"blockActors,omitempty"`
+	BlockConversations []string `json:"blockConversations,omitempty"`
+	Enabled            bool     `json:"enabled"`
+	SupersededBy       string   `json:"supersededBy,omitempty"`
+	ArchivedAt         string   `json:"archivedAt,omitempty"`
+	DeletedAt          string   `json:"deletedAt,omitempty"`
+	Version            int      `json:"version"`
+	CreatedAt          string   `json:"createdAt"`
+}
+
+type gatewayFoundationObservationShape struct {
+	ConnectionID         string   `json:"connectionId"`
+	Sequence             uint64   `json:"sequence"`
+	Status               string   `json:"status"`
+	Error                string   `json:"error,omitempty"`
+	Cursor               string   `json:"cursor,omitempty"`
+	LastEventAt          string   `json:"lastEventAt,omitempty"`
+	ObservedCapabilities []string `json:"observedCapabilities,omitempty"`
+	HeartbeatAt          string   `json:"heartbeatAt,omitempty"`
+	ObservedAt           string   `json:"observedAt"`
 }
 
 type stableDataDir struct {
@@ -208,28 +287,99 @@ func validateFoundation(root *os.Root) error {
 		return fmt.Errorf("open Runtime foundation: %w", err)
 	}
 	defer f.Close()
-	dec := json.NewDecoder(io.LimitReader(f, 1<<20))
+	dec := json.NewDecoder(io.LimitReader(f, runtimeFoundationMaxBytes))
 	dec.DisallowUnknownFields()
-	var envelope foundationEnvelope
+	var envelope runtimeFoundationEnvelope
 	if err := dec.Decode(&envelope); err != nil {
 		return fmt.Errorf("decode Runtime foundation: %w", err)
 	}
 	if err := requireJSONEOF(dec); err != nil {
 		return fmt.Errorf("decode Runtime foundation: %w", err)
 	}
-	if envelope.SchemaVersion != 1 || envelope.MinimumWriter < 0 || envelope.MinimumWriter > 1 {
+	if envelope.SchemaVersion != runtimeFoundationSchemaVersion {
 		return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
 	}
 	stateDec := json.NewDecoder(strings.NewReader(string(envelope.State)))
 	stateDec.DisallowUnknownFields()
 	var state foundationState
-	if err := stateDec.Decode(&state); err != nil || state.Version != 1 {
+	if err := stateDec.Decode(&state); err != nil {
 		return fmt.Errorf("invalid Runtime foundation state")
 	}
 	if err := requireJSONEOF(stateDec); err != nil {
 		return fmt.Errorf("invalid Runtime foundation state: %w", err)
 	}
+	switch state.Version {
+	case 1:
+		if envelope.MinimumWriter < 0 || envelope.MinimumWriter > runtimeWriterFloorS0 || len(state.GatewayState) != 0 {
+			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
+		}
+	case 2:
+		if envelope.MinimumWriter != runtimeWriterFloorGatewayState || len(state.GatewayState) == 0 {
+			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
+		}
+		if err := validateGatewayFoundationState(state.GatewayState); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("invalid Runtime foundation state version %d", state.Version)
+	}
 	return nil
+}
+
+func validateGatewayFoundationState(raw json.RawMessage) error {
+	gatewayDec := json.NewDecoder(strings.NewReader(string(raw)))
+	gatewayDec.DisallowUnknownFields()
+	var gateway gatewayFoundationStateShape
+	if err := gatewayDec.Decode(&gateway); err != nil {
+		return fmt.Errorf("invalid Runtime Gateway foundation state")
+	}
+	if err := requireJSONEOF(gatewayDec); err != nil {
+		return fmt.Errorf("invalid Runtime Gateway foundation state: %w", err)
+	}
+	if gateway.Version != 1 || gateway.Controls == nil || gateway.Observations == nil {
+		return fmt.Errorf("invalid Runtime Gateway foundation state version")
+	}
+	for id, control := range gateway.Controls {
+		if id == "" || control == nil || control.ConnectionID != id || control.Epoch == 0 ||
+			(control.Lifecycle != "provisioning" && control.Lifecycle != "adopted") ||
+			(control.Recovery != "none" && control.Recovery != "needs_reconcile" && control.Recovery != "manual_recovery_required") ||
+			control.Binding.Connection.ID != id || control.Binding.Connection.Provider == "" ||
+			!foundationStringsCanonical(control.Binding.Connection.Capabilities, true) {
+			return fmt.Errorf("invalid Runtime Gateway control %q", id)
+		}
+		previousAddressID := ""
+		for _, address := range control.Binding.Addresses {
+			if address.ID == "" || address.ID <= previousAddressID || address.ConnectionID != id || address.AgentID == "" || address.ExternalIdentity == "" || address.Version < 1 ||
+				!foundationStringsCanonical(address.AllowActors, false) || !foundationStringsCanonical(address.AllowConversations, false) ||
+				!foundationStringsCanonical(address.BlockActors, false) || !foundationStringsCanonical(address.BlockConversations, false) {
+				return fmt.Errorf("invalid Runtime Gateway Address binding %q", address.ID)
+			}
+			previousAddressID = address.ID
+		}
+	}
+	for id, observation := range gateway.Observations {
+		if id == "" || observation == nil || observation.ConnectionID != id || observation.Sequence == 0 || gateway.Controls[id] == nil ||
+			(observation.Status != "disconnected" && observation.Status != "connecting" && observation.Status != "connected" && observation.Status != "degraded") ||
+			!foundationStringsCanonical(observation.ObservedCapabilities, true) {
+			return fmt.Errorf("invalid Runtime Gateway observation %q", id)
+		}
+	}
+	return nil
+}
+
+func foundationStringsCanonical(values []string, lower bool) bool {
+	previous := ""
+	for _, value := range values {
+		normalized := strings.TrimSpace(value)
+		if lower {
+			normalized = strings.ToLower(normalized)
+		}
+		if value != normalized || value == "" || value <= previous {
+			return false
+		}
+		previous = value
+	}
+	return true
 }
 
 func requireJSONEOF(dec *json.Decoder) error {
