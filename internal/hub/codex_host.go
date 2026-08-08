@@ -168,6 +168,9 @@ func (h *Hub) verifyRuntimeThreadControl(agentID string, rt *runtime) error {
 func (h *Hub) materializeModelCatalog() (modelcatalog.Snapshot, error) {
 	dataDir := filepath.Join(os.TempDir(), "codexloom-runtime")
 	if h.st != nil {
+		if err := h.st.ValidateWritableIdentity(); err != nil {
+			return modelcatalog.Snapshot{}, err
+		}
 		dataDir = h.st.Dir()
 	}
 	return modelcatalog.Materialize(dataDir, os.Getenv("CODEX_LOOM_MODEL_CATALOG"))
@@ -225,6 +228,11 @@ func (h *Hub) initCodexHost(host *codexHostRuntime) {
 		return
 	}
 	if h.st != nil {
+		if err := h.st.ValidateWritableIdentity(); err != nil {
+			host.initErr = fmt.Errorf("validate builtin Skill store: %w", err)
+			host.client.Close()
+			return
+		}
 		skillRoot := filepath.Join(h.st.Dir(), "builtin-skills")
 		missing := missingUserSkills()
 		if len(missing) == 0 {

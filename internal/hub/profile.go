@@ -377,6 +377,9 @@ func (h *Hub) migrateCommAgentIDsLocked() error {
 	if !changed {
 		return nil
 	}
+	if h.passive {
+		return nil
+	}
 	records := make([]json.RawMessage, 0, len(h.commOrder))
 	for _, id := range h.commOrder {
 		msg := h.comms[id]
