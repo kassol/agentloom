@@ -383,6 +383,10 @@ func (s *Store) organizationLinksFile() string {
 
 func (s *Store) integrationsFile() string { return filepath.Join(s.dir, "integrations.json") }
 
+func (s *Store) runtimeFoundationFile() string {
+	return filepath.Join(s.dir, foundationFileName)
+}
+
 func (s *Store) remoteFile() string { return filepath.Join(s.dir, "remote.json") }
 
 func (s *Store) messagesFile() string { return filepath.Join(s.dir, "messages.ndjson") }
@@ -651,6 +655,92 @@ func (s *Store) SaveOrganizationLinks(v any) error { return s.saveJSON(s.organiz
 func (s *Store) LoadIntegrations(v any) error { return s.loadJSON(s.integrationsFile(), v) }
 
 func (s *Store) SaveIntegrations(v any) error { return s.saveJSON(s.integrationsFile(), v) }
+
+// LoadRuntimeGatewayState reads the private R0b payload. Absence and the S0
+// empty envelope both mean that no Gateway control has ever been adopted.
+// The stable directory open path has already validated the envelope from the
+// same directory handle before any writable Hub mutation was possible.
+func (s *Store) LoadRuntimeGatewayState(v any) (bool, error) {
+	data, err := s.readFile(s.runtimeFoundationFile())
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var envelope runtimeFoundationEnvelope
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
+		return false, err
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return false, err
+	}
+	var state foundationState
+	stateDecoder := json.NewDecoder(strings.NewReader(string(envelope.State)))
+	stateDecoder.DisallowUnknownFields()
+	if err := stateDecoder.Decode(&state); err != nil {
+		return false, err
+	}
+	if err := requireJSONEOF(stateDecoder); err != nil {
+		return false, err
+	}
+	if state.Version == 1 {
+		return false, nil
+	}
+	if envelope.SchemaVersion != runtimeFoundationSchemaVersion || envelope.MinimumWriter != runtimeWriterFloorGatewayState || state.Version != 2 || len(state.GatewayState) == 0 {
+		return false, fmt.Errorf("unsupported Runtime Gateway foundation")
+	}
+	gatewayDecoder := json.NewDecoder(strings.NewReader(string(state.GatewayState)))
+	gatewayDecoder.DisallowUnknownFields()
+	if err := gatewayDecoder.Decode(v); err != nil {
+		return false, err
+	}
+	if err := requireJSONEOF(gatewayDecoder); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// SaveRuntimeGatewayState is the only R0b writer-floor transition. The state
+// and minimum writer are encoded in one atomic file replacement; ordinary
+// Store/Hub open, Passive mode, and shutdown never call it.
+func (s *Store) SaveRuntimeGatewayState(v any) error {
+	if s == nil {
+		return fmt.Errorf("store is unavailable")
+	}
+	s.closeMu.RLock()
+	owned := !s.closed && !s.readOnly && s.ownerActive
+	s.closeMu.RUnlock()
+	if !owned {
+		return fmt.Errorf("Runtime Gateway foundation requires a live writable Hub owner")
+	}
+	gateway, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if err := validateGatewayFoundationState(gateway); err != nil {
+		return err
+	}
+	state, err := json.Marshal(foundationState{Version: 2, GatewayState: gateway})
+	if err != nil {
+		return err
+	}
+	envelope := runtimeFoundationEnvelope{
+		SchemaVersion: runtimeFoundationSchemaVersion,
+		MinimumWriter: runtimeWriterFloorGatewayState,
+		State:         state,
+	}
+	data, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		return err
+	}
+	if len(data) >= runtimeFoundationMaxBytes {
+		return fmt.Errorf("Runtime Gateway foundation exceeds %d bytes", runtimeFoundationMaxBytes)
+	}
+	return s.replaceFile(s.runtimeFoundationFile(), data, 0o600)
+}
 
 func (s *Store) LoadRemote(v any) error { return s.loadJSON(s.remoteFile(), v) }
 

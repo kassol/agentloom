@@ -340,6 +340,16 @@ type Hub struct {
 	contextHistoryProbe     contextHistoryProbeFunc
 	threadResumeTimeout     time.Duration
 	developerContextTimeout time.Duration
+
+	integrationNormalizationPending bool
+	gatewayState                    gatewayState
+	gatewayFoundationPoisoned       bool
+	gatewayFoundationPoisonReason   string
+	gatewayOpenGeneration           string
+	gatewayCoordinatorInitMu        sync.Mutex
+	gatewayCoordinator              *gatewayConnectionCoordinator
+	saveGatewayStateForTest         func(gatewayState) error
+	loadGatewayStateForTest         func(*gatewayState) (bool, error)
 }
 
 // New is retained for in-process callers that cannot recover from an invalid
@@ -407,6 +417,9 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		organizationLinks:      map[string]*OrganizationRelationship{},
 		connections:            map[string]*PlatformConnection{},
 		addresses:              map[string]*AgentAddress{},
+		gatewayState:           emptyGatewayState(),
+		gatewayOpenGeneration:  newIntegrationID("gopen"),
+		gatewayCoordinator:     newGatewayConnectionCoordinator(),
 		addressOperations:      map[string]*AddressLifecycleOperation{},
 		memberships:            map[string]*ConversationMembership{},
 		conversationCandidates: map[string]*ConversationCandidate{},
@@ -424,6 +437,23 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		globalSubs:             map[*subscriber]struct{}{},
 		triggerObservations:    map[string]struct{}{},
 		stop:                   make(chan struct{}),
+	}
+	// Validate the complete private Gateway foundation against integrations
+	// before any startup recovery or compatibility normalization can write the
+	// durable tree. This keeps corrupt/newer state fail-closed at Hub open.
+	if err := h.loadIntegrations(); err != nil {
+		return nil, fmt.Errorf("load integrations: %w", err)
+	}
+	if err := h.loadGatewayState(); err != nil {
+		return nil, fmt.Errorf("load Gateway foundation: %w", err)
+	}
+	if h.integrationNormalizationPending && !options.Passive {
+		if len(h.gatewayState.Controls) != 0 {
+			return nil, fmt.Errorf("integration normalization requires explicit Gateway reconciliation")
+		}
+		if err := h.persistIntegrationsLocked(); err != nil {
+			return nil, fmt.Errorf("persist normalized integrations: %w", err)
+		}
 	}
 	h.globalSeq = st.LastSeq(globalEventLogID)
 	if err := st.LoadAgents(&h.agents); err != nil {
@@ -482,9 +512,6 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	}
 	if err := h.validateLoadedCollaborationGroupsLocked(); err != nil {
 		return nil, fmt.Errorf("validate collaboration groups: %w", err)
-	}
-	if err := h.loadIntegrations(); err != nil {
-		return nil, fmt.Errorf("load integrations: %w", err)
 	}
 	if err := h.loadInboxState(); err != nil {
 		return nil, fmt.Errorf("load inbox state: %w", err)
