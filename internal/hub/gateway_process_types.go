@@ -12,10 +12,13 @@ import (
 	goruntime "runtime"
 	"strings"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/credentials"
 )
 
 const (
 	gatewayProcessStateVersion       = 2
+	gatewayLaunchProofStateVersion   = 3
 	gatewayProcessStringMax          = 4096
 	gatewayProcessPlanMaxBytes       = 32 << 10
 	gatewayProcessExecutableMaxBytes = 512 << 20
@@ -61,34 +64,39 @@ const (
 	gatewayAttemptManualRecoveryRequired gatewayAttemptPhase = "manual_recovery_required"
 )
 
-// gatewayLaunchDescriptor is deliberately closed and secret-free. R1 does
-// not accept arbitrary argv, environment, registration payloads, or provider
-// fields. Later credential/provider stages must add their own gated primitive
-// instead of smuggling values through this descriptor.
+// gatewayLaunchDescriptor is deliberately closed and secret-free. The L2a
+// fields are the minimum typed Feishu launch identity; arbitrary argv,
+// environment, registration payloads, and provider secrets remain forbidden.
 type gatewayLaunchDescriptor struct {
-	Manager          gatewayServiceManager `json:"manager"`
-	ConnectionID     string                `json:"connectionId"`
-	ServiceID        string                `json:"serviceId"`
-	UnitPath         string                `json:"unitPath"`
-	Executable       string                `json:"executable"`
-	WorkingDirectory string                `json:"workingDirectory"`
-	HubURL           string                `json:"hubUrl"`
-	DataDir          string                `json:"dataDir"`
-	LogPath          string                `json:"logPath"`
-	Build            string                `json:"build"`
-	ExecutableDigest string                `json:"executableDigest"`
+	Manager              gatewayServiceManager `json:"manager"`
+	ConnectionID         string                `json:"connectionId"`
+	Provider             string                `json:"provider,omitempty"`
+	AddressID            string                `json:"addressId,omitempty"`
+	AccountRef           string                `json:"accountRef,omitempty"`
+	ManagedCredentialRef string                `json:"managedCredentialRef,omitempty"`
+	ServiceID            string                `json:"serviceId"`
+	UnitPath             string                `json:"unitPath"`
+	Executable           string                `json:"executable"`
+	WorkingDirectory     string                `json:"workingDirectory"`
+	HubURL               string                `json:"hubUrl"`
+	DataDir              string                `json:"dataDir"`
+	LogPath              string                `json:"logPath"`
+	Build                string                `json:"build"`
+	ExecutableDigest     string                `json:"executableDigest"`
 }
 
 type gatewayRegistrationAnchor struct {
 	Descriptor      gatewayLaunchDescriptor `json:"descriptor"`
+	AttemptID       string                  `json:"attemptId,omitempty"`
 	Generation      string                  `json:"generation,omitempty"`
 	IntegritySHA256 string                  `json:"integritySha256"`
 }
 
 type gatewayLaunchPlan struct {
-	ConnectionID string                    `json:"connectionId"`
-	Target       gatewayLaunchDescriptor   `json:"target"`
-	Anchor       gatewayRegistrationAnchor `json:"anchor"`
+	ConnectionID    string                    `json:"connectionId"`
+	Target          gatewayLaunchDescriptor   `json:"target"`
+	Anchor          gatewayRegistrationAnchor `json:"anchor"`
+	IntegritySHA256 string                    `json:"integritySha256,omitempty"`
 }
 
 type gatewayProcessProof struct {
@@ -155,14 +163,19 @@ func newGatewayRegistrationAnchor(descriptor gatewayLaunchDescriptor) (gatewayRe
 }
 
 func gatewayAnchorIntegrity(descriptor gatewayLaunchDescriptor) string {
-	return gatewayAnchorIntegrityWithGeneration(descriptor, "")
+	return gatewayAnchorIntegrityWithProcess(descriptor, "", "")
 }
 
 func gatewayAnchorIntegrityWithGeneration(descriptor gatewayLaunchDescriptor, generation string) string {
+	return gatewayAnchorIntegrityWithProcess(descriptor, "", generation)
+}
+
+func gatewayAnchorIntegrityWithProcess(descriptor gatewayLaunchDescriptor, attemptID, generation string) string {
 	payload := struct {
 		Descriptor gatewayLaunchDescriptor `json:"descriptor"`
+		AttemptID  string                  `json:"attemptId,omitempty"`
 		Generation string                  `json:"generation,omitempty"`
-	}{Descriptor: descriptor, Generation: generation}
+	}{Descriptor: descriptor, AttemptID: attemptID, Generation: generation}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return ""
@@ -185,8 +198,20 @@ func validateGatewayLaunchPlan(plan gatewayLaunchPlan) error {
 	if plan.Target.ConnectionID != plan.ConnectionID || anchor.ConnectionID != plan.ConnectionID ||
 		plan.Target.Manager != anchor.Manager || plan.Target.ServiceID != anchor.ServiceID ||
 		plan.Target.UnitPath != anchor.UnitPath || plan.Target.HubURL != anchor.HubURL ||
-		plan.Target.DataDir != anchor.DataDir || plan.Target.LogPath != anchor.LogPath {
+		plan.Target.DataDir != anchor.DataDir || plan.Target.LogPath != anchor.LogPath ||
+		plan.Target.Provider != anchor.Provider || plan.Target.AddressID != anchor.AddressID ||
+		plan.Target.AccountRef != anchor.AccountRef {
 		return fmt.Errorf("Gateway target and registration anchor identify different services")
+	}
+	if plan.Target.Provider != "" {
+		if !credentials.IsManagedRef(plan.Target.ManagedCredentialRef) {
+			return fmt.Errorf("Lark Gateway target has no canonical managed credential reference")
+		}
+		if plan.IntegritySHA256 == "" || plan.IntegritySHA256 != gatewayLaunchPlanIntegrity(plan) {
+			return fmt.Errorf("Gateway launch plan integrity does not match")
+		}
+	} else if plan.IntegritySHA256 != "" && plan.IntegritySHA256 != gatewayLaunchPlanIntegrity(plan) {
+		return fmt.Errorf("Gateway launch plan integrity does not match")
 	}
 	data, err := json.Marshal(plan)
 	if err != nil {
@@ -202,8 +227,10 @@ func validateGatewayRegistrationAnchor(anchor gatewayRegistrationAnchor) error {
 	if err := validateGatewayLaunchDescriptor(anchor.Descriptor); err != nil {
 		return err
 	}
-	if len(anchor.Generation) > gatewayProcessStringMax || strings.ContainsAny(anchor.Generation, "\r\n\x00") ||
-		anchor.IntegritySHA256 == "" || anchor.IntegritySHA256 != gatewayAnchorIntegrityWithGeneration(anchor.Descriptor, anchor.Generation) {
+	if len(anchor.AttemptID) > gatewayProcessStringMax || strings.ContainsAny(anchor.AttemptID, "\r\n\x00") || gatewayStringMayContainSecret(anchor.AttemptID) ||
+		len(anchor.Generation) > gatewayProcessStringMax || strings.ContainsAny(anchor.Generation, "\r\n\x00") || gatewayStringMayContainSecret(anchor.Generation) ||
+		(anchor.Descriptor.Provider != "" && (anchor.AttemptID == "") != (anchor.Generation == "")) ||
+		anchor.IntegritySHA256 == "" || anchor.IntegritySHA256 != gatewayAnchorIntegrityWithProcess(anchor.Descriptor, anchor.AttemptID, anchor.Generation) {
 		return fmt.Errorf("registration anchor integrity does not match")
 	}
 	return nil
@@ -225,6 +252,18 @@ func validateGatewayLaunchDescriptor(value gatewayLaunchDescriptor) error {
 	}
 	if !gatewayServiceIdentifierCanonical(value.ConnectionID) || !gatewayServiceIdentifierCanonical(value.ServiceID) {
 		return fmt.Errorf("Gateway Connection/service identifier is not canonical")
+	}
+	hasTypedProvider := value.Provider != "" || value.AddressID != "" || value.AccountRef != "" || value.ManagedCredentialRef != ""
+	if hasTypedProvider {
+		provider := strings.ToLower(strings.TrimSpace(value.Provider))
+		if (provider != "lark" && provider != "feishu") || value.Provider != provider ||
+			!gatewayServiceIdentifierCanonical(value.AddressID) || value.AccountRef == "" || value.AccountRef != strings.TrimSpace(value.AccountRef) ||
+			len(value.AccountRef) > gatewayProcessStringMax || strings.ContainsAny(value.AccountRef, "\r\n\x00") || gatewayStringMayContainSecret(value.AccountRef) {
+			return fmt.Errorf("Gateway provider launch identity is not canonical")
+		}
+		if value.ManagedCredentialRef != "" && (value.ManagedCredentialRef != strings.TrimSpace(value.ManagedCredentialRef) || !credentials.IsManagedRef(value.ManagedCredentialRef)) {
+			return fmt.Errorf("managed credential reference is not canonical")
+		}
 	}
 	for _, path := range []string{value.UnitPath, value.Executable, value.WorkingDirectory, value.DataDir, value.LogPath} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -253,6 +292,20 @@ func validateGatewayLaunchDescriptor(value gatewayLaunchDescriptor) error {
 	return nil
 }
 
+func gatewayLaunchPlanIntegrity(plan gatewayLaunchPlan) string {
+	payload := struct {
+		ConnectionID string                    `json:"connectionId"`
+		Target       gatewayLaunchDescriptor   `json:"target"`
+		Anchor       gatewayRegistrationAnchor `json:"anchor"`
+	}{ConnectionID: plan.ConnectionID, Target: plan.Target, Anchor: plan.Anchor}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
 func gatewayServiceIdentifierCanonical(value string) bool {
 	if value == "" || len(value) > 255 {
 		return false
@@ -278,43 +331,51 @@ func verifyGatewayLaunchPlanExecutables(plan gatewayLaunchPlan) error {
 }
 
 func verifyGatewayExecutable(descriptor gatewayLaunchDescriptor) error {
-	pathInfo, err := os.Lstat(descriptor.Executable)
+	digest, err := verifyGatewayExecutablePath(descriptor.Executable)
 	if err != nil {
 		return err
+	}
+	if digest != descriptor.ExecutableDigest {
+		return fmt.Errorf("Gateway executable digest mismatch")
+	}
+	return nil
+}
+
+func verifyGatewayExecutablePath(path string) (string, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return "", err
 	}
 	if !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || pathInfo.Size() <= 0 || pathInfo.Size() > gatewayProcessExecutableMaxBytes {
-		return fmt.Errorf("Gateway executable is not a bounded regular file")
+		return "", fmt.Errorf("Gateway executable is not a bounded regular file")
 	}
 	if goruntime.GOOS != "windows" && pathInfo.Mode().Perm()&0o111 == 0 {
-		return fmt.Errorf("Gateway executable is not executable")
+		return "", fmt.Errorf("Gateway executable is not executable")
 	}
-	file, err := os.Open(descriptor.Executable)
+	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer file.Close()
 	openedInfo, err := file.Stat()
 	if err != nil || !os.SameFile(pathInfo, openedInfo) {
-		return fmt.Errorf("Gateway executable changed while opening")
+		return "", fmt.Errorf("Gateway executable changed while opening")
 	}
 	digest := sha256.New()
 	written, err := io.Copy(digest, io.LimitReader(file, gatewayProcessExecutableMaxBytes+1))
 	if err != nil || written != pathInfo.Size() || written > gatewayProcessExecutableMaxBytes {
-		return fmt.Errorf("Gateway executable changed or exceeded integrity bound")
+		return "", fmt.Errorf("Gateway executable changed or exceeded integrity bound")
 	}
 	afterInfo, err := file.Stat()
-	currentInfo, pathErr := os.Stat(descriptor.Executable)
-	currentLstat, lstatErr := os.Lstat(descriptor.Executable)
+	currentInfo, pathErr := os.Stat(path)
+	currentLstat, lstatErr := os.Lstat(path)
 	if err != nil || pathErr != nil || !os.SameFile(openedInfo, afterInfo) || !os.SameFile(openedInfo, currentInfo) || afterInfo.Size() != openedInfo.Size() {
-		return fmt.Errorf("Gateway executable identity changed during verification")
+		return "", fmt.Errorf("Gateway executable identity changed during verification")
 	}
 	if lstatErr != nil || !currentLstat.Mode().IsRegular() || currentLstat.Mode()&os.ModeSymlink != 0 || !os.SameFile(openedInfo, currentLstat) {
-		return fmt.Errorf("Gateway executable path changed during verification")
+		return "", fmt.Errorf("Gateway executable path changed during verification")
 	}
-	if got := hex.EncodeToString(digest.Sum(nil)); got != descriptor.ExecutableDigest {
-		return fmt.Errorf("Gateway executable digest mismatch")
-	}
-	return nil
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func gatewayStringMayContainSecret(value string) bool {
@@ -341,7 +402,6 @@ func validateGatewayTransitionAttempt(attempt gatewayTransitionAttempt) error {
 	if attempt.ID == "" || attempt.ConnectionID == "" || !validGatewayAttemptKind(attempt.Kind) || !validGatewayAttemptPhase(attempt.Phase) ||
 		attempt.BindingEpoch == 0 || attempt.Binding.Connection.ID != attempt.ConnectionID ||
 		attempt.TargetGeneration == "" || attempt.RecoveryGeneration == "" || attempt.TargetGeneration == attempt.RecoveryGeneration ||
-		(attempt.Plan.Anchor.Generation != "" && (attempt.TargetGeneration == attempt.Plan.Anchor.Generation || attempt.RecoveryGeneration == attempt.Plan.Anchor.Generation)) ||
 		attempt.EffectStartedAt == "" || attempt.UpdatedAt == "" {
 		return fmt.Errorf("invalid Gateway transition attempt")
 	}
@@ -402,6 +462,10 @@ func validateGatewayTransitionAttempt(attempt gatewayTransitionAttempt) error {
 		}
 	} else if attempt.CompletedAt != "" || attempt.AcceptedProof != nil {
 		return fmt.Errorf("active Gateway attempt carries terminal proof")
+	}
+	if !gatewayAttemptTerminal(attempt.Phase) && attempt.Plan.Anchor.Generation != "" &&
+		(attempt.TargetGeneration == attempt.Plan.Anchor.Generation || attempt.RecoveryGeneration == attempt.Plan.Anchor.Generation) {
+		return fmt.Errorf("active Gateway generation reuses its registration anchor")
 	}
 	if attempt.Phase == gatewayAttemptReconcileRequired {
 		if attempt.ReconcileEffect != gatewayEffectTarget && attempt.ReconcileEffect != gatewayEffectRecovery {

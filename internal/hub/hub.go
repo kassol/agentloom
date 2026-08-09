@@ -341,18 +341,20 @@ type Hub struct {
 	threadResumeTimeout     time.Duration
 	developerContextTimeout time.Duration
 
-	integrationNormalizationPending bool
-	gatewayState                    gatewayState
-	gatewayFoundationPoisoned       bool
-	gatewayFoundationPoisonReason   string
-	gatewayOpenGeneration           string
-	gatewayCoordinatorInitMu        sync.Mutex
-	gatewayCoordinator              *gatewayConnectionCoordinator
-	saveGatewayStateForTest         func(gatewayState) error
-	loadGatewayStateForTest         func(*gatewayState) (bool, error)
-	gatewayServiceAdapterForTest    func(gatewayLaunchPlan) (gatewayServiceAdapter, error)
-	gatewayProofWaitForTest         time.Duration
-	larkUpdateConnectionForTest     func(string, string) (PlatformConnection, error)
+	integrationNormalizationPending  bool
+	gatewayState                     gatewayState
+	gatewayFoundationPoisoned        bool
+	gatewayFoundationPoisonReason    string
+	gatewayOpenGeneration            string
+	gatewayCoordinatorInitMu         sync.Mutex
+	gatewayCoordinator               *gatewayConnectionCoordinator
+	saveGatewayStateForTest          func(gatewayState) error
+	loadGatewayStateForTest          func(*gatewayState) (bool, error)
+	gatewayServiceAdapterForTest     func(gatewayLaunchPlan) (gatewayServiceAdapter, error)
+	gatewayProofWaitForTest          time.Duration
+	larkUpdateConnectionForTest      func(string, string) (PlatformConnection, error)
+	larkMigrationRecordWriteForTest  func() error
+	larkMigrationRecordRemoveForTest func(string) error
 }
 
 // New is retained for in-process callers that cannot recover from an invalid

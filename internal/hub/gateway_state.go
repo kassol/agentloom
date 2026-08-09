@@ -301,13 +301,21 @@ func cloneGatewayState(value gatewayState) gatewayState {
 
 func upgradeGatewayStateForProcess(value gatewayState) gatewayState {
 	result := cloneGatewayState(value)
-	result.Version = gatewayProcessStateVersion
+	if result.Version < gatewayProcessStateVersion {
+		result.Version = gatewayProcessStateVersion
+	}
 	if result.LaunchPlans == nil {
 		result.LaunchPlans = map[string]*gatewayLaunchPlan{}
 	}
 	if result.Attempts == nil {
 		result.Attempts = map[string]*gatewayTransitionAttempt{}
 	}
+	return result
+}
+
+func upgradeGatewayStateForLaunchProof(value gatewayState) gatewayState {
+	result := upgradeGatewayStateForProcess(value)
+	result.Version = gatewayLaunchProofStateVersion
 	return result
 }
 
@@ -346,7 +354,7 @@ func (h *Hub) loadGatewayState() error {
 }
 
 func (h *Hub) validateGatewayStateLocked(state gatewayState) error {
-	if (state.Version != gatewayStateVersion && state.Version != gatewayProcessStateVersion) || state.Controls == nil || state.Observations == nil {
+	if (state.Version != gatewayStateVersion && state.Version != gatewayProcessStateVersion && state.Version != gatewayLaunchProofStateVersion) || state.Controls == nil || state.Observations == nil {
 		return fmt.Errorf("unsupported Gateway state version %d", state.Version)
 	}
 	if state.Version == gatewayStateVersion && (len(state.LaunchPlans) != 0 || len(state.Attempts) != 0) {
@@ -395,6 +403,17 @@ func (h *Hub) validateGatewayStateLocked(state gatewayState) error {
 		if err := validateGatewayLaunchPlan(*plan); err != nil {
 			return fmt.Errorf("invalid Gateway launch plan %q: %w", id, err)
 		}
+		if plan.Target.Provider != "" {
+			if state.Version != gatewayLaunchProofStateVersion {
+				return fmt.Errorf("typed Lark Gateway launch plan %q requires L2a state", id)
+			}
+			control := state.Controls[id]
+			if control.Recovery == gatewayRecoveryNone || control.ActiveAttemptID != "" {
+				if err := validateGatewayLaunchPlanForBinding(*plan, control.Binding); err != nil {
+					return fmt.Errorf("invalid Lark Gateway launch plan %q: %w", id, err)
+				}
+			}
+		}
 		if h.st == nil || filepath.Clean(plan.Target.DataDir) != filepath.Clean(h.st.Dir()) {
 			return fmt.Errorf("Gateway launch plan %q targets another Runtime data directory", id)
 		}
@@ -407,11 +426,11 @@ func (h *Hub) validateGatewayStateLocked(state gatewayState) error {
 			return fmt.Errorf("invalid Gateway transition attempt %q: %w", id, err)
 		}
 		control := state.Controls[id]
-		if !gatewayLaunchPlansEqual(*state.LaunchPlans[id], attempt.Plan) {
-			return fmt.Errorf("Gateway attempt %q drifted from its launch plan", id)
-		}
 		if gatewayAttemptTerminal(attempt.Phase) {
 			continue
+		}
+		if !gatewayLaunchPlansEqual(*state.LaunchPlans[id], attempt.Plan) {
+			return fmt.Errorf("active Gateway attempt %q drifted from its launch plan", id)
 		}
 		if control.Epoch != attempt.BindingEpoch || !gatewayBindingsEqual(control.Binding, attempt.Binding) {
 			return fmt.Errorf("active Gateway attempt %q drifted from its frozen control", id)

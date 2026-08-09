@@ -26,13 +26,16 @@ const (
 	runtimeWriterFloorGatewayState   = 2
 	runtimeWriterFloorGatewayProcess = 3
 	runtimeWriterFloorCredential     = 4
+	runtimeWriterFloorGatewayProof   = 5
 )
 
 // runtimeFoundationEnvelope is private Runtime persistence shared by Store
 // and Hub. It is not an API or provider wire contract. S0 recognizes version
 // 1 as the empty foundation. Foundation state version 2 contains Gateway state:
 // Gateway v1/floor 2 is R0b control, while Gateway v2/floor 3 adds an explicit
-// R1 launch plan or attempt. Each first write raises its floor atomically.
+// R1 launch plan or attempt. Foundation v3/floor 4 marks managed credentials;
+// v4/floor 5 freezes the typed Lark launch/proof descriptor. Each first write
+// raises its floor atomically.
 type runtimeFoundationEnvelope struct {
 	SchemaVersion int             `json:"schemaVersion"`
 	MinimumWriter int             `json:"minimumWriter"`
@@ -40,9 +43,9 @@ type runtimeFoundationEnvelope struct {
 }
 
 type foundationState struct {
-	Version          int             `json:"version"`
-	GatewayState     json.RawMessage `json:"gatewayState,omitempty"`
-	CredentialManaged bool           `json:"credentialManaged,omitempty"`
+	Version           int             `json:"version"`
+	GatewayState      json.RawMessage `json:"gatewayState,omitempty"`
+	CredentialManaged bool            `json:"credentialManaged,omitempty"`
 }
 
 type gatewayFoundationStateShape struct {
@@ -65,29 +68,35 @@ type gatewayFoundationControlShape struct {
 }
 
 type gatewayFoundationLaunchDescriptorShape struct {
-	Manager          string `json:"manager"`
-	ConnectionID     string `json:"connectionId"`
-	ServiceID        string `json:"serviceId"`
-	UnitPath         string `json:"unitPath"`
-	Executable       string `json:"executable"`
-	WorkingDirectory string `json:"workingDirectory"`
-	HubURL           string `json:"hubUrl"`
-	DataDir          string `json:"dataDir"`
-	LogPath          string `json:"logPath"`
-	Build            string `json:"build"`
-	ExecutableDigest string `json:"executableDigest"`
+	Manager              string `json:"manager"`
+	ConnectionID         string `json:"connectionId"`
+	Provider             string `json:"provider,omitempty"`
+	AddressID            string `json:"addressId,omitempty"`
+	AccountRef           string `json:"accountRef,omitempty"`
+	ManagedCredentialRef string `json:"managedCredentialRef,omitempty"`
+	ServiceID            string `json:"serviceId"`
+	UnitPath             string `json:"unitPath"`
+	Executable           string `json:"executable"`
+	WorkingDirectory     string `json:"workingDirectory"`
+	HubURL               string `json:"hubUrl"`
+	DataDir              string `json:"dataDir"`
+	LogPath              string `json:"logPath"`
+	Build                string `json:"build"`
+	ExecutableDigest     string `json:"executableDigest"`
 }
 
 type gatewayFoundationAnchorShape struct {
 	Descriptor      gatewayFoundationLaunchDescriptorShape `json:"descriptor"`
+	AttemptID       string                                 `json:"attemptId,omitempty"`
 	Generation      string                                 `json:"generation,omitempty"`
 	IntegritySHA256 string                                 `json:"integritySha256"`
 }
 
 type gatewayFoundationLaunchPlanShape struct {
-	ConnectionID string                                 `json:"connectionId"`
-	Target       gatewayFoundationLaunchDescriptorShape `json:"target"`
-	Anchor       gatewayFoundationAnchorShape           `json:"anchor"`
+	ConnectionID    string                                 `json:"connectionId"`
+	Target          gatewayFoundationLaunchDescriptorShape `json:"target"`
+	Anchor          gatewayFoundationAnchorShape           `json:"anchor"`
+	IntegritySHA256 string                                 `json:"integritySha256,omitempty"`
 }
 
 type gatewayFoundationProofShape struct {
@@ -386,6 +395,9 @@ func validateFoundation(root *os.Root) error {
 		if err != nil {
 			return err
 		}
+		if gatewayVersion == 3 {
+			return fmt.Errorf("L2a Gateway launch proof requires the credential and launch-proof floors")
+		}
 		expectedFloor := runtimeWriterFloorGatewayState
 		if gatewayVersion == 2 {
 			expectedFloor = runtimeWriterFloorGatewayProcess
@@ -398,9 +410,21 @@ func validateFoundation(root *os.Root) error {
 			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
 		}
 		if len(state.GatewayState) != 0 {
-			if _, err := validateGatewayFoundationState(state.GatewayState); err != nil {
+			gatewayVersion, err := validateGatewayFoundationState(state.GatewayState)
+			if err != nil {
 				return err
 			}
+			if gatewayVersion == 3 {
+				return fmt.Errorf("L2a Gateway launch proof requires the launch-proof floor")
+			}
+		}
+	case 4:
+		if envelope.MinimumWriter != runtimeWriterFloorGatewayProof || !state.CredentialManaged || len(state.GatewayState) == 0 {
+			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
+		}
+		gatewayVersion, err := validateGatewayFoundationState(state.GatewayState)
+		if err != nil || gatewayVersion != 3 {
+			return fmt.Errorf("unsupported Runtime Gateway launch-proof foundation")
 		}
 	default:
 		return fmt.Errorf("invalid Runtime foundation state version %d", state.Version)
@@ -418,7 +442,7 @@ func validateGatewayFoundationState(raw json.RawMessage) (int, error) {
 	if err := requireJSONEOF(gatewayDec); err != nil {
 		return 0, fmt.Errorf("invalid Runtime Gateway foundation state: %w", err)
 	}
-	if (gateway.Version != 1 && gateway.Version != 2) || gateway.Controls == nil || gateway.Observations == nil {
+	if (gateway.Version != 1 && gateway.Version != 2 && gateway.Version != 3) || gateway.Controls == nil || gateway.Observations == nil {
 		return 0, fmt.Errorf("invalid Runtime Gateway foundation state version")
 	}
 	if gateway.Version == 1 && (len(gateway.LaunchPlans) != 0 || len(gateway.Attempts) != 0) {
@@ -442,6 +466,7 @@ func validateGatewayFoundationState(raw json.RawMessage) (int, error) {
 			return 0, fmt.Errorf("invalid Runtime Gateway observation %q", id)
 		}
 	}
+	typedPlans := 0
 	for id, plan := range gateway.LaunchPlans {
 		if plan == nil || plan.ConnectionID != id || gateway.Controls[id] == nil {
 			return 0, fmt.Errorf("invalid Runtime Gateway launch plan %q", id)
@@ -449,12 +474,17 @@ func validateGatewayFoundationState(raw json.RawMessage) (int, error) {
 		if err := validateGatewayFoundationLaunchPlan(*plan); err != nil {
 			return 0, fmt.Errorf("invalid Runtime Gateway launch plan %q: %w", id, err)
 		}
+		if plan.Target.Provider != "" {
+			typedPlans++
+		}
+	}
+	if gateway.Version != 3 && typedPlans != 0 {
+		return 0, fmt.Errorf("typed Gateway launch plan requires L2a foundation")
 	}
 	for id, attempt := range gateway.Attempts {
 		if attempt == nil || attempt.ConnectionID != id || gateway.Controls[id] == nil || gateway.LaunchPlans[id] == nil ||
 			attempt.ID == "" || attempt.BindingEpoch == 0 || !validateGatewayFoundationBinding(id, attempt.Binding) ||
 			attempt.TargetGeneration == "" || attempt.RecoveryGeneration == "" || attempt.TargetGeneration == attempt.RecoveryGeneration ||
-			(attempt.Plan.Anchor.Generation != "" && (attempt.TargetGeneration == attempt.Plan.Anchor.Generation || attempt.RecoveryGeneration == attempt.Plan.Anchor.Generation)) ||
 			!foundationAttemptKind(attempt.Kind) || !foundationAttemptPhase(attempt.Phase) {
 			return 0, fmt.Errorf("invalid Runtime Gateway attempt %q", id)
 		}
@@ -501,6 +531,10 @@ func validateGatewayFoundationState(raw json.RawMessage) (int, error) {
 			}
 		}
 		terminal := attempt.Phase == "succeeded" || attempt.Phase == "recovered" || attempt.Phase == "manual_recovery_required"
+		if !terminal && attempt.Plan.Anchor.Generation != "" &&
+			(attempt.TargetGeneration == attempt.Plan.Anchor.Generation || attempt.RecoveryGeneration == attempt.Plan.Anchor.Generation) {
+			return 0, fmt.Errorf("active Runtime Gateway attempt reuses its anchor generation %q", id)
+		}
 		if terminal != (attempt.CompletedAt != "") || (!terminal && attempt.AcceptedProof != nil) {
 			return 0, fmt.Errorf("invalid Runtime Gateway terminal attempt %q", id)
 		}
@@ -536,13 +570,12 @@ func validateGatewayFoundationState(raw json.RawMessage) (int, error) {
 		control := gateway.Controls[id]
 		attemptPlanJSON, _ := json.Marshal(attempt.Plan)
 		configuredPlanJSON, _ := json.Marshal(gateway.LaunchPlans[id])
-		if !bytes.Equal(attemptPlanJSON, configuredPlanJSON) {
-			return 0, fmt.Errorf("Runtime Gateway attempt plan drifted %q", id)
-		}
 		if terminal {
 			if control.ActiveAttemptID != "" {
 				return 0, fmt.Errorf("terminal Runtime Gateway attempt remains active %q", id)
 			}
+		} else if !bytes.Equal(attemptPlanJSON, configuredPlanJSON) {
+			return 0, fmt.Errorf("active Runtime Gateway attempt plan drifted %q", id)
 		} else if control.ActiveAttemptID != attempt.ID || control.Recovery == "none" {
 			return 0, fmt.Errorf("active Runtime Gateway attempt is not fenced %q", id)
 		} else {
@@ -563,6 +596,19 @@ func validateGatewayFoundationState(raw json.RawMessage) (int, error) {
 		}
 	}
 	return gateway.Version, nil
+}
+
+func gatewayFoundationHasTypedLaunchPlan(raw json.RawMessage) bool {
+	var gateway gatewayFoundationStateShape
+	if err := json.Unmarshal(raw, &gateway); err != nil {
+		return false
+	}
+	for _, plan := range gateway.LaunchPlans {
+		if plan != nil && plan.Target.Provider != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func validateGatewayFoundationBinding(id string, binding gatewayFoundationBindingShape) bool {
@@ -591,18 +637,25 @@ func validateGatewayFoundationLaunchPlan(plan gatewayFoundationLaunchPlanShape) 
 	if err := validateGatewayFoundationLaunchDescriptor(plan.Anchor.Descriptor); err != nil {
 		return err
 	}
-	if len(plan.Anchor.Generation) > 4096 || strings.ContainsAny(plan.Anchor.Generation, "\r\n\x00") || foundationStringMayContainSecret(plan.Anchor.Generation) {
-		return fmt.Errorf("invalid registration anchor generation")
+	if len(plan.Anchor.AttemptID) > 4096 || strings.ContainsAny(plan.Anchor.AttemptID, "\r\n\x00") || foundationStringMayContainSecret(plan.Anchor.AttemptID) ||
+		len(plan.Anchor.Generation) > 4096 || strings.ContainsAny(plan.Anchor.Generation, "\r\n\x00") || foundationStringMayContainSecret(plan.Anchor.Generation) ||
+		(plan.Anchor.Descriptor.Provider != "" && (plan.Anchor.AttemptID == "") != (plan.Anchor.Generation == "")) {
+		return fmt.Errorf("invalid registration anchor process identity")
 	}
 	anchor := plan.Anchor.Descriptor
 	if plan.Target.Manager != anchor.Manager || plan.Target.ServiceID != anchor.ServiceID || plan.Target.UnitPath != anchor.UnitPath ||
-		plan.Target.HubURL != anchor.HubURL || plan.Target.DataDir != anchor.DataDir || plan.Target.LogPath != anchor.LogPath {
+		plan.Target.HubURL != anchor.HubURL || plan.Target.DataDir != anchor.DataDir || plan.Target.LogPath != anchor.LogPath ||
+		plan.Target.Provider != anchor.Provider || plan.Target.AddressID != anchor.AddressID || plan.Target.AccountRef != anchor.AccountRef {
 		return fmt.Errorf("launch plan registration mismatch")
+	}
+	if plan.Target.Provider != "" && !foundationManagedCredentialRef(plan.Target.ManagedCredentialRef) {
+		return fmt.Errorf("Lark Gateway target has no managed credential reference")
 	}
 	payload := struct {
 		Descriptor gatewayFoundationLaunchDescriptorShape `json:"descriptor"`
+		AttemptID  string                                 `json:"attemptId,omitempty"`
 		Generation string                                 `json:"generation,omitempty"`
-	}{Descriptor: anchor, Generation: plan.Anchor.Generation}
+	}{Descriptor: anchor, AttemptID: plan.Anchor.AttemptID, Generation: plan.Anchor.Generation}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -610,6 +663,23 @@ func validateGatewayFoundationLaunchPlan(plan gatewayFoundationLaunchPlanShape) 
 	digest := sha256.Sum256(data)
 	if plan.Anchor.IntegritySHA256 != hex.EncodeToString(digest[:]) {
 		return fmt.Errorf("registration anchor integrity mismatch")
+	}
+	if plan.Target.Provider != "" {
+		integrityPayload := struct {
+			ConnectionID string                                 `json:"connectionId"`
+			Target       gatewayFoundationLaunchDescriptorShape `json:"target"`
+			Anchor       gatewayFoundationAnchorShape           `json:"anchor"`
+		}{ConnectionID: plan.ConnectionID, Target: plan.Target, Anchor: plan.Anchor}
+		integrityData, err := json.Marshal(integrityPayload)
+		if err != nil {
+			return err
+		}
+		integrityDigest := sha256.Sum256(integrityData)
+		if plan.IntegritySHA256 != hex.EncodeToString(integrityDigest[:]) {
+			return fmt.Errorf("launch plan integrity mismatch")
+		}
+	} else if plan.IntegritySHA256 != "" && !foundationSHA256(plan.IntegritySHA256) {
+		return fmt.Errorf("invalid launch plan integrity")
 	}
 	planJSON, err := json.Marshal(plan)
 	if err != nil || len(planJSON) > 32<<10 {
@@ -630,6 +700,19 @@ func validateGatewayFoundationLaunchDescriptor(value gatewayFoundationLaunchDesc
 	}
 	if !foundationGatewayServiceIdentifier(value.ConnectionID) || !foundationGatewayServiceIdentifier(value.ServiceID) {
 		return fmt.Errorf("invalid launch descriptor identifier")
+	}
+	hasTypedProvider := value.Provider != "" || value.AddressID != "" || value.AccountRef != "" || value.ManagedCredentialRef != ""
+	if hasTypedProvider {
+		if (value.Provider != "lark" && value.Provider != "feishu") || !foundationGatewayServiceIdentifier(value.AddressID) ||
+			value.AccountRef == "" || value.AccountRef != strings.TrimSpace(value.AccountRef) || len(value.AccountRef) > 4096 || strings.ContainsAny(value.AccountRef, "\r\n\x00") {
+			return fmt.Errorf("invalid provider launch identity")
+		}
+		if foundationStringMayContainSecret(value.AccountRef) {
+			return fmt.Errorf("provider launch identity may contain secret material")
+		}
+		if value.ManagedCredentialRef != "" && !foundationManagedCredentialRef(value.ManagedCredentialRef) {
+			return fmt.Errorf("invalid managed credential reference")
+		}
 	}
 	for _, path := range []string{value.UnitPath, value.Executable, value.WorkingDirectory, value.DataDir, value.LogPath} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -652,6 +735,11 @@ func validateGatewayFoundationLaunchDescriptor(value gatewayFoundationLaunchDesc
 		}
 	}
 	return nil
+}
+
+func foundationManagedCredentialRef(value string) bool {
+	const prefix = "managed:"
+	return value == strings.TrimSpace(value) && strings.HasPrefix(value, prefix) && foundationSHA256(strings.TrimPrefix(value, prefix))
 }
 
 func foundationGatewayServiceIdentifier(value string) bool {

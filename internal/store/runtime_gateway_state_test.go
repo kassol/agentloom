@@ -48,6 +48,49 @@ func validRuntimeGatewayProcessFixture(t *testing.T) gatewayFoundationStateShape
 	}
 }
 
+func validRuntimeGatewayLaunchProofFixture(t *testing.T) gatewayFoundationStateShape {
+	t.Helper()
+	value := validRuntimeGatewayProcessFixture(t)
+	value.Version = 3
+	control := value.Controls["conn-r1"]
+	control.Binding.Connection.Provider = "lark"
+	control.Binding.Connection.AccountRef = "cli_l2a"
+	control.Binding.Connection.CredentialRef = "managed:" + strings.Repeat("c", 64)
+	control.Binding.Addresses = []gatewayFoundationAddressShape{{
+		ID: "addr-l2a", AgentID: "agent-l2a", ConnectionID: "conn-r1", ExternalIdentity: "lark://ou_l2a",
+		TriggerPolicy: "mention", ReplyPolicy: "final_answer", TrustDomain: "lark:cli_l2a", Enabled: true,
+		Version: 1, CreatedAt: "2026-08-09T00:00:00Z",
+	}}
+	plan := value.LaunchPlans["conn-r1"]
+	for _, descriptor := range []*gatewayFoundationLaunchDescriptorShape{&plan.Target, &plan.Anchor.Descriptor} {
+		descriptor.Provider = "lark"
+		descriptor.AddressID = "addr-l2a"
+		descriptor.AccountRef = "cli_l2a"
+	}
+	plan.Target.ManagedCredentialRef = control.Binding.Connection.CredentialRef
+	anchorJSON, err := json.Marshal(struct {
+		Descriptor gatewayFoundationLaunchDescriptorShape `json:"descriptor"`
+		AttemptID  string                                 `json:"attemptId,omitempty"`
+		Generation string                                 `json:"generation,omitempty"`
+	}{Descriptor: plan.Anchor.Descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorDigest := sha256.Sum256(anchorJSON)
+	plan.Anchor.IntegritySHA256 = hex.EncodeToString(anchorDigest[:])
+	planJSON, err := json.Marshal(struct {
+		ConnectionID string                                 `json:"connectionId"`
+		Target       gatewayFoundationLaunchDescriptorShape `json:"target"`
+		Anchor       gatewayFoundationAnchorShape           `json:"anchor"`
+	}{ConnectionID: plan.ConnectionID, Target: plan.Target, Anchor: plan.Anchor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planDigest := sha256.Sum256(planJSON)
+	plan.IntegritySHA256 = hex.EncodeToString(planDigest[:])
+	return value
+}
+
 type runtimeGatewayFixture struct {
 	Version      int            `json:"version"`
 	Controls     map[string]any `json:"controls"`
@@ -202,6 +245,73 @@ func TestRuntimeGatewayProcessStateRaisesFloorThreeAtomically(t *testing.T) {
 	exists, err := reopened.LoadRuntimeGatewayState(&got)
 	if err != nil || !exists || got.Version != 2 || got.LaunchPlans["conn-r1"] == nil {
 		t.Fatalf("R1 process round trip = %#v exists=%v err=%v", got, exists, err)
+	}
+}
+
+func TestL2aGatewayLaunchProofRaisesFloorFiveAtomicallyAndCannotLower(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := st.ClaimWritableOwnership()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { owner.Release(); _ = st.Close() }()
+	if err := st.SaveCredentialFloor(); err != nil {
+		t.Fatal(err)
+	}
+	value := validRuntimeGatewayLaunchProofFixture(t)
+	if err := st.SaveRuntimeGatewayState(value); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, foundationFileName)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope runtimeFoundationEnvelope
+	if err := json.Unmarshal(before, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	var foundation foundationState
+	if err := json.Unmarshal(envelope.State, &foundation); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.MinimumWriter != runtimeWriterFloorGatewayProof || foundation.Version != 4 || !foundation.CredentialManaged {
+		t.Fatalf("L2a foundation was not committed atomically at floor 5: %s", before)
+	}
+	var got gatewayFoundationStateShape
+	exists, err := st.LoadRuntimeGatewayState(&got)
+	if err != nil || !exists || got.Version != 3 || got.LaunchPlans["conn-r1"].IntegritySHA256 == "" {
+		t.Fatalf("L2a launch-proof round trip = %#v exists=%v err=%v", got, exists, err)
+	}
+	if err := st.SaveRuntimeGatewayState(validRuntimeGatewayProcessFixture(t)); err == nil {
+		t.Fatal("floor-5 Gateway state was allowed to regress to an R1-only document")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("rejected floor regression changed durable bytes: equal=%v err=%v", bytes.Equal(before, after), err)
+	}
+}
+
+func TestL2aGatewayLaunchProofRequiresCredentialFloorBeforeCommit(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := st.ClaimWritableOwnership()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { owner.Release(); _ = st.Close() }()
+	if err := st.SaveRuntimeGatewayState(validRuntimeGatewayLaunchProofFixture(t)); err == nil {
+		t.Fatal("typed managed launch plan committed before the credential writer floor")
+	}
+	if _, err := os.Stat(filepath.Join(dir, foundationFileName)); !os.IsNotExist(err) {
+		t.Fatalf("rejected typed plan created a foundation file: %v", err)
 	}
 }
 

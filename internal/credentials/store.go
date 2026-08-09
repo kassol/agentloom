@@ -39,6 +39,12 @@ type Ref string
 
 var errCredentialNotFound = errors.New("managed credential not found")
 
+// IsCredentialNotFound reports whether err indicates a managed credential is
+// absent, which is an idempotent success for delete/rollback flows.
+func IsCredentialNotFound(err error) bool {
+	return errors.Is(err, errCredentialNotFound)
+}
+
 // Store manages the fixed Owner-only credentials directory inside one stable
 // data directory.
 type Store struct {
@@ -58,6 +64,22 @@ func New(st *store.Store) (*Store, error) {
 		return nil, fmt.Errorf("managed credentials require a live writable Hub owner")
 	}
 	return &Store{st: st}, nil
+}
+
+// ResolveReadOnly resolves one canonical managed reference through the stable
+// read-only view without requiring a live writable Hub owner. It is the narrow
+// same-UID consumption path for child processes such as the Feishu gateway,
+// which must never write credentials. Canonical reference parsing and
+// owner-only file verification still apply; unsupported platforms fail closed.
+func ResolveReadOnly(st *store.Store, ref Ref) ([]byte, error) {
+	if st == nil {
+		return nil, fmt.Errorf("credential store requires a stable Store")
+	}
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		return nil, fmt.Errorf("managed credentials are unsupported on %s", runtime.GOOS)
+	}
+	credentialStore := Store{st: st}
+	return credentialStore.Resolve(ref)
 }
 
 // Put durably writes one new immutable credential and returns its canonical
