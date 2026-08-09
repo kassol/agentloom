@@ -213,6 +213,18 @@ func (s *Store) ClaimWritableOwnership() (*WritableOwnership, error) {
 	return &WritableOwnership{store: s, generation: s.ownerGeneration}, nil
 }
 
+// HasLiveWritableOwner reports whether a live writable Hub currently owns this
+// Store. Foundation-owned subsystems (for example the managed credential
+// store) require it before issuing any durable mutation capability.
+func (s *Store) HasLiveWritableOwner() bool {
+	if s == nil {
+		return false
+	}
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
+	return !s.closed && !s.readOnly && s.ownerActive
+}
+
 func (o *WritableOwnership) Release() {
 	if o == nil || o.store == nil {
 		return
@@ -300,6 +312,53 @@ func (s *Store) finishWrite(err error) error {
 		return fmt.Errorf("data directory identity changed during write: %w", err)
 	}
 	return nil
+}
+
+// WithStableWriteRoot runs one data-dir mutation through the live-Hub
+// ownership and stable directory-handle boundary. The callback must use only
+// the supplied Root with relative paths; finishWrite revalidates the directory
+// identity after the operation. This is the narrow write capability used by
+// foundation-owned subsystems (for example the managed credential store).
+func (s *Store) WithStableWriteRoot(fn func(*os.Root) error) error {
+	done, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer done()
+	if fn == nil {
+		return fmt.Errorf("stable data directory writer callback is required")
+	}
+	return s.finishWrite(fn(s.dirHandle.root))
+}
+
+// ReadStableFile reads one file beneath the stable data directory through the
+// stable root handle without requiring write ownership.
+func (s *Store) ReadStableFile(relative string) ([]byte, error) {
+	done, err := s.beginRead()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	clean := filepath.Clean(relative)
+	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("stable path escapes data directory: %s", relative)
+	}
+	return s.dirHandle.root.ReadFile(clean)
+}
+
+// StatStableFile stats one file beneath the stable data directory through the
+// stable root handle without requiring write ownership.
+func (s *Store) StatStableFile(relative string) (os.FileInfo, error) {
+	done, err := s.beginRead()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	clean := filepath.Clean(relative)
+	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("stable path escapes data directory: %s", relative)
+	}
+	return s.dirHandle.root.Stat(clean)
 }
 
 // EdgeAgent is one entry from pinix-edge's registry (~/.pinix/code_agents/names.json).
