@@ -10,6 +10,7 @@ import (
 	goruntime "runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
 // larkGatewayHubURL is the standard CodexLoom Hub URL used when freezing a
@@ -28,10 +29,40 @@ func (h *Hub) ConfigureLarkGatewayLaunch(connectionID, executable string) error 
 	if err != nil {
 		return err
 	}
+	if h.larkGatewayLaunchCutoverReady(connectionID) {
+		return nil
+	}
 	if _, err := h.configureLarkGatewayLaunch(launchSpec); err != nil {
 		return err
 	}
 	return nil
+}
+
+// larkGatewayLaunchCutoverReady reports whether the durable typed plan is
+// already frozen with the current managed reference and a fresh accepted
+// target proof exists. Preflight and the maintenance configure use it to no-op
+// after a successful cutover instead of re-checking the legacy anchor or
+// re-committing a plan.
+func (h *Hub) larkGatewayLaunchCutoverReady(connectionID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	connection := h.connections[connectionID]
+	plan := h.gatewayState.LaunchPlans[connectionID]
+	if connection == nil || plan == nil || plan.Target.Provider == "" ||
+		plan.Target.ManagedCredentialRef != strings.TrimSpace(connection.CredentialRef) {
+		return false
+	}
+	attempt := h.gatewayState.Attempts[connectionID]
+	if attempt == nil || attempt.AcceptedProof == nil || attempt.Phase != gatewayAttemptSucceeded {
+		return false
+	}
+	proof := attempt.AcceptedProof
+	if proof.Generation != attempt.TargetGeneration || proof.Build != attempt.Plan.Target.Build ||
+		proof.ExecutableDigest != attempt.Plan.Target.ExecutableDigest {
+		return false
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, proof.ObservedAt)
+	return err == nil && time.Since(observedAt) <= gatewayProcessProofFreshness
 }
 
 func (h *Hub) larkGatewayLaunchSpec(connectionID, executable string) (larkGatewayLaunchSpec, error) {
@@ -91,6 +122,9 @@ func (h *Hub) PreflightLarkGatewayLaunch(connectionID, executable string) error 
 	launchSpec, err := h.larkGatewayLaunchSpec(connectionID, executable)
 	if err != nil {
 		return err
+	}
+	if h.larkGatewayLaunchCutoverReady(connectionID) {
+		return nil
 	}
 	h.mu.Lock()
 	connection := h.connections[launchSpec.ConnectionID]

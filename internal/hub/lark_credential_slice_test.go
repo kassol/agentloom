@@ -107,34 +107,152 @@ func TestLarkMigrateVerifyRollbackPreservesIdentity(t *testing.T) {
 func TestLarkMigrateVerifyAfterExactProof(t *testing.T) {
 	fixture := newLarkFixture(t)
 	defer fixture.close(t)
-	result, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false)
-	if err != nil {
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err != nil {
 		t.Fatal(err)
 	}
-	initializeAdoptedR0bControl(t, &fixture, gatewayRecoveryNone, "")
-	adapter := &fakeGatewayServiceAdapter{}
-	adapter.applyResult = gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied}
+	adapter := &fakeGatewayServiceAdapter{applyResult: gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied}}
 	fixture.h.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) { return adapter, nil }
-	snapshot, err := fixture.h.snapshotGatewayBindingForProcessPlan(fixture.connection.ID)
-	if err != nil {
+	executable := filepath.Join(fixture.dir, "loom-feishu-gateway")
+	if err := os.WriteFile(executable, []byte("accepted gateway binary\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	plan := r1Plan(t, fixture.connection.ID, fixture.st.Dir())
-	if _, err := fixture.h.configureGatewayLaunchPlan(snapshot, plan); err != nil {
+	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
 		t.Fatal(err)
 	}
-	attempt, err := fixture.h.beginGatewayProcessAttempt(context.Background(), fixture.connection.ID, gatewayAttemptManual)
-	if err != nil {
+	if err := fixture.h.FinishLarkGatewayLaunchPlan(fixture.connection.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.h.acceptGatewayProcessProof(fixture.connection.ID, exactR1Proof(attempt, false, timeNow()), timeNow()); err != nil {
+	if err := fixture.h.RestartGatewayProcesses(); err != nil {
+		t.Fatal(err)
+	}
+	fixture.h.mu.Lock()
+	attempt := fixture.h.gatewayState.Attempts[fixture.connection.ID]
+	fixture.h.mu.Unlock()
+	if attempt == nil || attempt.Phase != gatewayAttemptAwaitingTargetProof {
+		t.Fatalf("startup did not consume the typed plan: %#v", attempt)
+	}
+	proof := &GatewayProcessHeartbeatParams{
+		AttemptID: attempt.ID, Generation: attempt.TargetGeneration, Build: attempt.Plan.Target.Build,
+		ExecutableDigest: attempt.Plan.Target.ExecutableDigest,
+	}
+	if _, err := fixture.h.HeartbeatConnection(fixture.connection.ID, ConnectionHeartbeatParams{Status: "connected", GatewayProcess: proof}); err != nil {
 		t.Fatal(err)
 	}
 	verified, err := fixture.h.VerifyLarkCredential(fixture.connection.ID)
 	if err != nil || !verified.AlreadyMigrated || verified.RequiresProof {
-		t.Fatalf("verify after exact proof failed: %#v err=%v", verified, err)
+		t.Fatalf("verify after exact target proof failed: %#v err=%v", verified, err)
 	}
-	_ = result
+}
+
+func TestLarkVerifyRejectsRecoveryProofAfterTargetFailure(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &fakeGatewayServiceAdapter{
+		applyResult:   gatewayServiceEffectResult{Outcome: gatewayServiceEffectFailed, Err: context.DeadlineExceeded},
+		restoreResult: gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied},
+	}
+	fixture.h.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) { return adapter, nil }
+	executable := filepath.Join(fixture.dir, "loom-feishu-gateway")
+	if err := os.WriteFile(executable, []byte("accepted gateway binary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.FinishLarkGatewayLaunchPlan(fixture.connection.ID); err != nil {
+		t.Fatal(err)
+	}
+	type launchResult struct {
+		attempt gatewayTransitionAttempt
+		err     error
+	}
+	result := make(chan launchResult, 1)
+	spec := l2aLaunchSpec(t, &fixture, gatewayServiceManagerFake)
+	go func() {
+		attempt, err := fixture.h.startLarkGatewayLaunch(context.Background(), spec, gatewayAttemptMigration)
+		result <- launchResult{attempt: attempt, err: err}
+	}()
+	var attempt gatewayTransitionAttempt
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		fixture.h.mu.Lock()
+		if current := fixture.h.gatewayState.Attempts[fixture.connection.ID]; current != nil {
+			attempt = *current
+		}
+		fixture.h.mu.Unlock()
+		if attempt.Phase == gatewayAttemptAwaitingRecoveryProof {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if attempt.Phase != gatewayAttemptAwaitingRecoveryProof {
+		t.Fatalf("target failure did not reach recovery proof: %#v", attempt)
+	}
+	recoveryProof := &GatewayProcessHeartbeatParams{
+		AttemptID: attempt.ID, Generation: attempt.RecoveryGeneration, Build: attempt.Plan.Anchor.Descriptor.Build,
+		ExecutableDigest: attempt.Plan.Anchor.Descriptor.ExecutableDigest,
+	}
+	if _, err := fixture.h.HeartbeatConnection(fixture.connection.ID, ConnectionHeartbeatParams{Status: "connected", GatewayProcess: recoveryProof}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case completed := <-result:
+		if completed.err == nil || completed.attempt.Phase != gatewayAttemptRecovered {
+			t.Fatalf("recovery result = %#v err=%v", completed.attempt, completed.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery attempt did not terminate")
+	}
+	if _, err := fixture.h.VerifyLarkCredential(fixture.connection.ID); err == nil {
+		t.Fatal("verify accepted a legacy recovery proof as managed target success")
+	}
+}
+
+func TestLarkMigratePlanPendingDurableAndReentrant(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	first, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.PlanPending || first.AlreadyMigrated {
+		t.Fatalf("fresh migration must end durable in plan_pending: %#v", first)
+	}
+	record, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != larkMigrationPhasePlanPending {
+		t.Fatalf("record phase = %q", record.Phase)
+	}
+	// Re-entry before the plan is configured stays durable and does not error.
+	second, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("different"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.PlanPending || second.CurrentRef != first.CurrentRef {
+		t.Fatalf("re-entered migrate did not stay plan_pending: %#v", second)
+	}
+	fixture.h.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) {
+		return &fakeGatewayServiceAdapter{applyResult: gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied}}, nil
+	}
+	executable := filepath.Join(fixture.dir, "loom-feishu-gateway")
+	if err := os.WriteFile(executable, []byte("accepted gateway binary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.FinishLarkGatewayLaunchPlan(fixture.connection.ID); err != nil {
+		t.Fatal(err)
+	}
+	record, err = fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+	if err != nil || record.Phase != larkMigrationPhaseCompleted {
+		t.Fatalf("record did not complete: %#v err=%v", record, err)
+	}
 }
 
 func timeNow() time.Time { return time.Now().UTC() }
@@ -167,12 +285,129 @@ func TestLarkMigrateIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fixture.h.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) {
+		return &fakeGatewayServiceAdapter{applyResult: gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied}}, nil
+	}
+	executable := filepath.Join(fixture.dir, "loom-feishu-gateway")
+	if err := os.WriteFile(executable, []byte("accepted gateway binary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.FinishLarkGatewayLaunchPlan(fixture.connection.ID); err != nil {
+		t.Fatal(err)
+	}
 	second, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("different"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !second.AlreadyMigrated || second.CurrentRef != first.CurrentRef {
 		t.Fatalf("second migrate not idempotent: %#v vs %#v", second, first)
+	}
+}
+
+func TestLarkRollbackReentrantAfterRefRestoredCrash(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err != nil {
+		t.Fatal(err)
+	}
+	fixture.h.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) {
+		return &fakeGatewayServiceAdapter{applyResult: gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied}}, nil
+	}
+	executable := filepath.Join(fixture.dir, "loom-feishu-gateway")
+	if err := os.WriteFile(executable, []byte("accepted gateway binary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.FinishLarkGatewayLaunchPlan(fixture.connection.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after the reference restore but before plan revoke,
+	// credential deletion, and record removal.
+	if _, err := fixture.h.UpdateConnection(fixture.connection.ID, ConnectionParams{CredentialRef: "keychain:com.codexloom.lark"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.advanceLarkMigrationPhase(fixture.connection.ID, larkMigrationPhaseRefRestored); err != nil {
+		t.Fatal(err)
+	}
+	if ref := fixture.h.LarkGatewayLaunchPlanRef(fixture.connection.ID); ref == "" {
+		t.Fatal("crash simulation did not leave a typed plan in place")
+	}
+	rollback, err := fixture.h.RollbackLarkCredential(fixture.connection.ID)
+	if err != nil {
+		t.Fatalf("re-entered rollback could not finish: %v", err)
+	}
+	if rollback.CurrentRef != "keychain:com.codexloom.lark" {
+		t.Fatalf("rollback result = %#v", rollback)
+	}
+	if ref := fixture.h.LarkGatewayLaunchPlanRef(fixture.connection.ID); ref != "" {
+		t.Fatalf("typed launch plan survived rollback: %q", ref)
+	}
+	if _, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID); !os.IsNotExist(err) {
+		t.Fatalf("migration record survived rollback: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(fixture.st.Dir(), credentials.DirectoryName))
+	if err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				t.Fatalf("managed credential file survived rollback: %s", entry.Name())
+			}
+		}
+	}
+}
+
+func TestLarkMigrateIdempotentAfterCutover(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &fakeGatewayServiceAdapter{applyResult: gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied}}
+	fixture.h.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) { return adapter, nil }
+	executable := filepath.Join(fixture.dir, "loom-feishu-gateway")
+	if err := os.WriteFile(executable, []byte("accepted gateway binary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.FinishLarkGatewayLaunchPlan(fixture.connection.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.RestartGatewayProcesses(); err != nil {
+		t.Fatal(err)
+	}
+	fixture.h.mu.Lock()
+	attempt := fixture.h.gatewayState.Attempts[fixture.connection.ID]
+	fixture.h.mu.Unlock()
+	proof := &GatewayProcessHeartbeatParams{
+		AttemptID: attempt.ID, Generation: attempt.TargetGeneration, Build: attempt.Plan.Target.Build,
+		ExecutableDigest: attempt.Plan.Target.ExecutableDigest,
+	}
+	if _, err := fixture.h.HeartbeatConnection(fixture.connection.ID, ConnectionHeartbeatParams{Status: "connected", GatewayProcess: proof}); err != nil {
+		t.Fatal(err)
+	}
+	fixture.h.Shutdown()
+	fixture.h = nil
+	reopened, err := Open(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.h = reopened
+	reopened.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) { return adapter, nil }
+	if err := fixture.h.PreflightLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+		t.Fatalf("preflight after successful cutover failed: %v", err)
+	}
+	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+		t.Fatalf("configure after successful cutover was not a no-op: %v", err)
+	}
+	again, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("different"), false)
+	if err != nil || !again.AlreadyMigrated {
+		t.Fatalf("migrate after successful cutover was not idempotent: %#v err=%v", again, err)
 	}
 }
 

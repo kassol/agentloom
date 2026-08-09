@@ -24,6 +24,7 @@ type LarkCredentialMigration struct {
 	DryRun          bool   `json:"dryRun"`
 	AlreadyMigrated bool   `json:"alreadyMigrated"`
 	RequiresProof   bool   `json:"requiresProof"`
+	PlanPending     bool   `json:"planPending,omitempty"`
 }
 
 type larkCredentialMigrationRecord struct {
@@ -37,6 +38,7 @@ type larkCredentialMigrationRecord struct {
 
 const (
 	larkMigrationPhasePrepared    = "prepared"
+	larkMigrationPhasePlanPending = "plan_pending"
 	larkMigrationPhaseCompleted   = "completed"
 	larkMigrationPhaseRefRestored = "ref_restored"
 )
@@ -84,13 +86,21 @@ func (h *Hub) MigrateLarkCredential(_ context.Context, connectionID string, secr
 			result.AlreadyMigrated = true
 			result.FloorRaised = h.st.CredentialFloorPresent()
 			return result, nil
+		case larkMigrationPhasePlanPending:
+			if _, err := h.resolveManagedCredential(connection.CredentialRef); err != nil {
+				return result, errf(409, "managed credential is dangling: %s", err)
+			}
+			result.CurrentRef = connection.CredentialRef
+			result.PlanPending = true
+			result.FloorRaised = h.st.CredentialFloorPresent()
+			return result, nil
 		case larkMigrationPhasePrepared:
 			// Crash after the reference effect before the phase advanced.
-			if err := h.advanceLarkMigrationPhase(connectionID, larkMigrationPhaseCompleted); err != nil {
+			if err := h.advanceLarkMigrationPhase(connectionID, larkMigrationPhasePlanPending); err != nil {
 				return result, errf(500, "reconcile migration record: %s", err)
 			}
 			result.CurrentRef = connection.CredentialRef
-			result.AlreadyMigrated = true
+			result.PlanPending = true
 			result.FloorRaised = h.st.CredentialFloorPresent()
 			return result, nil
 		default:
@@ -105,12 +115,12 @@ func (h *Hub) MigrateLarkCredential(_ context.Context, connectionID string, secr
 		if _, err := h.updateLarkConnection(connectionID, record.CurrentRef); err != nil {
 			return result, errf(500, "resume migration reference update: %s", err)
 		}
-		if err := h.advanceLarkMigrationPhase(connectionID, larkMigrationPhaseCompleted); err != nil {
+		if err := h.advanceLarkMigrationPhase(connectionID, larkMigrationPhasePlanPending); err != nil {
 			return result, errf(500, "reconcile migration record: %s", err)
 		}
 		result.PreviousRef = record.PreviousRef
 		result.CurrentRef = record.CurrentRef
-		result.AlreadyMigrated = true
+		result.PlanPending = true
 		result.FloorRaised = h.st.CredentialFloorPresent()
 		return result, nil
 	}
@@ -154,10 +164,49 @@ func (h *Hub) MigrateLarkCredential(_ context.Context, connectionID string, secr
 		_ = h.removeLarkMigrationRecord(connectionID)
 		return result, errf(500, "update connection credential reference: %s (managed credential and record removed; credential floor stays raised)", err)
 	}
-	if err := h.advanceLarkMigrationPhase(connectionID, larkMigrationPhaseCompleted); err != nil {
+	if err := h.advanceLarkMigrationPhase(connectionID, larkMigrationPhasePlanPending); err != nil {
 		return result, fmt.Errorf("migrated but migration record phase is pending: %w", err)
 	}
+	result.PlanPending = true
 	return result, nil
+}
+
+// FinishLarkGatewayLaunchPlan advances a durable plan_pending migration to
+// completed once the typed Lark launch plan is frozen with the exact managed
+// reference of the committed binding. It is idempotent: a completed migration
+// is a no-op, and a missing typed plan fails closed so the operator can re-run
+// migrate to configure it.
+func (h *Hub) FinishLarkGatewayLaunchPlan(connectionID string) error {
+	connectionID = strings.TrimSpace(connectionID)
+	if connectionID == "" {
+		return errf(400, "connection id is required")
+	}
+	record, err := h.readLarkMigrationRecord(connectionID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return errf(409, "connection is not migrated")
+		}
+		return errf(409, "migration record is unreadable: %s", err)
+	}
+	if record.Phase == larkMigrationPhaseCompleted {
+		return nil
+	}
+	if record.Phase != larkMigrationPhasePlanPending {
+		return errf(409, "migration record phase %q cannot complete the launch plan", record.Phase)
+	}
+	h.mu.Lock()
+	connection := h.connections[connectionID]
+	h.mu.Unlock()
+	if connection == nil {
+		return errf(404, "connection not found: %s", connectionID)
+	}
+	if !credentials.IsManagedRef(connection.CredentialRef) || connection.CredentialRef != record.CurrentRef {
+		return errf(409, "migration record does not match the connection reference")
+	}
+	if planRef := h.LarkGatewayLaunchPlanRef(connectionID); planRef != connection.CredentialRef {
+		return errf(409, "typed Gateway launch plan is not frozen with the managed reference")
+	}
+	return h.advanceLarkMigrationPhase(connectionID, larkMigrationPhaseCompleted)
 }
 
 // VerifyLarkCredential confirms the managed credential resolves and the
@@ -196,9 +245,11 @@ func (h *Hub) VerifyLarkCredential(connectionID string) (LarkCredentialMigration
 	return result, nil
 }
 
-// RollbackLarkCredential restores the previous credential reference, deletes
-// the managed credential, and removes the migration record. Every step is
-// idempotent and resumable; the credential writer floor is never lowered.
+// RollbackLarkCredential restores the previous credential reference, revokes
+// any durable typed Gateway launch plan, deletes the managed credential, and
+// only then removes the migration record. Every step is idempotent and
+// resumable: a crash anywhere leaves the record in a state that a re-run of
+// rollback completes, and the credential writer floor is never lowered.
 func (h *Hub) RollbackLarkCredential(connectionID string) (LarkCredentialMigration, error) {
 	result, connection, err := h.larkMigrationBaseline(connectionID)
 	if err != nil {
@@ -217,7 +268,7 @@ func (h *Hub) RollbackLarkCredential(connectionID string) (LarkCredentialMigrati
 	if record.CurrentRef == "" || record.PreviousRef == "" {
 		return result, errf(409, "migration record is incomplete")
 	}
-	if connection.CredentialRef == record.CurrentRef {
+	if strings.TrimSpace(connection.CredentialRef) == strings.TrimSpace(record.CurrentRef) {
 		if strings.TrimSpace(record.PreviousRef) == "" {
 			return result, errf(409, "rollback requires a non-empty previous credential reference")
 		}
@@ -228,12 +279,19 @@ func (h *Hub) RollbackLarkCredential(connectionID string) (LarkCredentialMigrati
 			return result, errf(500, "persist rollback phase: %s", err)
 		}
 	}
+	// The migration record must survive until the typed launch plan is revoked
+	// durably, so a crash between these steps is re-entrant from the same
+	// rollback command.
+	if err := h.RevokeLarkGatewayLaunch(connectionID); err != nil {
+		return result, errf(500, "credential reference restored but Gateway launch plan revocation failed: %s", err)
+	}
 	credentialStore, err := credentials.New(h.st)
 	if err != nil {
 		return result, errf(500, "open managed credential store: %s", err)
 	}
-	if err := credentialStore.Delete(credentials.Ref(record.CurrentRef)); err != nil {
-		return result, errf(500, "credential reference restored but managed credential deletion failed: %s", err)
+	deleteErr := credentialStore.Delete(credentials.Ref(record.CurrentRef))
+	if deleteErr != nil && !credentials.IsCredentialNotFound(deleteErr) {
+		return result, errf(500, "credential reference restored but managed credential deletion failed: %s", deleteErr)
 	}
 	if err := h.removeLarkMigrationRecord(connectionID); err != nil {
 		return result, errf(500, "managed credential deleted but migration record removal failed: %s", err)
@@ -308,7 +366,21 @@ func (h *Hub) requireAcceptedGatewayProof(connectionID string) error {
 	if attempt == nil || attempt.AcceptedProof == nil || !gatewayAttemptTerminal(attempt.Phase) {
 		return fmt.Errorf("no accepted exact process proof")
 	}
-	observedAt, err := time.Parse(time.RFC3339Nano, attempt.AcceptedProof.ObservedAt)
+	if attempt.Phase != gatewayAttemptSucceeded {
+		return fmt.Errorf("Gateway lifecycle ended in %s, not an accepted managed target proof", attempt.Phase)
+	}
+	plan := h.gatewayState.LaunchPlans[connectionID]
+	connection := h.connections[connectionID]
+	if connection == nil || plan == nil || plan.Target.Provider == "" ||
+		plan.Target.ManagedCredentialRef != strings.TrimSpace(connection.CredentialRef) {
+		return fmt.Errorf("typed Gateway launch plan does not match the current managed binding")
+	}
+	proof := attempt.AcceptedProof
+	if proof.Generation != attempt.TargetGeneration || proof.Build != attempt.Plan.Target.Build ||
+		proof.ExecutableDigest != attempt.Plan.Target.ExecutableDigest {
+		return fmt.Errorf("accepted process proof is not the managed target proof")
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, proof.ObservedAt)
 	if err != nil || time.Since(observedAt) > gatewayProcessProofFreshness {
 		return fmt.Errorf("accepted process proof is stale")
 	}
@@ -404,7 +476,7 @@ func (h *Hub) readLarkMigrationRecord(connectionID string) (larkCredentialMigrat
 		return larkCredentialMigrationRecord{}, fmt.Errorf("invalid migration record")
 	}
 	switch record.Phase {
-	case larkMigrationPhasePrepared, larkMigrationPhaseCompleted, larkMigrationPhaseRefRestored:
+	case larkMigrationPhasePrepared, larkMigrationPhasePlanPending, larkMigrationPhaseCompleted, larkMigrationPhaseRefRestored:
 	default:
 		return larkCredentialMigrationRecord{}, fmt.Errorf("invalid migration record phase")
 	}

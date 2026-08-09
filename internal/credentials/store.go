@@ -39,6 +39,12 @@ type Ref string
 
 var errCredentialNotFound = errors.New("managed credential not found")
 
+// IsCredentialNotFound reports whether err indicates a managed credential is
+// absent, which is an idempotent success for delete/rollback flows.
+func IsCredentialNotFound(err error) bool {
+	return errors.Is(err, errCredentialNotFound)
+}
+
 // Store manages the fixed Owner-only credentials directory inside one stable
 // data directory.
 type Store struct {

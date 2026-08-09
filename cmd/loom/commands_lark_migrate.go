@@ -90,6 +90,13 @@ func cmdLarkMigrate(a args) {
 		if err != nil {
 			fail(err)
 		}
+		executable, err := larkGatewayBinaryPath()
+		if err != nil {
+			fail(fmt.Errorf("locate loom-feishu-gateway for launch plan: %w", err))
+		}
+		if err := h.PreflightLarkGatewayLaunch(connectionID, executable); err != nil {
+			fail(fmt.Errorf("launch plan preflight: %w", err))
+		}
 		result, err := h.MigrateLarkCredential(ctx, connectionID, []byte(secretText), false)
 		if err != nil {
 			fail(err)
@@ -98,14 +105,17 @@ func cmdLarkMigrate(a args) {
 		if result.FloorRaised {
 			fmt.Println("  credential writer floor raised; old builds are blocked from this data directory")
 		}
-		executable, err := larkGatewayBinaryPath()
-		if err != nil {
-			fail(fmt.Errorf("credential migrated but the Lark Gateway launch plan was not configured: %w", err))
+		if result.AlreadyMigrated && !result.PlanPending && h.LarkGatewayLaunchPlanRef(connectionID) == result.CurrentRef {
+			fmt.Println("  launch plan already frozen; Hub startup will consume it")
+		} else {
+			if err := h.ConfigureLarkGatewayLaunch(connectionID, executable); err != nil {
+				fail(fmt.Errorf("credential migrated but the Lark Gateway launch plan is pending: %w", err))
+			}
+			if err := h.FinishLarkGatewayLaunchPlan(connectionID); err != nil {
+				fail(fmt.Errorf("launch plan frozen but migration completion failed: %w", err))
+			}
+			fmt.Println("  launch plan frozen (dormant); Hub startup will consume it")
 		}
-		if err := h.ConfigureLarkGatewayLaunch(connectionID, executable); err != nil {
-			fail(fmt.Errorf("credential migrated but the Lark Gateway launch plan was not configured: %w", err))
-		}
-		fmt.Println("  launch plan frozen (dormant); Hub startup will consume it")
 	case "verify":
 		result, err := h.VerifyLarkCredential(connectionID)
 		if err != nil {
@@ -118,9 +128,6 @@ func cmdLarkMigrate(a args) {
 			fail(err)
 		}
 		fmt.Printf("%s Lark connection %s restored to %s\n", green("rolled back"), bold(result.ConnectionID), result.CurrentRef)
-		if err := h.RevokeLarkGatewayLaunch(connectionID); err != nil {
-			fail(fmt.Errorf("credential restored but the Lark Gateway launch plan was not revoked: %w", err))
-		}
 		fmt.Println("  managed launch plan revoked; next startup returns to the legacy path")
 	default:
 		usage("lark-migrate preflight|dry-run|migrate|verify|rollback ...")

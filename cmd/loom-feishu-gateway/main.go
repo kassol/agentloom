@@ -4,8 +4,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -29,12 +32,20 @@ func main() {
 	flag.Parse()
 
 	processProof := gatewayProcessProofFromEnv()
-	managedRef := strings.TrimSpace(os.Getenv("CODEX_LOOM_MANAGED_CREDENTIAL_REF"))
-	secret := ""
-	if managedRef != "" {
-		if !credentials.IsManagedRef(managedRef) {
-			log.Fatalf("invalid managed credential reference")
+	managedRef, managedRefSet, err := managedRefFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if processProof != nil && !managedRefSet {
+		log.Fatalf("gateway attempt proof identity requires an explicit managed credential reference")
+	}
+	if processProof != nil {
+		if err := verifySelfExecutable(processProof); err != nil {
+			log.Fatalf("gateway executable does not match the frozen launch plan: %v", err)
 		}
+	}
+	secret := ""
+	if managedRefSet {
 		resolved, err := resolveManagedSecret(dataDir(), credentials.Ref(managedRef))
 		if err != nil {
 			log.Fatalf("resolve managed credential: %v", err)
@@ -96,6 +107,66 @@ func gatewayProcessProofFromEnv() *hub.GatewayProcessHeartbeatParams {
 	return &hub.GatewayProcessHeartbeatParams{
 		AttemptID: attemptID, Generation: generation, Build: build, ExecutableDigest: digest,
 	}
+}
+
+// managedRefFromEnv distinguishes an unset managed credential reference from an
+// explicitly set one. An explicitly set variable must be a canonical managed
+// reference: empty, whitespace, or malformed values fail closed before any
+// legacy credential source or provider hook runs.
+func managedRefFromEnv() (ref string, set bool, err error) {
+	raw, set := os.LookupEnv("CODEX_LOOM_MANAGED_CREDENTIAL_REF")
+	ref = strings.TrimSpace(raw)
+	if !set {
+		return "", false, nil
+	}
+	if !credentials.IsManagedRef(ref) {
+		return "", true, fmt.Errorf("invalid managed credential reference")
+	}
+	return ref, true, nil
+}
+
+// verifySelfExecutable proves the running gateway binary is the exact
+// executable the launch plan froze: the plan's executable digest must equal the
+// sha256 of the current executable file, and the plan's build identity must be
+// the digest-derived build used by the maintenance launch entry. A replaced or
+// corrupted binary therefore cannot echo the target proof.
+func verifySelfExecutable(proof *hub.GatewayProcessHeartbeatParams) error {
+	if proof == nil {
+		return nil
+	}
+	current, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve running executable: %w", err)
+	}
+	return verifyExecutableProof(current, proof)
+}
+
+func verifyExecutableProof(path string, proof *hub.GatewayProcessHeartbeatParams) error {
+	digest, err := executableDigest(path)
+	if err != nil {
+		return err
+	}
+	if proof.ExecutableDigest != digest {
+		return fmt.Errorf("running executable digest %s does not match the frozen plan %s", digest, proof.ExecutableDigest)
+	}
+	expectedBuild := "sha256:" + digest[:16]
+	if proof.Build != expectedBuild {
+		return fmt.Errorf("running executable build %s does not match the frozen plan %s", expectedBuild, proof.Build)
+	}
+	return nil
+}
+
+func executableDigest(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, io.LimitReader(file, 512<<20)); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // resolveManagedSecret opens the C-v1 stable data directory read-only and
