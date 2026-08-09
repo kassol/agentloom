@@ -60,6 +60,22 @@ func New(st *store.Store) (*Store, error) {
 	return &Store{st: st}, nil
 }
 
+// ResolveReadOnly resolves one canonical managed reference through the stable
+// read-only view without requiring a live writable Hub owner. It is the narrow
+// same-UID consumption path for child processes such as the Feishu gateway,
+// which must never write credentials. Canonical reference parsing and
+// owner-only file verification still apply; unsupported platforms fail closed.
+func ResolveReadOnly(st *store.Store, ref Ref) ([]byte, error) {
+	if st == nil {
+		return nil, fmt.Errorf("credential store requires a stable Store")
+	}
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		return nil, fmt.Errorf("managed credentials are unsupported on %s", runtime.GOOS)
+	}
+	credentialStore := Store{st: st}
+	return credentialStore.Resolve(ref)
+}
+
 // Put durably writes one new immutable credential and returns its canonical
 // reference. The secret is written to a temporary file and atomically renamed
 // to a fresh random ID; an existing ID is never overwritten.

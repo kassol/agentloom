@@ -86,6 +86,48 @@ func TestVPutResolveRoundTripAndOwnerOnlyPermissions(t *testing.T) {
 	}
 }
 
+func TestResolveReadOnlyWorksWithoutLiveWritableOwner(t *testing.T) {
+	dir := t.TempDir()
+	ownerStore, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ownerStore.ClaimWritableOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ownerStore.SaveCredentialFloor(); err != nil {
+		t.Fatal(err)
+	}
+	ownerCredentials, err := New(ownerStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte("readonly-secret")
+	ref, err := ownerCredentials.Put(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readOnlyStore, err := store.OpenWithOptions(dir, store.OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = readOnlyStore.Close() })
+	got, err := ResolveReadOnly(readOnlyStore, ref)
+	if err != nil {
+		t.Fatalf("read-only resolution failed: %v", err)
+	}
+	if !bytes.Equal(got, secret) {
+		t.Fatal("read-only resolved secret does not match")
+	}
+	if _, err := ResolveReadOnly(readOnlyStore, Ref("managed:"+strings.Repeat("0", idHexLen))); err == nil {
+		t.Fatal("read-only resolution accepted a missing reference")
+	}
+	if _, err := ResolveReadOnly(readOnlyStore, Ref("keychain:com.codexloom.feishu")); err == nil {
+		t.Fatal("read-only resolution accepted a non-managed reference")
+	}
+}
+
 func TestVPutRequiresLiveWritableStoreOwner(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

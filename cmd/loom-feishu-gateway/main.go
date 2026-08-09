@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -12,8 +13,11 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/yan5xu/codex-loom/internal/credentials"
 	"github.com/yan5xu/codex-loom/internal/feishu"
 	"github.com/yan5xu/codex-loom/internal/feishugw"
+	"github.com/yan5xu/codex-loom/internal/hub"
+	"github.com/yan5xu/codex-loom/internal/store"
 )
 
 func main() {
@@ -24,17 +28,31 @@ func main() {
 	stateFile := flag.String("state-file", "", "gateway state file")
 	flag.Parse()
 
-	secret := strings.TrimSpace(os.Getenv("FEISHU_APP_SECRET"))
-	if secret == "" {
-		if inherited, ok := readInheritedCredentialFD(); ok {
-			secret = strings.TrimSpace(string(inherited))
+	processProof := gatewayProcessProofFromEnv()
+	managedRef := strings.TrimSpace(os.Getenv("CODEX_LOOM_MANAGED_CREDENTIAL_REF"))
+	secret := ""
+	if managedRef != "" {
+		if !credentials.IsManagedRef(managedRef) {
+			log.Fatalf("invalid managed credential reference")
 		}
-	}
-	if secret == "" && strings.TrimSpace(*appID) != "" {
-		var err error
-		secret, err = feishu.LoadAppSecret(*appID)
+		resolved, err := resolveManagedSecret(dataDir(), credentials.Ref(managedRef))
 		if err != nil {
-			log.Fatalf("read Feishu App Secret from keychain: %v", err)
+			log.Fatalf("resolve managed credential: %v", err)
+		}
+		secret = string(resolved)
+	} else {
+		secret = strings.TrimSpace(os.Getenv("FEISHU_APP_SECRET"))
+		if secret == "" {
+			if inherited, ok := readInheritedCredentialFD(); ok {
+				secret = strings.TrimSpace(string(inherited))
+			}
+		}
+		if secret == "" && strings.TrimSpace(*appID) != "" {
+			var err error
+			secret, err = feishu.LoadAppSecret(*appID)
+			if err != nil {
+				log.Fatalf("read Feishu App Secret from keychain: %v", err)
+			}
 		}
 	}
 	if *stateFile == "" && *connectionID != "" {
@@ -43,7 +61,7 @@ func main() {
 	gateway, err := feishugw.New(feishugw.Config{
 		HubURL: *hubURL, ConnectionID: *connectionID, AddressID: *addressID,
 		AppID: *appID, AppSecret: secret, ConnectorToken: os.Getenv("CODEX_LOOM_CONNECTOR_TOKEN"),
-		StateFile: *stateFile,
+		StateFile: *stateFile, ProcessProof: processProof,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -53,6 +71,46 @@ func main() {
 	if err := gateway.Run(ctx); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// gatewayProcessProofFromEnv reads the private R1 attempt identity that the
+// launch plan froze into the unit environment. All four values must appear
+// together and be bounded, secret-free strings; the exact proof is returned to
+// the Hub only after the provider socket opens.
+func gatewayProcessProofFromEnv() *hub.GatewayProcessHeartbeatParams {
+	attemptID := strings.TrimSpace(os.Getenv("CODEX_LOOM_GATEWAY_ATTEMPT_ID"))
+	generation := strings.TrimSpace(os.Getenv("CODEX_LOOM_GATEWAY_GENERATION"))
+	build := strings.TrimSpace(os.Getenv("CODEX_LOOM_GATEWAY_BUILD"))
+	digest := strings.TrimSpace(os.Getenv("CODEX_LOOM_GATEWAY_EXECUTABLE_DIGEST"))
+	if attemptID == "" && generation == "" && build == "" && digest == "" {
+		return nil
+	}
+	if attemptID == "" || generation == "" || build == "" || digest == "" {
+		log.Fatalf("gateway attempt proof identity is incomplete")
+	}
+	for _, value := range []string{attemptID, generation, build, digest} {
+		if len(value) > 4096 || strings.ContainsAny(value, "\r\n\x00") {
+			log.Fatalf("gateway attempt proof identity is unbounded or invalid")
+		}
+	}
+	return &hub.GatewayProcessHeartbeatParams{
+		AttemptID: attemptID, Generation: generation, Build: build, ExecutableDigest: digest,
+	}
+}
+
+// resolveManagedSecret opens the C-v1 stable data directory read-only and
+// resolves one canonical managed reference. It never writes and never falls
+// back to another credential source.
+func resolveManagedSecret(dataDir string, ref credentials.Ref) ([]byte, error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return nil, fmt.Errorf("managed credential resolution requires a data directory")
+	}
+	st, err := store.OpenWithOptions(dataDir, store.OpenOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	return credentials.ResolveReadOnly(st, ref)
 }
 
 func envFirst(names ...string) string {
