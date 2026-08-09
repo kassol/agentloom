@@ -25,6 +25,7 @@ const (
 	runtimeWriterFloorS0             = 1
 	runtimeWriterFloorGatewayState   = 2
 	runtimeWriterFloorGatewayProcess = 3
+	runtimeWriterFloorCredential     = 4
 )
 
 // runtimeFoundationEnvelope is private Runtime persistence shared by Store
@@ -39,8 +40,9 @@ type runtimeFoundationEnvelope struct {
 }
 
 type foundationState struct {
-	Version      int             `json:"version"`
-	GatewayState json.RawMessage `json:"gatewayState,omitempty"`
+	Version          int             `json:"version"`
+	GatewayState     json.RawMessage `json:"gatewayState,omitempty"`
+	CredentialManaged bool           `json:"credentialManaged,omitempty"`
 }
 
 type gatewayFoundationStateShape struct {
@@ -373,11 +375,11 @@ func validateFoundation(root *os.Root) error {
 	}
 	switch state.Version {
 	case 1:
-		if envelope.MinimumWriter < 0 || envelope.MinimumWriter > runtimeWriterFloorS0 || len(state.GatewayState) != 0 {
+		if envelope.MinimumWriter < 0 || envelope.MinimumWriter > runtimeWriterFloorS0 || len(state.GatewayState) != 0 || state.CredentialManaged {
 			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
 		}
 	case 2:
-		if len(state.GatewayState) == 0 {
+		if len(state.GatewayState) == 0 || state.CredentialManaged {
 			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
 		}
 		gatewayVersion, err := validateGatewayFoundationState(state.GatewayState)
@@ -390,6 +392,15 @@ func validateFoundation(root *os.Root) error {
 		}
 		if envelope.MinimumWriter != expectedFloor {
 			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
+		}
+	case 3:
+		if envelope.MinimumWriter != runtimeWriterFloorCredential || !state.CredentialManaged {
+			return fmt.Errorf("unsupported Runtime foundation schema/floor: schema=%d floor=%d", envelope.SchemaVersion, envelope.MinimumWriter)
+		}
+		if len(state.GatewayState) != 0 {
+			if _, err := validateGatewayFoundationState(state.GatewayState); err != nil {
+				return err
+			}
 		}
 	default:
 		return fmt.Errorf("invalid Runtime foundation state version %d", state.Version)
