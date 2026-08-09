@@ -350,6 +350,8 @@ type Hub struct {
 	gatewayCoordinator              *gatewayConnectionCoordinator
 	saveGatewayStateForTest         func(gatewayState) error
 	loadGatewayStateForTest         func(*gatewayState) (bool, error)
+	gatewayServiceAdapterForTest    func(gatewayLaunchPlan) (gatewayServiceAdapter, error)
+	gatewayProofWaitForTest         time.Duration
 }
 
 // New is retained for in-process callers that cannot recover from an invalid
