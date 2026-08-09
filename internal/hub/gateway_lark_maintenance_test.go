@@ -1,8 +1,10 @@
 package hub
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"testing"
 )
 
@@ -110,11 +112,27 @@ func TestL2aPhase2ConfigureRequiresManagedBindingAndActiveAddress(t *testing.T) 
 	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
 		t.Fatal(err)
 	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := writeL2aAnchorUnit(t, fixture, executable, home); err != nil {
+		t.Fatal(err)
+	}
 	if err := fixture.h.PreflightLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
 		t.Fatalf("preflight failed for a configurable launch: %v", err)
 	}
 	if err := fixture.h.PreflightLarkGatewayLaunch(fixture.connection.ID, filepath.Join(fixture.dir, "missing-binary")); err == nil {
 		t.Fatal("preflight accepted a missing executable")
+	}
+	label := "com.codexloom.feishu." + fixture.connection.ID
+	unitPath := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
+	if goruntime.GOOS == "linux" {
+		unitPath = filepath.Join(home, ".config", "systemd", "user", "codexloom-feishu-"+fixture.connection.ID+".service")
+	}
+	if err := os.Remove(unitPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.PreflightLarkGatewayLaunch(fixture.connection.ID, executable); err == nil {
+		t.Fatal("preflight accepted a missing registration anchor unit")
 	}
 }
 
@@ -184,5 +202,113 @@ func TestL2aPhase2RevokeClearsPlanDerivedReconcileAfterRollback(t *testing.T) {
 	}
 	if control.Binding.Connection.CredentialRef != legacyRef {
 		t.Fatalf("revoke changed the restored legacy binding: %q", control.Binding.Connection.CredentialRef)
+	}
+}
+
+func writeL2aAnchorUnit(t *testing.T, fixture r0bFixture, executable, home string) error {
+	t.Helper()
+	logPath := filepath.Join(fixture.st.Dir(), "gateway", "feishu-"+fixture.connection.ID+".log")
+	hubURL := "http://127.0.0.1:4870"
+	switch goruntime.GOOS {
+	case "darwin":
+		label := "com.codexloom.feishu." + fixture.connection.ID
+		unitPath := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
+		if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+			return err
+		}
+		plist := `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key><string>` + label + `</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>` + executable + `</string>
+      <string>--hub</string>
+      <string>` + hubURL + `</string>
+      <string>--connection</string>
+      <string>` + fixture.connection.ID + `</string>
+      <string>--address</string>
+      <string>` + fixture.address.ID + `</string>
+      <string>--app-id</string>
+      <string>` + fixture.connection.AccountRef + `</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict><key>CODEX_LOOM_DATA</key><string>` + fixture.st.Dir() + `</string></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>` + logPath + `</string>
+    <key>StandardErrorPath</key><string>` + logPath + `</string>
+  </dict>
+</plist>
+`
+		return os.WriteFile(unitPath, []byte(plist), 0o600)
+	case "linux":
+		service := "codexloom-feishu-" + fixture.connection.ID + ".service"
+		unitPath := filepath.Join(home, ".config", "systemd", "user", service)
+		if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+			return err
+		}
+		unit := `[Unit]
+Description=CodexLoom native Feishu gateway (` + fixture.connection.ID + `)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=` + executable + ` --hub ` + hubURL + ` --connection ` + fixture.connection.ID + ` --address ` + fixture.address.ID + ` --app-id ` + fixture.connection.AccountRef + `
+Environment=CODEX_LOOM_DATA=` + fixture.st.Dir() + `
+Restart=always
+RestartSec=2
+StandardOutput=append:` + logPath + `
+StandardError=append:` + logPath + `
+
+[Install]
+WantedBy=default.target
+`
+		return os.WriteFile(unitPath, []byte(unit), 0o600)
+	default:
+		t.Skipf("typed Lark launch anchor rehearsal is unsupported on %s", goruntime.GOOS)
+		return nil
+	}
+}
+
+func TestPreflightAnchorRenderMatchesInstalledUnitBytes(t *testing.T) {
+	fixture := newL2aFixture(t)
+	defer fixture.close(t)
+	executable := filepath.Join(fixture.dir, "loom-feishu-gateway")
+	if err := os.WriteFile(executable, []byte("accepted gateway binary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := writeL2aAnchorUnit(t, fixture, executable, home); err != nil {
+		t.Fatal(err)
+	}
+	launchSpec, err := fixture.h.larkGatewayLaunchSpec(fixture.connection.ID, executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.h.mu.Lock()
+	connection := fixture.h.connections[fixture.connection.ID]
+	fixture.h.mu.Unlock()
+	anchorDescriptor := gatewayLaunchDescriptor{
+		Manager: launchSpec.Manager, ConnectionID: launchSpec.ConnectionID,
+		Provider: "lark", AddressID: launchSpec.AddressID, AccountRef: connection.AccountRef,
+		ServiceID: launchSpec.ServiceID, UnitPath: launchSpec.UnitPath,
+		Executable: launchSpec.Anchor.Executable, WorkingDirectory: launchSpec.WorkingDirectory,
+		HubURL: launchSpec.HubURL, DataDir: launchSpec.DataDir, LogPath: launchSpec.LogPath,
+		Build: launchSpec.Anchor.Build, ExecutableDigest: launchSpec.Anchor.ExecutableDigest,
+	}
+	rendered, err := renderGatewayServiceUnitForAttempt(anchorDescriptor, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := os.ReadFile(launchSpec.UnitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rendered, installed) {
+		t.Fatalf("preflight anchor unit mismatch:\nrendered:\n%s\ninstalled:\n%s", rendered, installed)
 	}
 }

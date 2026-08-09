@@ -58,6 +58,10 @@ func TestLarkMigrateCLIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmdLarkMigrate(args{
+		positional: []string{"dry-run"},
+		flags:      map[string]string{"data": dir, "connection": connection.ID},
+	})
+	cmdLarkMigrate(args{
 		positional: []string{"migrate"},
 		flags:      map[string]string{"data": dir, "connection": connection.ID, "source": secretPath},
 	})

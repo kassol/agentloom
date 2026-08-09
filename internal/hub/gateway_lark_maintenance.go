@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -23,32 +24,53 @@ const larkGatewayHubURL = "http://127.0.0.1:4870"
 // (RestartManagedGateways) later consumes the plan through the shared R1
 // coordinator. It never opens a provider socket and never reads a secret.
 func (h *Hub) ConfigureLarkGatewayLaunch(connectionID, executable string) error {
+	launchSpec, err := h.larkGatewayLaunchSpec(connectionID, executable)
+	if err != nil {
+		return err
+	}
+	if _, err := h.configureLarkGatewayLaunch(launchSpec); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *Hub) larkGatewayLaunchSpec(connectionID, executable string) (larkGatewayLaunchSpec, error) {
 	connectionID = strings.TrimSpace(connectionID)
 	if connectionID == "" {
-		return errf(400, "Gateway launch Connection is required")
+		return larkGatewayLaunchSpec{}, errf(400, "Gateway launch Connection is required")
 	}
 	manager, err := larkGatewayServiceManager()
 	if err != nil {
-		return err
+		return larkGatewayLaunchSpec{}, err
 	}
 	executable, err = larkGatewayCanonicalExecutable(executable)
 	if err != nil {
-		return err
+		return larkGatewayLaunchSpec{}, err
 	}
 	digest, err := fileSHA256(executable)
 	if err != nil {
-		return err
+		return larkGatewayLaunchSpec{}, err
 	}
 	addressID, err := h.activeLarkAddressID(connectionID)
 	if err != nil {
-		return err
+		return larkGatewayLaunchSpec{}, err
+	}
+	h.mu.Lock()
+	connection := h.connections[connectionID]
+	h.mu.Unlock()
+	if connection == nil {
+		return larkGatewayLaunchSpec{}, errf(404, "connection not found: %s", connectionID)
+	}
+	accountRef := strings.TrimSpace(connection.AccountRef)
+	if accountRef == "" {
+		return larkGatewayLaunchSpec{}, errf(409, "Connection has no canonical Lark App ID")
 	}
 	spec := larkGatewayExecutableSpec{
 		Executable: executable, Build: "sha256:" + digest[:16], ExecutableDigest: digest,
 	}
 	serviceID, unitPath, err := larkGatewayServiceIdentity(manager, connectionID)
 	if err != nil {
-		return err
+		return larkGatewayLaunchSpec{}, err
 	}
 	launchSpec := larkGatewayLaunchSpec{
 		ConnectionID: connectionID, AddressID: addressID, Manager: manager,
@@ -57,32 +79,44 @@ func (h *Hub) ConfigureLarkGatewayLaunch(connectionID, executable string) error 
 		LogPath: filepath.Join(h.st.Dir(), "gateway", "feishu-"+connectionID+".log"),
 		Target:  spec, Anchor: spec,
 	}
-	if _, err := h.configureLarkGatewayLaunch(launchSpec); err != nil {
-		return err
-	}
-	return nil
+	return launchSpec, nil
 }
 
 // PreflightLarkGatewayLaunch is the read-only companion used by lark-migrate
-// preflight/dry-run. It verifies the launch plan prerequisites (supported
-// service manager, canonical executable with a computable digest, and exactly
-// one active launch Address) without writing any state.
+// preflight/dry-run. It proves the launch plan prerequisites without writing
+// any state: supported service manager, canonical executable with a computable
+// digest, exactly one active launch Address, and a legacy registration anchor
+// whose installed unit matches the typed Runtime render.
 func (h *Hub) PreflightLarkGatewayLaunch(connectionID, executable string) error {
-	connectionID = strings.TrimSpace(connectionID)
-	if connectionID == "" {
-		return errf(400, "Gateway launch Connection is required")
-	}
-	if _, err := larkGatewayServiceManager(); err != nil {
+	launchSpec, err := h.larkGatewayLaunchSpec(connectionID, executable)
+	if err != nil {
 		return err
 	}
-	if _, err := larkGatewayCanonicalExecutable(executable); err != nil {
+	h.mu.Lock()
+	connection := h.connections[launchSpec.ConnectionID]
+	h.mu.Unlock()
+	if connection == nil {
+		return errf(404, "connection not found: %s", launchSpec.ConnectionID)
+	}
+	anchorDescriptor := gatewayLaunchDescriptor{
+		Manager: launchSpec.Manager, ConnectionID: launchSpec.ConnectionID,
+		Provider:  strings.ToLower(strings.TrimSpace(connection.Provider)),
+		AddressID: launchSpec.AddressID, AccountRef: strings.TrimSpace(connection.AccountRef),
+		ServiceID: launchSpec.ServiceID, UnitPath: launchSpec.UnitPath,
+		Executable: launchSpec.Anchor.Executable, WorkingDirectory: launchSpec.WorkingDirectory,
+		HubURL: launchSpec.HubURL, DataDir: launchSpec.DataDir, LogPath: launchSpec.LogPath,
+		Build: launchSpec.Anchor.Build, ExecutableDigest: launchSpec.Anchor.ExecutableDigest,
+	}
+	want, err := renderGatewayServiceUnitForAttempt(anchorDescriptor, "", "")
+	if err != nil {
 		return err
 	}
-	if _, err := fileSHA256(executable); err != nil {
-		return err
+	got, err := readGatewayServiceUnit(launchSpec.UnitPath)
+	if err != nil {
+		return fmt.Errorf("Gateway registration anchor is not configurable: %w", err)
 	}
-	if _, err := h.activeLarkAddressID(connectionID); err != nil {
-		return err
+	if !bytes.Equal(got, want) {
+		return fmt.Errorf("Gateway registration anchor does not match the installed legacy unit")
 	}
 	return nil
 }
