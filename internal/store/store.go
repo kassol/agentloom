@@ -788,7 +788,7 @@ func (s *Store) LoadRuntimeGatewayState(v any) (bool, error) {
 	if len(state.GatewayState) == 0 {
 		return false, nil
 	}
-	if state.Version != 2 && state.Version != 3 {
+	if state.Version != 2 && state.Version != 3 && state.Version != 4 {
 		return false, fmt.Errorf("unsupported Runtime Gateway foundation")
 	}
 	gatewayVersion, err := validateGatewayFoundationState(state.GatewayState)
@@ -796,6 +796,9 @@ func (s *Store) LoadRuntimeGatewayState(v any) (bool, error) {
 		return false, err
 	}
 	if state.Version == 2 {
+		if gatewayVersion == 3 {
+			return false, fmt.Errorf("unsupported Runtime Gateway launch-proof foundation")
+		}
 		expectedFloor := runtimeWriterFloorGatewayState
 		if gatewayVersion == 2 {
 			expectedFloor = runtimeWriterFloorGatewayProcess
@@ -803,8 +806,12 @@ func (s *Store) LoadRuntimeGatewayState(v any) (bool, error) {
 		if current.envelope.MinimumWriter != expectedFloor {
 			return false, fmt.Errorf("unsupported Runtime Gateway foundation")
 		}
-	} else if current.envelope.MinimumWriter != runtimeWriterFloorCredential {
-		return false, fmt.Errorf("unsupported Runtime Gateway foundation")
+	} else if state.Version == 3 {
+		if current.envelope.MinimumWriter != runtimeWriterFloorCredential || gatewayVersion == 3 {
+			return false, fmt.Errorf("unsupported Runtime Gateway foundation")
+		}
+	} else if current.envelope.MinimumWriter != runtimeWriterFloorGatewayProof || gatewayVersion != 3 {
+		return false, fmt.Errorf("unsupported Runtime Gateway launch-proof foundation")
 	}
 	gatewayDecoder := json.NewDecoder(strings.NewReader(string(state.GatewayState)))
 	gatewayDecoder.DisallowUnknownFields()
@@ -843,6 +850,12 @@ func (s *Store) SaveRuntimeGatewayState(v any) error {
 	if err != nil {
 		return err
 	}
+	if current.exists && current.envelope.MinimumWriter == runtimeWriterFloorGatewayProof && gatewayVersion != 3 {
+		return fmt.Errorf("Runtime Gateway launch-proof floor cannot be lowered")
+	}
+	if gatewayVersion == 3 && (!current.exists || current.envelope.MinimumWriter != runtimeWriterFloorGatewayProof) && !gatewayFoundationHasTypedLaunchPlan(gateway) {
+		return fmt.Errorf("first L2a Gateway launch-proof commit requires a typed launch plan")
+	}
 	state := foundationState{Version: 2, GatewayState: gateway}
 	minimumWriter := runtimeWriterFloorGatewayState
 	if gatewayVersion == 2 {
@@ -852,6 +865,14 @@ func (s *Store) SaveRuntimeGatewayState(v any) error {
 		state.Version = 3
 		state.CredentialManaged = true
 		minimumWriter = runtimeWriterFloorCredential
+	}
+	if gatewayVersion == 3 {
+		if !current.exists || !current.state.CredentialManaged {
+			return fmt.Errorf("L2a Gateway launch proof requires the managed credential floor")
+		}
+		state.Version = 4
+		state.CredentialManaged = true
+		minimumWriter = runtimeWriterFloorGatewayProof
 	}
 	stateBytes, err := json.Marshal(state)
 	if err != nil {
@@ -893,14 +914,23 @@ func (s *Store) SaveCredentialFloor() error {
 	state := foundationState{Version: 3, CredentialManaged: true}
 	if current.exists && len(current.state.GatewayState) != 0 {
 		state.GatewayState = current.state.GatewayState
+		if gatewayVersion, gatewayErr := validateGatewayFoundationState(state.GatewayState); gatewayErr != nil {
+			return gatewayErr
+		} else if gatewayVersion == 3 {
+			state.Version = 4
+		}
 	}
 	stateBytes, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
+	minimumWriter := runtimeWriterFloorCredential
+	if state.Version == 4 {
+		minimumWriter = runtimeWriterFloorGatewayProof
+	}
 	envelope := runtimeFoundationEnvelope{
 		SchemaVersion: runtimeFoundationSchemaVersion,
-		MinimumWriter: runtimeWriterFloorCredential,
+		MinimumWriter: minimumWriter,
 		State:         stateBytes,
 	}
 	data, err := json.MarshalIndent(envelope, "", "  ")
@@ -917,7 +947,7 @@ func (s *Store) SaveCredentialFloor() error {
 // has been raised for this data directory. It performs no writes.
 func (s *Store) CredentialFloorPresent() bool {
 	current, err := s.loadFoundationEnvelope()
-	return err == nil && current.exists && current.state.Version == 3 && current.state.CredentialManaged
+	return err == nil && current.exists && (current.state.Version == 3 || current.state.Version == 4) && current.state.CredentialManaged
 }
 
 func (s *Store) LoadRemote(v any) error { return s.loadJSON(s.remoteFile(), v) }

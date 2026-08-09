@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"os"
 	"os/exec"
@@ -116,7 +117,7 @@ func (a *platformGatewayServiceAdapter) ValidateAnchor(_ context.Context, plan g
 	if plan.Target.Manager != a.manager {
 		return fmt.Errorf("Gateway service adapter mismatch")
 	}
-	want, err := renderGatewayServiceUnit(plan.Anchor.Descriptor, plan.Anchor.Generation)
+	want, err := renderGatewayServiceUnitForAttempt(plan.Anchor.Descriptor, plan.Anchor.AttemptID, plan.Anchor.Generation)
 	if err != nil {
 		return err
 	}
@@ -182,7 +183,7 @@ func (a *platformGatewayServiceAdapter) replaceAndRestart(ctx context.Context, e
 	if effect.Descriptor.Manager != a.manager {
 		return gatewayServiceEffectResult{Outcome: gatewayServiceEffectFailed, Err: fmt.Errorf("Gateway service adapter mismatch")}
 	}
-	content, err := renderGatewayServiceUnit(effect.Descriptor, effect.Generation)
+	content, err := renderGatewayServiceUnitForAttempt(effect.Descriptor, effect.AttemptID, effect.Generation)
 	if err != nil {
 		return gatewayServiceEffectResult{Outcome: gatewayServiceEffectFailed, Err: err}
 	}
@@ -214,15 +215,15 @@ func (a *platformGatewayServiceAdapter) Inspect(_ context.Context, request gatew
 	if err != nil {
 		return gatewayServiceInspection{}, err
 	}
-	target, err := renderGatewayServiceUnit(request.Plan.Target, request.TargetGeneration)
+	target, err := renderGatewayServiceUnitForAttempt(request.Plan.Target, request.AttemptID, request.TargetGeneration)
 	if err != nil {
 		return gatewayServiceInspection{}, err
 	}
-	recovery, err := renderGatewayServiceUnit(request.Plan.Anchor.Descriptor, request.RecoveryGeneration)
+	recovery, err := renderGatewayServiceUnitForAttempt(request.Plan.Anchor.Descriptor, request.AttemptID, request.RecoveryGeneration)
 	if err != nil {
 		return gatewayServiceInspection{}, err
 	}
-	anchor, err := renderGatewayServiceUnit(request.Plan.Anchor.Descriptor, request.Plan.Anchor.Generation)
+	anchor, err := renderGatewayServiceUnitForAttempt(request.Plan.Anchor.Descriptor, request.Plan.Anchor.AttemptID, request.Plan.Anchor.Generation)
 	if err != nil {
 		return gatewayServiceInspection{}, err
 	}
@@ -261,8 +262,15 @@ func invokeGatewayServiceEffect(fn func() gatewayServiceEffectResult) (result ga
 }
 
 func renderGatewayServiceUnit(descriptor gatewayLaunchDescriptor, generation string) ([]byte, error) {
+	return renderGatewayServiceUnitForAttempt(descriptor, "", generation)
+}
+
+func renderGatewayServiceUnitForAttempt(descriptor gatewayLaunchDescriptor, attemptID, generation string) ([]byte, error) {
 	if err := validateGatewayLaunchDescriptor(descriptor); err != nil {
 		return nil, err
+	}
+	if descriptor.Provider != "" {
+		return renderLarkGatewayServiceUnit(descriptor, attemptID, generation)
 	}
 	args := []string{
 		descriptor.Executable,
@@ -300,18 +308,109 @@ func renderGatewayServiceUnit(descriptor gatewayLaunchDescriptor, generation str
 			"\nStandardError=" + systemdGatewayQuote("append:"+descriptor.LogPath) + "\nRestart=no\n\n[Install]\nWantedBy=default.target\n"
 		return []byte(content), nil
 	case gatewayServiceManagerFake:
-		return jsonCanonicalGatewayUnit(descriptor, generation)
+		return jsonCanonicalGatewayUnit(descriptor, attemptID, generation)
 	default:
 		return nil, fmt.Errorf("unsupported Gateway service manager %q", descriptor.Manager)
 	}
 }
 
-func jsonCanonicalGatewayUnit(descriptor gatewayLaunchDescriptor, generation string) ([]byte, error) {
+func renderLarkGatewayServiceUnit(descriptor gatewayLaunchDescriptor, attemptID, generation string) ([]byte, error) {
+	if (attemptID == "") != (generation == "") || len(attemptID) > gatewayProcessStringMax || len(generation) > gatewayProcessStringMax ||
+		strings.ContainsAny(attemptID, "\r\n\x00") || strings.ContainsAny(generation, "\r\n\x00") ||
+		gatewayStringMayContainSecret(attemptID) || gatewayStringMayContainSecret(generation) {
+		return nil, fmt.Errorf("Gateway process identity is incomplete, unbounded, or sensitive")
+	}
+	args := []string{
+		descriptor.Executable,
+		"--hub", descriptor.HubURL,
+		"--connection", descriptor.ConnectionID,
+		"--address", descriptor.AddressID,
+		"--app-id", descriptor.AccountRef,
+	}
+	environment := [][2]string{{"CODEX_LOOM_DATA", descriptor.DataDir}}
+	if descriptor.ManagedCredentialRef != "" {
+		environment = append(environment, [2]string{"CODEX_LOOM_MANAGED_CREDENTIAL_REF", descriptor.ManagedCredentialRef})
+	}
+	if attemptID != "" {
+		environment = append(environment,
+			[2]string{"CODEX_LOOM_GATEWAY_ATTEMPT_ID", attemptID},
+			[2]string{"CODEX_LOOM_GATEWAY_GENERATION", generation},
+			[2]string{"CODEX_LOOM_GATEWAY_BUILD", descriptor.Build},
+			[2]string{"CODEX_LOOM_GATEWAY_EXECUTABLE_DIGEST", descriptor.ExecutableDigest},
+		)
+	}
+	switch descriptor.Manager {
+	case gatewayServiceManagerLaunchd:
+		var argsXML strings.Builder
+		for _, argument := range args {
+			argsXML.WriteString("      <string>" + html.EscapeString(argument) + "</string>\n")
+		}
+		var environmentXML strings.Builder
+		for _, entry := range environment {
+			environmentXML.WriteString("<key>" + html.EscapeString(entry[0]) + "</key><string>" + html.EscapeString(entry[1]) + "</string>")
+		}
+		content := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key><string>%s</string>
+    <key>ProgramArguments</key>
+    <array>
+%s    </array>
+    <key>EnvironmentVariables</key>
+    <dict>%s</dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>%s</string>
+    <key>StandardErrorPath</key><string>%s</string>
+  </dict>
+</plist>
+`, html.EscapeString(descriptor.ServiceID), argsXML.String(), environmentXML.String(), html.EscapeString(descriptor.LogPath), html.EscapeString(descriptor.LogPath))
+		return []byte(content), nil
+	case gatewayServiceManagerSystemd:
+		quoted := make([]string, 0, len(args))
+		for _, argument := range args {
+			quoted = append(quoted, feishuSystemdQuote(argument))
+		}
+		var environmentLines strings.Builder
+		for _, entry := range environment {
+			environmentLines.WriteString("Environment=" + entry[0] + "=" + feishuSystemdQuote(entry[1]) + "\n")
+		}
+		content := fmt.Sprintf(`[Unit]
+Description=CodexLoom native Feishu gateway (%s)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%s
+%sRestart=always
+RestartSec=2
+StandardOutput=append:%s
+StandardError=append:%s
+
+[Install]
+WantedBy=default.target
+`, descriptor.ConnectionID, strings.Join(quoted, " "), environmentLines.String(), descriptor.LogPath, descriptor.LogPath)
+		return []byte(content), nil
+	case gatewayServiceManagerFake:
+		return jsonCanonicalGatewayUnit(descriptor, attemptID, generation)
+	default:
+		return nil, fmt.Errorf("unsupported Gateway service manager %q", descriptor.Manager)
+	}
+}
+
+func feishuSystemdQuote(value string) string {
+	return `"` + strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`) + `"`
+}
+
+func jsonCanonicalGatewayUnit(descriptor gatewayLaunchDescriptor, attemptID, generation string) ([]byte, error) {
 	type fakeUnit struct {
 		Descriptor gatewayLaunchDescriptor `json:"descriptor"`
+		AttemptID  string                  `json:"attemptId,omitempty"`
 		Generation string                  `json:"generation"`
 	}
-	data, err := jsonMarshalNoEscape(fakeUnit{Descriptor: descriptor, Generation: generation})
+	data, err := jsonMarshalNoEscape(fakeUnit{Descriptor: descriptor, AttemptID: attemptID, Generation: generation})
 	if err != nil {
 		return nil, err
 	}

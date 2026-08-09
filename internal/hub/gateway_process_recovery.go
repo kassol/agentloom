@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// configureGatewayLaunchPlan is private R1 plumbing. No current HTTP, CLI, or
-// provider path can call it. The first explicit plan upgrades the private
+// configureGatewayLaunchPlan is private R1 plumbing consumed only by typed
+// in-process Runtime callers. The first explicit plan upgrades the private
 // foundation and writer floor atomically; ordinary open never does.
 func (h *Hub) configureGatewayLaunchPlan(snapshot gatewayBindingSnapshot, plan gatewayLaunchPlan) (gatewayControl, error) {
 	if err := validateGatewayLaunchPlan(plan); err != nil {
@@ -58,7 +58,15 @@ func (h *Hub) configureGatewayLaunchPlan(snapshot gatewayBindingSnapshot, plan g
 	if err != nil || !gatewayBindingsEqual(current, snapshot.Binding) || !gatewayBindingsEqual(current, control.Binding) {
 		return gatewayControl{}, errf(409, "Gateway configured binding changed")
 	}
+	if plan.Target.Provider != "" {
+		if err := validateGatewayLaunchPlanForBinding(plan, current); err != nil {
+			return gatewayControl{}, errf(409, "Gateway launch plan does not match configured binding: %s", err)
+		}
+	}
 	next := upgradeGatewayStateForProcess(h.gatewayState)
+	if plan.Target.Provider != "" {
+		next = upgradeGatewayStateForLaunchProof(h.gatewayState)
+	}
 	nextControl := next.Controls[connectionID]
 	nextEpoch, err := advanceGatewayEpoch(nextControl.Epoch)
 	if err != nil {
@@ -186,7 +194,7 @@ func (h *Hub) beginGatewayProcessAttempt(ctx context.Context, connectionID strin
 	}
 	previousAttempt := h.gatewayState.Attempts[connectionID]
 	attemptID := newIntegrationID("gattempt")
-	for previousAttempt != nil && attemptID == previousAttempt.ID {
+	for (previousAttempt != nil && attemptID == previousAttempt.ID) || attemptID == planCopy.Anchor.AttemptID {
 		attemptID = newIntegrationID("gattempt")
 	}
 	targetGeneration := newIntegrationID("ggen")
@@ -437,28 +445,48 @@ func (h *Hub) finishGatewayRecoveryEffect(connectionID, attemptID string, result
 }
 
 func (h *Hub) acceptGatewayProcessProof(connectionID string, proof gatewayProcessProof, observedNow time.Time) (gatewayTransitionAttempt, error) {
-	if err := validateGatewayProcessProofShape(proof); err != nil {
-		return gatewayTransitionAttempt{}, errf(400, "%s", err)
-	}
 	connectionID = strings.TrimSpace(connectionID)
 	unlock := h.gatewayCoordinatorForUse().lock(connectionID)
 	defer unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.acceptGatewayProcessProofLocked(connectionID, proof, observedNow, "", nil)
+}
+
+// acceptGatewayProcessProofLocked requires both the per-Connection coordinator
+// and h.mu. The private heartbeat path uses it so exact proof, terminal control,
+// latch clear, and the connected observation remain one durable commit.
+func (h *Hub) acceptGatewayProcessProofLocked(connectionID string, proof gatewayProcessProof, observedNow time.Time, cursor string, capabilities []string) (gatewayTransitionAttempt, error) {
+	if err := validateGatewayProcessProofShape(proof); err != nil {
+		return gatewayTransitionAttempt{}, errf(400, "%s", err)
+	}
 	if err := h.requireGatewayFoundationHealthyLocked(); err != nil {
 		return gatewayTransitionAttempt{}, err
 	}
-	attempt := h.gatewayState.Attempts[connectionID]
-	control := h.gatewayState.Controls[connectionID]
-	if attempt == nil || control == nil || control.ActiveAttemptID != attempt.ID || proof.AttemptID != attempt.ID {
-		return gatewayTransitionAttempt{}, errf(409, "Gateway process proof does not match the active attempt")
-	}
 	observedAt, _ := time.Parse(time.RFC3339Nano, proof.ObservedAt)
-	effectStartedAt, _ := time.Parse(time.RFC3339Nano, attempt.EffectStartedAt)
 	if observedNow.IsZero() {
 		observedNow = time.Now().UTC()
 	}
-	if observedAt.Before(effectStartedAt) || observedAt.After(observedNow.Add(5*time.Second)) || observedNow.Sub(observedAt) > gatewayProcessProofFreshness {
+	if observedAt.After(observedNow.Add(5*time.Second)) || observedNow.Sub(observedAt) > gatewayProcessProofFreshness {
+		return gatewayTransitionAttempt{}, errf(409, "Gateway process proof is not fresh")
+	}
+	attempt := h.gatewayState.Attempts[connectionID]
+	control := h.gatewayState.Controls[connectionID]
+	if attempt != nil && control != nil && control.ActiveAttemptID == "" && gatewayAttemptTerminal(attempt.Phase) &&
+		attempt.AcceptedProof != nil && gatewayProcessProofIdentityEqual(*attempt.AcceptedProof, proof) {
+		next := cloneGatewayState(h.gatewayState)
+		next.Observations[connectionID] = gatewayObservationForAcceptedProof(next.Observations[connectionID], connectionID, proof, now(), cursor, capabilities)
+		if err := h.saveGatewayStateLocked(next); err != nil {
+			return *attempt, fmt.Errorf("persist repeated Gateway process proof heartbeat: %w", err)
+		}
+		h.applyGatewayHealthProjectionLocked(connectionID)
+		return *attempt, nil
+	}
+	if attempt == nil || control == nil || control.ActiveAttemptID != attempt.ID || proof.AttemptID != attempt.ID {
+		return gatewayTransitionAttempt{}, errf(409, "Gateway process proof does not match the active attempt")
+	}
+	effectStartedAt, _ := time.Parse(time.RFC3339Nano, attempt.EffectStartedAt)
+	if observedAt.Before(effectStartedAt) {
 		return gatewayTransitionAttempt{}, errf(409, "Gateway process proof is not fresh for the active attempt")
 	}
 	deadline, deadlineErr := time.Parse(time.RFC3339Nano, attempt.ProofDeadline)
@@ -484,6 +512,23 @@ func (h *Hub) acceptGatewayProcessProof(connectionID string, proof gatewayProces
 	nextControl := next.Controls[connectionID]
 	timestamp := now()
 	proofCopy := proof
+	promotedPlan := *next.LaunchPlans[connectionID]
+	promotedDescriptor, promotedGeneration := promotedPlan.Target, nextAttempt.TargetGeneration
+	if terminalPhase == gatewayAttemptRecovered {
+		promotedDescriptor, promotedGeneration = promotedPlan.Anchor.Descriptor, nextAttempt.RecoveryGeneration
+	}
+	promotedAnchor, anchorErr := newGatewayRegistrationAnchor(promotedDescriptor)
+	if anchorErr != nil {
+		return gatewayTransitionAttempt{}, errf(409, "accepted Gateway proof cannot promote its registration anchor: %s", anchorErr)
+	}
+	promotedAnchor.AttemptID = nextAttempt.ID
+	promotedAnchor.Generation = promotedGeneration
+	promotedAnchor.IntegritySHA256 = gatewayAnchorIntegrityWithProcess(promotedAnchor.Descriptor, promotedAnchor.AttemptID, promotedAnchor.Generation)
+	promotedPlan.Anchor = promotedAnchor
+	if promotedPlan.Target.Provider != "" {
+		promotedPlan.IntegritySHA256 = gatewayLaunchPlanIntegrity(promotedPlan)
+	}
+	next.LaunchPlans[connectionID] = &promotedPlan
 	nextAttempt.Phase = terminalPhase
 	nextAttempt.ReconcileEffect = ""
 	nextAttempt.AcceptedProof = &proofCopy
@@ -500,16 +545,7 @@ func (h *Hub) acceptGatewayProcessProof(connectionID string, proof gatewayProces
 	nextControl.Recovery = gatewayRecoveryNone
 	nextControl.Reason = ""
 	nextControl.UpdatedAt = timestamp
-	sequence := uint64(1)
-	observation := &gatewayProcessObservation{ConnectionID: connectionID, Status: "connected", HeartbeatAt: proof.ObservedAt, ObservedAt: timestamp}
-	if previous := next.Observations[connectionID]; previous != nil {
-		sequence = previous.Sequence + 1
-		observation.Cursor = previous.Cursor
-		observation.LastEventAt = previous.LastEventAt
-		observation.ObservedCapabilities = append([]string(nil), previous.ObservedCapabilities...)
-	}
-	observation.Sequence = sequence
-	next.Observations[connectionID] = observation
+	next.Observations[connectionID] = gatewayObservationForAcceptedProof(next.Observations[connectionID], connectionID, proof, timestamp, cursor, capabilities)
 	// The accepted proof and latch clear are one private foundation commit.
 	if err := h.saveGatewayStateLocked(next); err != nil {
 		return *nextAttempt, fmt.Errorf("persist accepted Gateway process proof: %w", err)
@@ -518,10 +554,34 @@ func (h *Hub) acceptGatewayProcessProof(connectionID string, proof gatewayProces
 	return *nextAttempt, nil
 }
 
+func gatewayProcessProofIdentityEqual(left, right gatewayProcessProof) bool {
+	return left.AttemptID == right.AttemptID && left.Generation == right.Generation && left.Build == right.Build && left.ExecutableDigest == right.ExecutableDigest
+}
+
+func gatewayObservationForAcceptedProof(previous *gatewayProcessObservation, connectionID string, proof gatewayProcessProof, timestamp, cursor string, capabilities []string) *gatewayProcessObservation {
+	sequence := uint64(1)
+	observation := &gatewayProcessObservation{ConnectionID: connectionID, Status: "connected", Cursor: strings.TrimSpace(cursor), HeartbeatAt: proof.ObservedAt, ObservedAt: timestamp}
+	if previous != nil {
+		sequence = previous.Sequence + 1
+		if observation.Cursor == "" {
+			observation.Cursor = previous.Cursor
+		}
+		observation.LastEventAt = previous.LastEventAt
+		if capabilities == nil {
+			observation.ObservedCapabilities = append([]string(nil), previous.ObservedCapabilities...)
+		}
+	}
+	if capabilities != nil {
+		observation.ObservedCapabilities = normalizeCapabilities(capabilities)
+	}
+	observation.Sequence = sequence
+	return observation
+}
+
 func (h *Hub) gatewayProcessEligibleConnectionIDs() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.gatewayFoundationPoisoned || h.gatewayState.Version != gatewayProcessStateVersion {
+	if h.gatewayFoundationPoisoned || (h.gatewayState.Version != gatewayProcessStateVersion && h.gatewayState.Version != gatewayLaunchProofStateVersion) {
 		return nil
 	}
 	result := []string{}

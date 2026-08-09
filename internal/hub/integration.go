@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 type PlatformConnection struct {
@@ -371,10 +372,22 @@ type InboxActionParams struct {
 }
 
 type ConnectionHeartbeatParams struct {
-	Status       string   `json:"status"`
-	Cursor       string   `json:"cursor"`
-	Capabilities []string `json:"capabilities"`
-	Error        string   `json:"error"`
+	Status         string                         `json:"status"`
+	Cursor         string                         `json:"cursor"`
+	Capabilities   []string                       `json:"capabilities"`
+	Error          string                         `json:"error"`
+	GatewayProcess *GatewayProcessHeartbeatParams `json:"_gatewayProcess,omitempty"`
+}
+
+// GatewayProcessHeartbeatParams is private connector-to-Runtime proof
+// plumbing. It is accepted only on the existing connector-authenticated
+// heartbeat route and is never projected into public Connection/SSE output.
+// Runtime supplies the observation timestamp on receipt.
+type GatewayProcessHeartbeatParams struct {
+	AttemptID        string `json:"attemptId"`
+	Generation       string `json:"generation"`
+	Build            string `json:"build"`
+	ExecutableDigest string `json:"executableDigest"`
 }
 
 type OutboxResultParams struct {
@@ -1195,6 +1208,30 @@ func (h *Hub) HeartbeatConnection(id string, p ConnectionHeartbeatParams) (Platf
 		return PlatformConnection{}, errf(400, "invalid connection status %q", status)
 	}
 	ts := now()
+	if p.GatewayProcess != nil {
+		if status != "connected" || strings.TrimSpace(p.Error) != "" {
+			return PlatformConnection{}, errf(409, "Gateway process proof requires a connected heartbeat")
+		}
+		observedNow, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil {
+			return PlatformConnection{}, errf(500, "Runtime heartbeat clock is invalid")
+		}
+		proof := gatewayProcessProof{
+			AttemptID: strings.TrimSpace(p.GatewayProcess.AttemptID), Generation: strings.TrimSpace(p.GatewayProcess.Generation),
+			Build: strings.TrimSpace(p.GatewayProcess.Build), ExecutableDigest: strings.TrimSpace(p.GatewayProcess.ExecutableDigest), ObservedAt: ts,
+		}
+		if _, err := h.acceptGatewayProcessProofLocked(next.ID, proof, observedNow, p.Cursor, p.Capabilities); err != nil {
+			return PlatformConnection{}, err
+		}
+		projected := h.connections[next.ID]
+		if projected == nil {
+			return PlatformConnection{}, errf(404, "connection not found: %s", id)
+		}
+		copy := *projected
+		copy.Capabilities = append([]string(nil), projected.Capabilities...)
+		h.emitGlobalLocked("loom/integration-connection", map[string]any{"connection": copy})
+		return copy, nil
+	}
 	if handled, err := h.recordGatewayObservationLocked(next.ID, status, p.Error, ts, ts, p.Cursor, "", p.Capabilities); handled {
 		if err != nil {
 			return PlatformConnection{}, errf(500, "persist Gateway observation: %s", err)
