@@ -38,6 +38,9 @@ func TestLSpawnWithCredentialFDOnlyInheritsAnonymousDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	if err := st.SaveCredentialFloor(); err != nil {
+		t.Fatal(err)
+	}
 	credentialStore, err := New(st)
 	if err != nil {
 		t.Fatal(err)

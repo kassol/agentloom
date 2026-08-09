@@ -41,10 +41,6 @@ func TestLarkMigrateCLIEndToEnd(t *testing.T) {
 		t.Fatalf("connection not migrated: %q", migratedRef)
 	}
 	cmdLarkMigrate(args{
-		positional: []string{"verify"},
-		flags:      map[string]string{"data": dir, "connection": connection.ID},
-	})
-	cmdLarkMigrate(args{
 		positional: []string{"rollback"},
 		flags:      map[string]string{"data": dir, "connection": connection.ID},
 	})

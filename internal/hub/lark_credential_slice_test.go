@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yan5xu/codex-loom/internal/credentials"
 )
@@ -81,9 +82,9 @@ func TestLarkMigrateVerifyRollbackPreservesIdentity(t *testing.T) {
 	if bytes.Contains(foundation, secret) {
 		t.Fatal("secret leaked into the runtime foundation")
 	}
-	verified, err := fixture.h.VerifyLarkCredential(fixture.connection.ID)
-	if err != nil || !verified.AlreadyMigrated {
-		t.Fatalf("verify failed: %#v err=%v", verified, err)
+	// Without an accepted exact R1 proof, Verify must fail closed.
+	if _, err := fixture.h.VerifyLarkCredential(fixture.connection.ID); err == nil {
+		t.Fatal("verify succeeded without an accepted Gateway exact proof")
 	}
 	rollback, err := fixture.h.RollbackLarkCredential(fixture.connection.ID)
 	if err != nil {
@@ -102,6 +103,41 @@ func TestLarkMigrateVerifyRollbackPreservesIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestLarkMigrateVerifyAfterExactProof(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	result, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initializeAdoptedR0bControl(t, &fixture, gatewayRecoveryNone, "")
+	adapter := &fakeGatewayServiceAdapter{}
+	adapter.applyResult = gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied}
+	fixture.h.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) { return adapter, nil }
+	snapshot, err := fixture.h.snapshotGatewayBindingForProcessPlan(fixture.connection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := r1Plan(t, fixture.connection.ID, fixture.st.Dir())
+	if _, err := fixture.h.configureGatewayLaunchPlan(snapshot, plan); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := fixture.h.beginGatewayProcessAttempt(context.Background(), fixture.connection.ID, gatewayAttemptManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.h.acceptGatewayProcessProof(fixture.connection.ID, exactR1Proof(attempt, false, timeNow()), timeNow()); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := fixture.h.VerifyLarkCredential(fixture.connection.ID)
+	if err != nil || !verified.AlreadyMigrated || verified.RequiresProof {
+		t.Fatalf("verify after exact proof failed: %#v err=%v", verified, err)
+	}
+	_ = result
+}
+
+func timeNow() time.Time { return time.Now().UTC() }
 
 func TestLarkMigrateDryRunZeroWrites(t *testing.T) {
 	fixture := newLarkFixture(t)

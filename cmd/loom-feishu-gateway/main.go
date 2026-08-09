@@ -25,6 +25,11 @@ func main() {
 	flag.Parse()
 
 	secret := strings.TrimSpace(os.Getenv("FEISHU_APP_SECRET"))
+	if secret == "" {
+		if inherited, ok := readInheritedCredentialFD(); ok {
+			secret = strings.TrimSpace(string(inherited))
+		}
+	}
 	if secret == "" && strings.TrimSpace(*appID) != "" {
 		var err error
 		secret, err = feishu.LoadAppSecret(*appID)

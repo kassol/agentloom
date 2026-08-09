@@ -23,8 +23,29 @@ func newCredentialFixture(t *testing.T) credentialFixture {
 	if _, err := st.ClaimWritableOwnership(); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.SaveCredentialFloor(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = st.Close() })
 	return credentialFixture{st: st}
+}
+
+func TestLPutRequiresCredentialFloor(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimWritableOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	credentialStore, err := New(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credentialStore.Put([]byte("secret")); err == nil {
+		t.Fatal("Put succeeded without a raised credential floor")
+	}
 }
 
 func TestVPutResolveRoundTripAndOwnerOnlyPermissions(t *testing.T) {

@@ -64,6 +64,9 @@ func New(st *store.Store) (*Store, error) {
 // reference. The secret is written to a temporary file and atomically renamed
 // to a fresh random ID; an existing ID is never overwritten.
 func (s *Store) Put(secret []byte) (Ref, error) {
+	if !s.st.CredentialFloorPresent() {
+		return "", fmt.Errorf("credential floor must be raised before the first managed credential write")
+	}
 	if len(secret) == 0 || len(secret) > maxSecret {
 		return "", fmt.Errorf("credential secret must be between 1 byte and %d bytes", maxSecret)
 	}
