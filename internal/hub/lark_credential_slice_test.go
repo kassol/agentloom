@@ -3,6 +3,7 @@ package hub
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -582,6 +583,165 @@ func TestLarkMigratePreparedResumeRequiresExistingCredential(t *testing.T) {
 	}
 	if ref := connectionRefByID(t, fixture.h, fixture.connection.ID); ref != "keychain:com.codexloom.lark" {
 		t.Fatalf("connection reference advanced to a dangling ref: %q", ref)
+	}
+}
+
+func TestLarkMigrateRecordWriteValidUnequalRetainsAll(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	connectionID := fixture.connection.ID
+	recordPath := filepath.Join(fixture.dir, "lark-migrations", connectionID+".json")
+	fixture.h.larkMigrationRecordWriteForTest = func() error {
+		// The intended record committed, then a valid but different record
+		// (same CurrentRef, different MigratedAt) replaced it before the error.
+		data, err := os.ReadFile(recordPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var committed larkCredentialMigrationRecord
+		if err := json.Unmarshal(data, &committed); err != nil {
+			t.Fatal(err)
+		}
+		committed.MigratedAt = "different-timestamp"
+		payload, err := json.Marshal(committed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(recordPath, payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Errorf("injected fsync failure after commit")
+	}
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), connectionID, []byte("secret"), false); err == nil {
+		t.Fatal("migrate succeeded despite valid-unequal record outcome")
+	} else if !IsLarkMigrationIndeterminate(err) {
+		t.Fatalf("valid-unequal record outcome was not a typed indeterminate: %v", err)
+	}
+	record, err := fixture.h.readLarkMigrationRecord(connectionID)
+	if err != nil || record.Phase != larkMigrationPhasePrepared {
+		t.Fatalf("valid-unequal record was not retained: %#v err=%v", record, err)
+	}
+	credentialStore, err := credentials.New(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credentialStore.Resolve(credentials.Ref(record.CurrentRef)); err != nil {
+		t.Fatalf("only credential was deleted despite valid-unequal record: %v", err)
+	}
+	// Re-entry must resume from the retained record/credential.
+	fixture.h.larkMigrationRecordWriteForTest = nil
+	result, err := fixture.h.MigrateLarkCredential(context.Background(), connectionID, nil, false)
+	if err != nil || !result.PlanPending {
+		t.Fatalf("re-run migrate did not resume plan_pending: %#v err=%v", result, err)
+	}
+}
+
+func TestLarkMigrateRecordWriteAbsentCleansCredential(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	connectionID := fixture.connection.ID
+	recordPath := filepath.Join(fixture.dir, "lark-migrations", connectionID+".json")
+	fixture.h.larkMigrationRecordWriteForTest = func() error {
+		// The record is absent at decision time: the effect provably did not
+		// commit, so the orphan credential may be cleaned.
+		if err := os.Remove(recordPath); err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Errorf("injected fsync failure after commit")
+	}
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), connectionID, []byte("secret"), false); err == nil {
+		t.Fatal("migrate succeeded despite absent record outcome")
+	} else if IsLarkMigrationIndeterminate(err) {
+		t.Fatalf("proven-absent record write was misclassified as indeterminate: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(fixture.st.Dir(), credentials.DirectoryName))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("orphan credential was not cleaned: entries=%v err=%v", entries, err)
+	}
+	if _, err := fixture.h.readLarkMigrationRecord(connectionID); !os.IsNotExist(err) {
+		t.Fatalf("absent record was not cleaned: %v", err)
+	}
+}
+
+func TestLarkMigrateThirdLegacyRefFailsClosedAfterReopen(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	connectionID := fixture.connection.ID
+	record := larkCredentialMigrationRecord{
+		Version: 1, ConnectionID: connectionID, PreviousRef: "keychain:com.codexloom.lark",
+		CurrentRef: "managed:" + strings.Repeat("a", 64), Phase: larkMigrationPhasePrepared, MigratedAt: now(),
+	}
+	if err := fixture.h.writeLarkMigrationRecord(record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.h.UpdateConnection(connectionID, ConnectionParams{CredentialRef: "keychain:com.codexloom.third"}); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := fixture.h.MigrateLarkCredential(context.Background(), connectionID, []byte("secret"), false); err == nil {
+			t.Fatal("migrate entered fresh Put on a third-party reference with a prepared record")
+		}
+		if ref := connectionRefByID(t, fixture.h, connectionID); ref != "keychain:com.codexloom.third" {
+			t.Fatalf("connection reference changed on inconsistent tuple: %q", ref)
+		}
+		if _, err := fixture.h.readLarkMigrationRecord(connectionID); err != nil {
+			t.Fatalf("migration record was overwritten on inconsistent tuple: %v", err)
+		}
+		entries, err := os.ReadDir(filepath.Join(fixture.st.Dir(), credentials.DirectoryName))
+		if err == nil && len(entries) != 0 {
+			t.Fatalf("migrate created a credential on inconsistent tuple: %v", entries)
+		}
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("read credentials directory: %v", err)
+		}
+		if attempt == 0 {
+			fixture.h.Shutdown()
+			fixture.h = nil
+			reopened, err := Open(fixture.st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.h = reopened
+		}
+	}
+}
+
+func TestLarkMigrateManagedPreparedMissingSecretDoesNotAdvance(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	if err := fixture.st.SaveCredentialFloor(); err != nil {
+		t.Fatal(err)
+	}
+	credentialStore, err := credentials.New(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := credentialStore.Put([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := larkCredentialMigrationRecord{
+		Version: 1, ConnectionID: fixture.connection.ID, PreviousRef: "keychain:com.codexloom.lark",
+		CurrentRef: string(ref), Phase: larkMigrationPhasePrepared, MigratedAt: now(),
+	}
+	if err := fixture.h.writeLarkMigrationRecord(record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.h.UpdateConnection(fixture.connection.ID, ConnectionParams{CredentialRef: string(ref)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentialStore.Delete(ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, nil, false); err == nil {
+		t.Fatal("managed prepared migration advanced without its managed credential")
+	}
+	after, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+	if err != nil || after.Phase != larkMigrationPhasePrepared {
+		t.Fatalf("prepared phase advanced without the managed credential: %#v err=%v", after, err)
+	}
+	if planRef := fixture.h.LarkGatewayLaunchPlanRef(fixture.connection.ID); planRef != "" {
+		t.Fatalf("launch plan was frozen without the managed credential: %q", planRef)
 	}
 }
 
