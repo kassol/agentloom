@@ -312,3 +312,25 @@ func TestPreflightAnchorRenderMatchesInstalledUnitBytes(t *testing.T) {
 		t.Fatalf("preflight anchor unit mismatch:\nrendered:\n%s\ninstalled:\n%s", rendered, installed)
 	}
 }
+
+func TestPreflightRejectsSymlinkExecutableLikeConfigure(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("symlink fixture is unsupported on windows")
+	}
+	fixture := newL2aFixture(t)
+	defer fixture.close(t)
+	realExecutable := filepath.Join(fixture.dir, "loom-feishu-gateway-real")
+	if err := os.WriteFile(realExecutable, []byte("accepted gateway binary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(fixture.dir, "loom-feishu-gateway")
+	if err := os.Symlink(realExecutable, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.PreflightLarkGatewayLaunch(fixture.connection.ID, symlink); err == nil {
+		t.Fatal("preflight accepted a symlink executable that configure rejects")
+	}
+	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, symlink); err == nil {
+		t.Fatal("configure accepted a symlink executable")
+	}
+}

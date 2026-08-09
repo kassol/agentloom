@@ -82,14 +82,6 @@ func cmdLarkMigrate(a args) {
 			"alreadyMigrated": result.AlreadyMigrated, "launchPlan": "ready",
 		})
 	case "migrate":
-		source := strings.TrimSpace(a.flags["source"])
-		if source == "" {
-			usage("lark-migrate migrate --source PATH")
-		}
-		secretText, err := readOwnerOnlySecretFile(source)
-		if err != nil {
-			fail(err)
-		}
 		executable, err := larkGatewayBinaryPath()
 		if err != nil {
 			fail(fmt.Errorf("locate loom-feishu-gateway for launch plan: %w", err))
@@ -97,9 +89,23 @@ func cmdLarkMigrate(a args) {
 		if err := h.PreflightLarkGatewayLaunch(connectionID, executable); err != nil {
 			fail(fmt.Errorf("launch plan preflight: %w", err))
 		}
-		result, err := h.MigrateLarkCredential(ctx, connectionID, []byte(secretText), false)
+		result, err := h.MigrateLarkCredential(ctx, connectionID, nil, false)
 		if err != nil {
-			fail(err)
+			if !hub.IsLarkCredentialSecretRequired(err) {
+				fail(err)
+			}
+			source := strings.TrimSpace(a.flags["source"])
+			if source == "" {
+				usage("lark-migrate migrate --source PATH")
+			}
+			secretText, readErr := readOwnerOnlySecretFile(source)
+			if readErr != nil {
+				fail(readErr)
+			}
+			result, err = h.MigrateLarkCredential(ctx, connectionID, []byte(secretText), false)
+			if err != nil {
+				fail(err)
+			}
 		}
 		fmt.Printf("%s Lark connection %s now uses %s\n", green("migrated"), bold(result.ConnectionID), result.CurrentRef)
 		if result.FloorRaised {

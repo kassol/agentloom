@@ -353,6 +353,7 @@ type Hub struct {
 	gatewayServiceAdapterForTest    func(gatewayLaunchPlan) (gatewayServiceAdapter, error)
 	gatewayProofWaitForTest         time.Duration
 	larkUpdateConnectionForTest     func(string, string) (PlatformConnection, error)
+	larkMigrationRecordWriteForTest func() error
 }
 
 // New is retained for in-process callers that cannot recover from an invalid

@@ -331,43 +331,51 @@ func verifyGatewayLaunchPlanExecutables(plan gatewayLaunchPlan) error {
 }
 
 func verifyGatewayExecutable(descriptor gatewayLaunchDescriptor) error {
-	pathInfo, err := os.Lstat(descriptor.Executable)
+	digest, err := verifyGatewayExecutablePath(descriptor.Executable)
 	if err != nil {
 		return err
+	}
+	if digest != descriptor.ExecutableDigest {
+		return fmt.Errorf("Gateway executable digest mismatch")
+	}
+	return nil
+}
+
+func verifyGatewayExecutablePath(path string) (string, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return "", err
 	}
 	if !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || pathInfo.Size() <= 0 || pathInfo.Size() > gatewayProcessExecutableMaxBytes {
-		return fmt.Errorf("Gateway executable is not a bounded regular file")
+		return "", fmt.Errorf("Gateway executable is not a bounded regular file")
 	}
 	if goruntime.GOOS != "windows" && pathInfo.Mode().Perm()&0o111 == 0 {
-		return fmt.Errorf("Gateway executable is not executable")
+		return "", fmt.Errorf("Gateway executable is not executable")
 	}
-	file, err := os.Open(descriptor.Executable)
+	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer file.Close()
 	openedInfo, err := file.Stat()
 	if err != nil || !os.SameFile(pathInfo, openedInfo) {
-		return fmt.Errorf("Gateway executable changed while opening")
+		return "", fmt.Errorf("Gateway executable changed while opening")
 	}
 	digest := sha256.New()
 	written, err := io.Copy(digest, io.LimitReader(file, gatewayProcessExecutableMaxBytes+1))
 	if err != nil || written != pathInfo.Size() || written > gatewayProcessExecutableMaxBytes {
-		return fmt.Errorf("Gateway executable changed or exceeded integrity bound")
+		return "", fmt.Errorf("Gateway executable changed or exceeded integrity bound")
 	}
 	afterInfo, err := file.Stat()
-	currentInfo, pathErr := os.Stat(descriptor.Executable)
-	currentLstat, lstatErr := os.Lstat(descriptor.Executable)
+	currentInfo, pathErr := os.Stat(path)
+	currentLstat, lstatErr := os.Lstat(path)
 	if err != nil || pathErr != nil || !os.SameFile(openedInfo, afterInfo) || !os.SameFile(openedInfo, currentInfo) || afterInfo.Size() != openedInfo.Size() {
-		return fmt.Errorf("Gateway executable identity changed during verification")
+		return "", fmt.Errorf("Gateway executable identity changed during verification")
 	}
 	if lstatErr != nil || !currentLstat.Mode().IsRegular() || currentLstat.Mode()&os.ModeSymlink != 0 || !os.SameFile(openedInfo, currentLstat) {
-		return fmt.Errorf("Gateway executable path changed during verification")
+		return "", fmt.Errorf("Gateway executable path changed during verification")
 	}
-	if got := hex.EncodeToString(digest.Sum(nil)); got != descriptor.ExecutableDigest {
-		return fmt.Errorf("Gateway executable digest mismatch")
-	}
-	return nil
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func gatewayStringMayContainSecret(value string) bool {

@@ -142,3 +142,37 @@ func TestVerifySelfExecutableMatchesRunningTestBinary(t *testing.T) {
 		t.Fatalf("running test binary was not accepted as its own proof: %v", err)
 	}
 }
+
+func TestValidateGatewayStartupAllowsLegacyRecoveryUnit(t *testing.T) {
+	current, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	digest := hex.EncodeToString(sum[:])
+	proof := &hub.GatewayProcessHeartbeatParams{
+		AttemptID: "gattempt_recovery", Generation: "ggen_recovery",
+		Build: "sha256:" + digest[:16], ExecutableDigest: digest,
+	}
+	// A legacy recovery unit carries proof identity but no managed reference:
+	// it must consume the legacy source, not fail before the provider socket.
+	if err := validateGatewayStartup(proof, false, ""); err != nil {
+		t.Fatalf("proof-bearing legacy recovery unit was rejected: %v", err)
+	}
+	// An explicitly set (even blank) managed reference never falls back.
+	if err := validateGatewayStartup(proof, true, "  "); err == nil {
+		t.Fatal("explicit blank managed ref with proof was not rejected")
+	}
+	if err := validateGatewayStartup(proof, true, "managed:"+strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("valid managed ref with matching executable was rejected: %v", err)
+	}
+	wrongDigest := *proof
+	wrongDigest.ExecutableDigest = strings.Repeat("0", 64)
+	if err := validateGatewayStartup(&wrongDigest, true, "managed:"+strings.Repeat("a", 64)); err == nil {
+		t.Fatal("proof with mismatched executable was accepted")
+	}
+}

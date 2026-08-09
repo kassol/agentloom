@@ -73,6 +73,14 @@ func TestLarkMigrateCLIEndToEnd(t *testing.T) {
 	if planRef := openConnectionLaunchPlanRef(t, dir, connection.ID); !strings.HasPrefix(planRef, "managed:") {
 		t.Fatalf("migrate did not freeze a typed launch plan: %q", planRef)
 	}
+	// A completed/plan_pending re-entry must not require the original source.
+	if err := os.Remove(secretPath); err != nil {
+		t.Fatal(err)
+	}
+	cmdLarkMigrate(args{
+		positional: []string{"migrate"},
+		flags:      map[string]string{"data": dir, "connection": connection.ID},
+	})
 	cmdLarkMigrate(args{
 		positional: []string{"rollback"},
 		flags:      map[string]string{"data": dir, "connection": connection.ID},

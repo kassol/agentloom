@@ -36,13 +36,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if processProof != nil && !managedRefSet {
-		log.Fatalf("gateway attempt proof identity requires an explicit managed credential reference")
-	}
-	if processProof != nil {
-		if err := verifySelfExecutable(processProof); err != nil {
-			log.Fatalf("gateway executable does not match the frozen launch plan: %v", err)
-		}
+	if err := validateGatewayStartup(processProof, managedRefSet, managedRef); err != nil {
+		log.Fatal(err)
 	}
 	secret := ""
 	if managedRefSet {
@@ -107,6 +102,24 @@ func gatewayProcessProofFromEnv() *hub.GatewayProcessHeartbeatParams {
 	return &hub.GatewayProcessHeartbeatParams{
 		AttemptID: attemptID, Generation: generation, Build: build, ExecutableDigest: digest,
 	}
+}
+
+// validateGatewayStartup enforces the startup credential/proof contract before
+// any provider socket opens: an explicitly set managed reference must be
+// canonical (never falls back to env/FD/Keychain), and a proof-bearing unit
+// must run the exact frozen executable. A proof-bearing legacy recovery unit
+// legitimately has no managed reference and consumes the legacy source; the
+// Hub discriminates recovery proof by its unique recovery generation.
+func validateGatewayStartup(proof *hub.GatewayProcessHeartbeatParams, managedRefSet bool, managedRef string) error {
+	if managedRefSet && !credentials.IsManagedRef(managedRef) {
+		return fmt.Errorf("invalid managed credential reference")
+	}
+	if proof != nil {
+		if err := verifySelfExecutable(proof); err != nil {
+			return fmt.Errorf("gateway executable does not match the frozen launch plan: %w", err)
+		}
+	}
+	return nil
 }
 
 // managedRefFromEnv distinguishes an unset managed credential reference from an

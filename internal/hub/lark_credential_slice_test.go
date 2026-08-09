@@ -3,6 +3,7 @@ package hub
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -228,8 +229,9 @@ func TestLarkMigratePlanPendingDurableAndReentrant(t *testing.T) {
 	if record.Phase != larkMigrationPhasePlanPending {
 		t.Fatalf("record phase = %q", record.Phase)
 	}
-	// Re-entry before the plan is configured stays durable and does not error.
-	second, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("different"), false)
+	// Re-entry before the plan is configured consumes no secret and stays
+	// durable plan_pending.
+	second, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,6 +410,169 @@ func TestLarkMigrateIdempotentAfterCutover(t *testing.T) {
 	again, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("different"), false)
 	if err != nil || !again.AlreadyMigrated {
 		t.Fatalf("migrate after successful cutover was not idempotent: %#v err=%v", again, err)
+	}
+}
+
+func TestLarkMigrateRecordWriteCommittedButErrorKeepsCredential(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	fixture.h.larkMigrationRecordWriteForTest = func() error {
+		return fmt.Errorf("injected dir fsync failure after commit")
+	}
+	secret := []byte("secret")
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, secret, false); err == nil {
+		t.Fatal("migrate succeeded despite indeterminate record write")
+	}
+	fixture.h.larkMigrationRecordWriteForTest = nil
+	// The committed record must keep the managed credential for re-entry.
+	record, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+	if err != nil || record.Phase != larkMigrationPhasePrepared {
+		t.Fatalf("committed record was not retained: %#v err=%v", record, err)
+	}
+	credentialStore, err := credentials.New(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credentialStore.Resolve(credentials.Ref(record.CurrentRef)); err != nil {
+		t.Fatalf("managed credential was deleted despite committed record: %v", err)
+	}
+	// Re-run migrate completes the migration without re-reading the secret.
+	result, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, nil, false)
+	if err != nil || !result.PlanPending {
+		t.Fatalf("re-run migrate did not resume plan_pending: %#v err=%v", result, err)
+	}
+}
+
+func TestLarkMigrateConnectionWriteCommittedButErrorKeepsCredential(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	fixture.h.larkUpdateConnectionForTest = func(connectionID, credentialRef string) (PlatformConnection, error) {
+		committed, commitErr := fixture.h.UpdateConnection(connectionID, ConnectionParams{CredentialRef: credentialRef})
+		if commitErr != nil {
+			return PlatformConnection{}, commitErr
+		}
+		return committed, fmt.Errorf("injected integrations fsync failure after commit")
+	}
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err == nil {
+		t.Fatal("migrate succeeded despite indeterminate connection write")
+	}
+	fixture.h.larkUpdateConnectionForTest = nil
+	record, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+	if err != nil || record.Phase != larkMigrationPhasePrepared {
+		t.Fatalf("committed record was not retained: %#v err=%v", record, err)
+	}
+	if ref := connectionRefByID(t, fixture.h, fixture.connection.ID); ref != record.CurrentRef {
+		t.Fatalf("connection reference was not committed: %q", ref)
+	}
+	credentialStore, err := credentials.New(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credentialStore.Resolve(credentials.Ref(record.CurrentRef)); err != nil {
+		t.Fatalf("managed credential was deleted despite committed reference: %v", err)
+	}
+	result, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, nil, false)
+	if err != nil || !result.PlanPending {
+		t.Fatalf("re-run migrate did not resume plan_pending: %#v err=%v", result, err)
+	}
+}
+
+func TestLarkRollbackRejectsThirdPartyBindingDrift(t *testing.T) {
+	for _, third := range []string{"keychain:com.codexloom.other", "managed:" + strings.Repeat("c", 64)} {
+		fixture := newLarkFixture(t)
+		defer fixture.close(t)
+		if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err != nil {
+			t.Fatal(err)
+		}
+		fixture.h.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) {
+			return &fakeGatewayServiceAdapter{applyResult: gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied}}, nil
+		}
+		executable := filepath.Join(fixture.dir, "loom-feishu-gateway")
+		if err := os.WriteFile(executable, []byte("accepted gateway binary\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.h.FinishLarkGatewayLaunchPlan(fixture.connection.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.h.UpdateConnection(fixture.connection.ID, ConnectionParams{CredentialRef: third}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.h.RollbackLarkCredential(fixture.connection.ID); err == nil {
+			t.Fatalf("rollback accepted third-party binding drift %q", third)
+		}
+		if ref := connectionRefByID(t, fixture.h, fixture.connection.ID); ref != third {
+			t.Fatalf("rollback changed the drifted reference: %q", ref)
+		}
+		if ref := fixture.h.LarkGatewayLaunchPlanRef(fixture.connection.ID); ref == "" {
+			t.Fatal("rollback revoked the typed plan on third-party drift")
+		}
+		if _, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID); err != nil {
+			t.Fatalf("rollback removed the migration record on third-party drift: %v", err)
+		}
+	}
+}
+
+func TestLarkVerifyFreshnessRefreshedByContinuousExactHeartbeat(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &fakeGatewayServiceAdapter{applyResult: gatewayServiceEffectResult{Outcome: gatewayServiceEffectApplied}}
+	fixture.h.gatewayServiceAdapterForTest = func(gatewayLaunchPlan) (gatewayServiceAdapter, error) { return adapter, nil }
+	executable := filepath.Join(fixture.dir, "loom-feishu-gateway")
+	if err := os.WriteFile(executable, []byte("accepted gateway binary\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.ConfigureLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.FinishLarkGatewayLaunchPlan(fixture.connection.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.h.RestartGatewayProcesses(); err != nil {
+		t.Fatal(err)
+	}
+	fixture.h.mu.Lock()
+	attempt := fixture.h.gatewayState.Attempts[fixture.connection.ID]
+	exact := &GatewayProcessHeartbeatParams{
+		AttemptID: attempt.ID, Generation: attempt.TargetGeneration, Build: attempt.Plan.Target.Build,
+		ExecutableDigest: attempt.Plan.Target.ExecutableDigest,
+	}
+	fixture.h.mu.Unlock()
+	if _, err := fixture.h.HeartbeatConnection(fixture.connection.ID, ConnectionHeartbeatParams{Status: "connected", GatewayProcess: exact}); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-2 * gatewayProcessProofFreshness).Format(time.RFC3339Nano)
+	fixture.h.mu.Lock()
+	live := fixture.h.gatewayState.Attempts[fixture.connection.ID]
+	live.AcceptedProof.ObservedAt = old
+	live.UpdatedAt = old
+	fixture.h.mu.Unlock()
+	if _, err := fixture.h.VerifyLarkCredential(fixture.connection.ID); err == nil {
+		t.Fatal("verify passed with a stale accepted proof")
+	}
+	wrong := &GatewayProcessHeartbeatParams{AttemptID: "gattempt_other", Generation: "ggen_other", Build: "x", ExecutableDigest: "y"}
+	if _, err := fixture.h.HeartbeatConnection(fixture.connection.ID, ConnectionHeartbeatParams{Status: "connected", GatewayProcess: wrong}); err == nil {
+		t.Fatal("wrong identity heartbeat was accepted")
+	}
+	fixture.h.mu.Lock()
+	staleAfterWrong := fixture.h.gatewayState.Attempts[fixture.connection.ID].AcceptedProof.ObservedAt
+	fixture.h.mu.Unlock()
+	if staleAfterWrong != old {
+		t.Fatal("wrong identity heartbeat refreshed the accepted proof")
+	}
+	if _, err := fixture.h.HeartbeatConnection(fixture.connection.ID, ConnectionHeartbeatParams{Status: "connected", GatewayProcess: exact}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.h.VerifyLarkCredential(fixture.connection.ID); err != nil {
+		t.Fatalf("verify failed after a fresh exact heartbeat: %v", err)
+	}
+	if err := fixture.h.PreflightLarkGatewayLaunch(fixture.connection.ID, executable); err != nil {
+		t.Fatalf("cutover-ready no-op failed after freshness refresh: %v", err)
 	}
 }
 

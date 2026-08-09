@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,6 +43,15 @@ const (
 	larkMigrationPhaseCompleted   = "completed"
 	larkMigrationPhaseRefRestored = "ref_restored"
 )
+
+var errLarkCredentialSecretRequired = errors.New("credential secret is required")
+
+// IsLarkCredentialSecretRequired reports whether err indicates a fresh
+// migration needs the operator to supply the credential secret. plan_pending
+// and completed re-entries return without this error and consume no secret.
+func IsLarkCredentialSecretRequired(err error) bool {
+	return errors.Is(err, errLarkCredentialSecretRequired)
+}
 
 func validCredentialRef(value string) bool {
 	value = strings.TrimSpace(value)
@@ -134,7 +144,7 @@ func (h *Hub) MigrateLarkCredential(_ context.Context, connectionID string, secr
 		return result, nil
 	}
 	if len(secret) == 0 {
-		return result, errf(400, "credential secret is required")
+		return result, errLarkCredentialSecretRequired
 	}
 	if !h.st.CredentialFloorPresent() {
 		if err := h.st.SaveCredentialFloor(); err != nil {
@@ -156,10 +166,16 @@ func (h *Hub) MigrateLarkCredential(_ context.Context, connectionID string, secr
 		CurrentRef: result.CurrentRef, Phase: larkMigrationPhasePrepared, MigratedAt: now(),
 	}
 	if err := h.writeLarkMigrationRecord(record); err != nil {
+		if _, readErr := h.readLarkMigrationRecord(connectionID); readErr == nil {
+			return result, errf(500, "migration record committed but reported indeterminate: %s (managed credential retained; re-run migrate to reconcile)", err)
+		}
 		_ = credentialStore.Delete(ref)
 		return result, errf(500, "persist migration record: %s (managed credential deleted; credential floor stays raised)", err)
 	}
 	if _, err := h.updateLarkConnection(connectionID, result.CurrentRef); err != nil {
+		if persisted, readErr := h.larkConnectionRefPersisted(connectionID); readErr == nil && persisted == result.CurrentRef {
+			return result, errf(500, "connection reference committed but reported indeterminate: %s (credential and record retained; re-run migrate to reconcile)", err)
+		}
 		_ = credentialStore.Delete(ref)
 		_ = h.removeLarkMigrationRecord(connectionID)
 		return result, errf(500, "update connection credential reference: %s (managed credential and record removed; credential floor stays raised)", err)
@@ -268,7 +284,13 @@ func (h *Hub) RollbackLarkCredential(connectionID string) (LarkCredentialMigrati
 	if record.CurrentRef == "" || record.PreviousRef == "" {
 		return result, errf(409, "migration record is incomplete")
 	}
-	if strings.TrimSpace(connection.CredentialRef) == strings.TrimSpace(record.CurrentRef) {
+	currentRef := strings.TrimSpace(connection.CredentialRef)
+	recordCurrent := strings.TrimSpace(record.CurrentRef)
+	recordPrevious := strings.TrimSpace(record.PreviousRef)
+	if currentRef != recordCurrent && currentRef != recordPrevious {
+		return result, errf(409, "connection reference %q is neither the migrated reference nor its previous reference; manual reconcile required", currentRef)
+	}
+	if currentRef == recordCurrent {
 		if strings.TrimSpace(record.PreviousRef) == "" {
 			return result, errf(409, "rollback requires a non-empty previous credential reference")
 		}
@@ -405,6 +427,22 @@ func (h *Hub) updateLarkConnection(connectionID, credentialRef string) (Platform
 	return h.UpdateConnection(connectionID, ConnectionParams{CredentialRef: credentialRef})
 }
 
+// larkConnectionRefPersisted is the authoritative disk readback used to decide
+// whether an indeterminate integrations write actually committed the reference
+// effect. In-memory state is deliberately not trusted here because a persist
+// error may already have reverted it.
+func (h *Hub) larkConnectionRefPersisted(connectionID string) (string, error) {
+	var config integrationConfig
+	if err := h.st.LoadIntegrations(&config); err != nil {
+		return "", err
+	}
+	connection := config.Connections[connectionID]
+	if connection == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(connection.CredentialRef), nil
+}
+
 func (h *Hub) advanceLarkMigrationPhase(connectionID, phase string) error {
 	record, err := h.readLarkMigrationRecord(connectionID)
 	if err != nil {
@@ -449,6 +487,11 @@ func (h *Hub) writeLarkMigrationRecord(record larkCredentialMigrationRecord) err
 			return err
 		}
 		committed = true
+		if h.larkMigrationRecordWriteForTest != nil {
+			if hookErr := h.larkMigrationRecordWriteForTest(); hookErr != nil {
+				return hookErr
+			}
+		}
 		directory, err := root.Open("lark-migrations")
 		if err != nil {
 			return err

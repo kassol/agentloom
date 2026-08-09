@@ -475,7 +475,12 @@ func (h *Hub) acceptGatewayProcessProofLocked(connectionID string, proof gateway
 	if attempt != nil && control != nil && control.ActiveAttemptID == "" && gatewayAttemptTerminal(attempt.Phase) &&
 		attempt.AcceptedProof != nil && gatewayProcessProofIdentityEqual(*attempt.AcceptedProof, proof) {
 		next := cloneGatewayState(h.gatewayState)
-		next.Observations[connectionID] = gatewayObservationForAcceptedProof(next.Observations[connectionID], connectionID, proof, now(), cursor, capabilities)
+		timestamp := now()
+		if nextAttempt := next.Attempts[connectionID]; nextAttempt != nil && nextAttempt.AcceptedProof != nil {
+			nextAttempt.AcceptedProof.ObservedAt = timestamp
+			nextAttempt.UpdatedAt = timestamp
+		}
+		next.Observations[connectionID] = gatewayObservationForAcceptedProof(next.Observations[connectionID], connectionID, proof, timestamp, cursor, capabilities)
 		if err := h.saveGatewayStateLocked(next); err != nil {
 			return *attempt, fmt.Errorf("persist repeated Gateway process proof heartbeat: %w", err)
 		}

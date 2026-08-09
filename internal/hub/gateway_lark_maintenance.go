@@ -2,8 +2,6 @@ package hub
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -78,7 +76,7 @@ func (h *Hub) larkGatewayLaunchSpec(connectionID, executable string) (larkGatewa
 	if err != nil {
 		return larkGatewayLaunchSpec{}, err
 	}
-	digest, err := fileSHA256(executable)
+	digest, err := verifyGatewayExecutablePath(executable)
 	if err != nil {
 		return larkGatewayLaunchSpec{}, err
 	}
@@ -239,15 +237,6 @@ func larkGatewayCanonicalExecutable(executable string) (string, error) {
 		return "", fmt.Errorf("Gateway executable is not a regular executable file")
 	}
 	return executable, nil
-}
-
-func fileSHA256(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(data)
-	return hex.EncodeToString(digest[:]), nil
 }
 
 func larkGatewayServiceIdentity(manager gatewayServiceManager, connectionID string) (serviceID, unitPath string, err error) {
