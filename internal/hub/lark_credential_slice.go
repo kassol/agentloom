@@ -53,6 +53,33 @@ func IsLarkCredentialSecretRequired(err error) bool {
 	return errors.Is(err, errLarkCredentialSecretRequired)
 }
 
+// larkMigrationIndeterminateError is returned when a write-then-error outcome
+// cannot be classified as committed or provably uncommitted. All artifacts are
+// retained and the operator must reconcile (re-run migrate or rollback).
+type larkMigrationIndeterminateError struct {
+	Cause   error
+	Message string
+}
+
+func (e *larkMigrationIndeterminateError) Error() string {
+	return e.Message + ": " + e.Cause.Error()
+}
+
+func (e *larkMigrationIndeterminateError) Unwrap() error { return e.Cause }
+
+// IsLarkMigrationIndeterminate reports whether err is a typed indeterminate
+// migration outcome that requires manual reconcile.
+func IsLarkMigrationIndeterminate(err error) bool {
+	var target *larkMigrationIndeterminateError
+	return errors.As(err, &target)
+}
+
+func larkMigrationRecordsEqual(left, right larkCredentialMigrationRecord) bool {
+	return left.Version == right.Version && left.ConnectionID == right.ConnectionID &&
+		left.PreviousRef == right.PreviousRef && left.CurrentRef == right.CurrentRef &&
+		left.Phase == right.Phase && left.MigratedAt == right.MigratedAt
+}
+
 func validCredentialRef(value string) bool {
 	value = strings.TrimSpace(value)
 	if strings.HasPrefix(value, "env:") || strings.HasPrefix(value, "keychain:") {
@@ -122,6 +149,11 @@ func (h *Hub) MigrateLarkCredential(_ context.Context, connectionID string, secr
 	}
 	if recordFound && record.Phase == larkMigrationPhasePrepared && connection.CredentialRef == record.PreviousRef {
 		// Crash after Put and record write but before the reference effect.
+		// The exact managed credential must still exist before the binding is
+		// advanced to it; a compensated/deleted secret fails closed.
+		if _, err := h.resolveManagedCredential(record.CurrentRef); err != nil {
+			return result, errf(500, "managed credential for the prepared migration is missing; manual reconcile required: %s", err)
+		}
 		if _, err := h.updateLarkConnection(connectionID, record.CurrentRef); err != nil {
 			return result, errf(500, "resume migration reference update: %s", err)
 		}
@@ -166,19 +198,41 @@ func (h *Hub) MigrateLarkCredential(_ context.Context, connectionID string, secr
 		CurrentRef: result.CurrentRef, Phase: larkMigrationPhasePrepared, MigratedAt: now(),
 	}
 	if err := h.writeLarkMigrationRecord(record); err != nil {
-		if _, readErr := h.readLarkMigrationRecord(connectionID); readErr == nil {
-			return result, errf(500, "migration record committed but reported indeterminate: %s (managed credential retained; re-run migrate to reconcile)", err)
+		readback, readErr := h.readLarkMigrationRecord(connectionID)
+		switch {
+		case readErr == nil && larkMigrationRecordsEqual(readback, record):
+			return result, &larkMigrationIndeterminateError{Cause: err, Message: "migration record committed but reported indeterminate (managed credential retained; re-run migrate to reconcile)"}
+		case readErr != nil:
+			return result, &larkMigrationIndeterminateError{Cause: errors.Join(err, readErr), Message: "migration record write outcome is ambiguous (all artifacts retained; manual reconcile required)"}
+		default:
+			// Mechanically proven absent: the record effect did not commit.
+			cleanupErr := credentialStore.Delete(ref)
+			if cleanupErr != nil && !credentials.IsCredentialNotFound(cleanupErr) {
+				return result, &larkMigrationIndeterminateError{Cause: errors.Join(err, cleanupErr), Message: "credential cleanup failed after proven-uncommitted record write (credential retained; manual reconcile required)"}
+			}
+			return result, errf(500, "persist migration record: %s (managed credential deleted; credential floor stays raised)", err)
 		}
-		_ = credentialStore.Delete(ref)
-		return result, errf(500, "persist migration record: %s (managed credential deleted; credential floor stays raised)", err)
 	}
 	if _, err := h.updateLarkConnection(connectionID, result.CurrentRef); err != nil {
-		if persisted, readErr := h.larkConnectionRefPersisted(connectionID); readErr == nil && persisted == result.CurrentRef {
-			return result, errf(500, "connection reference committed but reported indeterminate: %s (credential and record retained; re-run migrate to reconcile)", err)
+		persisted, readErr := h.larkConnectionRefPersisted(connectionID)
+		switch {
+		case readErr == nil && persisted == result.CurrentRef:
+			return result, &larkMigrationIndeterminateError{Cause: err, Message: "connection reference committed but reported indeterminate (credential and record retained; re-run migrate to reconcile)"}
+		case readErr != nil || (persisted != result.PreviousRef && persisted != ""):
+			return result, &larkMigrationIndeterminateError{Cause: errors.Join(err, readErr), Message: "connection reference write outcome is ambiguous (all artifacts retained; manual reconcile required)"}
+		default:
+			// Mechanically proven uncommitted: durably remove the record first,
+			// then delete the credential. Any cleanup error retains the safe
+			// side and reports a typed indeterminate stop.
+			if removeErr := h.removeLarkMigrationRecord(connectionID); removeErr != nil {
+				return result, &larkMigrationIndeterminateError{Cause: errors.Join(err, removeErr), Message: "reference effect proven uncommitted but migration record cleanup failed (credential retained; re-run migrate to reconcile)"}
+			}
+			cleanupErr := credentialStore.Delete(ref)
+			if cleanupErr != nil && !credentials.IsCredentialNotFound(cleanupErr) {
+				return result, &larkMigrationIndeterminateError{Cause: errors.Join(err, cleanupErr), Message: "reference effect and record proven uncommitted but credential cleanup failed (orphan credential retained)"}
+			}
+			return result, errf(500, "update connection credential reference: %s (managed credential and record removed; credential floor stays raised)", err)
 		}
-		_ = credentialStore.Delete(ref)
-		_ = h.removeLarkMigrationRecord(connectionID)
-		return result, errf(500, "update connection credential reference: %s (managed credential and record removed; credential floor stays raised)", err)
 	}
 	if err := h.advanceLarkMigrationPhase(connectionID, larkMigrationPhasePlanPending); err != nil {
 		return result, fmt.Errorf("migrated but migration record phase is pending: %w", err)
@@ -527,11 +581,24 @@ func (h *Hub) readLarkMigrationRecord(connectionID string) (larkCredentialMigrat
 }
 
 func (h *Hub) removeLarkMigrationRecord(connectionID string) error {
+	if h.larkMigrationRecordRemoveForTest != nil {
+		if err := h.larkMigrationRecordRemoveForTest(connectionID); err != nil {
+			return err
+		}
+	}
 	return h.st.WithStableWriteRoot(func(root *os.Root) error {
 		if err := root.Remove(larkMigrationRecordPath(connectionID)); err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		return nil
+		directory, err := root.Open("lark-migrations")
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		defer directory.Close()
+		return directory.Sync()
 	})
 }
 

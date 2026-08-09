@@ -422,6 +422,8 @@ func TestLarkMigrateRecordWriteCommittedButErrorKeepsCredential(t *testing.T) {
 	secret := []byte("secret")
 	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, secret, false); err == nil {
 		t.Fatal("migrate succeeded despite indeterminate record write")
+	} else if !IsLarkMigrationIndeterminate(err) {
+		t.Fatalf("committed-but-error record write was not a typed indeterminate: %v", err)
 	}
 	fixture.h.larkMigrationRecordWriteForTest = nil
 	// The committed record must keep the managed credential for re-entry.
@@ -455,6 +457,8 @@ func TestLarkMigrateConnectionWriteCommittedButErrorKeepsCredential(t *testing.T
 	}
 	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err == nil {
 		t.Fatal("migrate succeeded despite indeterminate connection write")
+	} else if !IsLarkMigrationIndeterminate(err) {
+		t.Fatalf("committed-but-error connection write was not a typed indeterminate: %v", err)
 	}
 	fixture.h.larkUpdateConnectionForTest = nil
 	record, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
@@ -474,6 +478,110 @@ func TestLarkMigrateConnectionWriteCommittedButErrorKeepsCredential(t *testing.T
 	result, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, nil, false)
 	if err != nil || !result.PlanPending {
 		t.Fatalf("re-run migrate did not resume plan_pending: %#v err=%v", result, err)
+	}
+}
+
+func TestLarkMigrateRecordWriteAmbiguousReadbackRetainsAllArtifacts(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	connectionID := fixture.connection.ID
+	recordPath := filepath.Join(fixture.dir, "lark-migrations", connectionID+".json")
+	fixture.h.larkMigrationRecordWriteForTest = func() error {
+		// The record rename committed, then the reported fsync error is
+		// followed by an unreadable record: readback cannot classify the
+		// outcome, so nothing may be compensated away.
+		if err := os.WriteFile(recordPath, []byte("{corrupt"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Errorf("injected fsync failure after commit")
+	}
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), connectionID, []byte("secret"), false); err == nil {
+		t.Fatal("migrate succeeded despite ambiguous record outcome")
+	} else if !IsLarkMigrationIndeterminate(err) {
+		t.Fatalf("ambiguous record outcome was not a typed indeterminate: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(fixture.st.Dir(), credentials.DirectoryName))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("credential was not retained despite ambiguous outcome: entries=%v err=%v", entries, err)
+	}
+	// The record artifact is retained (corrupt) and the reference must not move.
+	if ref := connectionRefByID(t, fixture.h, connectionID); ref != "keychain:com.codexloom.lark" {
+		t.Fatalf("connection reference changed on ambiguous outcome: %q", ref)
+	}
+	if _, err := fixture.h.readLarkMigrationRecord(connectionID); err == nil {
+		t.Fatal("record was not retained in its corrupt/ambiguous state")
+	}
+}
+
+func TestLarkMigrateCleanupRecordRemoveErrorRetainsSafeSide(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	fixture.h.larkUpdateConnectionForTest = func(string, string) (PlatformConnection, error) {
+		return PlatformConnection{}, fmt.Errorf("injected connection persist failure (uncommitted)")
+	}
+	fixture.h.larkMigrationRecordRemoveForTest = func(string) error {
+		return fmt.Errorf("injected record removal failure")
+	}
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err == nil {
+		t.Fatal("migrate succeeded despite cleanup failure")
+	} else if !IsLarkMigrationIndeterminate(err) {
+		t.Fatalf("cleanup failure was not a typed indeterminate: %v", err)
+	}
+	fixture.h.larkMigrationRecordRemoveForTest = nil
+	record, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+	if err != nil || record.Phase != larkMigrationPhasePrepared {
+		t.Fatalf("record was not retained after cleanup failure: %#v err=%v", record, err)
+	}
+	credentialStore, err := credentials.New(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credentialStore.Resolve(credentials.Ref(record.CurrentRef)); err != nil {
+		t.Fatalf("credential was deleted despite cleanup failure: %v", err)
+	}
+	// Crash/reopen keeps the safe side and the same migrate re-enters.
+	fixture.h.Shutdown()
+	fixture.h = nil
+	reopened, err := Open(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.h = reopened
+	result, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, nil, false)
+	if err != nil || !result.PlanPending {
+		t.Fatalf("re-run migrate after reopen did not resume plan_pending: %#v err=%v", result, err)
+	}
+}
+
+func TestLarkMigratePreparedResumeRequiresExistingCredential(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	if err := fixture.st.SaveCredentialFloor(); err != nil {
+		t.Fatal(err)
+	}
+	credentialStore, err := credentials.New(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := credentialStore.Put([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := larkCredentialMigrationRecord{
+		Version: 1, ConnectionID: fixture.connection.ID, PreviousRef: "keychain:com.codexloom.lark",
+		CurrentRef: string(ref), Phase: larkMigrationPhasePrepared, MigratedAt: now(),
+	}
+	if err := fixture.h.writeLarkMigrationRecord(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentialStore.Delete(ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, nil, false); err == nil {
+		t.Fatal("prepared resume advanced the binding to a missing managed credential")
+	}
+	if ref := connectionRefByID(t, fixture.h, fixture.connection.ID); ref != "keychain:com.codexloom.lark" {
+		t.Fatalf("connection reference advanced to a dangling ref: %q", ref)
 	}
 }
 
