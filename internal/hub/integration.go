@@ -663,8 +663,8 @@ func (h *Hub) CreateConnection(p ConnectionParams) (PlatformConnection, error) {
 		return PlatformConnection{}, errf(400, "provider is required")
 	}
 	credentialRef := strings.TrimSpace(p.CredentialRef)
-	if credentialRef != "" && !strings.HasPrefix(credentialRef, "env:") && !strings.HasPrefix(credentialRef, "keychain:") {
-		return PlatformConnection{}, errf(400, "credentialRef must use env: or keychain:")
+	if credentialRef != "" && !validCredentialRef(credentialRef) {
+		return PlatformConnection{}, errf(400, "credentialRef must use env:, keychain:, or managed:")
 	}
 	enabled := true
 	if p.Enabled != nil {
@@ -1140,8 +1140,8 @@ func (h *Hub) UpdateConnection(id string, p ConnectionParams) (PlatformConnectio
 	}
 	if p.CredentialRef != "" {
 		value := strings.TrimSpace(p.CredentialRef)
-		if !strings.HasPrefix(value, "env:") && !strings.HasPrefix(value, "keychain:") {
-			return PlatformConnection{}, errf(400, "credentialRef must use env: or keychain:")
+		if !validCredentialRef(value) {
+			return PlatformConnection{}, errf(400, "credentialRef must use env:, keychain:, or managed:")
 		}
 		next.CredentialRef = value
 	}

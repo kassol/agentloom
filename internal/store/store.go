@@ -361,6 +361,22 @@ func (s *Store) StatStableFile(relative string) (os.FileInfo, error) {
 	return s.dirHandle.root.Stat(clean)
 }
 
+// OpenStableFile opens one file beneath the stable data directory through the
+// stable root handle without requiring write ownership. The returned handle
+// remains bound to the stable root for the Store lifetime.
+func (s *Store) OpenStableFile(relative string, flag int) (*os.File, error) {
+	done, err := s.beginRead()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	clean := filepath.Clean(relative)
+	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("stable path escapes data directory: %s", relative)
+	}
+	return s.dirHandle.root.OpenFile(clean, flag, 0)
+}
+
 // EdgeAgent is one entry from pinix-edge's registry (~/.pinix/code_agents/names.json).
 type EdgeAgent struct {
 	Name     string
@@ -715,51 +731,79 @@ func (s *Store) LoadIntegrations(v any) error { return s.loadJSON(s.integrations
 
 func (s *Store) SaveIntegrations(v any) error { return s.saveJSON(s.integrationsFile(), v) }
 
-// LoadRuntimeGatewayState reads the private R0b/R1 payload. Absence and the S0
-// empty envelope both mean that no Gateway control has ever been adopted.
-// The stable directory open path has already validated the envelope from the
-// same directory handle before any writable Hub mutation was possible.
-func (s *Store) LoadRuntimeGatewayState(v any) (bool, error) {
+type foundationEnvelopeState struct {
+	envelope runtimeFoundationEnvelope
+	state    foundationState
+	exists   bool
+}
+
+// loadFoundationEnvelope reads the private Runtime foundation through the
+// stable directory handle. Writers must preserve the other component's state
+// so a Gateway write never drops the managed-credential floor and vice versa.
+func (s *Store) loadFoundationEnvelope() (foundationEnvelopeState, error) {
 	data, err := s.readFile(s.runtimeFoundationFile())
 	if os.IsNotExist(err) {
-		return false, nil
+		return foundationEnvelopeState{}, nil
 	}
 	if err != nil {
-		return false, err
+		return foundationEnvelopeState{}, err
 	}
 	var envelope runtimeFoundationEnvelope
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&envelope); err != nil {
-		return false, err
+		return foundationEnvelopeState{}, err
 	}
 	if err := requireJSONEOF(decoder); err != nil {
-		return false, err
+		return foundationEnvelopeState{}, err
 	}
 	var state foundationState
 	stateDecoder := json.NewDecoder(strings.NewReader(string(envelope.State)))
 	stateDecoder.DisallowUnknownFields()
 	if err := stateDecoder.Decode(&state); err != nil {
-		return false, err
+		return foundationEnvelopeState{}, err
 	}
 	if err := requireJSONEOF(stateDecoder); err != nil {
+		return foundationEnvelopeState{}, err
+	}
+	return foundationEnvelopeState{envelope: envelope, state: state, exists: true}, nil
+}
+
+// LoadRuntimeGatewayState reads the private R0b/R1 payload. Absence and the S0
+// empty envelope both mean that no Gateway control has ever been adopted.
+// The stable directory open path has already validated the envelope from the
+// same directory handle before any writable Hub mutation was possible.
+func (s *Store) LoadRuntimeGatewayState(v any) (bool, error) {
+	current, err := s.loadFoundationEnvelope()
+	if err != nil {
 		return false, err
 	}
+	if !current.exists {
+		return false, nil
+	}
+	state := current.state
 	if state.Version == 1 {
 		return false, nil
 	}
-	if envelope.SchemaVersion != runtimeFoundationSchemaVersion || state.Version != 2 || len(state.GatewayState) == 0 {
+	if len(state.GatewayState) == 0 {
+		return false, nil
+	}
+	if state.Version != 2 && state.Version != 3 {
 		return false, fmt.Errorf("unsupported Runtime Gateway foundation")
 	}
 	gatewayVersion, err := validateGatewayFoundationState(state.GatewayState)
 	if err != nil {
 		return false, err
 	}
-	expectedFloor := runtimeWriterFloorGatewayState
-	if gatewayVersion == 2 {
-		expectedFloor = runtimeWriterFloorGatewayProcess
-	}
-	if envelope.MinimumWriter != expectedFloor {
+	if state.Version == 2 {
+		expectedFloor := runtimeWriterFloorGatewayState
+		if gatewayVersion == 2 {
+			expectedFloor = runtimeWriterFloorGatewayProcess
+		}
+		if current.envelope.MinimumWriter != expectedFloor {
+			return false, fmt.Errorf("unsupported Runtime Gateway foundation")
+		}
+	} else if current.envelope.MinimumWriter != runtimeWriterFloorCredential {
 		return false, fmt.Errorf("unsupported Runtime Gateway foundation")
 	}
 	gatewayDecoder := json.NewDecoder(strings.NewReader(string(state.GatewayState)))
@@ -795,17 +839,28 @@ func (s *Store) SaveRuntimeGatewayState(v any) error {
 	if err != nil {
 		return err
 	}
-	state, err := json.Marshal(foundationState{Version: 2, GatewayState: gateway})
+	current, err := s.loadFoundationEnvelope()
+	if err != nil {
+		return err
+	}
+	state := foundationState{Version: 2, GatewayState: gateway}
+	minimumWriter := runtimeWriterFloorGatewayState
+	if gatewayVersion == 2 {
+		minimumWriter = runtimeWriterFloorGatewayProcess
+	}
+	if current.exists && current.state.CredentialManaged {
+		state.Version = 3
+		state.CredentialManaged = true
+		minimumWriter = runtimeWriterFloorCredential
+	}
+	stateBytes, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
 	envelope := runtimeFoundationEnvelope{
 		SchemaVersion: runtimeFoundationSchemaVersion,
-		MinimumWriter: runtimeWriterFloorGatewayState,
-		State:         state,
-	}
-	if gatewayVersion == 2 {
-		envelope.MinimumWriter = runtimeWriterFloorGatewayProcess
+		MinimumWriter: minimumWriter,
+		State:         stateBytes,
 	}
 	data, err := json.MarshalIndent(envelope, "", "  ")
 	if err != nil {
@@ -815,6 +870,54 @@ func (s *Store) SaveRuntimeGatewayState(v any) error {
 		return fmt.Errorf("Runtime Gateway foundation exceeds %d bytes", runtimeFoundationMaxBytes)
 	}
 	return s.replaceFile(s.runtimeFoundationFile(), data, 0o600)
+}
+
+// SaveCredentialFloor atomically raises the credential minimum writer floor.
+// Old builds that do not understand credential backup exclusion will reject
+// the raised floor at writable open, closing the downgrade gate before the
+// first managed credential Put. Gateway state, if present, is preserved.
+func (s *Store) SaveCredentialFloor() error {
+	if s == nil {
+		return fmt.Errorf("store is unavailable")
+	}
+	s.closeMu.RLock()
+	owned := !s.closed && !s.readOnly && s.ownerActive
+	s.closeMu.RUnlock()
+	if !owned {
+		return fmt.Errorf("credential floor requires a live writable Hub owner")
+	}
+	current, err := s.loadFoundationEnvelope()
+	if err != nil {
+		return err
+	}
+	state := foundationState{Version: 3, CredentialManaged: true}
+	if current.exists && len(current.state.GatewayState) != 0 {
+		state.GatewayState = current.state.GatewayState
+	}
+	stateBytes, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	envelope := runtimeFoundationEnvelope{
+		SchemaVersion: runtimeFoundationSchemaVersion,
+		MinimumWriter: runtimeWriterFloorCredential,
+		State:         stateBytes,
+	}
+	data, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		return err
+	}
+	if len(data) >= runtimeFoundationMaxBytes {
+		return fmt.Errorf("Runtime foundation exceeds %d bytes", runtimeFoundationMaxBytes)
+	}
+	return s.replaceFile(s.runtimeFoundationFile(), data, 0o600)
+}
+
+// CredentialFloorPresent reports whether the credential minimum writer floor
+// has been raised for this data directory. It performs no writes.
+func (s *Store) CredentialFloorPresent() bool {
+	current, err := s.loadFoundationEnvelope()
+	return err == nil && current.exists && current.state.Version == 3 && current.state.CredentialManaged
 }
 
 func (s *Store) LoadRemote(v any) error { return s.loadJSON(s.remoteFile(), v) }

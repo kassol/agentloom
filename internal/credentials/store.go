@@ -165,6 +165,28 @@ func (s *Store) Resolve(ref Ref) ([]byte, error) {
 	return data, nil
 }
 
+// OpenSecretForChild opens the owner-only secret file for anonymous descriptor
+// inheritance into an isolated Lark gateway child. The returned file must not
+// outlive the caller.
+func (s *Store) OpenSecretForChild(ref Ref) (*os.File, error) {
+	id, err := parseRef(ref)
+	if err != nil {
+		return nil, err
+	}
+	file, err := s.st.OpenStableFile(filepath.Join(DirectoryName, id), os.O_RDONLY)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, errCredentialNotFound
+		}
+		return nil, err
+	}
+	if err := verifyOwnerOnlyFile(file); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
 // Delete removes one canonical managed credential through the stable write
 // capability. A post-effect directory sync failure is reported as
 // indeterminate rather than committed.
@@ -253,6 +275,14 @@ func parseRef(ref Ref) (string, error) {
 		return "", fmt.Errorf("managed credential reference is not canonical")
 	}
 	return id, nil
+}
+
+// IsManagedRef reports whether value is a canonical managed credential
+// reference. It is used by the Hub to accept managed credential references on
+// Connections without resolving or exposing any secret.
+func IsManagedRef(value string) bool {
+	_, err := parseRef(Ref(strings.TrimSpace(value)))
+	return err == nil
 }
 
 func isLowerHex(value string) bool {

@@ -296,6 +296,8 @@ func main() {
 		cmdMsg(a)
 	case "ask-user":
 		cmdAskUser(a)
+	case "lark-migrate":
+		cmdLarkMigrate(a)
 	case "inbox":
 		cmdInbox(a)
 	case "outbox":
