@@ -72,3 +72,20 @@ time. A process restart does not reread files from that directory.
 - When a frontend feature adds an API, verify that API returns JSON after the
   restart. An HTML response from an `/api/...` URL means the running binary
   does not contain that route and the SPA fallback handled the request.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues for `kassol/agentloom`. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage uses the default five-label vocabulary. See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses a single-context domain-doc layout. See
+`docs/agents/domain.md`.
