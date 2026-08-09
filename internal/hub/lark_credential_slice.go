@@ -110,12 +110,25 @@ func (h *Hub) MigrateLarkCredential(_ context.Context, connectionID string, secr
 	if recordErr != nil && !os.IsNotExist(recordErr) {
 		return result, errf(409, "migration record is unreadable: %s", recordErr)
 	}
-	if recordFound && record.Phase != larkMigrationPhaseRefRestored {
+	if recordFound {
 		currentRef := strings.TrimSpace(connection.CredentialRef)
 		recordCurrent := strings.TrimSpace(record.CurrentRef)
 		recordPrevious := strings.TrimSpace(record.PreviousRef)
-		if currentRef != recordCurrent && currentRef != recordPrevious {
-			return result, errf(409, "connection reference %q is inconsistent with the durable migration record (neither the migrated reference nor its previous reference); manual reconcile required", currentRef)
+		switch record.Phase {
+		case larkMigrationPhaseRefRestored:
+			return result, errf(409, "migration rollback cleanup is pending; run rollback to finish")
+		case larkMigrationPhasePlanPending, larkMigrationPhaseCompleted:
+			// These phases mean the reference effect committed: only the
+			// migrated reference is a consistent tuple. A previous reference
+			// here is an inconsistent legacy state that must never re-enter a
+			// fresh migration.
+			if currentRef != recordCurrent {
+				return result, errf(409, "connection reference %q is inconsistent with a %s migration record; manual reconcile required", currentRef, record.Phase)
+			}
+		case larkMigrationPhasePrepared:
+			if currentRef != recordCurrent && currentRef != recordPrevious {
+				return result, errf(409, "connection reference %q is inconsistent with the prepared migration record; manual reconcile required", currentRef)
+			}
 		}
 	}
 	if credentials.IsManagedRef(connection.CredentialRef) {
@@ -156,9 +169,6 @@ func (h *Hub) MigrateLarkCredential(_ context.Context, connectionID string, secr
 		default:
 			return result, errf(409, "migration record phase %q is inconsistent with the connection reference", record.Phase)
 		}
-	}
-	if recordFound && record.Phase == larkMigrationPhaseRefRestored {
-		return result, errf(409, "migration rollback cleanup is pending; run rollback to finish")
 	}
 	if recordFound && record.Phase == larkMigrationPhasePrepared && connection.CredentialRef == record.PreviousRef {
 		// Crash after Put and record write but before the reference effect.
@@ -363,11 +373,14 @@ func (h *Hub) RollbackLarkCredential(connectionID string) (LarkCredentialMigrati
 		if strings.TrimSpace(record.PreviousRef) == "" {
 			return result, errf(409, "rollback requires a non-empty previous credential reference")
 		}
+		// The rollback intent must be durable before any binding effect so a
+		// crash between the two steps leaves a tuple that migrate refuses and
+		// rollback re-enters idempotently.
+		if err := h.advanceLarkMigrationPhase(connectionID, larkMigrationPhaseRefRestored); err != nil {
+			return result, errf(500, "persist rollback intent before restoring the reference: %s", err)
+		}
 		if _, err := h.updateLarkConnection(connectionID, record.PreviousRef); err != nil {
 			return result, errf(500, "restore previous credential reference: %s", err)
-		}
-		if err := h.advanceLarkMigrationPhase(connectionID, larkMigrationPhaseRefRestored); err != nil {
-			return result, errf(500, "persist rollback phase: %s", err)
 		}
 	}
 	// The migration record must survive until the typed launch plan is revoked

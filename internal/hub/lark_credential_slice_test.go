@@ -745,6 +745,105 @@ func TestLarkMigrateManagedPreparedMissingSecretDoesNotAdvance(t *testing.T) {
 	}
 }
 
+func TestLarkRollbackIntentDurableBeforeBindingRestore(t *testing.T) {
+	fixture := newLarkFixture(t)
+	defer fixture.close(t)
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err != nil {
+		t.Fatal(err)
+	}
+	migratedRef := connectionRefByID(t, fixture.h, fixture.connection.ID)
+	record, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+	if err != nil || record.CurrentRef != migratedRef {
+		t.Fatalf("migration setup: %#v err=%v", record, err)
+	}
+	fixture.h.larkUpdateConnectionForTest = func(string, string) (PlatformConnection, error) {
+		return PlatformConnection{}, fmt.Errorf("injected restore failure before commit")
+	}
+	if _, err := fixture.h.RollbackLarkCredential(fixture.connection.ID); err == nil {
+		t.Fatal("rollback succeeded despite injected restore failure")
+	}
+	fixture.h.larkUpdateConnectionForTest = nil
+	// The rollback intent is durable even though the binding restore did not
+	// run: migrate must refuse and rollback must re-enter.
+	record, err = fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+	if err != nil || record.Phase != larkMigrationPhaseRefRestored {
+		t.Fatalf("rollback intent was not durable: %#v err=%v", record, err)
+	}
+	if ref := connectionRefByID(t, fixture.h, fixture.connection.ID); ref != migratedRef {
+		t.Fatalf("binding restored despite injected failure: %q", ref)
+	}
+	fixture.h.Shutdown()
+	fixture.h = nil
+	reopened, err := Open(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.h = reopened
+	if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err == nil {
+		t.Fatal("migrate re-entered while rollback cleanup is pending")
+	}
+	after, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+	if err != nil || after.Phase != larkMigrationPhaseRefRestored || after.CurrentRef != migratedRef {
+		t.Fatalf("migrate mutated the pending rollback state: %#v err=%v", after, err)
+	}
+	if ref := connectionRefByID(t, fixture.h, fixture.connection.ID); ref != migratedRef {
+		t.Fatalf("migrate changed the reference during pending rollback: %q", ref)
+	}
+	credentialStore, err := credentials.New(fixture.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credentialStore.Resolve(credentials.Ref(migratedRef)); err != nil {
+		t.Fatalf("managed credential was removed during pending rollback: %v", err)
+	}
+	rollback, err := fixture.h.RollbackLarkCredential(fixture.connection.ID)
+	if err != nil || rollback.CurrentRef != "keychain:com.codexloom.lark" {
+		t.Fatalf("re-entered rollback could not finish: %#v err=%v", rollback, err)
+	}
+}
+
+func TestLarkMigrateInconsistentCommittedPhaseWithPreviousRefFailsClosed(t *testing.T) {
+	for _, phase := range []string{larkMigrationPhasePlanPending, larkMigrationPhaseCompleted} {
+		t.Run(phase, func(t *testing.T) {
+			fixture := newLarkFixture(t)
+			defer fixture.close(t)
+			if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err != nil {
+				t.Fatal(err)
+			}
+			record, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record.Phase = phase
+			if err := fixture.h.writeLarkMigrationRecord(record); err != nil {
+				t.Fatal(err)
+			}
+			// Simulate a legacy/inconsistent tuple: reference restored to the
+			// previous value while the committed-phase record remains.
+			if _, err := fixture.h.UpdateConnection(fixture.connection.ID, ConnectionParams{CredentialRef: "keychain:com.codexloom.lark"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.h.MigrateLarkCredential(context.Background(), fixture.connection.ID, []byte("secret"), false); err == nil {
+				t.Fatal("migrate entered fresh Put on an inconsistent committed-phase tuple")
+			}
+			if ref := connectionRefByID(t, fixture.h, fixture.connection.ID); ref != "keychain:com.codexloom.lark" {
+				t.Fatalf("migrate changed the inconsistent reference: %q", ref)
+			}
+			after, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID)
+			if err != nil || after.Phase != phase || after.CurrentRef != record.CurrentRef {
+				t.Fatalf("migrate overwrote the rollback anchor: %#v err=%v", after, err)
+			}
+			rollback, err := fixture.h.RollbackLarkCredential(fixture.connection.ID)
+			if err != nil || rollback.CurrentRef != "keychain:com.codexloom.lark" {
+				t.Fatalf("rollback could not finish the inconsistent tuple: %#v err=%v", rollback, err)
+			}
+			if _, err := fixture.h.readLarkMigrationRecord(fixture.connection.ID); !os.IsNotExist(err) {
+				t.Fatalf("rollback did not remove the record: %v", err)
+			}
+		})
+	}
+}
+
 func TestLarkRollbackRejectsThirdPartyBindingDrift(t *testing.T) {
 	for _, third := range []string{"keychain:com.codexloom.other", "managed:" + strings.Repeat("c", 64)} {
 		fixture := newLarkFixture(t)
