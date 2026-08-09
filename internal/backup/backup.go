@@ -313,6 +313,7 @@ func walkDataDir(dataDir, backupDir string, fn func(src, rel string)) error {
 	backupAbs, _ := filepath.Abs(backupDir)
 	eventsAbs, _ := filepath.Abs(filepath.Join(dataAbs, "events"))
 	credentialsAbs, _ := filepath.Abs(filepath.Join(dataAbs, credentials.DirectoryName))
+	credentialsInfo, credentialsStatErr := os.Stat(filepath.Join(dataAbs, credentials.DirectoryName))
 	return filepath.WalkDir(dataAbs, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -322,7 +323,13 @@ func walkDataDir(dataDir, backupDir string, fn func(src, rel string)) error {
 		}
 		if d.IsDir() {
 			pAbs, _ := filepath.Abs(path)
-			if pAbs == backupAbs || strings.HasPrefix(pAbs, backupAbs+string(os.PathSeparator)) || pAbs == eventsAbs || pAbs == credentialsAbs {
+			identityMatch := false
+			if credentialsStatErr == nil {
+				if info, infoErr := d.Info(); infoErr == nil && os.SameFile(info, credentialsInfo) {
+					identityMatch = true
+				}
+			}
+			if pAbs == backupAbs || strings.HasPrefix(pAbs, backupAbs+string(os.PathSeparator)) || pAbs == eventsAbs || pAbs == credentialsAbs || identityMatch {
 				return filepath.SkipDir
 			}
 			return nil

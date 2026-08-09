@@ -1,20 +1,24 @@
 // Package credentials implements the v1 managed credential file store.
 //
 // Credentials are immutable: every Put writes a fresh random ID and never
-// overwrites an existing file in place. The fixed Owner-only directory is
-// protected by local file permissions (directory 0700, files 0600); there is
-// no at-rest encryption and the threat model does not cover a malicious
-// same-UID Owner. Only macOS/POSIX is supported in this stage.
+// overwrites an existing file in place. All durable mutations go through the
+// stable data-directory root with live-Hub writer ownership, so the merged S0
+// single-writer invariant still holds; reads use a read-only stable view.
+// Only macOS/POSIX is supported in this stage.
 package credentials
 
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/yan5xu/codex-loom/internal/store"
 )
 
 // DirectoryName is the fixed Owner-only credential directory beneath the
@@ -22,33 +26,38 @@ import (
 const DirectoryName = "credentials"
 
 const (
-	idBytes    = 32
-	idHexLen   = idBytes * 2
-	maxSecret  = 1 << 20
-	dirMode    = 0o700
-	fileMode   = 0o600
+	idBytes   = 32
+	idHexLen  = idBytes * 2
+	maxSecret = 1 << 20
+	dirMode   = 0o700
+	fileMode  = 0o600
 )
 
 // Ref is the canonical Hub-issued reference for one managed credential. It is
 // always "managed:" followed by the random opaque ID; it is never a path.
 type Ref string
 
-// Store manages the fixed Owner-only credentials directory.
+var errCredentialNotFound = errors.New("managed credential not found")
+
+// Store manages the fixed Owner-only credentials directory inside one stable
+// data directory.
 type Store struct {
-	dir string
+	st *store.Store
 }
 
-// New returns a v1 credential store rooted at dataDir/credentials. Non-POSIX
-// platforms fail closed.
-func New(dataDir string) (*Store, error) {
+// New returns a v1 credential store bound to a stable Store. Mutations require
+// a live writable Hub owner; non-POSIX platforms fail closed.
+func New(st *store.Store) (*Store, error) {
+	if st == nil {
+		return nil, fmt.Errorf("credential store requires a stable Store")
+	}
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		return nil, fmt.Errorf("managed credentials are unsupported on %s", runtime.GOOS)
 	}
-	clean := filepath.Clean(dataDir)
-	if clean == "" || clean == "." || clean == string(filepath.Separator) {
-		return nil, fmt.Errorf("credential store requires a data directory")
+	if !st.HasLiveWritableOwner() {
+		return nil, fmt.Errorf("managed credentials require a live writable Hub owner")
 	}
-	return &Store{dir: filepath.Join(clean, DirectoryName)}, nil
+	return &Store{st: st}, nil
 }
 
 // Put durably writes one new immutable credential and returns its canonical
@@ -62,97 +71,159 @@ func (s *Store) Put(secret []byte) (Ref, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(s.dir, dirMode); err != nil {
-		return "", fmt.Errorf("create credential store: %w", err)
-	}
-	if err := verifyOwnerOnlyPath(s.dir, true); err != nil {
-		return "", err
-	}
-	temporary, err := os.CreateTemp(s.dir, ".managed-credential-*")
-	if err != nil {
-		return "", fmt.Errorf("stage credential: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	committed := false
-	defer func() {
-		_ = temporary.Close()
-		if !committed {
-			_ = os.Remove(temporaryPath)
+	target := filepath.Join(DirectoryName, id)
+	err = s.st.WithStableWriteRoot(func(root *os.Root) error {
+		if err := root.MkdirAll(DirectoryName, dirMode); err != nil {
+			return err
 		}
-	}()
-	if err := temporary.Chmod(fileMode); err != nil {
-		return "", err
-	}
-	if _, err := temporary.Write(secret); err != nil {
-		return "", err
-	}
-	if err := temporary.Sync(); err != nil {
-		return "", err
-	}
-	if err := temporary.Close(); err != nil {
-		return "", err
-	}
-	target := filepath.Join(s.dir, id)
-	if _, err := os.Lstat(target); err == nil {
-		return "", fmt.Errorf("credential ID collision")
-	} else if !os.IsNotExist(err) {
-		return "", err
-	}
-	if err := os.Rename(temporaryPath, target); err != nil {
-		return "", err
-	}
-	committed = true
-	if err := verifyOwnerOnlyPath(target, false); err != nil {
+		dirInfo, err := root.Stat(DirectoryName)
+		if err != nil {
+			return err
+		}
+		if err := verifyOwnerOnlyStat(dirInfo, true); err != nil {
+			return err
+		}
+		if err := verifyExactDirectoryName(root, dirInfo); err != nil {
+			return err
+		}
+		temporary := filepath.Join(DirectoryName, ".managed-credential-"+randomSuffix())
+		file, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fileMode)
+		if err != nil {
+			return err
+		}
+		committed := false
+		defer func() {
+			_ = file.Close()
+			if !committed {
+				_ = root.Remove(temporary)
+			}
+		}()
+		if err := file.Chmod(fileMode); err != nil {
+			return err
+		}
+		if _, err := file.Write(secret); err != nil {
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		if _, err := root.Lstat(target); err == nil {
+			return fmt.Errorf("credential ID collision")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := root.Rename(temporary, target); err != nil {
+			return err
+		}
+		committed = true
+		if err := syncStableDir(root, DirectoryName); err != nil {
+			return fmt.Errorf("credential write outcome is indeterminate: %w", err)
+		}
+		info, err := root.Stat(target)
+		if err != nil {
+			return err
+		}
+		return verifyOwnerOnlyStat(info, false)
+	})
+	if err != nil {
 		return "", err
 	}
 	return Ref("managed:" + id), nil
 }
 
-// Resolve returns the secret bytes for one canonical reference.
+// Resolve returns the secret bytes for one canonical reference through the
+// read-only stable view.
 func (s *Store) Resolve(ref Ref) ([]byte, error) {
 	id, err := parseRef(ref)
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(s.dir, id)
-	file, err := os.Open(path)
+	relative := filepath.Join(DirectoryName, id)
+	info, err := s.st.StatStableFile(relative)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("managed credential not found")
+			return nil, errCredentialNotFound
 		}
 		return nil, err
 	}
-	defer file.Close()
-	if err := verifyOwnerOnlyFile(file); err != nil {
-		return nil, err
-	}
-	info, err := file.Stat()
-	if err != nil {
+	if err := verifyOwnerOnlyStat(info, false); err != nil {
 		return nil, err
 	}
 	if info.Size() <= 0 || info.Size() > maxSecret {
 		return nil, fmt.Errorf("managed credential is not a bounded regular file")
 	}
-	data := make([]byte, info.Size())
-	if _, err := file.Read(data); err != nil {
+	data, err := s.st.ReadStableFile(relative)
+	if err != nil {
 		return nil, err
+	}
+	if int64(len(data)) != info.Size() {
+		return nil, fmt.Errorf("managed credential changed or is truncated")
 	}
 	return data, nil
 }
 
-// Delete removes one canonical managed credential.
+// Delete removes one canonical managed credential through the stable write
+// capability. A post-effect directory sync failure is reported as
+// indeterminate rather than committed.
 func (s *Store) Delete(ref Ref) error {
 	id, err := parseRef(ref)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(filepath.Join(s.dir, id)); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("managed credential not found")
+	relative := filepath.Join(DirectoryName, id)
+	err = s.st.WithStableWriteRoot(func(root *os.Root) error {
+		if err := root.Remove(relative); err != nil {
+			if os.IsNotExist(err) {
+				return errCredentialNotFound
+			}
+			return err
 		}
+		if err := syncStableDir(root, DirectoryName); err != nil {
+			return fmt.Errorf("credential delete outcome is indeterminate: %w", err)
+		}
+		return nil
+	})
+	if errors.Is(err, errCredentialNotFound) {
+		return err
+	}
+	if err != nil {
 		return err
 	}
 	return nil
+}
+
+func syncStableDir(root *os.Root, relative string) error {
+	directory, err := root.Open(relative)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
+// verifyExactDirectoryName rejects a pre-existing case alias whose actual
+// directory name differs from the fixed name on case-insensitive volumes.
+func verifyExactDirectoryName(root *os.Root, dirInfo fs.FileInfo) error {
+	entries, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if os.SameFile(dirInfo, info) {
+			if entry.Name() != DirectoryName {
+				return fmt.Errorf("credential directory alias %q is not the exact fixed name", entry.Name())
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("credential directory identity is not visible at the fixed name")
 }
 
 func newID() (string, error) {
@@ -161,6 +232,14 @@ func newID() (string, error) {
 		return "", fmt.Errorf("issue managed credential ID: %w", err)
 	}
 	return hex.EncodeToString(random), nil
+}
+
+func randomSuffix() string {
+	random := make([]byte, 12)
+	if _, err := rand.Read(random); err != nil {
+		return "fallback"
+	}
+	return hex.EncodeToString(random)
 }
 
 func parseRef(ref Ref) (string, error) {

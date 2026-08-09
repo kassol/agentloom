@@ -2,7 +2,6 @@ package backup
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"io"
 	"os"
@@ -26,17 +25,42 @@ func TestCBackupExcludesFixedCredentialDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), []byte(`{"agent":{"id":"a"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	assertNoCredentialEntries(t, dataDir, secret, false)
+}
+
+func TestCBackupExcludesCaseAliasedCredentialDirectoryByIdentity(t *testing.T) {
+	dataDir := t.TempDir()
+	aliased := filepath.Join(dataDir, strings.ToUpper(credentials.DirectoryName))
+	if err := os.Mkdir(aliased, 0o700); err != nil {
+		t.Skipf("cannot create case alias fixture: %v", err)
+	}
+	probe, err := os.Stat(aliased)
+	if err != nil {
+		t.Skipf("case alias unavailable: %v", err)
+	}
+	exact, err := os.Stat(filepath.Join(dataDir, credentials.DirectoryName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(probe, exact) {
+		t.Skip("test volume is case-sensitive")
+	}
+	secret := []byte("aliased-secret-must-not-be-backed-up")
+	if err := os.WriteFile(filepath.Join(aliased, strings.Repeat("b", 64)), secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), []byte(`{"agent":{"id":"a"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertNoCredentialEntries(t, dataDir, secret, true)
+}
+
+func assertNoCredentialEntries(t *testing.T, dataDir string, secret []byte, aliasFixture bool) {
+	t.Helper()
 	agentsDir := t.TempDir()
 	snapshot, err := Create(Options{Reason: "credential-exclusion", DataDir: dataDir, CodexSessionsDir: agentsDir})
 	if err != nil {
 		t.Fatal(err)
-	}
-	archive, err := os.ReadFile(snapshot.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(archive, secret) {
-		t.Fatal("backup archive contains managed credential material")
 	}
 	file, err := os.Open(snapshot.Path)
 	if err != nil {
@@ -48,7 +72,8 @@ func TestCBackupExcludesFixedCredentialDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	tarReader := tar.NewReader(gz)
-	found := false
+	manifestFound := false
+	manifestMarker := false
 	for {
 		header, err := tarReader.Next()
 		if err == io.EOF {
@@ -57,18 +82,27 @@ func TestCBackupExcludesFixedCredentialDirectory(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if header.Name != "manifest.json" {
-			continue
+		name := header.Name
+		lower := strings.ToLower(name)
+		if strings.HasPrefix(lower, "codex-loom/"+strings.ToLower(credentials.DirectoryName)+"/") {
+			t.Fatalf("backup archive contains credential entry: %s", name)
 		}
-		manifestBytes, err := io.ReadAll(tarReader)
+		content, err := io.ReadAll(tarReader)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(manifestBytes), credentials.DirectoryName+"/**") {
-			found = true
+		if strings.Contains(string(content), string(secret)) {
+			t.Fatalf("backup archive contains credential material in entry %s", name)
+		}
+		if name == "manifest.json" {
+			manifestFound = true
+			if strings.Contains(string(content), credentials.DirectoryName+"/**") {
+				manifestMarker = true
+			}
 		}
 	}
-	if !found {
+	if !manifestFound || !manifestMarker {
 		t.Fatal("backup manifest does not declare the credential directory exclusion")
 	}
+	_ = aliasFixture
 }
