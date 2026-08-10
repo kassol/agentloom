@@ -116,6 +116,8 @@ export function AgentPane({
   const [modelCustomOpen, setModelCustomOpen] = useState(isCustomModel(agent.model || "", agent.providerId, modelProviders));
 	const [runtimeModels, setRuntimeModels] = useState<RuntimeModel[]>([]);
 	const [runtimeModelCurrent, setRuntimeModelCurrent] = useState<RuntimeModel | null>(null);
+	const [runtimeThinkingLevel, setRuntimeThinkingLevel] = useState("");
+	const [runtimeThinkingLevels, setRuntimeThinkingLevels] = useState<string[]>([]);
   const [effortDraft, setEffortDraft] = useState(agent.effort || "");
   const [sandboxDraft, setSandboxDraft] = useState(agent.sandbox || "danger-full-access");
   const [approvalDraft, setApprovalDraft] = useState(agent.approvalPolicy || "never");
@@ -321,8 +323,11 @@ export function AgentPane({
 		  const current = data.current as RuntimeModel;
 		  setRuntimeModels((data.models || []) as RuntimeModel[]);
 		  setRuntimeModelCurrent(current);
+		  setRuntimeThinkingLevel(data.thinkingLevel || "off");
+		  setRuntimeThinkingLevels(data.thinkingLevels || []);
 		  setProviderDraft(current.provider);
 		  setModelDraft(current.id);
+		  setEffortDraft(data.thinkingLevel || "off");
 		  setModelCustomOpen(false);
 		})
 		.catch((err: Error) => { if (!cancelled) onError(err.message); });
@@ -803,13 +808,16 @@ export function AgentPane({
     try {
       let updated = agent;
 	  const piRuntime = agent.runtimeBinding.kind === "pi";
-	  if (piRuntime && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id)) {
+	  if (piRuntime && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel)) {
 		const state = await api("POST", `/api/agents/${agent.id}/runtime/model`, {
 		  provider: providerDraft,
 		  model: modelDraft.trim(),
+		  thinkingLevel: effortDraft,
 		});
 		setRuntimeModelCurrent(state.current as RuntimeModel);
 		setRuntimeModels((state.models || []) as RuntimeModel[]);
+		setRuntimeThinkingLevel(state.thinkingLevel || "off");
+		setRuntimeThinkingLevels(state.thinkingLevels || []);
 	  } else if (!piRuntime && providerDraft !== (agent.providerId || "openai")) {
         const switched = await api("POST", `/api/agents/${agent.id}/provider`, {
           providerId: providerDraft,
@@ -964,7 +972,7 @@ export function AgentPane({
 	const piProviders = [...new Set(runtimeModels.map((model) => model.provider))];
 	const piModels = runtimeModels.filter((model) => model.provider === providerDraft);
 	const runtimeModelChanged = piRuntime
-	  ? providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id
+	  ? providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel
 	  : providerChanged;
   const profileDirty = Boolean(
     profile &&
@@ -1166,9 +1174,9 @@ export function AgentPane({
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Thinking Effort</span>
-					<select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={piRuntime || running || !agent.runtimeCapabilities.provider} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
-                      <option value="">default{selectedModelDetail?.defaultReasoningEffort ? ` (${selectedModelDetail.defaultReasoningEffort})` : ""}</option>
-                      {reasoningEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+					<select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running || (piRuntime ? runtimeThinkingLevels.length === 0 : !agent.runtimeCapabilities.provider)} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+					  {!piRuntime && <option value="">default{selectedModelDetail?.defaultReasoningEffort ? ` (${selectedModelDetail.defaultReasoningEffort})` : ""}</option>}
+					  {(piRuntime ? runtimeThinkingLevels : reasoningEfforts).map((effort) => <option key={effort} value={effort}>{effort}</option>)}
                     </select>
                   </label>
                   <label className="mb-2 block">

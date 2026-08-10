@@ -13,13 +13,16 @@ type RuntimeModel struct {
 }
 
 type RuntimeModelState struct {
-	Current RuntimeModel   `json:"current"`
-	Models  []RuntimeModel `json:"models"`
+	Current        RuntimeModel   `json:"current"`
+	Models         []RuntimeModel `json:"models"`
+	ThinkingLevel  string         `json:"thinkingLevel"`
+	ThinkingLevels []string       `json:"thinkingLevels"`
 }
 
 type RuntimeModelSelection struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	Provider      string `json:"provider"`
+	Model         string `json:"model"`
+	ThinkingLevel string `json:"thinkingLevel"`
 }
 
 func (h *Hub) GetRuntimeModels(key string) (RuntimeModelState, error) {
@@ -57,6 +60,7 @@ func (h *Hub) GetRuntimeModels(key string) (RuntimeModelState, error) {
 func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (RuntimeModelState, error) {
 	selection.Provider = strings.TrimSpace(selection.Provider)
 	selection.Model = strings.TrimSpace(selection.Model)
+	selection.ThinkingLevel = strings.TrimSpace(selection.ThinkingLevel)
 	if selection.Provider == "" || selection.Model == "" {
 		return RuntimeModelState{}, errf(400, "provider and model are required")
 	}
@@ -106,7 +110,7 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 	}
 	h.mu.Lock()
 	if agent = h.agents[agentID]; agent != nil {
-		agent.ProviderID, agent.Model, agent.UpdatedAt = state.Current.Provider, state.Current.ID, now()
+		agent.ProviderID, agent.Model, agent.Effort, agent.UpdatedAt = state.Current.Provider, state.Current.ID, state.ThinkingLevel, now()
 		if err := h.persistAgentsLocked(); err != nil {
 			h.mu.Unlock()
 			return RuntimeModelState{}, errf(500, "save Pi model selection: %s", err)

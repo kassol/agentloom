@@ -115,6 +115,8 @@ describe("AgentPane scroll restoration", () => {
 	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
 	  if (url.includes("/runtime/models")) return new Response(JSON.stringify({
 		current: { provider: "openai-codex", id: "gpt-5.4-mini", reasoning: true },
+		thinkingLevel: "medium",
+		thinkingLevels: ["off", "minimal", "low", "medium", "high"],
 		models: [
 		  { provider: "openai-codex", id: "gpt-5.4-mini", reasoning: true },
 		  { provider: "xai", id: "grok-4.5", reasoning: true },
@@ -142,6 +144,7 @@ describe("AgentPane scroll restoration", () => {
     expect(view.getByText("Provider switching").nextElementSibling).toHaveTextContent("Available");
 	const provider = view.getByText("Provider").closest("label")?.querySelector("select") as HTMLSelectElement;
 	const model = view.getByText("Model").closest("label")?.querySelector("select") as HTMLSelectElement;
+	const thinking = view.getByText("Thinking Effort").closest("label")?.querySelector("select") as HTMLSelectElement;
     expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
 	expect(view.getByText("Approval Policy").closest("label")?.querySelector("select")).toBeEnabled();
 	expect(view.getByText("Sandbox isolation is unsupported for the pi Runtime.")).toBeInTheDocument();
@@ -154,14 +157,17 @@ describe("AgentPane scroll restoration", () => {
 	return waitFor(() => {
 	  expect(provider).toBeEnabled();
 	  expect(model).toBeEnabled();
+	  expect(thinking).toBeEnabled();
 	  expect(provider).toHaveValue("openai-codex");
+	  expect(thinking).toHaveValue("medium");
 	}).then(async () => {
 	  fireEvent.change(provider, { target: { value: "xai" } });
 	  expect(model).toHaveValue("grok-4.5");
+	  fireEvent.change(thinking, { target: { value: "high" } });
 	  fireEvent.click(view.getByRole("button", { name: "Save" }));
 	  await waitFor(() => expect(vi.mocked(fetch).mock.calls).toContainEqual([
 		"/api/agents/agent-scroll/runtime/model",
-		expect.objectContaining({ method: "POST", body: JSON.stringify({ provider: "xai", model: "grok-4.5" }) }),
+		expect.objectContaining({ method: "POST", body: JSON.stringify({ provider: "xai", model: "grok-4.5", thinkingLevel: "high" }) }),
 	  ]));
 
 	  const task = view.getByRole("textbox", { name: "task message" });

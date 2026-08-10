@@ -31,7 +31,8 @@ func TestPiAgentSwitchesNativeModelWithoutReplacingSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if before.Current.Provider != "openai-codex" || before.Current.ID != "gpt-5.4-mini" || len(before.Models) != 2 {
+	if before.Current.Provider != "openai-codex" || before.Current.ID != "gpt-5.4-mini" || len(before.Models) != 2 ||
+		before.ThinkingLevel != "medium" || strings.Join(before.ThinkingLevels, ",") != "off,minimal,low,medium,high" {
 		t.Fatalf("initial Pi models = %#v", before)
 	}
 	diagnostics, err := h.GetRuntimeDiagnostics(agent.ID)
@@ -39,12 +40,12 @@ func TestPiAgentSwitchesNativeModelWithoutReplacingSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	after, err := h.SwitchRuntimeModel(agent.ID, RuntimeModelSelection{Provider: "xai", Model: "grok-4.5"})
+	after, err := h.SwitchRuntimeModel(agent.ID, RuntimeModelSelection{Provider: "xai", Model: "grok-4.5", ThinkingLevel: "high"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Current.Provider != "xai" || after.Current.ID != "grok-4.5" {
-		t.Fatalf("switched Pi model = %#v", after.Current)
+	if after.Current.Provider != "xai" || after.Current.ID != "grok-4.5" || after.ThinkingLevel != "high" {
+		t.Fatalf("switched Pi model = %#v", after)
 	}
 	view, err := h.GetAgent(agent.ID)
 	if err != nil {
@@ -95,7 +96,7 @@ func TestFakePiModelRPCProcess(t *testing.T) {
 	_ = os.WriteFile(sessionFile, []byte(fmt.Sprintf(`{"type":"session","version":3,"id":%q}`, sessionID)+"\n"), 0o600)
 
 	reader := bufio.NewReader(os.Stdin)
-	provider, model := "openai-codex", "gpt-5.4-mini"
+	provider, model, thinkingLevel := "openai-codex", "gpt-5.4-mini", "medium"
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -108,9 +109,11 @@ func TestFakePiModelRPCProcess(t *testing.T) {
 		id, _ := command["id"].(string)
 		switch command["type"] {
 		case "get_state":
-			fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q,"model":{"provider":%q,"id":%q,"input":["text"]}}}`+"\n", id, sessionFile, sessionID, provider, model)
+			fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q,"thinkingLevel":%q,"model":{"provider":%q,"id":%q,"input":["text"]}}}`+"\n", id, sessionFile, sessionID, thinkingLevel, provider, model)
 		case "get_available_models":
 			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"openai-codex","id":"gpt-5.4-mini","contextWindow":128000,"reasoning":true},{"provider":"xai","id":"grok-4.5","contextWindow":256000,"reasoning":true}]}}`+"\n", id)
+		case "get_available_thinking_levels":
+			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","minimal","low","medium","high"]}}`+"\n", id)
 		case "set_model":
 			provider, _ = command["provider"].(string)
 			model, _ = command["modelId"].(string)
@@ -119,6 +122,9 @@ func TestFakePiModelRPCProcess(t *testing.T) {
 				continue
 			}
 			fmt.Printf(`{"id":%q,"type":"response","command":"set_model","success":true,"data":{"provider":%q,"id":%q,"input":["text"]}}`+"\n", id, provider, model)
+		case "set_thinking_level":
+			thinkingLevel, _ = command["level"].(string)
+			fmt.Printf(`{"id":%q,"type":"response","command":"set_thinking_level","success":true}`+"\n", id)
 		default:
 			os.Exit(42)
 		}
