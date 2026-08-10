@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -61,9 +62,12 @@ type TurnSummary struct {
 }
 
 type RuntimeBinding struct {
-	Kind      string `json:"kind"`
-	NativeRef string `json:"nativeRef,omitempty"`
+	SchemaVersion int    `json:"schemaVersion,omitempty"`
+	Kind          string `json:"kind"`
+	NativeRef     string `json:"nativeRef,omitempty"`
 }
+
+const RuntimeBindingSchemaVersion = runtimecontract.BindingSchemaVersion
 
 // Agent is CodexLoom's stable governance entity. ThreadID is owned by Loom;
 // RuntimeBinding is the durable association to a Runtime-native conversation.
@@ -511,13 +515,25 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	if h.agents == nil {
 		h.agents = map[string]*Agent{}
 	}
+	agentRegistryRecovered := false
 	for id, meta := range h.agents {
-		if meta == nil || strings.TrimSpace(meta.ThreadID) == "" || strings.TrimSpace(meta.RuntimeBinding.Kind) == "" || strings.TrimSpace(meta.RuntimeBinding.NativeRef) == "" {
+		if meta == nil {
 			return nil, fmt.Errorf("load agents: Agent %s uses the unsupported legacy Codex-only format; recreate the Agent", id)
 		}
-	}
-	agentRegistryRecovered := false
-	for _, meta := range h.agents {
+		switch meta.RuntimeBinding.SchemaVersion {
+		case 0, 1:
+			if strings.TrimSpace(meta.ThreadID) == "" || strings.TrimSpace(meta.RuntimeBinding.Kind) == "" || strings.TrimSpace(meta.RuntimeBinding.NativeRef) == "" {
+				return nil, fmt.Errorf("load agents: Agent %s uses the unsupported legacy Codex-only format; recreate the Agent", id)
+			}
+			meta.RuntimeBinding.SchemaVersion = RuntimeBindingSchemaVersion
+			agentRegistryRecovered = true
+		case RuntimeBindingSchemaVersion:
+			if strings.TrimSpace(meta.ThreadID) == "" || strings.TrimSpace(meta.RuntimeBinding.Kind) == "" || strings.TrimSpace(meta.RuntimeBinding.NativeRef) == "" {
+				return nil, fmt.Errorf("load agents: Agent %s has an invalid Runtime Binding schema version %d", id, meta.RuntimeBinding.SchemaVersion)
+			}
+		default:
+			return nil, fmt.Errorf("load agents: Agent %s uses unsupported Runtime Binding schema version %d", id, meta.RuntimeBinding.SchemaVersion)
+		}
 		if meta.RuntimeBinding.Kind == "pi" && meta.Status == "idle" && meta.LastError == piShutdownInterruptError && meta.LastTurn != nil && meta.LastTurn.Status == "completed" {
 			meta.LastError = ""
 			meta.UpdatedAt = now()
@@ -533,7 +549,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	}
 	if agentRegistryRecovered && !options.Passive {
 		if err := h.persistAgentsLocked(); err != nil {
-			return nil, fmt.Errorf("recover interrupted Provider switch: %w", err)
+			return nil, fmt.Errorf("persist normalized Agent registry: %w", err)
 		}
 	}
 	if err := h.st.LoadAgentSkillConfigs(&h.agentSkillConfigs); err != nil {
@@ -887,6 +903,9 @@ func (h *Hub) persistAgentsLocked() error {
 	for id, meta := range h.agents {
 		if meta.Source == "edge" {
 			continue
+		}
+		if meta.RuntimeBinding.Kind != "" {
+			meta.RuntimeBinding.SchemaVersion = RuntimeBindingSchemaVersion
 		}
 		own[id] = meta
 	}
@@ -2098,6 +2117,7 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 		view.LastTurn = &last
 	}
 	view.RuntimeBinding.NativeRef = ""
+	view.RuntimeBinding.SchemaVersion = 0
 	view.RuntimeTurnBindings = nil
 	view.TurnRecoveryMarkers = nil
 	view.RuntimeCapabilities = h.runtimeCapabilitiesLocked(meta)

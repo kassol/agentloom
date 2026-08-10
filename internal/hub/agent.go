@@ -231,7 +231,7 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 	}
 	meta := &Agent{
 		ID: id, Name: p.Name, Cwd: p.Cwd, ThreadID: newIntegrationID("thr"),
-		RuntimeBinding:      RuntimeBinding{Kind: p.RuntimeKind},
+		RuntimeBinding:      RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: p.RuntimeKind},
 		RuntimeTurnBindings: map[string]string{},
 		Sandbox:             p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort,
 		Status: "idle", CreatedAt: now(), UpdatedAt: now(),
@@ -286,8 +286,14 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	p.ThreadID = strings.TrimSpace(p.ThreadID)
 	p.RuntimeBinding.Kind = strings.TrimSpace(p.RuntimeBinding.Kind)
 	p.RuntimeBinding.NativeRef = strings.TrimSpace(p.RuntimeBinding.NativeRef)
+	if p.RuntimeBinding.SchemaVersion == 0 || p.RuntimeBinding.SchemaVersion == 1 {
+		p.RuntimeBinding.SchemaVersion = RuntimeBindingSchemaVersion
+	}
 	if p.ID == "" || p.Name == "" || p.Cwd == "" || p.ThreadID == "" || p.RuntimeBinding.Kind == "" || p.RuntimeBinding.NativeRef == "" {
 		return AgentView{}, errf(400, "id, name, cwd, threadId, and Runtime Binding are required")
+	}
+	if p.RuntimeBinding.SchemaVersion != RuntimeBindingSchemaVersion {
+		return AgentView{}, errf(400, "unsupported Runtime Binding schema version %d", p.RuntimeBinding.SchemaVersion)
 	}
 	if p.RuntimeBinding.Kind != "codex" && p.RuntimeBinding.Kind != "pi" {
 		return AgentView{}, errf(400, "unsupported Runtime kind %q", p.RuntimeBinding.Kind)

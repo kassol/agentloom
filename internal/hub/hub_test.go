@@ -3,6 +3,7 @@ package hub
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -363,6 +364,266 @@ func TestOpenRejectsLegacyAgentRegistryWithRecreateRequiredError(t *testing.T) {
 	_, err = Open(st)
 	if err == nil || !strings.Contains(err.Error(), "recreate") {
 		t.Fatalf("Open legacy registry error = %v, want recreate-required error", err)
+	}
+}
+
+func TestOpenMigratesCurrentRuntimeBindingSchemaOnceWithoutChangingLoomIdentity(t *testing.T) {
+	t.Setenv("PINIX_EDGE_NAMES", filepath.Join(t.TempDir(), "missing.json"))
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := `{"agent-1":{"id":"agent-1","name":"worker","cwd":"/tmp","threadId":"thr-loom","runtimeBinding":{"kind":"pi","nativeRef":"/tmp/pi-session.jsonl"},"runtimeTurnBindings":{"turn-loom":"entry-native"},"status":"idle","createdAt":"2026-08-10T00:00:00Z","updatedAt":"2026-08-10T00:00:00Z"}}`
+	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), []byte(current), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := Open(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := h.GetAgent("agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ID != "agent-1" || view.ThreadID != "thr-loom" || view.CurrentTurnID != "" {
+		t.Fatalf("migrated Loom identity = %#v", view.Agent)
+	}
+	diagnostics, err := h.GetRuntimeDiagnostics("agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostics.NativeRef != "/tmp/pi-session.jsonl" || diagnostics.TurnBindings["turn-loom"] != "entry-native" {
+		t.Fatalf("migrated Runtime Binding = %#v", diagnostics)
+	}
+	h.Shutdown()
+
+	var persisted map[string]*Agent
+	if err := st.LoadAgents(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if got := persisted["agent-1"].RuntimeBinding.SchemaVersion; got != RuntimeBindingSchemaVersion {
+		t.Fatalf("Runtime Binding schema version = %d, want %d", got, RuntimeBindingSchemaVersion)
+	}
+	first, err := os.ReadFile(filepath.Join(dataDir, "agents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err = Open(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Shutdown()
+	second, err := os.ReadFile(filepath.Join(dataDir, "agents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second) != string(first) {
+		t.Fatalf("idempotent reopen rewrote agents.json:\nfirst:  %s\nsecond: %s", first, second)
+	}
+}
+
+func TestOpenMigratesRuntimeBindingSchemaV1AndPreservesControlPlaneIDs(t *testing.T) {
+	t.Setenv("PINIX_EDGE_NAMES", filepath.Join(t.TempDir(), "missing.json"))
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &Agent{
+		ID: "agent-1", Name: "worker", Cwd: "/tmp", ThreadID: "thr-loom", Status: "idle",
+		RuntimeBinding:      RuntimeBinding{SchemaVersion: 1, Kind: "codex", NativeRef: "native-thread"},
+		RuntimeTurnBindings: map[string]string{"turn-loom": "native-turn"},
+		CreatedAt:           "2026-08-10T00:00:00Z", UpdatedAt: "2026-08-10T00:00:00Z",
+	}
+	if err := st.SaveAgents(map[string]*Agent{agent.ID: agent}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveProfiles(map[string]*AgentProfile{agent.ID: {AgentID: agent.ID, Identity: "runtime specialist", Version: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	message := AgentMessage{
+		ID: "msg-1", FromAgentID: schedulerAgentID, ToAgentID: agent.ID, From: schedulerIdentity, To: agent.Name,
+		Subject: "review", Body: "inspect", Response: "none", Status: "closed", Resolution: "no_reply",
+		DeliveryStatus: "delivered", CreatedAt: agent.CreatedAt, UpdatedAt: agent.UpdatedAt,
+	}
+	if err := st.AppendComm(commRecord{Message: message}); err != nil {
+		t.Fatal(err)
+	}
+	topic := &Topic{
+		ID: "tpc-1", Title: "Runtime contract", Purpose: "preserve continuity", CompletionBoundary: "migration complete",
+		Status: TopicStatusActive, ResponsibleAgentID: agent.ID, ResponsibleAgent: agent.Name,
+		Participants:    []TopicParticipant{{AgentID: agent.ID, Agent: agent.Name, Responsibility: "own", JoinedAt: agent.CreatedAt}},
+		CurrentBrief:    TopicBrief{Version: 1, Summary: "ready", UpdatedBy: agent.Name, UpdatedAt: agent.UpdatedAt},
+		BriefHistory:    []TopicBrief{{Version: 1, Summary: "ready", UpdatedBy: agent.Name, UpdatedAt: agent.UpdatedAt}},
+		DeliveryCursors: map[string]int64{}, Version: 1, CreatedBy: agent.Name, CreatedAt: agent.CreatedAt, UpdatedAt: agent.UpdatedAt,
+	}
+	if err := st.SaveTopics(map[string]*Topic{topic.ID: topic}); err != nil {
+		t.Fatal(err)
+	}
+	request := HumanRequest{
+		ID: "hrq-1", AgentID: agent.ID, AgentName: agent.Name, ThreadID: agent.ThreadID, SourceTurnID: "turn-loom", TopicID: topic.ID,
+		Expectation: HumanRequestRequired, Question: "continue?", State: "open", DeliveryStatus: "waiting", CreatedAt: agent.CreatedAt, UpdatedAt: agent.UpdatedAt,
+	}
+	if err := st.AppendHumanRequest(request); err != nil {
+		t.Fatal(err)
+	}
+
+	assertControlPlane := func(h *Hub) {
+		t.Helper()
+		view, err := h.GetAgent(agent.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		profile, profileErr := h.GetProfile(agent.ID)
+		gotMessage, messageErr := h.GetAgentMessage(message.ID)
+		gotTopic, topicErr := h.GetTopic(topic.ID)
+		gotRequest, requestErr := h.GetHumanRequest(request.ID)
+		if profileErr != nil || messageErr != nil || topicErr != nil || requestErr != nil {
+			t.Fatalf("read migrated control plane: profile=%v message=%v topic=%v request=%v", profileErr, messageErr, topicErr, requestErr)
+		}
+		if view.ID != agent.ID || view.ThreadID != agent.ThreadID || profile.AgentID != agent.ID || gotMessage.ID != message.ID || gotMessage.ToAgentID != agent.ID || gotTopic.ID != topic.ID || gotTopic.ResponsibleAgentID != agent.ID || gotRequest.ID != request.ID || gotRequest.AgentID != agent.ID || gotRequest.ThreadID != agent.ThreadID || gotRequest.SourceTurnID != "turn-loom" || gotRequest.TopicID != topic.ID {
+			t.Fatalf("control-plane identities changed: agent=%q thread=%q profile=%q message=%#v topic=%#v request=%#v", view.ID, view.ThreadID, profile.AgentID, gotMessage, gotTopic, gotRequest)
+		}
+		if h.agents[agent.ID].RuntimeBinding.SchemaVersion != RuntimeBindingSchemaVersion || h.agents[agent.ID].RuntimeTurnBindings["turn-loom"] != "native-turn" {
+			t.Fatalf("migrated Agent = %#v", h.agents[agent.ID])
+		}
+	}
+
+	var firstRegistry []byte
+	for open := 0; open < 2; open++ {
+		h, err := Open(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertControlPlane(h)
+		h.Shutdown()
+		registry, err := os.ReadFile(filepath.Join(dataDir, "agents.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if open == 0 {
+			firstRegistry = registry
+		} else if string(registry) != string(firstRegistry) {
+			t.Fatalf("reopen rewrote migrated registry:\nfirst: %s\nnext:  %s", firstRegistry, registry)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if open == 0 {
+			st, err = store.Open(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestOpenRejectsUnsupportedRuntimeBindingSchemaVersions(t *testing.T) {
+	for _, version := range []int{-1, RuntimeBindingSchemaVersion + 1} {
+		t.Run(fmt.Sprintf("version-%d", version), func(t *testing.T) {
+			dataDir := t.TempDir()
+			st, err := store.Open(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry := fmt.Sprintf(`{"agent-1":{"id":"agent-1","name":"worker","cwd":"/tmp","threadId":"thr-loom","runtimeBinding":{"schemaVersion":%d,"kind":"pi","nativeRef":"native"},"status":"idle"}}`, version)
+			if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), []byte(registry), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(st); err == nil || !strings.Contains(err.Error(), "unsupported Runtime Binding schema version") {
+				t.Fatalf("Open schema version %d error = %v", version, err)
+			}
+		})
+	}
+}
+
+func TestOpenReportsFutureRuntimeBindingSchemaBeforeCurrentShapeValidation(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := fmt.Sprintf(`{"agent-1":{"id":"agent-1","name":"future","runtimeBinding":{"schemaVersion":%d}}}`, RuntimeBindingSchemaVersion+1)
+	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Open(st)
+	if err == nil || !strings.Contains(err.Error(), "unsupported Runtime Binding schema version") {
+		t.Fatalf("future schema error = %v", err)
+	}
+	if strings.Contains(err.Error(), "legacy") {
+		t.Fatalf("future schema was misclassified as legacy: %v", err)
+	}
+}
+
+func TestPassiveOpenNormalizesRuntimeBindingSchemaWithoutWriting(t *testing.T) {
+	t.Setenv("PINIX_EDGE_NAMES", filepath.Join(t.TempDir(), "missing.json"))
+	dataDir := t.TempDir()
+	writable, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := []byte(`{"agent-1":{"id":"agent-1","name":"worker","cwd":"/tmp","threadId":"thr-loom","runtimeBinding":{"kind":"pi","nativeRef":"native"},"status":"idle"}}`)
+	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), registry, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readonly, err := store.OpenWithOptions(dataDir, store.OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := OpenWithOptions(readonly, OpenOptions{Passive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.agents["agent-1"].RuntimeBinding.SchemaVersion != RuntimeBindingSchemaVersion {
+		t.Fatalf("passive in-memory schema version = %d", h.agents["agent-1"].RuntimeBinding.SchemaVersion)
+	}
+	h.Shutdown()
+	after, err := os.ReadFile(filepath.Join(dataDir, "agents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(registry) {
+		t.Fatalf("passive Open wrote registry: before=%s after=%s", registry, after)
+	}
+}
+
+func TestRuntimeBindingMigrationFailureLeavesCanonicalRegistryUntouched(t *testing.T) {
+	t.Setenv("PINIX_EDGE_NAMES", filepath.Join(t.TempDir(), "missing.json"))
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := []byte(`{"agent-1":{"id":"agent-1","name":"worker","cwd":"/tmp","threadId":"thr-loom","runtimeBinding":{"kind":"pi","nativeRef":"native"},"status":"idle"}}`)
+	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), registry, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dataDir, "sessions.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(st); err == nil {
+		t.Fatal("Open succeeded when Runtime Binding migration could not be saved")
+	}
+	after, err := os.ReadFile(filepath.Join(dataDir, "agents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(registry) {
+		t.Fatalf("failed migration changed canonical registry: before=%s after=%s", registry, after)
 	}
 }
 
