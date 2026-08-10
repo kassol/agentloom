@@ -114,6 +114,18 @@ func TestAgentRuntimeKindIsRequiredAndImmutable(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	diagnosticsRequest := httptest.NewRequest(http.MethodGet, "/api/agents/agent-1/runtime/diagnostics", nil)
+	diagnosticsResponse := httptest.NewRecorder()
+	server.ServeHTTP(diagnosticsResponse, diagnosticsRequest)
+	if diagnosticsResponse.Code != http.StatusOK || !strings.Contains(diagnosticsResponse.Body.String(), `"nativeRef":"codex-thread-1"`) {
+		t.Fatalf("Runtime diagnostics = %d %s", diagnosticsResponse.Code, diagnosticsResponse.Body.String())
+	}
+	ordinaryRequest := httptest.NewRequest(http.MethodGet, "/api/agents/agent-1", nil)
+	ordinaryResponse := httptest.NewRecorder()
+	server.ServeHTTP(ordinaryResponse, ordinaryRequest)
+	if strings.Contains(ordinaryResponse.Body.String(), "codex-thread-1") {
+		t.Fatalf("ordinary Agent API leaked native Runtime identity: %s", ordinaryResponse.Body.String())
+	}
 	update := httptest.NewRequest(http.MethodPatch, "/api/agents/agent-1/config", strings.NewReader(`{"runtimeKind":"pi"}`))
 	updated := httptest.NewRecorder()
 	server.ServeHTTP(updated, update)

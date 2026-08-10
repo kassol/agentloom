@@ -111,6 +111,16 @@ type AgentView struct {
 	nativeTurnBindings  map[string]string
 }
 
+// RuntimeDiagnostics is the explicit Developer-only projection of native
+// Runtime identity. Ordinary Agent and event APIs keep these values redacted.
+type RuntimeDiagnostics struct {
+	AgentID      string            `json:"agentId"`
+	ThreadID     string            `json:"threadId"`
+	RuntimeKind  string            `json:"runtimeKind"`
+	NativeRef    string            `json:"nativeRef"`
+	TurnBindings map[string]string `json:"turnBindings"`
+}
+
 // SessionView is the pre-CodexLoom compatibility name.
 type SessionView = AgentView
 
@@ -1509,11 +1519,11 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 	if method == "thread/goal/updated" || method == "thread/goal/cleared" {
 		h.onGoalNotificationLocked(meta.ID, method, params)
 	}
-	if len(runtimeEvents) > 0 {
-		h.emitLocked(meta.ID, method, runtimeCompatibilityPayload(params))
-	} else {
-		h.emitLocked(meta.ID, method, params)
+	turnID := ""
+	if rt.activeTurn != nil {
+		turnID = rt.activeTurn.turnID
 	}
+	h.emitLocked(meta.ID, method, runtimePublicPayload(params, meta.ThreadID, turnID, len(runtimeEvents) > 0))
 }
 
 func (h *Hub) onRuntimeEvent(rt *runtime, event RuntimeEvent) {
@@ -1652,23 +1662,53 @@ func runtimeEventIsModelProduced(kind RuntimeEventKind) bool {
 	}
 }
 
-func runtimeCompatibilityPayload(params json.RawMessage) any {
+func runtimePublicPayload(params json.RawMessage, threadID, turnID string, compatibility bool) any {
 	var payload map[string]any
 	if json.Unmarshal(params, &payload) == nil {
-		payload["compatibility"] = true
+		if _, ok := payload["threadId"]; ok {
+			payload["threadId"] = threadID
+		}
+		if thread, ok := payload["thread"].(map[string]any); ok {
+			if _, exists := thread["id"]; exists {
+				thread["id"] = threadID
+			}
+		}
+		if _, ok := payload["turnId"]; ok {
+			if turnID == "" {
+				delete(payload, "turnId")
+			} else {
+				payload["turnId"] = turnID
+			}
+		}
+		if turn, ok := payload["turn"].(map[string]any); ok {
+			if _, exists := turn["id"]; exists {
+				if turnID == "" {
+					delete(turn, "id")
+				} else {
+					turn["id"] = turnID
+				}
+			}
+		}
+		if compatibility {
+			payload["compatibility"] = true
+		}
 		return payload
 	}
-	return map[string]any{"compatibility": true, "raw": params}
+	return map[string]any{"compatibility": compatibility, "redacted": true}
 }
 
 func (h *Hub) emitRuntimeEventsLocked(meta *Agent, rt *runtime, events []RuntimeEvent) {
 	for _, event := range events {
+		turnID := ""
+		if rt.activeTurn != nil {
+			turnID = rt.activeTurn.turnID
+		}
 		data := map[string]any{
-			"nativeTurnId": event.NativeTurnID,
-			"itemId":       event.ItemID,
-			"text":         event.Text,
-			"delta":        event.Text,
-			"item":         event.Item,
+			"turnId": turnID,
+			"itemId": event.ItemID,
+			"text":   event.Text,
+			"delta":  event.Text,
+			"item":   event.Item,
 		}
 		switch event.Kind {
 		case RuntimeUserInput:

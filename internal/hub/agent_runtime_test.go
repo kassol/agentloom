@@ -3,6 +3,7 @@ package hub
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ type fakeAgentRuntime struct {
 	closed                                          bool
 	binding                                         string
 	history                                         RuntimeHistory
+	historyErr                                      error
 	interruptedNative                               string
 	steeredNativeRef, steeredExpected, steeredInput string
 	capabilities                                    *RuntimeCapabilities
@@ -51,7 +53,7 @@ func (f *fakeAgentRuntime) Interrupt(_ string, nativeTurnID string, _ time.Durat
 }
 func (f *fakeAgentRuntime) NormalizeEvent(string, json.RawMessage) []RuntimeEvent { return nil }
 func (f *fakeAgentRuntime) ReadHistory(string, int, int) (RuntimeHistory, error) {
-	return f.history, nil
+	return f.history, f.historyErr
 }
 func (f *fakeAgentRuntime) ReadTurn(string, string) (RuntimeHistoryTurn, error) {
 	return RuntimeHistoryTurn{}, rollout.ErrTurnNotFound
@@ -64,6 +66,24 @@ func (f *fakeAgentRuntime) Capabilities() RuntimeCapabilities {
 	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true}
 }
 func (f *fakeAgentRuntime) Close() { f.closed = true }
+
+func TestHistorySurfacesRuntimeReadFailure(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeAgentRuntime{historyErr: errors.New("corrupt native history")}
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "worker", ThreadID: "thr-loom", Status: "idle",
+		RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: "native-session"},
+	}
+	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", agentRuntime: fake}
+
+	if _, err := h.History("agent-1", 10, 0); err == nil || !strings.Contains(err.Error(), "corrupt native history") {
+		t.Fatalf("History error = %v, want Runtime read failure", err)
+	}
+}
 
 func TestHubRoutesCoreExecutionThroughAgentRuntime(t *testing.T) {
 	st, err := store.Open(t.TempDir())
@@ -279,7 +299,7 @@ func TestHubPublishesNormalizedCoreEventBeforeRawCompatibilityEvent(t *testing.T
 	}
 	rt := &runtime{agentID: "agent-1", agentRuntime: &codexAgentRuntime{}}
 	h.onNotification(rt, "item/agentMessage/delta", json.RawMessage(`{
-		"threadId":"thr-native","turnId":"turn-1","itemId":"answer-1","delta":"hello"
+		"threadId":"thr-native","thread":{"id":"thr-native"},"turnId":"turn-1","itemId":"answer-1","delta":"hello"
 	}`))
 
 	events, err := st.ReadEvents("agent-1", 0, 10)
@@ -292,5 +312,9 @@ func TestHubPublishesNormalizedCoreEventBeforeRawCompatibilityEvent(t *testing.T
 	var raw map[string]any
 	if err := json.Unmarshal(events[1].Data, &raw); err != nil || raw["compatibility"] != true {
 		t.Fatalf("raw compatibility event = %s, err=%v", events[1].Data, err)
+	}
+	thread, _ := raw["thread"].(map[string]any)
+	if raw["threadId"] != "thr-loom" || thread["id"] != "thr-loom" || raw["turnId"] == "turn-1" || strings.Contains(string(events[0].Data), "nativeTurnId") {
+		t.Fatalf("public Runtime events leaked native identity: normalized=%s compatibility=%s", events[0].Data, events[1].Data)
 	}
 }

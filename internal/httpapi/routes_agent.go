@@ -52,6 +52,14 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, 200, map[string]any{"agent": agent})
 	})
+	mux.HandleFunc("GET /api/agents/{key}/runtime/diagnostics", func(w http.ResponseWriter, r *http.Request) {
+		diagnostics, err := s.hub.GetRuntimeDiagnostics(r.PathValue("key"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"diagnostics": diagnostics})
+	})
 	mux.HandleFunc("GET /api/turns/{turnId}", func(w http.ResponseWriter, r *http.Request) {
 		turn, err := s.hub.GetTurn(r.PathValue("turnId"))
 		if err != nil {

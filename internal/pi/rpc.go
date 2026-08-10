@@ -182,7 +182,12 @@ func (r *RPC) Request(ctx context.Context, command string, fields map[string]any
 		r.mu.Lock()
 		delete(r.pending, id)
 		r.mu.Unlock()
-		return RPCResponse{}, fmt.Errorf("Pi RPC command %s: %w", command, ctx.Err())
+		err := fmt.Errorf("Pi RPC command %s: %w", command, ctx.Err())
+		// A late response cannot be correlated safely, and a timed-out prompt
+		// may already be mutating the workspace. Fail the process so Hub enters
+		// interruption recovery instead of reporting a false terminal failure.
+		r.fail(err)
+		return RPCResponse{}, err
 	}
 }
 

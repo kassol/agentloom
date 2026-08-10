@@ -2,6 +2,7 @@ package hub
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -83,10 +84,14 @@ func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string)
 	if existing, ok := meta.TurnRecoveryMarkers[predecessorTurnID]; ok {
 		if h.recoveryTargetExistsLocked(meta, existing) {
 			if existing.State != TurnRecoveryCompleted {
+				previous := existing
 				existing.State = TurnRecoveryDispatched
 				existing.UpdatedAt = now()
 				meta.TurnRecoveryMarkers[predecessorTurnID] = existing
-				_ = h.persistAgentsLocked()
+				if err := h.persistAgentsLocked(); err != nil {
+					meta.TurnRecoveryMarkers[predecessorTurnID] = previous
+					log.Printf("[codex-loom] persist recovered target marker: %v", err)
+				}
 			}
 			h.mu.Unlock()
 			return
@@ -139,13 +144,21 @@ func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string)
 		return
 	}
 	if evidence.Status == RuntimeInterruptionTerminal && inspectErr == nil {
+		previousStatus, previousError, previousUpdatedAt := meta.Status, meta.LastError, meta.UpdatedAt
+		previousTurnStatus := meta.LastTurn.Status
 		meta.Status = "idle"
 		if evidence.TerminalStatus == "completed" {
 			meta.LastError = ""
 		}
 		meta.LastTurn.Status = evidence.TerminalStatus
 		meta.UpdatedAt = now()
-		_ = h.persistAgentsLocked()
+		if err := h.persistAgentsLocked(); err != nil {
+			meta.Status, meta.LastError, meta.UpdatedAt = previousStatus, previousError, previousUpdatedAt
+			meta.LastTurn.Status = previousTurnStatus
+			log.Printf("[codex-loom] persist terminal recovery evidence: %v", err)
+			h.mu.Unlock()
+			return
+		}
 		h.emitStatusLocked(meta, "idle")
 		h.mu.Unlock()
 		return
@@ -232,15 +245,18 @@ func (h *Hub) recoveryTargetExistsLocked(meta *Agent, marker TurnRecoveryMarker)
 
 func (h *Hub) markRecoveryDispatched(agentID, predecessorTurnID string, marker TurnRecoveryMarker, clearAttention bool) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	meta := h.agents[agentID]
 	if meta == nil {
+		h.mu.Unlock()
 		return
 	}
 	current, ok := meta.TurnRecoveryMarkers[predecessorTurnID]
 	if !ok || current.RecoveryTurnID != marker.RecoveryTurnID || current.HumanRequestID != marker.HumanRequestID {
+		h.mu.Unlock()
 		return
 	}
+	previousMarker := current
+	previousStatus, previousError, previousUpdatedAt := meta.Status, meta.LastError, meta.UpdatedAt
 	if current.State != TurnRecoveryCompleted {
 		current.State = TurnRecoveryDispatched
 	}
@@ -250,9 +266,18 @@ func (h *Hub) markRecoveryDispatched(agentID, predecessorTurnID string, marker T
 		meta.Status = "idle"
 		meta.LastError = ""
 		meta.UpdatedAt = now()
+	}
+	if err := h.persistAgentsLocked(); err != nil {
+		meta.TurnRecoveryMarkers[predecessorTurnID] = previousMarker
+		meta.Status, meta.LastError, meta.UpdatedAt = previousStatus, previousError, previousUpdatedAt
+		log.Printf("[codex-loom] persist dispatched recovery marker: %v", err)
+		h.mu.Unlock()
+		return
+	}
+	if clearAttention && previousStatus == "interrupted" && meta.Status == "idle" {
 		h.emitStatusLocked(meta, "idle")
 	}
-	_ = h.persistAgentsLocked()
+	h.mu.Unlock()
 }
 
 func (h *Hub) recoverySource(agentID, predecessorTurnID, topicID string) *TurnReference {

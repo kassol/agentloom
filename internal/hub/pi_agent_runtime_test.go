@@ -214,6 +214,7 @@ func TestPiApprovalDenyAndTimeoutFailClosedBeforeToolExecution(t *testing.T) {
 	}{
 		{name: "deny", scenario: "approval-deny", decision: "deny", status: "denied"},
 		{name: "timeout", scenario: "approval-timeout", decision: "", status: "timed_out"},
+		{name: "abort", scenario: "approval-abort", decision: "abort", status: "aborted"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			st, err := store.Open(t.TempDir())
@@ -257,6 +258,27 @@ func TestPiApprovalDenyAndTimeoutFailClosedBeforeToolExecution(t *testing.T) {
 			h.mu.Unlock()
 			if terminal == nil || terminal.Status != test.status {
 				t.Fatalf("durable Approval terminal = %#v, want %s", terminal, test.status)
+			}
+			failedToolDeadline := time.Now().Add(2 * time.Second)
+			failedTool := false
+			for time.Now().Before(failedToolDeadline) {
+				events, readErr := st.ReadEvents(agent.ID, 0, 100)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				for _, event := range events {
+					if event.Type == "loom/tool-completed" && strings.Contains(string(event.Data), `"status":"failed"`) {
+						failedTool = true
+						break
+					}
+				}
+				if failedTool {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !failedTool {
+				t.Fatalf("%s did not produce a truthful failed tool event", test.name)
 			}
 			if _, err := os.Stat(os.Getenv("FAKE_PI_TOOL_EFFECT_FILE")); !os.IsNotExist(err) {
 				t.Fatalf("tool executed after %s: %v", test.name, err)
@@ -1166,6 +1188,7 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 	}
 	if strings.HasPrefix(scenario, "approval") {
 		fmt.Print("{\"type\":\"agent_start\"}\n")
+		fmt.Print("{\"type\":\"tool_execution_start\",\"toolCallId\":\"call-approval-1\",\"toolName\":\"bash\",\"args\":{\"command\":\"touch approval-effect\"}}\n")
 		payload, _ := json.Marshal(map[string]any{
 			"version": 1, "operation": "request_approval", "toolCallId": "call-approval-1",
 			"toolName": "bash", "input": map[string]any{"command": "touch approval-effect"},
@@ -1184,15 +1207,18 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 			os.Exit(36)
 		}
 		decision, _ := command["value"].(string)
+		answer := "tool approved"
 		if decision == "approve" {
 			_ = os.WriteFile(os.Getenv("FAKE_PI_TOOL_EFFECT_FILE"), []byte("executed"), 0o600)
-			fmt.Print("{\"type\":\"tool_execution_start\",\"toolCallId\":\"call-approval-1\",\"toolName\":\"bash\",\"args\":{\"command\":\"touch approval-effect\"}}\n")
 			fmt.Print("{\"type\":\"tool_execution_end\",\"toolCallId\":\"call-approval-1\",\"toolName\":\"bash\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"executed\"}]},\"isError\":false}\n")
 		} else if decision != "deny" && decision != "timeout" && decision != "abort" {
 			os.Exit(37)
+		} else {
+			answer = "tool blocked: " + decision
+			fmt.Printf("{\"type\":\"tool_execution_end\",\"toolCallId\":\"call-approval-1\",\"toolName\":\"bash\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":%q}]},\"isError\":true}\n", answer)
 		}
 		fmt.Print("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n")
-		fmt.Print("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"approved\"}]}}\n")
+		fmt.Printf("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":%q}]}}\n", answer)
 		fmt.Print("{\"type\":\"agent_end\"}\n")
 		fmt.Print("{\"type\":\"agent_settled\"}\n")
 		serveFakePiHistory(reader, sessionFile)

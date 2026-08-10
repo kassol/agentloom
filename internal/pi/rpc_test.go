@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -178,6 +179,31 @@ func TestRPCProcessReportsProtocolDriftMalformedOutputAndExit(t *testing.T) {
 	}
 }
 
+func TestRPCCommandTimeoutInvalidatesProcess(t *testing.T) {
+	failures := make(chan error, 1)
+	rpc, err := SpawnRPC(RPCOptions{
+		Bin: fakeRPCBin(t, "timeout"), Cwd: t.TempDir(),
+		OnFailure: func(err error) { failures <- err },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rpc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := rpc.Request(ctx, "get_state", nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timed-out command error = %v", err)
+	}
+	select {
+	case err := <-failures:
+		if !errors.Is(err, context.DeadlineExceeded) || rpc.Alive() {
+			t.Fatalf("timeout failure = %v, alive=%v", err, rpc.Alive())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed-out command did not fail the Runtime")
+	}
+}
+
 func scenarioFailureWord(scenario string) string {
 	switch scenario {
 	case "wrong-id":
@@ -238,6 +264,9 @@ func TestFakePiRPCProcess(t *testing.T) {
 		return
 	case "exit":
 		os.Exit(23)
+	case "timeout":
+		_, _ = reader.ReadString('\n')
+		return
 	}
 	if os.Getenv("FAKE_PI_RPC_SCENARIO") == "blocked-extension-ui-handler" || os.Getenv("FAKE_PI_RPC_SCENARIO") == "extension-ui-response" {
 		fmt.Print(`{"type":"extension_ui_request","id":"ui-approval-1","method":"input","title":"codex-loom-approval-v1","placeholder":"{}"}` + "\n")

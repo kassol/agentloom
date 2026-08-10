@@ -91,6 +91,23 @@ func (h *Hub) GetAgent(key string) (AgentView, error) {
 	return view, nil
 }
 
+func (h *Hub) GetRuntimeDiagnostics(key string) (RuntimeDiagnostics, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta := h.resolveLocked(key)
+	if meta == nil {
+		return RuntimeDiagnostics{}, errf(404, "agent not found: %s", key)
+	}
+	bindings := make(map[string]string, len(meta.RuntimeTurnBindings))
+	for turnID, nativeTurnID := range meta.RuntimeTurnBindings {
+		bindings[turnID] = nativeTurnID
+	}
+	return RuntimeDiagnostics{
+		AgentID: meta.ID, ThreadID: meta.ThreadID, RuntimeKind: meta.RuntimeBinding.Kind,
+		NativeRef: meta.RuntimeBinding.NativeRef, TurnBindings: bindings,
+	}, nil
+}
+
 // GetSession is the pre-CodexLoom compatibility method.
 func (h *Hub) GetSession(key string) (SessionView, error) { return h.GetAgent(key) }
 
@@ -1364,14 +1381,14 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 	}
 
 	if backend == nil || !backend.Capabilities().History {
-		return hist, nil
+		return History{}, errf(503, "%s Runtime history backend is unavailable", view.RuntimeBinding.Kind)
 	}
 	window, err := backend.ReadHistory(threadID, count, offset)
 	if err != nil {
-		// No rollout on disk (e.g. a new Agent before its first Turn is
-		// flushed). Not an error: report empty history for this Agent.
-		log.Printf("[codex-loom] history: no rollout for %s (thread %s): %v", view.Name, threadID, err)
-		return hist, nil
+		if errors.Is(err, rollout.ErrRolloutNotFound) {
+			return hist, nil
+		}
+		return History{}, errf(500, "read %s Runtime history: %v", view.RuntimeBinding.Kind, err)
 	}
 	all := window.Turns
 	for i := range all {

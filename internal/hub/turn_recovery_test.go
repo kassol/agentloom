@@ -232,6 +232,37 @@ func TestAutomaticRecoveryMarkerFencesManualInterruptedTurnActions(t *testing.T)
 	}
 }
 
+func TestRecoveryDispatchPersistenceFailureKeepsInterruptedMarker(t *testing.T) {
+	dir := t.TempDir()
+	writable, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err := store.OpenWithOptions(dir, store.OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	h := testHub(readOnly)
+	marker := TurnRecoveryMarker{
+		PredecessorTurnID: "turn-before", Disposition: "needs_you", State: TurnRecoveryPlanned,
+		HumanRequestID: "hrq-recovery", CreatedAt: now(), UpdatedAt: now(),
+	}
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "worker", Status: "interrupted", LastError: "runtime failed",
+		LastTurn:            &TurnSummary{TurnID: "turn-before", Status: "interrupted"},
+		TurnRecoveryMarkers: map[string]TurnRecoveryMarker{"turn-before": marker},
+	}
+
+	h.markRecoveryDispatched("agent-1", "turn-before", marker, true)
+	if got := h.agents["agent-1"]; got.Status != "interrupted" || got.LastError != "runtime failed" || got.TurnRecoveryMarkers["turn-before"].State != TurnRecoveryPlanned {
+		t.Fatalf("failed persistence changed recovery truth: %#v", got)
+	}
+}
+
 func TestAutomaticRecoveryClaimFencesManualActionsBeforeMarkerIsPersisted(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
