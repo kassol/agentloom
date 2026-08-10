@@ -72,6 +72,8 @@ export interface RuntimeModel {
   id: string;
   contextWindow?: number;
   reasoning: boolean;
+  thinkingLevels: string[];
+  imageInput: boolean;
 }
 
 export interface ModelProvider {

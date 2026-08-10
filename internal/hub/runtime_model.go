@@ -6,10 +6,12 @@ import (
 )
 
 type RuntimeModel struct {
-	Provider      string `json:"provider"`
-	ID            string `json:"id"`
-	ContextWindow int    `json:"contextWindow,omitempty"`
-	Reasoning     bool   `json:"reasoning"`
+	Provider       string   `json:"provider"`
+	ID             string   `json:"id"`
+	ContextWindow  int      `json:"contextWindow,omitempty"`
+	Reasoning      bool     `json:"reasoning"`
+	ThinkingLevels []string `json:"thinkingLevels"`
+	ImageInput     bool     `json:"imageInput"`
 }
 
 type RuntimeModelState struct {

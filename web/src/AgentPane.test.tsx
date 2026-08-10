@@ -176,8 +176,9 @@ describe("AgentPane scroll restoration", () => {
 		thinkingLevel: "medium",
 		thinkingLevels: ["off", "minimal", "low", "medium", "high"],
 		models: [
-		  { provider: "openai-codex", id: "gpt-5.4-mini", reasoning: true },
-		  { provider: "xai", id: "grok-4.5", reasoning: true },
+		  { provider: "openai-codex", id: "gpt-5.4-mini", reasoning: true, thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"], imageInput: false },
+		  { provider: "xai", id: "grok-4.5", reasoning: true, thinkingLevels: ["low", "medium", "high"], imageInput: true },
+		  { provider: "xai", id: "grok-build-0.1", reasoning: false, thinkingLevels: ["off"], imageInput: false },
 		],
 	  }), { status: 200, headers: { "Content-Type": "application/json" } });
 	  const body = url.includes("/thread/history") ? { total: 0, turns: [] } : url.includes("/config") ? { agent: piAgent } : { artifacts: [] };
@@ -222,6 +223,17 @@ describe("AgentPane scroll restoration", () => {
 	}).then(async () => {
 	  fireEvent.change(provider, { target: { value: "xai" } });
 	  expect(model).toHaveValue("grok-4.5");
+	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Available after Save");
+	  expect(Array.from(thinking.options).map((option) => option.value)).toEqual(["low", "medium", "high"]);
+	  expect(thinking).toHaveValue("medium");
+	  fireEvent.change(model, { target: { value: "grok-build-0.1" } });
+	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Unavailable after Save");
+	  expect(Array.from(thinking.options).map((option) => option.value)).toEqual(["off"]);
+	  expect(thinking).toHaveValue("off");
+	  fireEvent.change(model, { target: { value: "grok-4.5" } });
+	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Available after Save");
+	  expect(Array.from(thinking.options).map((option) => option.value)).toEqual(["low", "medium", "high"]);
+	  expect(thinking).toHaveValue("low");
 	  fireEvent.change(thinking, { target: { value: "high" } });
 	  fireEvent.click(view.getByRole("button", { name: "Save" }));
 	  await waitFor(() => expect(vi.mocked(fetch).mock.calls).toContainEqual([

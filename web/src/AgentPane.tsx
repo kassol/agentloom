@@ -978,6 +978,10 @@ export function AgentPane({
   const providerChanged = providerDraft !== (agent.providerId || "openai");
 	const piProviders = [...new Set(runtimeModels.map((model) => model.provider))];
 	const piModels = runtimeModels.filter((model) => model.provider === providerDraft);
+	const selectedRuntimeModel = piModels.find((model) => model.id === modelDraft);
+	const runtimeThinkingOptions = selectedRuntimeModel?.thinkingLevels?.length ? selectedRuntimeModel.thinkingLevels : runtimeThinkingLevels;
+	const runtimeModelIdentityChanged = piRuntime && !!selectedRuntimeModel && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id);
+	const imageInputAvailable = selectedRuntimeModel?.imageInput ?? agent.runtimeCapabilities.imageInput;
 	const runtimeModelChanged = piRuntime
 	  ? providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel
 	  : providerChanged;
@@ -1086,7 +1090,7 @@ export function AgentPane({
 					<div className="mb-1.5 text-[10px] font-semibold uppercase text-muted-foreground">Runtime capabilities</div>
 					<div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10.5px]">
 					  {([
-						["Image input", agent.runtimeCapabilities.imageInput],
+						["Image input", imageInputAvailable],
 						["History", agent.runtimeCapabilities.history],
 						["Goal support", agent.runtimeCapabilities.goal],
 						["Remote", agent.runtimeCapabilities.remote],
@@ -1095,7 +1099,7 @@ export function AgentPane({
 						["Sandbox configuration", agent.runtimeCapabilities.sandbox],
 						["Manual compaction", agent.runtimeCapabilities.compaction],
 					  ] as Array<[string, boolean]>).map(([label, available]) => (
-						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{available ? "Available" : label === "Image input" && agent.runtimeBinding.kind === "pi" && !agent.processAlive ? "Checked on start" : "Unavailable"}</span></div>
+						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{label === "Image input" && runtimeModelIdentityChanged ? `${available ? "Available" : "Unavailable"} after Save` : available ? "Available" : label === "Image input" && agent.runtimeBinding.kind === "pi" && !agent.processAlive ? "Checked on start" : "Unavailable"}</span></div>
 					  ))}
 					</div>
 				  </div>
@@ -1116,8 +1120,11 @@ export function AgentPane({
 					  value={providerDraft}
 					  onChange={(event) => {
 						const provider = event.target.value;
+						const model = runtimeModels.find((candidate) => candidate.provider === provider);
 						setProviderDraft(provider);
-						setModelDraft(runtimeModels.find((model) => model.provider === provider)?.id || "");
+						setModelDraft(model?.id || "");
+						const levels = model?.thinkingLevels || [];
+						setEffortDraft(levels.includes(effortDraft) ? effortDraft : levels[0] || "");
 					  }}
 					  disabled={running || runtimeModels.length === 0}
 					  className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
@@ -1144,7 +1151,12 @@ export function AgentPane({
                     <span className="mb-1 block text-[11px] text-muted-foreground">Model</span>
 					{piRuntime ? <select
 					  value={modelDraft}
-					  onChange={(event) => setModelDraft(event.target.value)}
+					  onChange={(event) => {
+						const model = piModels.find((candidate) => candidate.id === event.target.value);
+						setModelDraft(event.target.value);
+						const levels = model?.thinkingLevels || [];
+						setEffortDraft(levels.includes(effortDraft) ? effortDraft : levels[0] || "");
+					  }}
 					  disabled={running || piModels.length === 0}
 					  className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
 					>
@@ -1181,9 +1193,9 @@ export function AgentPane({
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Thinking Effort</span>
-					<select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running || (piRuntime ? runtimeThinkingLevels.length === 0 : !agent.runtimeCapabilities.provider)} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+					<select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running || (piRuntime ? runtimeThinkingOptions.length === 0 : !agent.runtimeCapabilities.provider)} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
 					  {!piRuntime && <option value="">default{selectedModelDetail?.defaultReasoningEffort ? ` (${selectedModelDetail.defaultReasoningEffort})` : ""}</option>}
-					  {(piRuntime ? runtimeThinkingLevels : reasoningEfforts).map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+					  {(piRuntime ? runtimeThinkingOptions : reasoningEfforts).map((effort) => <option key={effort} value={effort}>{effort}</option>)}
                     </select>
                   </label>
                   <label className="mb-2 block">

@@ -35,6 +35,13 @@ func TestPiAgentSwitchesNativeModelWithoutReplacingSession(t *testing.T) {
 		before.ThinkingLevel != "medium" || strings.Join(before.ThinkingLevels, ",") != "off,minimal,low,medium,high" {
 		t.Fatalf("initial Pi models = %#v", before)
 	}
+	if strings.Join(before.Models[0].ThinkingLevels, ",") != "off,minimal,low,medium,high,xhigh" ||
+		strings.Join(before.Models[1].ThinkingLevels, ",") != "low,medium,high" {
+		t.Fatalf("per-model Pi thinking levels = %#v", before.Models)
+	}
+	if !before.Models[0].ImageInput || before.Models[1].ImageInput {
+		t.Fatalf("per-model Pi image input = %#v", before.Models)
+	}
 	diagnostics, err := h.GetRuntimeDiagnostics(agent.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +118,7 @@ func TestFakePiModelRPCProcess(t *testing.T) {
 		case "get_state":
 			fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q,"thinkingLevel":%q,"model":{"provider":%q,"id":%q,"input":["text"]}}}`+"\n", id, sessionFile, sessionID, thinkingLevel, provider, model)
 		case "get_available_models":
-			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"openai-codex","id":"gpt-5.4-mini","contextWindow":128000,"reasoning":true},{"provider":"xai","id":"grok-4.5","contextWindow":256000,"reasoning":true}]}}`+"\n", id)
+			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"openai-codex","id":"gpt-5.4-mini","input":["text","image"],"contextWindow":128000,"reasoning":true,"thinkingLevelMap":{"minimal":"low","xhigh":"xhigh"}},{"provider":"xai","id":"grok-4.5","input":["text"],"contextWindow":256000,"reasoning":true,"thinkingLevelMap":{"off":null,"minimal":null,"low":"low","medium":"medium","high":"high","xhigh":null,"max":null}}]}}`+"\n", id)
 		case "get_available_thinking_levels":
 			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","minimal","low","medium","high"]}}`+"\n", id)
 		case "set_model":

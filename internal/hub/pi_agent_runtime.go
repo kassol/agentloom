@@ -100,11 +100,12 @@ type piSessionState struct {
 }
 
 type piRuntimeModel struct {
-	Provider      string   `json:"provider"`
-	ID            string   `json:"id"`
-	Input         []string `json:"input"`
-	ContextWindow int      `json:"contextWindow"`
-	Reasoning     bool     `json:"reasoning"`
+	Provider         string             `json:"provider"`
+	ID               string             `json:"id"`
+	Input            []string           `json:"input"`
+	ContextWindow    int                `json:"contextWindow"`
+	Reasoning        bool               `json:"reasoning"`
+	ThinkingLevelMap map[string]*string `json:"thinkingLevelMap"`
 }
 
 func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) (piSessionState, error) {
@@ -165,19 +166,14 @@ func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) 
 		rpc.Close()
 		return piSessionState{}, fmt.Errorf("Pi get_state returned unsupported session state: %s", response.Data)
 	}
-	imageInput := false
+	currentModel := RuntimeModel{}
 	if state.Model != nil {
-		for _, input := range state.Model.Input {
-			if input == "image" {
-				imageInput = true
-				break
-			}
-		}
+		currentModel = runtimeModel(*state.Model)
 	}
 	r.mu.Lock()
-	r.imageInput = imageInput
+	r.imageInput = currentModel.ImageInput
 	if state.Model != nil {
-		r.currentModel = runtimeModel(*state.Model)
+		r.currentModel = currentModel
 	}
 	r.thinkingLevel = state.ThinkingLevel
 	r.mu.Unlock()
@@ -185,7 +181,25 @@ func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) 
 }
 
 func runtimeModel(model piRuntimeModel) RuntimeModel {
-	return RuntimeModel{Provider: model.Provider, ID: model.ID, ContextWindow: model.ContextWindow, Reasoning: model.Reasoning}
+	imageInput := false
+	for _, input := range model.Input {
+		if input == "image" {
+			imageInput = true
+			break
+		}
+	}
+	levels := []string{"off"}
+	if model.Reasoning {
+		levels = levels[:0]
+		for _, level := range []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"} {
+			mapped, present := model.ThinkingLevelMap[level]
+			if (present && mapped == nil) || ((level == "xhigh" || level == "max") && !present) {
+				continue
+			}
+			levels = append(levels, level)
+		}
+	}
+	return RuntimeModel{Provider: model.Provider, ID: model.ID, ContextWindow: model.ContextWindow, Reasoning: model.Reasoning, ThinkingLevels: levels, ImageInput: imageInput}
 }
 
 func (r *piAgentRuntime) models(timeout time.Duration) (RuntimeModelState, error) {
@@ -263,17 +277,13 @@ func (r *piAgentRuntime) switchModel(selection RuntimeModelSelection, timeout ti
 			return RuntimeModelState{}, err
 		}
 	}
+	nextModel := current
 	if modelChanged {
-		imageInput = false
-		for _, input := range model.Input {
-			if input == "image" {
-				imageInput = true
-				break
-			}
-		}
+		nextModel = runtimeModel(model)
+		imageInput = nextModel.ImageInput
 	}
 	r.mu.Lock()
-	r.currentModel = runtimeModel(model)
+	r.currentModel = nextModel
 	r.imageInput = imageInput
 	if selection.ThinkingLevel != "" {
 		r.thinkingLevel = selection.ThinkingLevel
@@ -282,7 +292,7 @@ func (r *piAgentRuntime) switchModel(selection RuntimeModelSelection, timeout ti
 	thinkingLevel := r.thinkingLevel
 	models := append([]RuntimeModel(nil), r.availableModels...)
 	r.mu.Unlock()
-	return RuntimeModelState{Current: runtimeModel(model), Models: models, ThinkingLevel: thinkingLevel, ThinkingLevels: levelsData.Levels}, nil
+	return RuntimeModelState{Current: nextModel, Models: models, ThinkingLevel: thinkingLevel, ThinkingLevels: levelsData.Levels}, nil
 }
 
 func (r *piAgentRuntime) InjectDeveloperContext(_ string, content string, _ time.Duration) error {
