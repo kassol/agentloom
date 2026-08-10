@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ type piAgentRuntime struct {
 	pendingTerminal  RuntimeEvent
 	settled          chan struct{}
 	abortRequested   bool
+	imageInput       bool
 }
 
 func newPiAgentRuntime(agentID, dataDir string) *piAgentRuntime {
@@ -76,6 +78,9 @@ func (r *piAgentRuntime) Resume(request RuntimeBindingRequest, timeout time.Dura
 type piSessionState struct {
 	SessionFile string `json:"sessionFile"`
 	SessionID   string `json:"sessionId"`
+	Model       *struct {
+		Input []string `json:"input"`
+	} `json:"model,omitempty"`
 }
 
 func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) (piSessionState, error) {
@@ -126,6 +131,18 @@ func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) 
 		rpc.Close()
 		return piSessionState{}, fmt.Errorf("Pi get_state returned unsupported session state: %s", response.Data)
 	}
+	imageInput := false
+	if state.Model != nil {
+		for _, input := range state.Model.Input {
+			if input == "image" {
+				imageInput = true
+				break
+			}
+		}
+	}
+	r.mu.Lock()
+	r.imageInput = imageInput
+	r.mu.Unlock()
 	return state, nil
 }
 
@@ -138,23 +155,44 @@ func (r *piAgentRuntime) InjectDeveloperContext(_ string, content string, _ time
 
 func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	parts := make([]string, 0, len(request.Input)+1)
+	type piImage struct {
+		Type     string `json:"type"`
+		Data     string `json:"data"`
+		MimeType string `json:"mimeType"`
+	}
+	images := make([]piImage, 0)
 	r.mu.Lock()
 	if r.developerContext != "" {
 		parts = append(parts, r.developerContext)
 		r.developerContext = ""
 	}
 	rpc := r.rpc
+	imageInput := r.imageInput
 	r.pendingTerminal = RuntimeEvent{}
 	r.currentMessage = 0
 	r.settled = make(chan struct{})
 	r.abortRequested = false
 	r.mu.Unlock()
 	for _, input := range request.Input {
-		if input.Kind != RuntimeInputText {
-			return "", fmt.Errorf("Pi core Turn supports direct text only")
-		}
-		if text := strings.TrimSpace(input.Text); text != "" {
-			parts = append(parts, text)
+		switch input.Kind {
+		case RuntimeInputText:
+			if text := strings.TrimSpace(input.Text); text != "" {
+				parts = append(parts, text)
+			}
+		case RuntimeInputLocalImage:
+			if !imageInput {
+				return "", errors.New("Pi Runtime active model does not support image input")
+			}
+			if !strings.HasPrefix(strings.ToLower(input.MimeType), "image/") {
+				return "", fmt.Errorf("Pi image input %q has invalid MIME type %q", input.Path, input.MimeType)
+			}
+			data, err := os.ReadFile(input.Path)
+			if err != nil {
+				return "", fmt.Errorf("read Pi image input %q: %w", input.Path, err)
+			}
+			images = append(images, piImage{Type: "image", Data: base64.StdEncoding.EncodeToString(data), MimeType: input.MimeType})
+		default:
+			return "", fmt.Errorf("Pi Runtime does not support input kind %q", input.Kind)
 		}
 	}
 	if rpc == nil || !rpc.Alive() {
@@ -166,7 +204,11 @@ func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), request.Timeout)
 	defer cancel()
-	_, err := rpc.Request(ctx, "prompt", map[string]any{"message": message})
+	prompt := map[string]any{"message": message}
+	if len(images) > 0 {
+		prompt["images"] = images
+	}
+	_, err := rpc.Request(ctx, "prompt", prompt)
 	return "", err
 }
 
@@ -420,7 +462,10 @@ func (r *piAgentRuntime) ReadTurn(string, string) (RuntimeHistoryTurn, error) {
 func (r *piAgentRuntime) LatestTurn(string) (*RuntimeHistoryTurn, error) { return nil, nil }
 
 func (r *piAgentRuntime) Capabilities() RuntimeCapabilities {
-	return RuntimeCapabilities{Interrupt: true}
+	r.mu.Lock()
+	imageInput := r.imageInput
+	r.mu.Unlock()
+	return RuntimeCapabilities{Interrupt: true, ImageInput: imageInput}
 }
 
 func (r *piAgentRuntime) Close() {

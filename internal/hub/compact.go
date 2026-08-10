@@ -34,6 +34,10 @@ func (h *Hub) CompactAgentThread(key string) (ThreadCompactResult, error) {
 		h.mu.Unlock()
 		return ThreadCompactResult{}, errf(404, "agent not found: %s", key)
 	}
+	if !h.runtimeCapabilitiesLocked(agent).Compaction {
+		h.mu.Unlock()
+		return ThreadCompactResult{}, unsupportedRuntimeCapability(agent, "manual compaction")
+	}
 	if agent.Status == "running" {
 		h.mu.Unlock()
 		return ThreadCompactResult{}, errf(409, "agent %q is running; stop the active Turn before compacting", agent.Name)

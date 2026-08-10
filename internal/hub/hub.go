@@ -1851,13 +1851,7 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 	view := AgentView{Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID], nativeRuntimeRef: meta.RuntimeBinding.NativeRef, nativeTurnBindings: bindings}
 	view.RuntimeBinding.NativeRef = ""
 	view.RuntimeTurnBindings = nil
-	backend := runtimeForKind(meta.RuntimeBinding.Kind)
-	if rt := h.runtimes[meta.ID]; rt != nil {
-		backend = runtimeBackend(rt)
-	}
-	if backend != nil {
-		view.RuntimeCapabilities = backend.Capabilities()
-	}
+	view.RuntimeCapabilities = h.runtimeCapabilitiesLocked(meta)
 	if goal := h.goals[meta.ID]; goal != nil {
 		copy := *goal
 		view.Goal = &copy
@@ -1871,6 +1865,30 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 		}
 	}
 	return view
+}
+
+func (h *Hub) runtimeCapabilitiesLocked(meta *Agent) RuntimeCapabilities {
+	if meta == nil {
+		return RuntimeCapabilities{}
+	}
+	backend := runtimeForKind(meta.RuntimeBinding.Kind)
+	if rt := h.runtimes[meta.ID]; rt != nil {
+		backend = runtimeBackend(rt)
+	}
+	if backend == nil {
+		return RuntimeCapabilities{}
+	}
+	return backend.Capabilities()
+}
+
+func unsupportedRuntimeCapability(agent *Agent, capability string) error {
+	kind := "Agent"
+	if agent != nil {
+		if runtimeKind := strings.TrimSpace(agent.RuntimeBinding.Kind); runtimeKind != "" {
+			kind = strings.ToUpper(runtimeKind[:1]) + runtimeKind[1:]
+		}
+	}
+	return errf(409, "%s Runtime does not support %s", kind, capability)
 }
 
 func runtimeForKind(kind string) AgentRuntime {

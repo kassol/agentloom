@@ -250,6 +250,10 @@ func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (Agen
 		h.mu.Unlock()
 		return AgentView{}, errf(404, "agent not found: %s", key)
 	}
+	if !h.runtimeCapabilitiesLocked(agent).Provider {
+		h.mu.Unlock()
+		return AgentView{}, unsupportedRuntimeCapability(agent, "Provider switching")
+	}
 	if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" {
 		h.mu.Unlock()
 		return AgentView{}, errf(409, "agent has no primary Thread binding")

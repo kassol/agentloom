@@ -49,9 +49,11 @@ func TestCompactAgentThreadRejectsActiveTurnAndGoal(t *testing.T) {
 	}
 	h := testHub(st)
 	defer h.Shutdown()
-	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: "thr-stale", Status: "idle"}
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "worker", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"}, Status: "idle",
+	}
 
-	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", activeTurn: &turnState{finished: false}}
+	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", agentRuntime: &codexAgentRuntime{}, activeTurn: &turnState{finished: false}}
 	_, err = h.CompactAgentThread("agent-1")
 	if err == nil || !strings.Contains(err.Error(), "active Turn") {
 		t.Fatalf("active Turn compact error = %v", err)

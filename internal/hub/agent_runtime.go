@@ -59,9 +59,10 @@ const (
 )
 
 type RuntimeInput struct {
-	Kind RuntimeInputKind
-	Text string
-	Path string
+	Kind     RuntimeInputKind
+	Text     string
+	Path     string
+	MimeType string
 }
 
 type RuntimeCapabilities struct {
@@ -78,6 +79,7 @@ type RuntimeCapabilities struct {
 	Naming      bool `json:"naming"`
 	Archive     bool `json:"archive"`
 	Sandbox     bool `json:"sandbox"`
+	ImageInput  bool `json:"imageInput"`
 }
 
 type RuntimeEventKind string

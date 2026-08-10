@@ -28,6 +28,11 @@ const testAgent: Agent = {
   cwd: "/workspace/agent-scroll",
   threadId: "thread-scroll",
   runtimeBinding: { kind: "codex" },
+  runtimeCapabilities: {
+    history: true, causalSteer: true, interrupt: true, goal: true, remote: true,
+    usage: true, provider: true, compaction: true, approval: true, skills: true,
+    naming: true, archive: true, sandbox: true, imageInput: true,
+  },
   sandbox: "workspace-write",
   approvalPolicy: "on-request",
   status: "idle",
@@ -100,5 +105,39 @@ describe("AgentPane scroll restoration", () => {
 	const view = render(<AgentPane {...props} active configRequestNonce={1} />);
 	expect(view.getByText("Runtime kind").nextElementSibling).toHaveTextContent("codex");
 	expect(view.queryByDisplayValue("codex")).toBeNull();
+  });
+
+  it("shows Pi capability limits and disables unsupported Runtime controls", () => {
+	const onError = vi.fn();
+    const piAgent: Agent = {
+      ...testAgent,
+      runtimeBinding: { kind: "pi" },
+      runtimeCapabilities: {
+        history: false, causalSteer: false, interrupt: true, goal: false, remote: false,
+        usage: false, provider: false, compaction: false, approval: false, skills: false,
+        naming: false, archive: false, sandbox: false, imageInput: false,
+      },
+    };
+    const view = render(<AgentPane {...props} agent={piAgent} onError={onError} active configRequestNonce={1} />);
+
+    expect(view.getByText("Runtime capabilities")).toBeInTheDocument();
+    expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Unavailable");
+    expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Unavailable");
+    expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();
+    expect(view.getByText("Provider").closest("label")?.querySelector("select")).toBeDisabled();
+    expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
+    expect(view.getByRole("button", { name: "Usage" })).toBeDisabled();
+    expect(view.getByText("History is unavailable for the pi Runtime.")).toBeInTheDocument();
+    expect(view.getByText("Goal is unavailable for the pi Runtime.")).toBeInTheDocument();
+    expect(view.queryByRole("button", { name: "Set a Goal" })).toBeNull();
+
+	const task = view.getByRole("textbox", { name: "task message" });
+	fireEvent.change(task, { target: { value: "/compact" } });
+	fireEvent.click(view.getByRole("button", { name: "send task" }));
+	expect(onError).toHaveBeenCalledWith("Manual compaction is unavailable for the pi Runtime");
+
+	const requestedURLs = vi.mocked(fetch).mock.calls.map(([input]) => typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url);
+	expect(requestedURLs.some((url) => url.includes("/thread/history"))).toBe(false);
+	expect(requestedURLs.some((url) => url.includes("/compact"))).toBe(false);
   });
 });

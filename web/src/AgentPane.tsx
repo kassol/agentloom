@@ -380,6 +380,16 @@ export function AgentPane({
     totalRef.current = 0;
     stickRef.current = true;
     setShowJumpToBottom(false);
+    if (!agent.runtimeCapabilities.history) {
+      api("GET", `/api/agents/${agent.id}/artifacts`)
+        .then((data) => {
+          if (!cancelled) dispatch({ type: "__published_artifacts__", ts: "", data } as any);
+        })
+        .catch(() => {});
+      return () => {
+        cancelled = true;
+      };
+    }
     api("GET", `/api/agents/${agent.id}/thread/history?count=${PAGE}&offset=0`)
       .then((h) => {
         if (cancelled) return;
@@ -402,10 +412,11 @@ export function AgentPane({
     return () => {
       cancelled = true;
     };
-  }, [agent.id]);
+  }, [agent.id, agent.runtimeCapabilities.history]);
 
   // Scroll-up lazy load: fetch the next older page and prepend it.
   const loadOlder = () => {
+    if (!agent.runtimeCapabilities.history) return;
     if (loadingRef.current || loadedRef.current >= totalRef.current) return;
     loadingRef.current = true;
     const el = feedRef.current;
@@ -430,6 +441,7 @@ export function AgentPane({
     let cancelled = false;
     const unsubscribe = subscribeThreadEvents(agent.id, (event) => {
       if (event.type === "loom/reconcile") {
+        if (!agent.runtimeCapabilities.history) return;
         api("GET", `/api/agents/${agent.id}/thread/history?count=${PAGE}&offset=0`)
           .then((history) => {
             if (cancelled) return;
@@ -442,6 +454,7 @@ export function AgentPane({
       }
       dispatch(event);
       if (event.type === "turn/completed" || event.type.endsWith("turn-completed")) {
+        if (!agent.runtimeCapabilities.history) return;
         window.setTimeout(() => {
           api("GET", `/api/agents/${agent.id}/thread/history?count=1&offset=0`)
             .then((history) => {
@@ -457,7 +470,7 @@ export function AgentPane({
       cancelled = true;
       unsubscribe();
     };
-  }, [agent.id]);
+  }, [agent.id, agent.runtimeCapabilities.history]);
 
   // After blocks change: if a prepend just happened, preserve the scroll
   // position (keep the same turn under the viewport); otherwise autoscroll to
@@ -622,6 +635,10 @@ export function AgentPane({
       return;
     }
     const isCompact = !request && text === "/compact";
+    if (isCompact && !agent.runtimeCapabilities.compaction) {
+      onError(`Manual compaction is unavailable for the ${agent.runtimeBinding.kind} Runtime`);
+      return;
+    }
     if (isCompact && draftAttachments.length > 0) {
       onError("/compact does not accept attachments");
       return;
@@ -1000,7 +1017,7 @@ export function AgentPane({
                 <button onClick={() => setConfigSection("external")} className={`h-7 rounded px-3 ${configSection === "external" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>External</button>
                 <button onClick={() => setConfigSection("triggers")} className={`h-7 rounded px-3 ${configSection === "triggers" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Triggers</button>
                 <button onClick={() => setConfigSection("runtime")} className={`h-7 rounded px-3 ${configSection === "runtime" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Runtime</button>
-                <button onClick={() => setConfigSection("usage")} className={`h-7 rounded px-3 ${configSection === "usage" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Usage</button>
+                <button onClick={() => setConfigSection("usage")} disabled={!agent.runtimeCapabilities.usage} title={!agent.runtimeCapabilities.usage ? `Usage is unavailable for the ${agent.runtimeBinding.kind} Runtime` : undefined} className={`h-7 rounded px-3 disabled:cursor-not-allowed disabled:opacity-40 ${configSection === "usage" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Usage</button>
               </div>
 
 			  {configSection === "runtime" ? (
@@ -1009,12 +1026,29 @@ export function AgentPane({
 					<span className="mb-1 block text-[11px] text-muted-foreground">Runtime kind</span>
 					<span className="block h-8 rounded-md bg-muted/50 px-2.5 py-2 font-mono text-[12px]">{agent.runtimeBinding.kind}</span>
 				  </div>
+				  <div className="mb-3 rounded-md border border-border bg-muted/20 p-2">
+					<div className="mb-1.5 text-[10px] font-semibold uppercase text-muted-foreground">Runtime capabilities</div>
+					<div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10.5px]">
+					  {([
+						["Image input", agent.runtimeCapabilities.imageInput],
+						["History", agent.runtimeCapabilities.history],
+						["Goal support", agent.runtimeCapabilities.goal],
+						["Remote", agent.runtimeCapabilities.remote],
+						["Usage reporting", agent.runtimeCapabilities.usage],
+						["Provider switching", agent.runtimeCapabilities.provider],
+						["Sandbox configuration", agent.runtimeCapabilities.sandbox],
+						["Manual compaction", agent.runtimeCapabilities.compaction],
+					  ] as Array<[string, boolean]>).map(([label, available]) => (
+						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{available ? "Available" : "Unavailable"}</span></div>
+					  ))}
+					</div>
+				  </div>
 				  <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Name</span>
                     <input
                       value={nameDraft}
                       onChange={(e) => setNameDraft(e.target.value)}
-                      disabled={running}
+					  disabled={running}
                       placeholder="agent-name"
                       spellCheck={false}
                       className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition placeholder:text-muted-foreground/60 focus:ring-ring/25 disabled:opacity-60"
@@ -1033,7 +1067,7 @@ export function AgentPane({
                         setEffortDraft("");
                         setModelCustomOpen(nextProvider !== "openai" && nextModel === "");
                       }}
-                      disabled={running}
+                      disabled={running || !agent.runtimeCapabilities.provider}
                       className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
                     >
                       {selectableProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
@@ -1052,7 +1086,7 @@ export function AgentPane({
                         setModelCustomOpen(false);
                         setModelDraft(e.target.value);
                       }}
-                      disabled={running}
+                      disabled={running || !agent.runtimeCapabilities.provider}
                       className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition placeholder:text-muted-foreground/60 focus:ring-ring/25 disabled:opacity-60"
                     >
                       {providerModelPresets.map((option) => (
@@ -1064,7 +1098,7 @@ export function AgentPane({
                       <input
                         value={modelDraft}
                         onChange={(e) => setModelDraft(e.target.value)}
-                        disabled={running}
+                        disabled={running || !agent.runtimeCapabilities.provider}
                         placeholder="model id"
                         spellCheck={false}
                         className="mt-2 h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition placeholder:text-muted-foreground/60 focus:ring-ring/25 disabled:opacity-60"
@@ -1073,20 +1107,20 @@ export function AgentPane({
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Thinking Effort</span>
-                    <select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+                    <select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running || !agent.runtimeCapabilities.provider} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
                       <option value="">default{selectedModelDetail?.defaultReasoningEffort ? ` (${selectedModelDetail.defaultReasoningEffort})` : ""}</option>
                       {reasoningEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
                     </select>
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Sandbox</span>
-                    <select value={sandboxDraft} onChange={(e) => setSandboxDraft(e.target.value)} disabled={running} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+                    <select value={sandboxDraft} onChange={(e) => setSandboxDraft(e.target.value)} disabled={running || !agent.runtimeCapabilities.sandbox} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
                       <option value="danger-full-access">danger-full-access</option><option value="workspace-write">workspace-write</option><option value="read-only">read-only</option>
                     </select>
                   </label>
                   <label className="mb-3 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Approval Policy</span>
-                    <select value={approvalDraft} onChange={(e) => setApprovalDraft(e.target.value)} disabled={running} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+                    <select value={approvalDraft} onChange={(e) => setApprovalDraft(e.target.value)} disabled={running || !agent.runtimeCapabilities.approval} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
                       <option value="never">never</option><option value="on-request">on-request</option>
                     </select>
                   </label>
@@ -1214,6 +1248,7 @@ export function AgentPane({
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <div ref={feedRef} onScroll={onScroll} className="absolute inset-0 overflow-y-auto">
           <div className="mx-auto max-w-[880px] px-3 pb-8 pt-3 md:px-6 md:pt-5">
+            {!agent.runtimeCapabilities.history ? <div className="mb-3 rounded-md border border-border bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground">History is unavailable for the {agent.runtimeBinding.kind} Runtime.</div> : null}
             <div className="relative w-full" style={{ height: `${feedVirtualizer.getTotalSize()}px` }}>
               {active ? feedVirtualizer.getVirtualItems().map((virtualRow) => {
                 const row = feedRows[virtualRow.index];
@@ -1281,7 +1316,7 @@ export function AgentPane({
               <span className="break-words">{readableRuntimeError(agent.lastError)}</span>
             </div>
           ) : null}
-          <GoalBar goal={agent.goal} onUpdate={updateGoal} onClear={clearGoal} onError={onError} />
+          {agent.runtimeCapabilities.goal ? <GoalBar goal={agent.goal} onUpdate={updateGoal} onClear={clearGoal} onError={onError} /> : <div className="mb-1 rounded-sm bg-muted/35 px-2 py-1.5 text-[10.5px] text-muted-foreground">Goal is unavailable for the {agent.runtimeBinding.kind} Runtime.</div>}
           <NeedsYouBar entries={humanRequests} onAnswer={(request, value = "") => {
             for (const attachment of attachments) {
               if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);

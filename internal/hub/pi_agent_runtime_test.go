@@ -2,6 +2,8 @@ package hub
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -106,6 +108,61 @@ func TestPiAgentCompletesLiveLoomTurnOnlyAfterAgentSettled(t *testing.T) {
 		t.Fatalf("Pi process starts = %q, err=%v", starts, err)
 	}
 	h.Shutdown()
+}
+
+func TestPiAgentSendsSupportedImagesAsNativeRPCContent(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	configureFakePiHubRPC(t, "image")
+	h := testHub(st)
+	h.stop = make(chan struct{})
+	defer h.Shutdown()
+
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-vision", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !agent.RuntimeCapabilities.ImageInput {
+		t.Fatalf("Pi image capability = %#v", agent.RuntimeCapabilities)
+	}
+	imageBytes := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0x5a}, 64)...)
+	image, err := h.StageThreadArtifact(agent.ID, "diagram.png", "image/png", bytes.NewReader(imageBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := h.StageThreadArtifact(agent.ID, "brief.pdf", "application/pdf", strings.NewReader("%PDF-1.4\nloom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.SendTaskWithArtifacts(agent.ID, "Review both files", []string{image.ID, document.ID}, time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(os.Getenv("FAKE_PI_PROMPT_JSON_FILE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prompt struct {
+		Message string `json:"message"`
+		Images  []struct {
+			Type     string `json:"type"`
+			Data     string `json:"data"`
+			MimeType string `json:"mimeType"`
+		} `json:"images"`
+	}
+	if err := json.Unmarshal(data, &prompt); err != nil {
+		t.Fatal(err)
+	}
+	if len(prompt.Images) != 1 || prompt.Images[0].Type != "image" || prompt.Images[0].MimeType != "image/png" ||
+		prompt.Images[0].Data != base64.StdEncoding.EncodeToString(imageBytes) {
+		t.Fatalf("Pi native images = %#v", prompt.Images)
+	}
+	if !strings.Contains(prompt.Message, document.Path) {
+		t.Fatalf("generic file was not path-only guidance: %s", data)
+	}
 }
 
 func TestPiProtocolFailureFailsActiveLoomTurn(t *testing.T) {
@@ -333,6 +390,7 @@ func configureFakePiHubRPC(t *testing.T, scenario string) {
 	t.Setenv("FAKE_PI_HUB_SCENARIO", scenario)
 	t.Setenv("FAKE_PI_AGENT_END_FILE", filepath.Join(dir, "agent-end"))
 	t.Setenv("FAKE_PI_PROMPT_FILE", filepath.Join(dir, "prompt"))
+	t.Setenv("FAKE_PI_PROMPT_JSON_FILE", filepath.Join(dir, "prompt.json"))
 	t.Setenv("FAKE_PI_STARTS_FILE", filepath.Join(dir, "starts"))
 	t.Setenv("FAKE_PI_ABORT_READY_FILE", filepath.Join(dir, "abort-ready"))
 }
@@ -357,11 +415,18 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 	readFakePiCommand(t, reader, &command)
 	id, _ := command["id"].(string)
 	sessionFile := filepath.Join(sessionDir, "session-"+sessionID+".jsonl")
-	fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q}}`+"\n", id, sessionFile, sessionID)
+	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "image" {
+		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q,"model":{"id":"vision","input":["text","image"]}}}`+"\n", id, sessionFile, sessionID)
+	} else {
+		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q}}`+"\n", id, sessionFile, sessionID)
+	}
 	readFakePiCommand(t, reader, &command)
 	id, _ = command["id"].(string)
 	message, _ := command["message"].(string)
 	_ = os.WriteFile(os.Getenv("FAKE_PI_PROMPT_FILE"), []byte(message), 0o600)
+	if encoded, err := json.Marshal(command); err == nil {
+		_ = os.WriteFile(os.Getenv("FAKE_PI_PROMPT_JSON_FILE"), encoded, 0o600)
+	}
 	fmt.Printf(`{"id":%q,"type":"response","command":"prompt","success":true}`+"\n", id)
 	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "abort" {
 		fmt.Print("{\"type\":\"agent_start\"}\n")

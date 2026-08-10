@@ -18,6 +18,7 @@ export interface Agent {
   cwd: string;
   threadId: string;
   runtimeBinding: { kind: string };
+  runtimeCapabilities: RuntimeCapabilities;
   sandbox: string;
   approvalPolicy: string;
   providerId?: string;
@@ -39,6 +40,23 @@ export interface Agent {
   pendingApprovals: Approval[];
   goal?: ThreadGoal;
   lastSeq: number;
+}
+
+export interface RuntimeCapabilities {
+  history: boolean;
+  causalSteer: boolean;
+  interrupt: boolean;
+  goal: boolean;
+  remote: boolean;
+  usage: boolean;
+  provider: boolean;
+  compaction: boolean;
+  approval: boolean;
+  skills: boolean;
+  naming: boolean;
+  archive: boolean;
+  sandbox: boolean;
+  imageInput: boolean;
 }
 
 export interface ModelProvider {

@@ -278,7 +278,7 @@ func (r *codexAgentRuntime) Capabilities() RuntimeCapabilities {
 	return RuntimeCapabilities{
 		History: true, CausalSteer: true, Interrupt: true, Goal: true, Remote: true,
 		Usage: true, Provider: true, Compaction: true, Approval: true, Skills: true,
-		Naming: true, Archive: true, Sandbox: true,
+		Naming: true, Archive: true, Sandbox: true, ImageInput: true,
 	}
 }
 

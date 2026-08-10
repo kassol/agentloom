@@ -197,7 +197,7 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 	h.mu.Lock()
 	targets := make([]target, 0, len(h.agents))
 	for _, agent := range h.agents {
-		if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" {
+		if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" || !h.runtimeCapabilitiesLocked(agent).Goal {
 			continue
 		}
 		providerID, model := effectiveProviderBinding(agent)
@@ -253,6 +253,10 @@ func (h *Hub) GetGoal(key string) (*ThreadGoal, error) {
 	if agent == nil {
 		h.mu.Unlock()
 		return nil, errf(404, "agent not found: %s", key)
+	}
+	if !h.runtimeCapabilitiesLocked(agent).Goal {
+		h.mu.Unlock()
+		return nil, unsupportedRuntimeCapability(agent, "Goal")
 	}
 	agentID, threadID := agent.ID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()
@@ -321,6 +325,10 @@ func (h *Hub) UpdateGoal(key string, update GoalUpdateParams) (*ThreadGoal, erro
 		h.mu.Unlock()
 		return nil, errf(404, "agent not found: %s", key)
 	}
+	if !h.runtimeCapabilitiesLocked(agent).Goal {
+		h.mu.Unlock()
+		return nil, unsupportedRuntimeCapability(agent, "Goal")
+	}
 	agentID, threadID := agent.ID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	if strings.TrimSpace(threadID) == "" {
@@ -366,6 +374,10 @@ func (h *Hub) ClearGoal(key string) (bool, error) {
 	if agent == nil {
 		h.mu.Unlock()
 		return false, errf(404, "agent not found: %s", key)
+	}
+	if !h.runtimeCapabilitiesLocked(agent).Goal {
+		h.mu.Unlock()
+		return false, unsupportedRuntimeCapability(agent, "Goal")
 	}
 	agentID, threadID := agent.ID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()

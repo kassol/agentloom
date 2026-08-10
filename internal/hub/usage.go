@@ -138,6 +138,10 @@ func (h *Hub) AgentTokenUsageRange(key string, start, endExclusive time.Time) (A
 		h.mu.Unlock()
 		return AgentUsage{}, errf(404, "agent not found: %s", key)
 	}
+	if !h.runtimeCapabilitiesLocked(meta).Usage {
+		h.mu.Unlock()
+		return AgentUsage{}, unsupportedRuntimeCapability(meta, "usage")
+	}
 	agent := h.viewLocked(meta)
 	h.mu.Unlock()
 	return buildAgentUsageRange(agent, start, endExclusive, time.Now().In(start.Location())), nil

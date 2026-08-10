@@ -354,6 +354,19 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 		h.mu.Unlock()
 		return AgentView{}, errf(409, "Agent Runtime kind is immutable")
 	}
+	capabilities := h.runtimeCapabilitiesLocked(meta)
+	if p.Sandbox != nil && !capabilities.Sandbox {
+		h.mu.Unlock()
+		return AgentView{}, unsupportedRuntimeCapability(meta, "sandbox configuration")
+	}
+	if (p.ProviderID != nil || p.Model != nil || p.Effort != nil) && !capabilities.Provider {
+		h.mu.Unlock()
+		return AgentView{}, unsupportedRuntimeCapability(meta, "Provider configuration")
+	}
+	if p.ApprovalPolicy != nil && !capabilities.Approval {
+		h.mu.Unlock()
+		return AgentView{}, unsupportedRuntimeCapability(meta, "Approval policy configuration")
+	}
 
 	nextName := meta.Name
 	nextModel := meta.Model
@@ -655,6 +668,7 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 	}
 	agentID := meta.ID
 	providerID := meta.ProviderID
+	imageCapabilityErr := unsupportedRuntimeCapability(meta, "image input for the active model")
 	h.mu.Unlock()
 	if providerID == deepSeekProviderID && len(artifactIDs) > 0 {
 		return SendResult{}, errf(400, "DeepSeek %s currently supports text input only; remove image and file attachments", deepSeekModel)
@@ -662,6 +676,13 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 	artifacts, err := h.resolveThreadArtifacts(agentID, artifactIDs)
 	if err != nil {
 		return SendResult{}, err
+	}
+	hasImageArtifact := false
+	for _, artifact := range artifacts {
+		if strings.HasPrefix(strings.ToLower(artifact.MimeType), "image/") {
+			hasImageArtifact = true
+			break
+		}
 	}
 	taskText := codexTaskText(text, artifacts)
 	visibleText := text
@@ -685,7 +706,7 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 	}
 	if err := waitReady(rt); err != nil {
 		rt.startMu.Unlock()
-		return SendResult{}, errf(500, "codex not ready: %s", err)
+		return SendResult{}, errf(500, "Runtime not ready: %s", err)
 	}
 	// A shared app-server may unload an idle Thread. Resume immediately before
 	// every Turn so Web, CLI and queued deliveries do not depend on a stale
@@ -693,6 +714,15 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 	if err := h.resumeAgentThread(agentID, rt); err != nil {
 		rt.startMu.Unlock()
 		return SendResult{}, err
+	}
+	backend := runtimeBackend(rt)
+	if backend == nil {
+		rt.startMu.Unlock()
+		return SendResult{}, errf(500, "Agent Runtime is unavailable")
+	}
+	if hasImageArtifact && !backend.Capabilities().ImageInput {
+		rt.startMu.Unlock()
+		return SendResult{}, imageCapabilityErr
 	}
 	contextPlan, err := h.prepareTurnContext(agentID, source, artifacts)
 	if err != nil {
@@ -779,10 +809,6 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 
 	h.startWorker(func() { h.watchdog(agentID, turn, inactivity) })
 
-	backend := runtimeBackend(rt)
-	if backend == nil {
-		return SendResult{}, errf(500, "Agent Runtime is unavailable")
-	}
 	startTurn := func() (string, error) {
 		return backend.StartTurn(RuntimeTurnRequest{
 			NativeRef: threadID, Input: input, ApprovalPolicy: approvalPolicy,
@@ -877,7 +903,7 @@ func codexArtifactInput(text, loomContext string, artifacts []ThreadArtifact) []
 	}
 	for _, artifact := range artifacts {
 		if strings.HasPrefix(strings.ToLower(artifact.MimeType), "image/") {
-			input = append(input, RuntimeInput{Kind: RuntimeInputLocalImage, Path: artifact.Path})
+			input = append(input, RuntimeInput{Kind: RuntimeInputLocalImage, Path: artifact.Path, MimeType: artifact.MimeType})
 		}
 	}
 	return input
@@ -1295,6 +1321,10 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 	if meta == nil {
 		h.mu.Unlock()
 		return History{}, errf(404, "agent not found: %s", key)
+	}
+	if !h.runtimeCapabilitiesLocked(meta).History {
+		h.mu.Unlock()
+		return History{}, unsupportedRuntimeCapability(meta, "history")
 	}
 	view := h.viewLocked(meta)
 	backend := runtimeForKind(meta.RuntimeBinding.Kind)

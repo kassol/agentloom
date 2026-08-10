@@ -1,9 +1,11 @@
 package hub
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +19,8 @@ type fakeAgentRuntime struct {
 	binding                                         string
 	history                                         RuntimeHistory
 	interruptedNative                               string
+	capabilities                                    *RuntimeCapabilities
+	lastTurnRequest                                 RuntimeTurnRequest
 }
 
 func (f *fakeAgentRuntime) Alive() bool { return !f.closed }
@@ -29,8 +33,9 @@ func (f *fakeAgentRuntime) Resume(RuntimeBindingRequest, time.Duration) error {
 	return nil
 }
 func (f *fakeAgentRuntime) InjectDeveloperContext(string, string, time.Duration) error { return nil }
-func (f *fakeAgentRuntime) StartTurn(RuntimeTurnRequest) (string, error) {
+func (f *fakeAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	f.started = true
+	f.lastTurnRequest = request
 	return "native-turn-1", nil
 }
 func (f *fakeAgentRuntime) Steer(string, string, string, time.Duration) (string, error) {
@@ -51,6 +56,9 @@ func (f *fakeAgentRuntime) ReadTurn(string, string) (RuntimeHistoryTurn, error) 
 }
 func (f *fakeAgentRuntime) LatestTurn(string) (*RuntimeHistoryTurn, error) { return nil, nil }
 func (f *fakeAgentRuntime) Capabilities() RuntimeCapabilities {
+	if f.capabilities != nil {
+		return *f.capabilities
+	}
 	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true}
 }
 func (f *fakeAgentRuntime) Close() { f.closed = true }
@@ -105,6 +113,90 @@ func TestHubRoutesCoreExecutionThroughAgentRuntime(t *testing.T) {
 	h.Shutdown()
 	if !fake.closed {
 		t.Fatal("Shutdown did not close Agent Runtime")
+	}
+}
+
+func TestSendTaskRejectsImageWhenRuntimeDoesNotAdvertiseImageInput(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities := RuntimeCapabilities{Interrupt: true}
+	fake := &fakeAgentRuntime{binding: "/tmp/pi-session.jsonl", capabilities: &capabilities}
+	h := testHub(st)
+	defer h.Shutdown()
+	h.agentRuntimeFactory = func(string) (AgentRuntime, error) { return fake, nil }
+	h.contextHistoryProbe = func(threadID string, _ rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
+		return rollout.ContextHistoryState{EpochID: "initial:" + threadID}, nil
+	}
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-worker", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageBytes := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0}, 64)...)
+	image, err := h.StageThreadArtifact(agent.ID, "diagram.png", "image/png", bytes.NewReader(imageBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = h.SendTaskWithArtifacts(agent.ID, "Inspect the diagram", []string{image.ID}, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "image input") || !strings.Contains(err.Error(), "Pi Runtime") {
+		t.Fatalf("unsupported image error = %v", err)
+	}
+	if fake.started {
+		t.Fatal("unsupported image reached the Agent Runtime")
+	}
+}
+
+func TestSendTaskBuildsRuntimeImageInputAndFilePathGuidance(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities := RuntimeCapabilities{Interrupt: true, ImageInput: true}
+	fake := &fakeAgentRuntime{binding: "/tmp/pi-session.jsonl", capabilities: &capabilities}
+	h := testHub(st)
+	defer h.Shutdown()
+	h.agentRuntimeFactory = func(string) (AgentRuntime, error) { return fake, nil }
+	h.contextHistoryProbe = func(threadID string, _ rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
+		return rollout.ContextHistoryState{EpochID: "initial:" + threadID}, nil
+	}
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-vision", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageBytes := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0}, 64)...)
+	image, err := h.StageThreadArtifact(agent.ID, "diagram.png", "image/png", bytes.NewReader(imageBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := h.StageThreadArtifact(agent.ID, "brief.pdf", "application/pdf", strings.NewReader("%PDF-1.4\nloom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h.SendTaskWithArtifacts(agent.ID, "Review the inputs", []string{image.ID, document.ID}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	var imageInputs []RuntimeInput
+	var textInputs []string
+	for _, input := range fake.lastTurnRequest.Input {
+		switch input.Kind {
+		case RuntimeInputLocalImage:
+			imageInputs = append(imageInputs, input)
+		case RuntimeInputText:
+			textInputs = append(textInputs, input.Text)
+		}
+	}
+	if len(imageInputs) != 1 || imageInputs[0].Path != image.Path || imageInputs[0].MimeType != "image/png" {
+		t.Fatalf("Runtime image inputs = %#v", imageInputs)
+	}
+	joinedText := strings.Join(textInputs, "\n")
+	if !strings.Contains(joinedText, document.Path) {
+		t.Fatalf("generic file path guidance missing from Runtime text: %s", joinedText)
+	}
+	if strings.Contains(joinedText, `"type":"file"`) || strings.Contains(joinedText, "data:application/pdf") {
+		t.Fatalf("generic file was encoded as Runtime content: %s", joinedText)
 	}
 }
 
