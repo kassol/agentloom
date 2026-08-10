@@ -260,4 +260,66 @@ export default function loomCollaboration(pi: ExtensionAPI) {
 			}));
 		},
 	});
+
+	pi.registerTool({
+		name: "loom_topic_publish_progress",
+		label: "Publish Loom Topic Progress",
+		description: "Publish an integrated progress Brief for a Topic. Only the Responsible Agent may update the shared Brief.",
+		promptGuidelines: ["Integrate Participant replies into one shared progress update; keep individual replies as intermediate evidence."],
+		parameters: Type.Object({
+			topicId: Type.String(),
+			expectedVersion: Type.Number({ description: "Current Topic version from loom_topic_get" }),
+			summary: Type.String(),
+			currentState: Type.Optional(Type.String()),
+			nextStep: Type.Optional(Type.String()),
+			limitations: Type.Optional(Type.String()),
+			evidence: Type.Optional(Type.Array(Type.Object({
+				type: Type.String(), id: Type.String(), label: Type.Optional(Type.String()),
+			}))),
+		}),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			return result(await request(`/api/topics/${encodeURIComponent(params.topicId)}`, signal, {
+				method: "PATCH",
+				body: JSON.stringify({
+					actor: agentID, expectedVersion: params.expectedVersion,
+					brief: {
+						summary: params.summary, currentState: params.currentState, nextStep: params.nextStep,
+						limitations: params.limitations, evidence: params.evidence ?? [],
+					},
+				}),
+			}));
+		},
+	});
+
+	pi.registerTool({
+		name: "loom_topic_publish_result",
+		label: "Publish Loom Topic Result",
+		description: "Publish the final integrated Topic result for Owner review. Only the Responsible Agent may cross this result boundary.",
+		promptGuidelines: ["Publish only the integrated Topic result after reconciling Participant replies, evidence, limitations, and the completion boundary."],
+		parameters: Type.Object({
+			topicId: Type.String(),
+			expectedVersion: Type.Number({ description: "Current Topic version from loom_topic_get" }),
+			summary: Type.String(),
+			currentState: Type.Optional(Type.String()),
+			nextStep: Type.Optional(Type.String()),
+			limitations: Type.Optional(Type.String()),
+			evidence: Type.Optional(Type.Array(Type.Object({
+				type: Type.String(), id: Type.String(), label: Type.Optional(Type.String()),
+			}))),
+		}),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			return result(await request(`/api/topics/${encodeURIComponent(params.topicId)}`, signal, {
+				method: "PATCH",
+				body: JSON.stringify({
+					actor: agentID, expectedVersion: params.expectedVersion, publishResult: true,
+					brief: {
+						summary: params.summary, currentState: params.currentState, nextStep: params.nextStep,
+						limitations: params.limitations, evidence: params.evidence ?? [],
+					},
+				}),
+			}));
+		},
+	});
 }
