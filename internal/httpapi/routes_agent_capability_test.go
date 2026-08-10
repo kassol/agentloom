@@ -29,10 +29,12 @@ func TestAgentDetailReportsTruthfulPiRuntimeCapabilities(t *testing.T) {
 	response := topicRequest(t, server, http.MethodGet, "/api/agents/agent-pi", nil, http.StatusOK)
 	agent := response["agent"].(map[string]any)
 	capabilities := agent["runtimeCapabilities"].(map[string]any)
-	if capabilities["interrupt"] != true {
-		t.Fatalf("Pi interrupt capability = %#v", capabilities["interrupt"])
+	for _, capability := range []string{"history", "interrupt"} {
+		if capabilities[capability] != true {
+			t.Fatalf("Pi %s capability = %#v", capability, capabilities[capability])
+		}
 	}
-	for _, capability := range []string{"history", "causalSteer", "goal", "remote", "usage", "provider", "compaction", "approval", "skills", "naming", "archive", "sandbox", "imageInput"} {
+	for _, capability := range []string{"causalSteer", "goal", "remote", "usage", "provider", "compaction", "approval", "skills", "naming", "archive", "sandbox", "imageInput"} {
 		if value, exists := capabilities[capability]; !exists || value != false {
 			t.Fatalf("Pi %s capability = %#v, exists=%v", capability, value, exists)
 		}
@@ -57,7 +59,6 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 	tests := []struct {
 		name, method, path, body, capability string
 	}{
-		{name: "history", method: http.MethodGet, path: "/api/agents/agent-pi/thread/history", capability: "history"},
 		{name: "usage", method: http.MethodGet, path: "/api/agents/agent-pi/usage?days=7", capability: "usage"},
 		{name: "read Goal", method: http.MethodGet, path: "/api/agents/agent-pi/goal", capability: "Goal"},
 		{name: "update Goal", method: http.MethodPut, path: "/api/agents/agent-pi/goal", body: `{"objective":"ship"}`, capability: "Goal"},

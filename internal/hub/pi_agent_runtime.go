@@ -202,14 +202,35 @@ func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	if message == "" {
 		return "", errors.New("Pi prompt text is required")
 	}
+	entriesBefore, leafBefore, err := r.piSessionEntries(request.NativeRef)
+	if err != nil {
+		return "", fmt.Errorf("snapshot Pi prompt entry: %w", err)
+	}
+	previousUserEntryID, err := latestPiUserEntryID(entriesBefore, leafBefore)
+	if err != nil {
+		return "", fmt.Errorf("snapshot Pi prompt entry: %w", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), request.Timeout)
 	defer cancel()
 	prompt := map[string]any{"message": message}
 	if len(images) > 0 {
 		prompt["images"] = images
 	}
-	_, err := rpc.Request(ctx, "prompt", prompt)
-	return "", err
+	if _, err := rpc.Request(ctx, "prompt", prompt); err != nil {
+		return "", err
+	}
+	entries, leafID, err := r.piSessionEntries(request.NativeRef)
+	if err != nil {
+		return "", fmt.Errorf("read Pi prompt entry: %w", err)
+	}
+	nativeUserEntryID, err := latestPiUserEntryID(entries, leafID)
+	if err != nil {
+		return "", fmt.Errorf("read Pi prompt entry: %w", err)
+	}
+	if nativeUserEntryID == "" || nativeUserEntryID == previousUserEntryID {
+		return "", errors.New("Pi accepted prompt without a new native user entry")
+	}
+	return nativeUserEntryID, nil
 }
 
 func (r *piAgentRuntime) Steer(string, string, string, time.Duration) (string, error) {
@@ -451,21 +472,64 @@ func piResultText(result map[string]any) string {
 	return strings.Join(parts, "")
 }
 
-func (r *piAgentRuntime) ReadHistory(string, int, int) (RuntimeHistory, error) {
-	return RuntimeHistory{}, nil
+func (r *piAgentRuntime) ReadHistory(nativeRef string, count, offset int) (RuntimeHistory, error) {
+	entries, leafID, err := r.piSessionEntries(nativeRef)
+	if err != nil {
+		return RuntimeHistory{}, err
+	}
+	history, err := projectPiHistory(entries, leafID)
+	if err != nil {
+		return RuntimeHistory{}, err
+	}
+	if count <= 0 {
+		count = 10
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	end := history.Total - offset
+	if end < 0 {
+		end = 0
+	}
+	start := end - count
+	if start < 0 {
+		start = 0
+	}
+	history.Turns = history.Turns[start:end]
+	return history, nil
 }
 
-func (r *piAgentRuntime) ReadTurn(string, string) (RuntimeHistoryTurn, error) {
-	return RuntimeHistoryTurn{}, rollout.ErrTurnNotFound
+func (r *piAgentRuntime) ReadTurn(nativeRef, nativeTurnID string) (RuntimeHistoryTurn, error) {
+	entries, leafID, err := r.piSessionEntries(nativeRef)
+	if err != nil {
+		return RuntimeHistoryTurn{}, err
+	}
+	history, err := projectPiHistory(entries, leafID)
+	if err != nil {
+		return RuntimeHistoryTurn{}, err
+	}
+	for _, turn := range history.Turns {
+		if turn.ID == nativeTurnID {
+			return turn, nil
+		}
+	}
+	return RuntimeHistoryTurn{}, fmt.Errorf("%w: %s", rollout.ErrTurnNotFound, nativeTurnID)
 }
 
-func (r *piAgentRuntime) LatestTurn(string) (*RuntimeHistoryTurn, error) { return nil, nil }
+func (r *piAgentRuntime) LatestTurn(nativeRef string) (*RuntimeHistoryTurn, error) {
+	history, err := r.ReadHistory(nativeRef, 1, 0)
+	if err != nil || len(history.Turns) == 0 {
+		return nil, err
+	}
+	turn := history.Turns[0]
+	return &turn, nil
+}
 
 func (r *piAgentRuntime) Capabilities() RuntimeCapabilities {
 	r.mu.Lock()
 	imageInput := r.imageInput
 	r.mu.Unlock()
-	return RuntimeCapabilities{Interrupt: true, ImageInput: imageInput}
+	return RuntimeCapabilities{History: true, Interrupt: true, ImageInput: imageInput}
 }
 
 func (r *piAgentRuntime) Close() {

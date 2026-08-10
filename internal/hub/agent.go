@@ -835,6 +835,13 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 	}
 	h.mu.Lock()
 	if turn.finished {
+		// Pi identifies a native Turn by the user Session entry discovered after
+		// prompt acceptance. A very fast Turn can settle before get_entries
+		// returns, but the response still belongs to this serialized StartTurn.
+		if meta.RuntimeBinding.Kind == "pi" && turnID != "" {
+			h.recordRuntimeTurnBindingLocked(meta, turn.turnID, turnID)
+			h.persistRuntimeProjectionLocked()
+		}
 		canonicalTurnID := turn.turnID
 		h.mu.Unlock()
 		return SendResult{Dispatched: true, AgentID: agentID, SessionID: agentID, TurnID: canonicalTurnID}, nil

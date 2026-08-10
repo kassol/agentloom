@@ -162,7 +162,7 @@ func (h *Hub) verifyRuntimeThreadControl(agentID string, rt *runtime) error {
 	}
 	// The indeterminate-RPC fence belongs to the shared Codex host. Other
 	// Runtime implementations provide their own control guarantees.
-	if rt != nil && rt.client == nil && runtimeBackend(rt) != nil && runtimeBackend(rt).Alive() {
+	if rt != nil && rt.client == nil && runtimeBackend(rt) != nil {
 		return nil
 	}
 	host := h.codexHost

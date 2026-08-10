@@ -113,7 +113,7 @@ describe("AgentPane scroll restoration", () => {
       ...testAgent,
       runtimeBinding: { kind: "pi" },
       runtimeCapabilities: {
-        history: false, causalSteer: false, interrupt: true, goal: false, remote: false,
+        history: true, causalSteer: false, interrupt: true, goal: false, remote: false,
         usage: false, provider: false, compaction: false, approval: false, skills: false,
         naming: false, archive: false, sandbox: false, imageInput: false,
       },
@@ -122,12 +122,13 @@ describe("AgentPane scroll restoration", () => {
 
     expect(view.getByText("Runtime capabilities")).toBeInTheDocument();
     expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Unavailable");
+    expect(view.getByText("History").nextElementSibling).toHaveTextContent("Available");
     expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Unavailable");
     expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();
     expect(view.getByText("Provider").closest("label")?.querySelector("select")).toBeDisabled();
     expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
     expect(view.getByRole("button", { name: "Usage" })).toBeDisabled();
-    expect(view.getByText("History is unavailable for the pi Runtime.")).toBeInTheDocument();
+    expect(view.queryByText("History is unavailable for the pi Runtime.")).toBeNull();
     expect(view.getByText("Goal is unavailable for the pi Runtime.")).toBeInTheDocument();
     expect(view.queryByRole("button", { name: "Set a Goal" })).toBeNull();
 
@@ -137,7 +138,7 @@ describe("AgentPane scroll restoration", () => {
 	expect(onError).toHaveBeenCalledWith("Manual compaction is unavailable for the pi Runtime");
 
 	const requestedURLs = vi.mocked(fetch).mock.calls.map(([input]) => typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url);
-	expect(requestedURLs.some((url) => url.includes("/thread/history"))).toBe(false);
+	expect(requestedURLs.some((url) => url.includes("/thread/history"))).toBe(true);
 	expect(requestedURLs.some((url) => url.includes("/compact"))).toBe(false);
   });
 });
