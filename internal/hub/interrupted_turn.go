@@ -39,17 +39,29 @@ func reconcileInterruptedTurn(meta *Agent) (*TurnSummary, bool) {
 	if err != nil || latest == nil || latest.ID == "" {
 		return summary, true
 	}
-	if summary.TurnID != "" && latest.ID != summary.TurnID {
+	nativeTurnID := summary.TurnID
+	if bound := meta.RuntimeTurnBindings[summary.TurnID]; bound != "" {
+		nativeTurnID = bound
+	}
+	if nativeTurnID != "" && latest.ID != nativeTurnID {
 		return summary, true
 	}
-	summary.TurnID = latest.ID
+	if summary.TurnID == "" {
+		summary.TurnID = latest.ID
+		for loomTurnID, candidate := range meta.RuntimeTurnBindings {
+			if candidate == latest.ID {
+				summary.TurnID = loomTurnID
+				break
+			}
+		}
+	}
 	if task := displayRolloutTask(latest.Task); task != "" {
 		summary.Task = task
 	}
 	if latest.UpdatedAt != "" {
 		summary.CompletedAt = latest.UpdatedAt
 	}
-	if latest.Status == "completed" || latest.Status == "interrupted" {
+	if latest.Status == "completed" || latest.Status == "failed" || latest.Status == "interrupted" {
 		summary.Status = latest.Status
 		return summary, false
 	}
@@ -70,6 +82,14 @@ func (h *Hub) ContinueInterruptedTurn(key string, inactivity time.Duration) (Int
 	if meta.Status != "interrupted" || meta.LastTurn == nil || meta.LastTurn.Status != "interrupted" {
 		h.mu.Unlock()
 		return InterruptedTurnAction{}, errf(409, "agent %s has no restart-interrupted Turn", meta.Name)
+	}
+	if h.turnRecoveryInFlight[recoveryKey(meta.ID, meta.LastTurn.TurnID)] {
+		h.mu.Unlock()
+		return InterruptedTurnAction{}, errf(409, "automatic recovery is already running for interrupted Turn %s", meta.LastTurn.TurnID)
+	}
+	if marker, exists := meta.TurnRecoveryMarkers[meta.LastTurn.TurnID]; exists && marker.State != TurnRecoveryCompleted {
+		h.mu.Unlock()
+		return InterruptedTurnAction{}, errf(409, "automatic recovery is already recorded for interrupted Turn %s", meta.LastTurn.TurnID)
 	}
 	agentID := meta.ID
 	interrupted := *meta.LastTurn
@@ -135,6 +155,14 @@ func (h *Hub) DismissInterruptedTurn(key string) (AgentView, error) {
 	if meta.Status != "interrupted" || meta.LastTurn == nil || meta.LastTurn.Status != "interrupted" {
 		h.mu.Unlock()
 		return AgentView{}, errf(409, "agent %s has no restart-interrupted Turn", meta.Name)
+	}
+	if h.turnRecoveryInFlight[recoveryKey(meta.ID, meta.LastTurn.TurnID)] {
+		h.mu.Unlock()
+		return AgentView{}, errf(409, "automatic recovery is already running for interrupted Turn %s", meta.LastTurn.TurnID)
+	}
+	if marker, exists := meta.TurnRecoveryMarkers[meta.LastTurn.TurnID]; exists && marker.State != TurnRecoveryCompleted {
+		h.mu.Unlock()
+		return AgentView{}, errf(409, "automatic recovery is already recorded for interrupted Turn %s", meta.LastTurn.TurnID)
 	}
 	turnID := meta.LastTurn.TurnID
 	if err := h.clearInterruptedAgentLocked(meta, turnID); err != nil {

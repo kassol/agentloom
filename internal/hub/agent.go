@@ -619,6 +619,10 @@ func (h *Hub) sendTaskWithArtifacts(key, text string, artifactIDs []string, inac
 }
 
 func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inactivity time.Duration, inboxItemID, attemptID, agentMessageID, topicID, displayTask string, source turnContextSource) (SendResult, error) {
+	return h.sendTaskWithContextReserved(key, text, artifactIDs, inactivity, inboxItemID, attemptID, agentMessageID, topicID, displayTask, source, "")
+}
+
+func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string, inactivity time.Duration, inboxItemID, attemptID, agentMessageID, topicID, displayTask string, source turnContextSource, reservedTurnID string) (SendResult, error) {
 	text = strings.TrimSpace(text)
 	if text == "" && len(artifactIDs) == 0 {
 		return SendResult{}, errf(400, "text or an artifact is required")
@@ -763,8 +767,12 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 		rt.startMu.Unlock()
 		return SendResult{}, errf(409, "agent %q is already running a task", meta.Name)
 	}
+	reservedCanonicalTurnID := strings.TrimSpace(reservedTurnID)
+	if reservedCanonicalTurnID == "" {
+		reservedCanonicalTurnID = newIntegrationID("turn")
+	}
 	turn := &turnState{
-		turnID:         newIntegrationID("turn"),
+		turnID:         reservedCanonicalTurnID,
 		task:           taskText,
 		source:         turnSource(inboxItemID, agentMessageID),
 		inboxItemID:    inboxItemID,
@@ -1278,6 +1286,13 @@ func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
 }
 
 func (h *Hub) turnReferenceLocked(agentID, turnID string) (*TurnReference, string) {
+	if meta := h.agents[agentID]; meta != nil {
+		for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
+			if marker.RecoveryTurnID == turnID {
+				return &TurnReference{Kind: "recovery", ID: predecessorTurnID, TopicID: marker.TopicID}, ""
+			}
+		}
+	}
 	for _, attempt := range h.attempts {
 		if attempt == nil || attempt.AgentID != agentID || attempt.TurnID != turnID {
 			continue

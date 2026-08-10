@@ -67,26 +67,27 @@ type RuntimeBinding struct {
 // Agent is CodexLoom's stable governance entity. ThreadID is owned by Loom;
 // RuntimeBinding is the durable association to a Runtime-native conversation.
 type Agent struct {
-	ID                    string                  `json:"id"`
-	Name                  string                  `json:"name"`
-	Cwd                   string                  `json:"cwd"`
-	ThreadID              string                  `json:"threadId"`
-	RuntimeBinding        RuntimeBinding          `json:"runtimeBinding"`
-	RuntimeTurnBindings   map[string]string       `json:"runtimeTurnBindings,omitempty"`
-	Sandbox               string                  `json:"sandbox"`
-	ApprovalPolicy        string                  `json:"approvalPolicy"`
-	ProviderID            string                  `json:"providerId,omitempty"`
-	Model                 string                  `json:"model,omitempty"`
-	Effort                string                  `json:"effort,omitempty"`
-	Status                string                  `json:"status"`
-	CurrentTask           string                  `json:"currentTask"`
-	CurrentTurnID         string                  `json:"currentTurnId"`
-	LastError             string                  `json:"lastError"`
-	LastTurn              *TurnSummary            `json:"lastTurn"`
-	CreatedAt             string                  `json:"createdAt"`
-	UpdatedAt             string                  `json:"updatedAt"`
-	PendingProviderSwitch *ProviderSwitchBinding  `json:"pendingProviderSwitch,omitempty"`
-	ProviderHistory       []ProviderBindingChange `json:"providerHistory,omitempty"`
+	ID                    string                        `json:"id"`
+	Name                  string                        `json:"name"`
+	Cwd                   string                        `json:"cwd"`
+	ThreadID              string                        `json:"threadId"`
+	RuntimeBinding        RuntimeBinding                `json:"runtimeBinding"`
+	RuntimeTurnBindings   map[string]string             `json:"runtimeTurnBindings,omitempty"`
+	TurnRecoveryMarkers   map[string]TurnRecoveryMarker `json:"turnRecoveryMarkers,omitempty"`
+	Sandbox               string                        `json:"sandbox"`
+	ApprovalPolicy        string                        `json:"approvalPolicy"`
+	ProviderID            string                        `json:"providerId,omitempty"`
+	Model                 string                        `json:"model,omitempty"`
+	Effort                string                        `json:"effort,omitempty"`
+	Status                string                        `json:"status"`
+	CurrentTask           string                        `json:"currentTask"`
+	CurrentTurnID         string                        `json:"currentTurnId"`
+	LastError             string                        `json:"lastError"`
+	LastTurn              *TurnSummary                  `json:"lastTurn"`
+	CreatedAt             string                        `json:"createdAt"`
+	UpdatedAt             string                        `json:"updatedAt"`
+	PendingProviderSwitch *ProviderSwitchBinding        `json:"pendingProviderSwitch,omitempty"`
+	ProviderHistory       []ProviderBindingChange       `json:"providerHistory,omitempty"`
 	// Source is "edge" for Agents mirrored read-only from pinix-edge's
 	// registry (they are re-imported each startup and never persisted here);
 	// empty for Agents CodexLoom owns. Starting a Turn promotes an edge mirror
@@ -326,6 +327,7 @@ type Hub struct {
 	seqs                    map[string]int64
 	globalSeq               int64
 	runtimes                map[string]*runtime
+	turnRecoveryInFlight    map[string]bool
 	subs                    map[string]map[*subscriber]struct{}
 	globalSubs              map[*subscriber]struct{}
 	remoteConfig            RemoteConfig
@@ -453,6 +455,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		goals:                  map[string]*ThreadGoal{},
 		seqs:                   map[string]int64{},
 		runtimes:               map[string]*runtime{},
+		turnRecoveryInFlight:   map[string]bool{},
 		subs:                   map[string]map[*subscriber]struct{}{},
 		globalSubs:             map[*subscriber]struct{}{},
 		triggerObservations:    map[string]struct{}{},
@@ -598,6 +601,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	// Reconcile: tasks running when the Hub last died are interrupted. Keep the
 	// interrupted projection visible until the Owner continues or dismisses it;
 	// otherwise a restart silently turns unfinished work into an idle Agent.
+	recoveryJobs := [][2]string{}
 	h.mu.Lock()
 	for _, meta := range h.agents {
 		if meta.Source == "edge" {
@@ -646,9 +650,31 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 			meta.UpdatedAt = now()
 		}
 	}
+	for _, meta := range h.agents {
+		if meta == nil || meta.Source == "edge" || meta.RuntimeBinding.Kind != "pi" {
+			continue
+		}
+		planned := map[string]bool{}
+		for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
+			if marker.State == TurnRecoveryPlanned {
+				planned[predecessorTurnID] = true
+				recoveryJobs = append(recoveryJobs, [2]string{meta.ID, predecessorTurnID})
+			}
+		}
+		if meta.LastTurn == nil || meta.LastTurn.Status != "interrupted" || planned[meta.LastTurn.TurnID] {
+			continue
+		}
+		if marker, exists := meta.TurnRecoveryMarkers[meta.LastTurn.TurnID]; !exists || marker.State == "" {
+			recoveryJobs = append(recoveryJobs, [2]string{meta.ID, meta.LastTurn.TurnID})
+		}
+	}
 	if err := h.persistAgentsLocked(); err != nil {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("persist startup recovery: %w", err)
+	}
+	for _, job := range recoveryJobs {
+		agentID, predecessorTurnID := job[0], job[1]
+		h.schedulePiRecoveryLocked(agentID, predecessorTurnID)
 	}
 	h.mu.Unlock()
 	h.background.Add(6)
@@ -1479,9 +1505,9 @@ func (h *Hub) onRuntimeFailure(rt *runtime, err error) {
 		return
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	meta := h.agents[rt.agentID]
 	if meta == nil {
+		h.mu.Unlock()
 		return
 	}
 	if rt.activeTurn == nil || rt.activeTurn.finished {
@@ -1489,9 +1515,23 @@ func (h *Hub) onRuntimeFailure(rt *runtime, err error) {
 		meta.UpdatedAt = now()
 		h.persistRuntimeProjectionLocked()
 		h.emitLocked(meta.ID, "loom/runtime-failed", map[string]any{"error": err.Error()})
+		h.mu.Unlock()
+		return
+	}
+	if meta.RuntimeBinding.Kind == "pi" {
+		predecessorTurnID := rt.activeTurn.turnID
+		h.finishTurnForRecoveryLocked(meta, rt, "interrupted", err.Error())
+		meta.Status = "interrupted"
+		meta.LastError = "interrupted: Pi Runtime process failed: " + err.Error()
+		meta.UpdatedAt = now()
+		h.persistRuntimeProjectionLocked()
+		h.emitStatusLocked(meta, "interrupted")
+		h.schedulePiRecoveryLocked(meta.ID, predecessorTurnID)
+		h.mu.Unlock()
 		return
 	}
 	h.onRuntimeEventLocked(meta, rt, RuntimeEvent{Kind: RuntimeTurnFailed, Error: err.Error()}, "", nil)
+	h.mu.Unlock()
 }
 
 func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent RuntimeEvent, method string, params json.RawMessage) {
@@ -1690,6 +1730,14 @@ func (h *Hub) ResolveApproval(key, approvalID, decision string) (map[string]any,
 }
 
 func (h *Hub) finishTurnLocked(meta *Agent, rt *runtime, status, errMsg string) {
+	h.finishTurnWithPendingLocked(meta, rt, status, errMsg, true)
+}
+
+func (h *Hub) finishTurnForRecoveryLocked(meta *Agent, rt *runtime, status, errMsg string) {
+	h.finishTurnWithPendingLocked(meta, rt, status, errMsg, false)
+}
+
+func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errMsg string, startPending bool) {
 	turn := rt.activeTurn
 	if turn == nil || turn.finished {
 		return
@@ -1738,12 +1786,21 @@ func (h *Hub) finishTurnLocked(meta *Agent, rt *runtime, status, errMsg string) 
 		meta.LastError = status
 	}
 	meta.LastTurn = &TurnSummary{TurnID: turn.turnID, Task: turn.task, Status: status, CompletedAt: now()}
+	for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
+		if marker.RecoveryTurnID == turn.turnID {
+			marker.State = TurnRecoveryCompleted
+			marker.UpdatedAt = now()
+			meta.TurnRecoveryMarkers[predecessorTurnID] = marker
+		}
+	}
 	meta.UpdatedAt = now()
 	h.finishInboxAttemptLocked(turn, status, errMsg)
 	h.finishAgentMessageTurnLocked(turn, status, errMsg)
 	h.persistRuntimeProjectionLocked()
 	h.emitStatusLocked(meta, "idle")
-	h.startPendingWorkersLocked(meta.ID)
+	if startPending {
+		h.startPendingWorkersLocked(meta.ID)
+	}
 }
 
 // finishAgentMessageTurnLocked completes the handling attempt associated with
@@ -1854,6 +1911,7 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 	view := AgentView{Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID], nativeRuntimeRef: meta.RuntimeBinding.NativeRef, nativeTurnBindings: bindings}
 	view.RuntimeBinding.NativeRef = ""
 	view.RuntimeTurnBindings = nil
+	view.TurnRecoveryMarkers = nil
 	view.RuntimeCapabilities = h.runtimeCapabilitiesLocked(meta)
 	if goal := h.goals[meta.ID]; goal != nil {
 		copy := *goal

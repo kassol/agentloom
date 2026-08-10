@@ -161,6 +161,105 @@ func latestPiUserEntryID(entries []piSessionEntry, leafID string) (string, error
 	return "", nil
 }
 
+func (r *piAgentRuntime) InspectInterruptedTurn(nativeRef, nativeTurnID string) (RuntimeInterruptionEvidence, error) {
+	entries, leafID, err := r.piSessionEntries(nativeRef)
+	if err != nil {
+		return RuntimeInterruptionEvidence{}, err
+	}
+	return inspectPiInterruptedTurn(entries, leafID, nativeTurnID)
+}
+
+func inspectPiInterruptedTurn(entries []piSessionEntry, leafID, nativeTurnID string) (RuntimeInterruptionEvidence, error) {
+	branch, err := piActiveBranch(entries, leafID)
+	if err != nil {
+		return RuntimeInterruptionEvidence{}, err
+	}
+	evidence := RuntimeInterruptionEvidence{Status: RuntimeInterruptionClean, LeafEntryID: leafID, UnfinishedTools: []RuntimeToolEvidence{}}
+	start := -1
+	for index, entry := range branch {
+		if entry.ID != nativeTurnID {
+			continue
+		}
+		if entry.Type != "message" {
+			return RuntimeInterruptionEvidence{}, fmt.Errorf("Pi native Turn %s is not a message entry", nativeTurnID)
+		}
+		var message piSessionMessage
+		if err := json.Unmarshal(entry.Message, &message); err != nil || message.Role != "user" {
+			return RuntimeInterruptionEvidence{}, fmt.Errorf("Pi native Turn %s is not a user message", nativeTurnID)
+		}
+		start = index
+		break
+	}
+	if start < 0 {
+		return RuntimeInterruptionEvidence{}, fmt.Errorf("Pi active branch does not contain native Turn %s", nativeTurnID)
+	}
+
+	pending := map[string]RuntimeToolEvidence{}
+	order := []string{}
+	terminalStatus := ""
+	for _, entry := range branch[start+1:] {
+		if entry.Type != "message" {
+			continue
+		}
+		var message piSessionMessage
+		if err := json.Unmarshal(entry.Message, &message); err != nil {
+			return RuntimeInterruptionEvidence{}, fmt.Errorf("parse Pi message entry %s: %w", entry.ID, err)
+		}
+		if message.Role == "user" {
+			terminalStatus = "completed"
+			break
+		}
+		switch message.Role {
+		case "assistant":
+			for _, block := range piMessageContent(message.Content) {
+				if block.Type != "toolCall" {
+					continue
+				}
+				if block.ID == "" || block.Name == "" {
+					return RuntimeInterruptionEvidence{}, fmt.Errorf("Pi assistant entry %s has malformed toolCall evidence", entry.ID)
+				}
+				if _, exists := pending[block.ID]; !exists {
+					order = append(order, block.ID)
+				}
+				pending[block.ID] = RuntimeToolEvidence{
+					ID: block.ID, Name: block.Name, Command: piToolCommand(block.Name, block.Arguments),
+					Arguments: block.Arguments, StartedAt: entry.Timestamp,
+				}
+			}
+			switch message.StopReason {
+			case "stop", "length":
+				terminalStatus = "completed"
+			case "error":
+				terminalStatus = "failed"
+			case "aborted":
+				terminalStatus = "interrupted"
+			}
+		case "toolResult":
+			if message.ToolCallID == "" {
+				return RuntimeInterruptionEvidence{}, fmt.Errorf("Pi tool result entry %s has no toolCallId", entry.ID)
+			}
+			if _, exists := pending[message.ToolCallID]; !exists {
+				return RuntimeInterruptionEvidence{}, fmt.Errorf("Pi tool result entry %s has no matching toolCall", entry.ID)
+			}
+			delete(pending, message.ToolCallID)
+		}
+	}
+	for _, id := range order {
+		if tool, exists := pending[id]; exists {
+			evidence.UnfinishedTools = append(evidence.UnfinishedTools, tool)
+		}
+	}
+	if len(evidence.UnfinishedTools) > 0 {
+		evidence.Status = RuntimeInterruptionAmbiguous
+		return evidence, nil
+	}
+	if terminalStatus != "" {
+		evidence.Status = RuntimeInterruptionTerminal
+		evidence.TerminalStatus = terminalStatus
+	}
+	return evidence, nil
+}
+
 func projectPiHistory(entries []piSessionEntry, leafID string) (RuntimeHistory, error) {
 	branch, err := piActiveBranch(entries, leafID)
 	if err != nil {

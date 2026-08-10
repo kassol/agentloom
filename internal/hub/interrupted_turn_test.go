@@ -1,11 +1,35 @@
 package hub
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/yan5xu/codex-loom/internal/store"
 )
+
+func TestReconcileInterruptedPiTurnKeepsCanonicalLoomTurnIdentity(t *testing.T) {
+	sessionFile := filepath.Join(t.TempDir(), "session.jsonl")
+	contents := strings.Join([]string{
+		`{"type":"session","version":3,"id":"session-1","timestamp":"2026-08-10T01:00:00Z","cwd":"/tmp/work"}`,
+		`{"type":"message","id":"native-user-1","parentId":null,"timestamp":"2026-08-10T01:00:01Z","message":{"role":"user","content":[{"type":"text","text":"recover canonical work"}]}}`,
+		`{"type":"message","id":"native-assistant-1","parentId":"native-user-1","timestamp":"2026-08-10T01:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(sessionFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta := &Agent{
+		ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: sessionFile},
+		RuntimeTurnBindings: map[string]string{"turn-loom-1": "native-user-1"},
+		Status:              "running", CurrentTurnID: "turn-loom-1", CurrentTask: "recover canonical work",
+	}
+
+	summary, missingTerminal := reconcileInterruptedTurn(meta)
+	if missingTerminal || summary.TurnID != "turn-loom-1" || summary.Status != "completed" {
+		t.Fatalf("reconciled Pi Turn = %#v, missingTerminal=%v", summary, missingTerminal)
+	}
+}
 
 func TestOpenKeepsRestartInterruptedAgentVisible(t *testing.T) {
 	t.Setenv("PINIX_EDGE_NAMES", t.TempDir()+"/missing.json")

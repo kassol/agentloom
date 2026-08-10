@@ -31,6 +31,34 @@ type RuntimeEventSource interface {
 	SetRuntimeEventHandlers(func(RuntimeEvent), func(error))
 }
 
+// RuntimeInterruptedTurnInspector is an optional Runtime capability used only
+// after process loss. It inspects durable native history without advancing the
+// conversation so Hub can decide whether automatic recovery is safe.
+type RuntimeInterruptedTurnInspector interface {
+	InspectInterruptedTurn(nativeRef, nativeTurnID string) (RuntimeInterruptionEvidence, error)
+}
+
+const (
+	RuntimeInterruptionClean     = "clean"
+	RuntimeInterruptionAmbiguous = "ambiguous"
+	RuntimeInterruptionTerminal  = "terminal"
+)
+
+type RuntimeInterruptionEvidence struct {
+	Status          string
+	TerminalStatus  string
+	LeafEntryID     string
+	UnfinishedTools []RuntimeToolEvidence
+}
+
+type RuntimeToolEvidence struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name,omitempty"`
+	Command   string         `json:"command,omitempty"`
+	Arguments map[string]any `json:"arguments,omitempty"`
+	StartedAt string         `json:"startedAt,omitempty"`
+}
+
 type RuntimeBindingRequest struct {
 	NativeRef          string
 	Name               string

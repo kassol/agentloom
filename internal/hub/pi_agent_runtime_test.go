@@ -282,6 +282,206 @@ func TestPiProtocolFailureFailsActiveLoomTurn(t *testing.T) {
 	t.Fatal("Pi protocol failure did not fail the active Loom Turn")
 }
 
+func TestPiCleanProcessLossCreatesOneRecoveryTurnWithoutReplayingOriginalPrompt(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	configureFakePiHubRPC(t, "crash-clean")
+	h := testHub(st)
+	h.stop = make(chan struct{})
+	defer h.Shutdown()
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-recovery", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	predecessor, err := h.SendTask(agent.ID, "publish once", 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(4 * time.Second)
+	var marker TurnRecoveryMarker
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		marker = h.agents[agent.ID].TurnRecoveryMarkers[predecessor.TurnID]
+		h.mu.Unlock()
+		if marker.State == TurnRecoveryCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if marker.State != TurnRecoveryCompleted || marker.RecoveryTurnID == "" || marker.RecoveryTurnID == predecessor.TurnID {
+		t.Fatalf("clean crash recovery marker = %#v", marker)
+	}
+	prompts, err := os.ReadFile(os.Getenv("FAKE_PI_PROMPTS_FILE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(prompts), "\n--- prompt ---\n") != 2 || strings.Count(string(prompts), "publish once") != 2 || !strings.Contains(string(prompts), `<loom_turn_recovery`) {
+		t.Fatalf("clean crash prompts = %q", prompts)
+	}
+	starts, err := os.ReadFile(os.Getenv("FAKE_PI_STARTS_FILE"))
+	if err != nil || strings.Count(string(starts), "start\n") != 2 {
+		t.Fatalf("Pi process starts = %q, err=%v", starts, err)
+	}
+	events, err := st.ReadEvents(agent.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var predecessorInterrupted, recoveryCompleted bool
+	for _, event := range events {
+		predecessorInterrupted = predecessorInterrupted || event.Type == "loom/turn-interrupted" && strings.Contains(string(event.Data), predecessor.TurnID)
+		recoveryCompleted = recoveryCompleted || event.Type == "loom/turn-completed" && strings.Contains(string(event.Data), marker.RecoveryTurnID)
+	}
+	if !predecessorInterrupted || !recoveryCompleted {
+		t.Fatalf("clean crash terminal events = %#v", events)
+	}
+}
+
+func TestPiProcessLossWithUnfinishedToolCreatesOneNeedsYou(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	configureFakePiHubRPC(t, "crash-ambiguous")
+	h := testHub(st)
+	h.stop = make(chan struct{})
+	defer h.Shutdown()
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-ambiguous", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	predecessor, err := h.SendTask(agent.ID, "deploy once", 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(4 * time.Second)
+	var requests []HumanRequest
+	var marker TurnRecoveryMarker
+	for time.Now().Before(deadline) {
+		requests, _ = h.ListHumanRequests(agent.ID, "all")
+		h.mu.Lock()
+		marker = h.agents[agent.ID].TurnRecoveryMarkers[predecessor.TurnID]
+		h.mu.Unlock()
+		if len(requests) == 1 && marker.State == TurnRecoveryDispatched {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(requests) != 1 || requests[0].SourceTurnID != predecessor.TurnID || requests[0].ThreadID != agent.ThreadID {
+		t.Fatalf("ambiguous crash Needs You = %#v", requests)
+	}
+	if !strings.Contains(requests[0].Context, "deploy --prod") || !strings.Contains(requests[0].Context, "partially completed") {
+		t.Fatalf("ambiguous crash context = %s", requests[0].Context)
+	}
+	if marker.Disposition != "needs_you" || marker.State != TurnRecoveryDispatched || marker.HumanRequestID != requests[0].ID || marker.RecoveryTurnID != "" {
+		t.Fatalf("ambiguous crash marker = %#v", marker)
+	}
+	prompts, err := os.ReadFile(os.Getenv("FAKE_PI_PROMPTS_FILE"))
+	if err != nil || strings.Count(string(prompts), "\n--- prompt ---\n") != 1 {
+		t.Fatalf("ambiguous crash prompts = %q, err=%v", prompts, err)
+	}
+	h.recoverPiInterruptedTurn(agent.ID, predecessor.TurnID)
+	requests, _ = h.ListHumanRequests(agent.ID, "all")
+	if len(requests) != 1 {
+		t.Fatalf("duplicate ambiguous Needs You = %#v", requests)
+	}
+
+	t.Setenv("FAKE_PI_HUB_SCENARIO", "happy")
+	if _, err := h.AnswerHumanRequest(requests[0].ID, AnswerHumanRequestParams{Answer: "The deployment did not complete; continue with verification first."}); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(4 * time.Second)
+	var delivered HumanRequest
+	for time.Now().Before(deadline) {
+		delivered, _ = h.GetHumanRequest(requests[0].ID)
+		if delivered.DeliveryStatus == "delivered" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if delivered.DeliveryStatus != "delivered" || delivered.ResumedTurnID == "" || delivered.ResumedTurnID == predecessor.TurnID || delivered.AgentID != agent.ID || delivered.ThreadID != agent.ThreadID {
+		t.Fatalf("eventual Needs You continuation = %#v", delivered)
+	}
+}
+
+func TestPiStoreRestartCreatesOneRecoveryTurnFromCleanDurableSession(t *testing.T) {
+	configureFakePiHubRPC(t, "happy")
+	dataDir := t.TempDir()
+	sessionDir := filepath.Join(dataDir, "pi", "agent-restart")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(sessionDir, "session-agent-restart.jsonl")
+	contents := strings.Join([]string{
+		`{"type":"session","version":3,"id":"agent-restart","timestamp":"2026-08-10T01:00:00Z","cwd":"/tmp/work"}`,
+		`{"type":"message","id":"user-before","parentId":null,"timestamp":"2026-08-10T01:00:01Z","message":{"role":"user","content":[{"type":"text","text":"publish after restart"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(sessionFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := now()
+	if err := st.SaveAgents(map[string]*Agent{
+		"agent-restart": {
+			ID: "agent-restart", Name: "pi-restart", Cwd: t.TempDir(), ThreadID: "loom-thread-restart",
+			RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: sessionFile}, RuntimeTurnBindings: map[string]string{"turn-before": "user-before"},
+			Status: "running", CurrentTurnID: "turn-before", CurrentTask: "publish after restart", CreatedAt: stamp, UpdatedAt: stamp,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Open(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	var marker TurnRecoveryMarker
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		marker = h.agents["agent-restart"].TurnRecoveryMarkers["turn-before"]
+		h.mu.Unlock()
+		if marker.State == TurnRecoveryCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if marker.State != TurnRecoveryCompleted || marker.RecoveryTurnID == "" {
+		t.Fatalf("restart recovery marker = %#v", marker)
+	}
+	starts, err := os.ReadFile(os.Getenv("FAKE_PI_STARTS_FILE"))
+	if err != nil || strings.Count(string(starts), "start\n") != 1 {
+		t.Fatalf("first restart Pi starts = %q, err=%v", starts, err)
+	}
+	h.Shutdown()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restarted, err := Open(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Shutdown()
+	time.Sleep(100 * time.Millisecond)
+	starts, err = os.ReadFile(os.Getenv("FAKE_PI_STARTS_FILE"))
+	if err != nil || strings.Count(string(starts), "start\n") != 1 {
+		t.Fatalf("second restart duplicated Pi recovery starts = %q, err=%v", starts, err)
+	}
+}
+
 func TestPiRuntimeNormalizesStreamingTextReasoningAndToolLifecycle(t *testing.T) {
 	runtime := newPiAgentRuntime("agent-1", t.TempDir(), "")
 	rawEvents := []string{
@@ -378,6 +578,9 @@ func TestPiAbortKeepsLoomTurnRunningUntilAbortedAgentSettles(t *testing.T) {
 	}
 	if view.Status != "idle" || view.LastTurn == nil || view.LastTurn.Status != "interrupted" || view.LastTurn.TurnID != result.TurnID {
 		t.Fatalf("settled aborted Pi Turn = %#v", view.Agent)
+	}
+	if len(h.agents[agent.ID].TurnRecoveryMarkers) != 0 || len(h.humanRequests) != 0 {
+		t.Fatalf("Owner abort triggered crash recovery markers=%#v requests=%#v", h.agents[agent.ID].TurnRecoveryMarkers, h.humanRequests)
 	}
 	events, err := st.ReadEvents(agent.ID, 0, 100)
 	if err != nil {
@@ -749,7 +952,8 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 		}
 	}
 	answer, stopReason := "hello from Pi", "stop"
-	switch os.Getenv("FAKE_PI_HUB_SCENARIO") {
+	scenario := os.Getenv("FAKE_PI_HUB_SCENARIO")
+	switch scenario {
 	case "abort":
 		answer, stopReason = "before abort after abort", "aborted"
 	case "retry-compaction":
@@ -757,7 +961,14 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 	case "malformed-after-prompt":
 		answer, stopReason = "", "error"
 	}
-	appendFakePiTurn(t, sessionFile, message, answer, stopReason)
+	crashInitial := scenario == "crash-clean" && !strings.Contains(message, "<loom_turn_recovery")
+	if crashInitial {
+		appendFakePiInterruptedTurn(t, sessionFile, message, false)
+	} else if scenario == "crash-ambiguous" {
+		appendFakePiInterruptedTurn(t, sessionFile, message, true)
+	} else {
+		appendFakePiTurn(t, sessionFile, message, answer, stopReason)
+	}
 	fmt.Printf(`{"id":%q,"type":"response","command":"prompt","success":true}`+"\n", id)
 	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "settle-before-entries" {
 		var entriesCommand map[string]any
@@ -771,6 +982,9 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 		return
 	}
 	serveOneFakePiEntries(t, reader, sessionFile)
+	if crashInitial || scenario == "crash-ambiguous" {
+		return
+	}
 	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "steer" {
 		fmt.Print("{\"type\":\"agent_start\"}\n")
 		readFakePiCommand(t, reader, &command)
@@ -882,6 +1096,57 @@ func appendFakePiTurn(t *testing.T, sessionFile, prompt, answer, stopReason stri
 	}
 	defer file.Close()
 	for _, entry := range []map[string]any{user, assistant} {
+		line, _ := json.Marshal(entry)
+		if _, err := file.Write(append(line, '\n')); err != nil {
+			os.Exit(33)
+		}
+	}
+}
+
+func appendFakePiInterruptedTurn(t *testing.T, sessionFile, prompt string, unfinishedTool bool) {
+	t.Helper()
+	entries, leafID, err := readPiSessionEntries(sessionFile)
+	if err != nil {
+		os.Exit(33)
+	}
+	index := 1
+	for _, entry := range entries {
+		if entry.Type != "message" {
+			continue
+		}
+		var message struct {
+			Role string `json:"role"`
+		}
+		_ = json.Unmarshal(entry.Message, &message)
+		if message.Role == "user" {
+			index++
+		}
+	}
+	userID := fmt.Sprintf("user-%d", index)
+	user := map[string]any{
+		"type": "message", "id": userID, "parentId": nil, "timestamp": fmt.Sprintf("2026-08-10T01:00:%02d.000Z", index*2),
+		"message": map[string]any{"role": "user", "content": []map[string]any{{"type": "text", "text": prompt}}},
+	}
+	if leafID != "" {
+		user["parentId"] = leafID
+	}
+	toAppend := []map[string]any{user}
+	if unfinishedTool {
+		toAppend = append(toAppend, map[string]any{
+			"type": "message", "id": fmt.Sprintf("assistant-%d", index), "parentId": userID,
+			"timestamp": fmt.Sprintf("2026-08-10T01:00:%02d.500Z", index*2),
+			"message": map[string]any{
+				"role": "assistant", "stopReason": "toolUse",
+				"content": []map[string]any{{"type": "toolCall", "id": "call-deploy", "name": "bash", "arguments": map[string]any{"command": "deploy --prod"}}},
+			},
+		})
+	}
+	file, err := os.OpenFile(sessionFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		os.Exit(33)
+	}
+	defer file.Close()
+	for _, entry := range toAppend {
 		line, _ := json.Marshal(entry)
 		if _, err := file.Write(append(line, '\n')); err != nil {
 			os.Exit(33)
