@@ -11,10 +11,19 @@ Do not create a request merely to report progress, seek reassurance, or delegate
 
 ## Create a request
 
+Use `question` as a short, single-line title. Put the long background and
+explanation in `context`, which supports Markdown. Keep `blocks` as a short,
+plain-text description of the work that is waiting on the answer. When a field
+needs multiple lines, pass real newline characters; do not write the literal
+two-character sequence `\n`.
+
 ```bash
-loom ask-user --from <your-agent-name> --question "What decision is needed?" \
-  --context "Why the decision matters and the minimum facts the human needs." \
-  --blocks "The work that cannot continue without this answer." \
+loom ask-user --from <your-agent-name> --question "Which release window should I use?" \
+  --context "Two windows are available.
+
+**Tomorrow morning:** lower risk, with a complete support window.
+**Tonight:** faster, but with a shorter support window." \
+  --blocks "Arrange and publish the migration notice" \
   --option "Recommended choice::Impact or tradeoff" \
   --option "Alternative::Impact or tradeoff"
 ```

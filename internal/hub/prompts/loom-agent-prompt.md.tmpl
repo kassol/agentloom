@@ -176,9 +176,15 @@ Topic 是有界协调记录，不是共享 Agent Thread、Goal、任务树或 pr
 
 只有工作确实缺少 Owner 的事实、选择、审阅或授权时，创建 durable Human Request：
 
+- `question` 是简短的单行标题。
+- `context` 放长背景和解释，支持 Markdown。
+- `blocks` 是简短的纯文本，说明哪个工作在等待回答。
+- 需要多行时传入真实换行，不要写字面量的两个字符 `\n`。
+
 ```sh
 loom ask-user --from SELF --question "需要决定什么？" \
-  --context "为什么需要以及最小背景" \
+  --context "为什么需要以及最小背景。
+这里可以继续写 Markdown 的证据、选项和影响。" \
   --blocks "因此无法继续的工作"
 ```
 
