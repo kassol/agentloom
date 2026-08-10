@@ -22,12 +22,13 @@ import (
 // processes. Remote clients join the same app-server and therefore share its
 // thread subscriptions with the Hub connection.
 type codexHostRuntime struct {
-	client     *codex.Client
-	ready      chan struct{}
-	initErr    error
-	generation uint64
-	bin        string
-	catalogSHA string
+	client       *codex.Client
+	agentRuntime AgentRuntime
+	ready        chan struct{}
+	initErr      error
+	generation   uint64
+	bin          string
+	catalogSHA   string
 	// A mutating Thread RPC that timed out may still complete later. Do not
 	// reuse that Thread on the same app-server generation because a retry could
 	// duplicate context or work. Replacing the host terminates the old effect
@@ -93,6 +94,7 @@ func (h *Hub) startCodexHostLocked() (*codexHostRuntime, error) {
 	h.codexHostGeneration++
 	host := &codexHostRuntime{
 		client:               client,
+		agentRuntime:         &codexAgentRuntime{client: client},
 		ready:                make(chan struct{}),
 		generation:           h.codexHostGeneration,
 		bin:                  codexHostBin(),
@@ -157,6 +159,11 @@ func (h *Hub) verifyRuntimeThreadControl(agentID string, rt *runtime) error {
 	meta := h.agents[agentID]
 	if meta == nil {
 		return errf(404, "agent vanished")
+	}
+	// The indeterminate-RPC fence belongs to the shared Codex host. Other
+	// Runtime implementations provide their own control guarantees.
+	if rt != nil && rt.client == nil && runtimeBackend(rt) != nil && runtimeBackend(rt).Alive() {
+		return nil
 	}
 	host := h.codexHost
 	if host == nil || rt == nil || host.generation != rt.hostGeneration || host.client != rt.client {

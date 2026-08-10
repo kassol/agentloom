@@ -10,8 +10,6 @@ import (
 	"log"
 	"strings"
 	"time"
-
-	"github.com/yan5xu/codex-loom/internal/codex"
 )
 
 func (h *Hub) ListComms(agent, status string) []AgentMessage {
@@ -757,8 +755,7 @@ func (h *Hub) tryDeliverReplyToActiveTurn(target string, timeout time.Duration) 
 		snapshot = &next
 		break
 	}
-	threadID := targetMeta.ThreadID
-	client := rt.client
+	threadID := targetMeta.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	if snapshot == nil {
 		return nil, false
@@ -768,7 +765,7 @@ func (h *Hub) tryDeliverReplyToActiveTurn(target string, timeout time.Duration) 
 		timeout = 30 * time.Second
 	}
 	input, topicCursor := h.formatAgentEnvelopeForDelivery(snapshot)
-	acceptedTurnID, err := h.requestTurnSteer(client, threadID, activeTurnID, input, timeout)
+	acceptedTurnID, err := h.requestTurnSteer(rt, threadID, activeTurnID, input, timeout)
 	if err == nil && snapshot.TopicID != "" {
 		h.markTopicContextDelivered(snapshot.TopicID, snapshot.ToAgentID, topicCursor)
 	}
@@ -811,34 +808,15 @@ func (h *Hub) tryDeliverReplyToActiveTurn(target string, timeout time.Duration) 
 	return &next, true
 }
 
-func (h *Hub) requestTurnSteer(client *codex.Client, threadID, expectedTurnID, input string, timeout time.Duration) (string, error) {
+func (h *Hub) requestTurnSteer(rt *runtime, threadID, expectedTurnID, input string, timeout time.Duration) (string, error) {
 	if h.steerTurn != nil {
 		return h.steerTurn(threadID, expectedTurnID, input, timeout)
 	}
-	if client == nil {
-		return "", errors.New("Codex runtime is unavailable")
+	backend := runtimeBackend(rt)
+	if backend == nil {
+		return "", errors.New("Agent Runtime is unavailable")
 	}
-	result, err := client.Request("turn/steer", map[string]any{
-		"threadId":       threadID,
-		"expectedTurnId": expectedTurnID,
-		"input":          []map[string]any{{"type": "text", "text": input}},
-	}, timeout)
-	if err != nil {
-		return "", err
-	}
-	var response struct {
-		TurnID string `json:"turnId"`
-	}
-	if err := json.Unmarshal(result, &response); err != nil {
-		return "", fmt.Errorf("decode turn/steer response: %w", err)
-	}
-	if response.TurnID == "" {
-		return "", errors.New("turn/steer returned no turnId")
-	}
-	if response.TurnID != expectedTurnID {
-		return "", fmt.Errorf("turn/steer accepted %s, expected %s", response.TurnID, expectedTurnID)
-	}
-	return response.TurnID, nil
+	return backend.Steer(threadID, expectedTurnID, input, timeout)
 }
 
 func (h *Hub) failQueuedForTarget(target string, cause error) {

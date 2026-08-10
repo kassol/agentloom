@@ -32,6 +32,12 @@ func (h *Hub) Shutdown() {
 		h.mu.Unlock()
 		if host != nil {
 			host.client.Close()
+		} else if h.agentRuntimeFactory != nil {
+			for _, rt := range h.runtimes {
+				if backend := runtimeBackend(rt); backend != nil {
+					backend.Close()
+				}
+			}
 		}
 		if h.writerOwnership != nil {
 			h.writerOwnership.Release()

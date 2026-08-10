@@ -1,0 +1,295 @@
+package hub
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/yan5xu/codex-loom/internal/codex"
+	"github.com/yan5xu/codex-loom/internal/rollout"
+)
+
+type codexAgentRuntime struct {
+	client *codex.Client
+}
+
+func (r *codexAgentRuntime) Alive() bool { return r != nil && r.client != nil && !r.client.Closed() }
+
+func (r *codexAgentRuntime) Create(request RuntimeBindingRequest) (string, error) {
+	result, err := r.client.Request("thread/start", threadBindingParams(request.Sandbox, request.Cwd, request.ProviderID, request.Model, request.DisabledSkillPaths), 30*time.Second)
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil || parsed.Thread.ID == "" {
+		return "", fmt.Errorf("thread/start returned no thread id")
+	}
+	return parsed.Thread.ID, nil
+}
+
+func (r *codexAgentRuntime) Resume(request RuntimeBindingRequest, timeout time.Duration) error {
+	params := threadBindingParams(request.Sandbox, request.Cwd, request.ProviderID, request.Model, request.DisabledSkillPaths)
+	params["threadId"] = request.NativeRef
+	_, err := r.client.Request("thread/resume", params, timeout)
+	return err
+}
+
+func (r *codexAgentRuntime) InjectDeveloperContext(nativeRef, content string, timeout time.Duration) error {
+	_, err := r.client.Request("thread/inject_items", map[string]any{
+		"threadId": nativeRef,
+		"items": []map[string]any{{
+			"type": "message", "role": "developer",
+			"content": []map[string]any{{"type": "input_text", "text": content}},
+		}},
+	}, timeout)
+	return err
+}
+
+func (r *codexAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
+	input := make([]map[string]any, 0, len(request.Input))
+	for _, item := range request.Input {
+		switch item.Kind {
+		case RuntimeInputText:
+			input = append(input, map[string]any{"type": "text", "text": item.Text})
+		case RuntimeInputLocalImage:
+			input = append(input, map[string]any{"type": "localImage", "path": item.Path})
+		}
+	}
+	params := map[string]any{
+		"threadId": request.NativeRef, "input": input,
+		"approvalPolicy": request.ApprovalPolicy, "sandboxPolicy": codexSandboxPolicy(request.Sandbox),
+	}
+	if request.Model != "" {
+		params["model"] = request.Model
+	}
+	if request.Effort != "" {
+		params["effort"] = request.Effort
+	}
+	result, err := r.client.Request("turn/start", params, request.Timeout)
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		Turn struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+		TurnID string `json:"turnId"`
+		ID     string `json:"id"`
+	}
+	_ = json.Unmarshal(result, &parsed)
+	for _, id := range []string{parsed.Turn.ID, parsed.TurnID, parsed.ID} {
+		if id != "" {
+			return id, nil
+		}
+	}
+	return "", nil
+}
+
+func (r *codexAgentRuntime) Steer(nativeRef, expectedNativeTurnID, input string, timeout time.Duration) (string, error) {
+	result, err := r.client.Request("turn/steer", map[string]any{
+		"threadId": nativeRef, "expectedTurnId": expectedNativeTurnID,
+		"input": []map[string]any{{"type": "text", "text": input}},
+	}, timeout)
+	if err != nil {
+		return "", err
+	}
+	var response struct {
+		TurnID string `json:"turnId"`
+	}
+	if err := json.Unmarshal(result, &response); err != nil {
+		return "", fmt.Errorf("decode turn/steer response: %w", err)
+	}
+	if response.TurnID == "" {
+		return "", errors.New("turn/steer returned no turnId")
+	}
+	if response.TurnID != expectedNativeTurnID {
+		return "", fmt.Errorf("turn/steer accepted %s, expected %s", response.TurnID, expectedNativeTurnID)
+	}
+	return response.TurnID, nil
+}
+
+func (r *codexAgentRuntime) Interrupt(nativeRef, nativeTurnID string, timeout time.Duration) error {
+	_, err := r.client.Request("turn/interrupt", map[string]any{"threadId": nativeRef, "turnId": nativeTurnID}, timeout)
+	return err
+}
+
+func (r *codexAgentRuntime) NormalizeEvent(method string, params json.RawMessage) []RuntimeEvent {
+	var envelope struct {
+		ThreadID string `json:"threadId"`
+		TurnID   string `json:"turnId"`
+		ItemID   string `json:"itemId"`
+		Delta    string `json:"delta"`
+		Thread   struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+		Turn struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+			Error  *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"turn"`
+		Item  map[string]any `json:"item"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(params, &envelope) != nil {
+		return nil
+	}
+	nativeRef := strings.TrimSpace(envelope.ThreadID)
+	if nativeRef == "" {
+		nativeRef = strings.TrimSpace(envelope.Thread.ID)
+	}
+	nativeTurnID := strings.TrimSpace(envelope.TurnID)
+	if nativeTurnID == "" {
+		nativeTurnID = strings.TrimSpace(envelope.Turn.ID)
+	}
+	event := RuntimeEvent{NativeRef: nativeRef, NativeTurnID: nativeTurnID, ItemID: envelope.ItemID, Text: envelope.Delta, Item: envelope.Item, Status: envelope.Turn.Status}
+	switch method {
+	case "turn/started":
+		event.Kind = RuntimeTurnStarted
+	case "item/agentMessage/delta":
+		event.Kind = RuntimeTextDelta
+	case "item/reasoning/delta":
+		event.Kind = RuntimeReasoningDelta
+	case "item/started", "item/updated", "item/completed":
+		itemType, _ := envelope.Item["type"].(string)
+		if id, _ := envelope.Item["id"].(string); event.ItemID == "" {
+			event.ItemID = id
+		}
+		switch itemType {
+		case "userMessage":
+			event.Kind = RuntimeUserInput
+			event.Text = notificationUserText(params)
+		case "agentMessage":
+			if method != "item/completed" {
+				return nil
+			}
+			event.Kind = RuntimeTextCompleted
+			event.Text = completedFinalAnswer(method, params)
+		case "reasoning":
+			if method != "item/completed" {
+				return nil
+			}
+			event.Kind = RuntimeReasoningCompleted
+		default:
+			switch method {
+			case "item/started":
+				event.Kind = RuntimeToolStarted
+			case "item/updated":
+				event.Kind = RuntimeToolUpdated
+			case "item/completed":
+				event.Kind = RuntimeToolCompleted
+			}
+		}
+	case "turn/completed", "turn/failed", "turn/aborted":
+		event.Kind = RuntimeTurnCompleted
+		if envelope.Turn.Error != nil {
+			event.Error = envelope.Turn.Error.Message
+		} else if envelope.Error != nil {
+			event.Error = envelope.Error.Message
+		}
+		switch {
+		case method == "turn/failed", envelope.Turn.Status == "failed":
+			event.Kind = RuntimeTurnFailed
+		case method == "turn/aborted", envelope.Turn.Status == "interrupted", envelope.Turn.Status == "aborted", envelope.Turn.Status == "cancelled", envelope.Turn.Status == "canceled":
+			event.Kind = RuntimeTurnInterrupted
+		}
+	default:
+		return nil
+	}
+	return []RuntimeEvent{event}
+}
+
+func (r *codexAgentRuntime) ReadHistory(nativeRef string, count, offset int) (RuntimeHistory, error) {
+	window, total, err := rollout.ReadWindow(nativeRef, count, offset)
+	if err != nil {
+		return RuntimeHistory{}, err
+	}
+	usageByTurn := map[string]rollout.TurnUsage{}
+	if report, usageErr := rollout.ReadUsage(nativeRef); usageErr == nil {
+		for _, turn := range report.Turns {
+			usageByTurn[turn.TurnID] = turn
+		}
+	}
+	result := RuntimeHistory{Total: total}
+	for _, turn := range window.Turns {
+		item := RuntimeHistoryTurn{ID: turn.ID, Status: turn.Status, Items: turn.Items}
+		if usage, ok := usageByTurn[turn.ID]; ok {
+			item.Model = usage.Model
+			item.Usage = runtimeTokenUsage(usage.Usage)
+			item.UsageUpdatedAt = usage.LastUpdatedAt
+		}
+		result.Turns = append(result.Turns, item)
+	}
+	return result, nil
+}
+
+func (r *codexAgentRuntime) ReadTurn(nativeRef, nativeTurnID string) (RuntimeHistoryTurn, error) {
+	turn, err := rollout.ReadTurn(nativeRef, nativeTurnID)
+	if err != nil {
+		return RuntimeHistoryTurn{}, err
+	}
+	result := RuntimeHistoryTurn{ID: turn.ID, Status: turn.Status, Items: turn.Items}
+	if report, usageErr := rollout.ReadUsage(nativeRef); usageErr == nil {
+		for _, activity := range report.Activity {
+			if activity.TurnID == nativeTurnID {
+				result.StartedAt, result.CompletedAt = activity.StartedAt, activity.EndedAt
+				if result.Status == "running" && activity.Status != "running" {
+					result.Status = activity.Status
+				}
+				break
+			}
+		}
+		for _, usage := range report.Turns {
+			if usage.TurnID == nativeTurnID {
+				result.Model = usage.Model
+				result.Usage = runtimeTokenUsage(usage.Usage)
+				result.UsageUpdatedAt = usage.LastUpdatedAt
+				break
+			}
+		}
+	}
+	if result.StartedAt == "" && len(result.Items) > 0 {
+		result.StartedAt, _ = result.Items[0]["timestamp"].(string)
+	}
+	if result.CompletedAt == "" && result.Status != "running" && len(result.Items) > 0 {
+		result.CompletedAt, _ = result.Items[len(result.Items)-1]["timestamp"].(string)
+	}
+	return result, nil
+}
+
+func (r *codexAgentRuntime) LatestTurn(nativeRef string) (*RuntimeHistoryTurn, error) {
+	turn, err := rollout.LatestTurn(nativeRef)
+	if err != nil || turn == nil {
+		return nil, err
+	}
+	return &RuntimeHistoryTurn{ID: turn.ID, Status: turn.Status, UpdatedAt: turn.UpdatedAt, Task: turn.Task}, nil
+}
+
+func (r *codexAgentRuntime) Capabilities() RuntimeCapabilities {
+	return RuntimeCapabilities{
+		History: true, CausalSteer: true, Interrupt: true, Goal: true, Remote: true,
+		Usage: true, Provider: true, Compaction: true, Approval: true, Skills: true,
+		Naming: true, Archive: true, Sandbox: true,
+	}
+}
+
+// Close releases per-binding resources. Codex bindings share one host-owned
+// app-server client, so the binding itself has nothing to close.
+func (r *codexAgentRuntime) Close() {}
+
+func runtimeTokenUsage(usage rollout.TokenUsage) *RuntimeTokenUsage {
+	return &RuntimeTokenUsage{
+		InputTokens: usage.InputTokens, CachedInputTokens: usage.CachedInputTokens,
+		OutputTokens: usage.OutputTokens, ReasoningOutputTokens: usage.ReasoningOutputTokens,
+		TotalTokens: usage.TotalTokens, Calls: usage.Calls,
+	}
+}

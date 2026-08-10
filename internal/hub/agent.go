@@ -3,7 +3,6 @@ package hub
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -772,27 +771,22 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 
 	h.startWorker(func() { h.watchdog(agentID, turn, inactivity) })
 
-	params := map[string]any{
-		"threadId":       threadID,
-		"input":          input,
-		"approvalPolicy": approvalPolicy,
-		"sandboxPolicy":  codexSandboxPolicy(sandbox),
+	backend := runtimeBackend(rt)
+	if backend == nil {
+		return SendResult{}, errf(500, "Agent Runtime is unavailable")
 	}
-	if model != "" {
-		params["model"] = model
+	startTurn := func() (string, error) {
+		return backend.StartTurn(RuntimeTurnRequest{
+			NativeRef: threadID, Input: input, ApprovalPolicy: approvalPolicy,
+			Sandbox: sandbox, Model: model, Effort: effort, Timeout: 30 * time.Second,
+		})
 	}
-	if effort != "" {
-		params["effort"] = effort
-	}
-	startTurn := func() (json.RawMessage, error) {
-		return rt.client.Request("turn/start", params, 30*time.Second)
-	}
-	result, err := startTurn()
+	turnID, err := startTurn()
 	if err != nil && isThreadNotFoundError(err) {
 		// The Thread can be evicted between resume and turn/start. Keep the
 		// already-reserved Turn and retry this idempotent pre-start sequence once.
 		if resumeErr := h.resumeAgentThread(agentID, rt); resumeErr == nil {
-			result, err = startTurn()
+			turnID, err = startTurn()
 		} else {
 			err = fmt.Errorf("%v; retry %v", err, resumeErr)
 		}
@@ -805,22 +799,6 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 		h.mu.Unlock()
 		return SendResult{}, errf(500, "turn/start failed: %s", err)
 	}
-	var parsed struct {
-		Turn struct {
-			ID string `json:"id"`
-		} `json:"turn"`
-		TurnID string `json:"turnId"`
-		ID     string `json:"id"`
-	}
-	_ = json.Unmarshal(result, &parsed)
-	turnID := parsed.Turn.ID
-	if turnID == "" {
-		turnID = parsed.TurnID
-	}
-	if turnID == "" {
-		turnID = parsed.ID
-	}
-
 	h.mu.Lock()
 	if turnID != "" && turn.turnID == "" && !turn.finished {
 		turn.turnID = turnID
@@ -871,21 +849,21 @@ func codexTaskText(text string, artifacts []ThreadArtifact) string {
 	return taskText
 }
 
-func codexArtifactInput(text, loomContext string, artifacts []ThreadArtifact) []map[string]any {
-	input := make([]map[string]any, 0, len(artifacts)+2)
+func codexArtifactInput(text, loomContext string, artifacts []ThreadArtifact) []RuntimeInput {
+	input := make([]RuntimeInput, 0, len(artifacts)+2)
 	original := strings.TrimSpace(text)
 	if original == "" && len(artifacts) > 0 {
 		original = "Review the attached files."
 	}
 	if original != "" {
-		input = append(input, map[string]any{"type": "text", "text": original})
+		input = append(input, RuntimeInput{Kind: RuntimeInputText, Text: original})
 	}
 	if strings.TrimSpace(loomContext) != "" {
-		input = append(input, map[string]any{"type": "text", "text": loomContext})
+		input = append(input, RuntimeInput{Kind: RuntimeInputText, Text: loomContext})
 	}
 	for _, artifact := range artifacts {
 		if strings.HasPrefix(strings.ToLower(artifact.MimeType), "image/") {
-			input = append(input, map[string]any{"type": "localImage", "path": artifact.Path})
+			input = append(input, RuntimeInput{Kind: RuntimeInputLocalImage, Path: artifact.Path})
 		}
 	}
 	return input
@@ -988,7 +966,7 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	agentID := meta.ID
 	threadID := meta.RuntimeBinding.NativeRef
 	turnID := turn.turnID
-	client := rt.client
+	backend := runtimeBackend(rt)
 	heldMessageID := turn.agentMessageID
 	heldSubject := ""
 	if message := h.comms[heldMessageID]; message != nil {
@@ -1000,11 +978,10 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 		return InterruptResult{}, errf(409, "active Turn is still starting; retry shortly")
 	}
 	interrupt := func(targetTurnID string) error {
-		_, err := client.Request("turn/interrupt", map[string]any{
-			"threadId": threadID,
-			"turnId":   targetTurnID,
-		}, 10*time.Second)
-		return err
+		if backend == nil {
+			return errors.New("Agent Runtime is unavailable")
+		}
+		return backend.Interrupt(threadID, targetTurnID, 10*time.Second)
 	}
 	err := interrupt(turnID)
 	if actualTurnID, mismatch := activeTurnInterruptMismatch(err); mismatch && actualTurnID != turnID {
@@ -1213,7 +1190,11 @@ func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
 
 	var lookupErr error
 	for _, agent := range agents {
-		turn, err := rollout.ReadTurn(agent.nativeRuntimeRef, turnID)
+		backend := runtimeForKind(agent.RuntimeBinding.Kind)
+		if backend == nil || !backend.Capabilities().History {
+			continue
+		}
+		turn, err := backend.ReadTurn(agent.nativeRuntimeRef, turnID)
 		if err != nil {
 			if !errors.Is(err, rollout.ErrTurnNotFound) && !errors.Is(err, rollout.ErrRolloutNotFound) && lookupErr == nil {
 				lookupErr = fmt.Errorf("Agent %s (%s): %w", agent.Name, agent.ThreadID, err)
@@ -1226,39 +1207,11 @@ func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
 		}
 		detail := TurnDetail{
 			ID: turn.ID, AgentID: agent.ID, Agent: agent.Name, ThreadID: agent.ThreadID,
-			Cwd: agent.Cwd, Status: turn.Status, Items: items,
+			Cwd: agent.Cwd, Status: turn.Status, StartedAt: turn.StartedAt, CompletedAt: turn.CompletedAt,
+			Model: turn.Model, Usage: rolloutTokenUsage(turn.Usage), UsageUpdatedAt: turn.UsageUpdatedAt, Items: items,
 		}
 		if detail.Status == "running" && (agent.Status != "running" || agent.CurrentTurnID != turnID) {
 			detail.Status = "interrupted"
-		}
-		if report, usageErr := rollout.ReadUsage(agent.nativeRuntimeRef); usageErr == nil {
-			for _, activity := range report.Activity {
-				if activity.TurnID != turnID {
-					continue
-				}
-				detail.StartedAt = activity.StartedAt
-				detail.CompletedAt = activity.EndedAt
-				if detail.Status == "running" && activity.Status != "running" {
-					detail.Status = activity.Status
-				}
-				break
-			}
-			for _, usage := range report.Turns {
-				if usage.TurnID != turnID {
-					continue
-				}
-				copy := usage.Usage
-				detail.Model = usage.Model
-				detail.Usage = &copy
-				detail.UsageUpdatedAt = usage.LastUpdatedAt
-				break
-			}
-		}
-		if detail.StartedAt == "" && len(items) > 0 {
-			detail.StartedAt, _ = items[0]["timestamp"].(string)
-		}
-		if detail.CompletedAt == "" && detail.Status != "running" && len(items) > 0 {
-			detail.CompletedAt, _ = items[len(items)-1]["timestamp"].(string)
 		}
 		h.mu.Lock()
 		detail.Source, detail.Error = h.turnReferenceLocked(agent.ID, turnID)
@@ -1327,6 +1280,10 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 		return History{}, errf(404, "agent not found: %s", key)
 	}
 	view := h.viewLocked(meta)
+	backend := runtimeForKind(meta.RuntimeBinding.Kind)
+	if rt := h.runtimes[meta.ID]; rt != nil {
+		backend = runtimeBackend(rt)
+	}
 	h.mu.Unlock()
 	applyRolloutStatus(&view)
 
@@ -1337,44 +1294,50 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 		return hist, nil // no thread started yet → no rollout, no history
 	}
 
-	tr, total, err := rollout.ReadWindow(threadID, count, offset)
+	if backend == nil || !backend.Capabilities().History {
+		return hist, nil
+	}
+	window, err := backend.ReadHistory(threadID, count, offset)
 	if err != nil {
 		// No rollout on disk (e.g. a new Agent before its first Turn is
 		// flushed). Not an error: report empty history for this Agent.
 		log.Printf("[codex-loom] history: no rollout for %s (thread %s): %v", view.Name, threadID, err)
 		return hist, nil
 	}
-	all := tr.Turns
-	hist.Total = total
+	all := window.Turns
+	hist.Total = window.Total
 	if len(all) > 0 && all[len(all)-1].Status == "running" && hist.Status != "running" {
-		if latest, err := rollout.LatestTurn(threadID); err == nil && latest != nil && latest.Status == "running" && externalTurnLooksLive(threadID, latest.UpdatedAt) {
+		if latest, err := backend.LatestTurn(threadID); err == nil && latest != nil && latest.Status == "running" && externalTurnLooksLive(threadID, latest.UpdatedAt) {
 			hist.Status = "running"
 		} else {
 			all[len(all)-1].Status = "interrupted"
 		}
 	}
-	turns := all
-	usageByTurn := map[string]rollout.TurnUsage{}
-	if report, usageErr := rollout.ReadUsage(threadID); usageErr == nil {
-		for _, turn := range report.Turns {
-			usageByTurn[turn.TurnID] = turn
-		}
-	}
-	for _, t := range turns {
+	for _, t := range all {
 		items := t.Items
 		if items == nil {
 			items = []map[string]any{}
 		}
 		turn := HistoryTurn{ID: t.ID, Status: t.Status, Items: items}
-		if usage, ok := usageByTurn[t.ID]; ok {
-			copy := usage.Usage
-			turn.Model = usage.Model
-			turn.Usage = &copy
-			turn.UsageUpdatedAt = usage.LastUpdatedAt
+		if t.Usage != nil {
+			turn.Model = t.Model
+			turn.Usage = rolloutTokenUsage(t.Usage)
+			turn.UsageUpdatedAt = t.UsageUpdatedAt
 		}
 		hist.Turns = append(hist.Turns, turn)
 	}
 	return hist, nil
+}
+
+func rolloutTokenUsage(usage *RuntimeTokenUsage) *rollout.TokenUsage {
+	if usage == nil {
+		return nil
+	}
+	return &rollout.TokenUsage{
+		InputTokens: usage.InputTokens, CachedInputTokens: usage.CachedInputTokens,
+		OutputTokens: usage.OutputTokens, ReasoningOutputTokens: usage.ReasoningOutputTokens,
+		TotalTokens: usage.TotalTokens, Calls: usage.Calls,
+	}
 }
 
 // Shutdown closes all codex processes. Running agents keep status=running

@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
-	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -101,11 +100,12 @@ type Session = Agent
 // Codex Thread runtime state.
 type AgentView struct {
 	Agent
-	ProcessAlive     bool           `json:"processAlive"`
-	PendingApprovals []ApprovalView `json:"pendingApprovals"`
-	Goal             *ThreadGoal    `json:"goal,omitempty"`
-	LastSeq          int64          `json:"lastSeq"`
-	nativeRuntimeRef string
+	ProcessAlive        bool                `json:"processAlive"`
+	RuntimeCapabilities RuntimeCapabilities `json:"runtimeCapabilities"`
+	PendingApprovals    []ApprovalView      `json:"pendingApprovals"`
+	Goal                *ThreadGoal         `json:"goal,omitempty"`
+	LastSeq             int64               `json:"lastSeq"`
+	nativeRuntimeRef    string
 }
 
 // SessionView is the pre-CodexLoom compatibility name.
@@ -257,6 +257,7 @@ type turnState struct {
 
 type runtime struct {
 	agentID           string
+	agentRuntime      AgentRuntime
 	client            *codex.Client
 	hostGeneration    uint64
 	skillConfigHash   string
@@ -346,6 +347,7 @@ type Hub struct {
 	contextHistoryProbe     contextHistoryProbeFunc
 	threadResumeTimeout     time.Duration
 	developerContextTimeout time.Duration
+	agentRuntimeFactory     func(kind string) (AgentRuntime, error)
 
 	integrationNormalizationPending  bool
 	gatewayState                     gatewayState
@@ -1015,7 +1017,7 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 	if err := h.threadControlFailureLocked(meta.RuntimeBinding.NativeRef); err != nil {
 		return nil, err
 	}
-	if rt, ok := h.runtimes[meta.ID]; ok && !rt.client.Closed() {
+	if rt, ok := h.runtimes[meta.ID]; ok && runtimeBackend(rt) != nil && runtimeBackend(rt).Alive() {
 		select {
 		case <-rt.ready:
 			if rt.initErr == nil {
@@ -1028,13 +1030,22 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 			return rt, nil
 		}
 	}
-	host, err := h.ensureCodexHostLocked()
-	if err != nil {
-		return nil, err
-	}
-	rt := &runtime{
-		agentID: meta.ID, client: host.client, hostGeneration: host.generation,
-		ready: make(chan struct{}), approvals: map[string]*approval{},
+	var rt *runtime
+	if h.agentRuntimeFactory != nil {
+		backend, err := h.agentRuntimeFactory(meta.RuntimeBinding.Kind)
+		if err != nil {
+			return nil, err
+		}
+		rt = &runtime{agentID: meta.ID, agentRuntime: backend, ready: make(chan struct{}), approvals: map[string]*approval{}}
+	} else {
+		host, err := h.ensureCodexHostLocked()
+		if err != nil {
+			return nil, err
+		}
+		rt = &runtime{
+			agentID: meta.ID, agentRuntime: host.agentRuntime, client: host.client, hostGeneration: host.generation,
+			ready: make(chan struct{}), approvals: map[string]*approval{},
+		}
 	}
 	h.runtimes[meta.ID] = rt
 	if !h.startWorkerLocked(func() { h.initRuntime(meta.ID, rt) }) {
@@ -1060,32 +1071,33 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
 	h.mu.Unlock()
 
-	h.mu.Lock()
-	host := h.codexHost
-	h.mu.Unlock()
-	if host == nil || host.generation != rt.hostGeneration {
-		rt.initErr = fmt.Errorf("CodexHost changed while thread was initializing")
+	backend := runtimeBackend(rt)
+	if backend == nil {
+		rt.initErr = fmt.Errorf("Agent Runtime is unavailable")
 		return
 	}
-	if err := waitCodexHost(host); err != nil {
-		rt.initErr = err
-		return
+	if rt.client != nil {
+		h.mu.Lock()
+		host := h.codexHost
+		h.mu.Unlock()
+		if host == nil || host.generation != rt.hostGeneration {
+			rt.initErr = fmt.Errorf("CodexHost changed while thread was initializing")
+			return
+		}
+		if err := waitCodexHost(host); err != nil {
+			rt.initErr = err
+			return
+		}
+	}
+	binding := RuntimeBindingRequest{
+		NativeRef: threadID, Name: threadName, Sandbox: sandbox, Cwd: cwd,
+		ProviderID: providerID, Model: model, DisabledSkillPaths: disabledSkillPaths,
 	}
 	startThread := func() error {
-		params := threadBindingParams(sandbox, cwd, providerID, model, disabledSkillPaths)
-		result, err := rt.client.Request("thread/start", params, 30*time.Second)
+		threadID, err := backend.Create(binding)
 		if err != nil {
 			return err
 		}
-		var parsed struct {
-			Thread struct {
-				ID string `json:"id"`
-			} `json:"thread"`
-		}
-		if err := json.Unmarshal(result, &parsed); err != nil || parsed.Thread.ID == "" {
-			return fmt.Errorf("thread/start returned no thread id")
-		}
-		threadID := parsed.Thread.ID
 		h.mu.Lock()
 		if m := h.agents[agentID]; m != nil {
 			previous := *m
@@ -1098,8 +1110,10 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 			}
 		}
 		h.mu.Unlock()
-		if err := setThreadName(rt.client, threadID, threadName); err != nil {
-			log.Printf("[codex-loom] set thread name %s to %q: %v", threadID, threadName, err)
+		if rt.client != nil {
+			if err := setThreadName(rt.client, threadID, threadName); err != nil {
+				log.Printf("[codex-loom] set thread name %s to %q: %v", threadID, threadName, err)
+			}
 		}
 		h.mu.Lock()
 		if h.runtimes[agentID] == rt {
@@ -1113,7 +1127,7 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		rt.initErr = startThread()
 		return
 	}
-	err := resumeThreadWithTimeout(rt.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths, h.effectiveThreadResumeTimeout())
+	err := backend.Resume(binding, h.effectiveThreadResumeTimeout())
 	if err != nil {
 		if codex.IsRequestTimeout(err) {
 			h.markThreadControlIndeterminate(rt, threadID, "thread/resume")
@@ -1126,8 +1140,10 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		}
 		return
 	}
-	if err := setThreadName(rt.client, threadID, threadName); err != nil {
-		log.Printf("[codex-loom] set thread name %s to %q: %v", threadID, threadName, err)
+	if rt.client != nil {
+		if err := setThreadName(rt.client, threadID, threadName); err != nil {
+			log.Printf("[codex-loom] set thread name %s to %q: %v", threadID, threadName, err)
+		}
 	}
 	h.mu.Lock()
 	if h.runtimes[agentID] == rt {
@@ -1135,6 +1151,19 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		rt.skillConfigLoaded = true
 	}
 	h.mu.Unlock()
+}
+
+func runtimeBackend(rt *runtime) AgentRuntime {
+	if rt == nil {
+		return nil
+	}
+	if rt.agentRuntime != nil {
+		return rt.agentRuntime
+	}
+	if rt.client != nil {
+		return &codexAgentRuntime{client: rt.client}
+	}
+	return nil
 }
 
 func threadBindingParams(sandbox, cwd, providerID, model string, disabledSkillPaths []string) map[string]any {
@@ -1203,7 +1232,14 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 	if strings.TrimSpace(threadID) == "" {
 		return errf(409, "agent has no Codex Thread binding")
 	}
-	if err := resumeThreadWithTimeout(rt.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths, h.effectiveThreadResumeTimeout()); err != nil {
+	backend := runtimeBackend(rt)
+	if backend == nil {
+		return errf(500, "Agent Runtime is unavailable")
+	}
+	if err := backend.Resume(RuntimeBindingRequest{
+		NativeRef: threadID, Name: meta.Name, Sandbox: sandbox, Cwd: cwd,
+		ProviderID: providerID, Model: model, DisabledSkillPaths: disabledSkillPaths,
+	}, h.effectiveThreadResumeTimeout()); err != nil {
 		if codex.IsRequestTimeout(err) {
 			h.markThreadControlIndeterminate(rt, threadID, "thread/resume")
 		}
@@ -1348,6 +1384,10 @@ func (h *Hub) adoptRemoteTurnLocked(meta *Agent, rt *runtime, turnID string) *tu
 	meta.UpdatedAt = now()
 	h.persistRuntimeProjectionLocked()
 	h.emitStatusLocked(meta, "running")
+	h.emitLocked(meta.ID, "loom/turn-started", map[string]any{
+		"turnId": turnID, "task": turn.task, "source": turn.source,
+		"providerId": publicProviderID(meta.ProviderID), "model": meta.Model,
+	})
 	return turn
 }
 
@@ -1423,14 +1463,14 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 	if meta == nil {
 		return
 	}
-	var tp turnParams
-	_ = json.Unmarshal(params, &tp)
-	turnID := tp.TurnID
-	if turnID == "" {
-		turnID = tp.Turn.ID
+	runtimeEvents := normalizeRuntimeEvents(rt, method, params)
+	var runtimeEvent RuntimeEvent
+	if len(runtimeEvents) > 0 {
+		runtimeEvent = runtimeEvents[0]
 	}
+	turnID := runtimeEvent.NativeTurnID
 
-	if method == "turn/started" && turnID != "" {
+	if runtimeEvent.Kind == RuntimeTurnStarted && turnID != "" {
 		switch turn := rt.activeTurn; {
 		case turn == nil || turn.finished:
 			h.adoptRemoteTurnLocked(meta, rt, turnID)
@@ -1457,7 +1497,7 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 	}
 	activeEvent := rt.activeTurn != nil && !rt.activeTurn.finished &&
 		(turnID == "" || rt.activeTurn.turnID == "" || rt.activeTurn.turnID == turnID)
-	if text := notificationUserText(params); text != "" && activeEvent {
+	if text := runtimeEvent.Text; runtimeEvent.Kind == RuntimeUserInput && text != "" && activeEvent {
 		task := displayUserTask(text)
 		rt.activeTurn.task = task
 		meta.CurrentTask = task
@@ -1471,13 +1511,13 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 
 	if activeEvent {
 		rt.activeTurn.lastActivity = time.Now()
-		if text := completedFinalAnswer(method, params); text != "" {
-			rt.activeTurn.finalAnswer = text
+		if runtimeEvent.Kind == RuntimeTextCompleted && runtimeEvent.Text != "" {
+			rt.activeTurn.finalAnswer = runtimeEvent.Text
 		}
 		if turnID != "" && rt.activeTurn.turnID == "" {
 			h.rebindActiveTurnIDLocked(meta, rt.activeTurn, turnID)
 		}
-		if isModelProducedNotification(method) {
+		if runtimeEventIsModelProduced(runtimeEvent.Kind) {
 			h.observeContextModelEventLocked(meta, rt.activeTurn)
 		}
 		if method == "error" && rt.activeTurn.forcedFailure == "" {
@@ -1490,10 +1530,15 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 		}
 	}
 
-	h.emitLocked(meta.ID, method, params)
+	h.emitRuntimeEventsLocked(meta, rt, runtimeEvents)
+	if len(runtimeEvents) > 0 {
+		h.emitLocked(meta.ID, method, runtimeCompatibilityPayload(params))
+	} else {
+		h.emitLocked(meta.ID, method, params)
+	}
 
-	switch method {
-	case "turn/completed", "turn/failed", "turn/aborted":
+	switch runtimeEvent.Kind {
+	case RuntimeTurnCompleted, RuntimeTurnFailed, RuntimeTurnInterrupted:
 		if rt.activeTurn == nil || rt.activeTurn.finished {
 			return
 		}
@@ -1505,22 +1550,77 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 			return
 		}
 		status := "completed"
-		errMsg := ""
-		if tp.Turn.Error != nil {
-			errMsg = tp.Turn.Error.Message
-		} else if tp.Error != nil {
-			errMsg = tp.Error.Message
-		}
+		errMsg := runtimeEvent.Error
 		if rt.activeTurn.forcedFailure == "" {
 			rt.activeTurn.forcedFailure = customProviderModelRouteFailureDetail(meta.ProviderID, meta.Model, errMsg)
 		}
-		switch {
-		case method == "turn/failed", tp.Turn.Status == "failed":
+		switch runtimeEvent.Kind {
+		case RuntimeTurnFailed:
 			status = "failed"
-		case method == "turn/aborted", tp.Turn.Status == "interrupted", tp.Turn.Status == "aborted", tp.Turn.Status == "cancelled", tp.Turn.Status == "canceled":
+		case RuntimeTurnInterrupted:
 			status = "interrupted"
 		}
 		h.finishTurnLocked(meta, rt, status, errMsg)
+	}
+}
+
+func normalizeRuntimeEvents(rt *runtime, method string, params json.RawMessage) []RuntimeEvent {
+	if backend := runtimeBackend(rt); backend != nil {
+		return backend.NormalizeEvent(method, params)
+	}
+	// Unit-level notification tests historically construct a Runtime without a
+	// live client. Their events are Codex-shaped, so use the same adapter.
+	return (&codexAgentRuntime{}).NormalizeEvent(method, params)
+}
+
+func runtimeEventIsModelProduced(kind RuntimeEventKind) bool {
+	switch kind {
+	case RuntimeTextDelta, RuntimeTextCompleted, RuntimeReasoningDelta, RuntimeReasoningCompleted,
+		RuntimeToolStarted, RuntimeToolUpdated, RuntimeToolCompleted:
+		return true
+	default:
+		return false
+	}
+}
+
+func runtimeCompatibilityPayload(params json.RawMessage) any {
+	var payload map[string]any
+	if json.Unmarshal(params, &payload) == nil {
+		payload["compatibility"] = true
+		return payload
+	}
+	return map[string]any{"compatibility": true, "raw": params}
+}
+
+func (h *Hub) emitRuntimeEventsLocked(meta *Agent, rt *runtime, events []RuntimeEvent) {
+	for _, event := range events {
+		data := map[string]any{
+			"nativeTurnId": event.NativeTurnID,
+			"itemId":       event.ItemID,
+			"text":         event.Text,
+			"delta":        event.Text,
+			"item":         event.Item,
+		}
+		switch event.Kind {
+		case RuntimeUserInput:
+			if rt.activeTurn != nil && rt.activeTurn.source == "remote" {
+				h.emitLocked(meta.ID, "loom/user-message", map[string]any{"text": event.Text})
+			}
+		case RuntimeTextDelta:
+			h.emitLocked(meta.ID, "loom/text-delta", data)
+		case RuntimeTextCompleted:
+			h.emitLocked(meta.ID, "loom/text-completed", data)
+		case RuntimeReasoningDelta:
+			h.emitLocked(meta.ID, "loom/reasoning-delta", data)
+		case RuntimeReasoningCompleted:
+			h.emitLocked(meta.ID, "loom/reasoning-completed", data)
+		case RuntimeToolStarted:
+			h.emitLocked(meta.ID, "loom/tool-started", data)
+		case RuntimeToolUpdated:
+			h.emitLocked(meta.ID, "loom/tool-updated", data)
+		case RuntimeToolCompleted:
+			h.emitLocked(meta.ID, "loom/tool-completed", data)
+		}
 	}
 }
 
@@ -1745,11 +1845,18 @@ func (h *Hub) finishAgentMessageTurnLocked(turn *turnState, status, errMsg strin
 func (h *Hub) viewLocked(meta *Agent) AgentView {
 	view := AgentView{Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID], nativeRuntimeRef: meta.RuntimeBinding.NativeRef}
 	view.RuntimeBinding.NativeRef = ""
+	backend := runtimeForKind(meta.RuntimeBinding.Kind)
+	if rt := h.runtimes[meta.ID]; rt != nil {
+		backend = runtimeBackend(rt)
+	}
+	if backend != nil {
+		view.RuntimeCapabilities = backend.Capabilities()
+	}
 	if goal := h.goals[meta.ID]; goal != nil {
 		copy := *goal
 		view.Goal = &copy
 	}
-	if rt, ok := h.runtimes[meta.ID]; ok && !rt.client.Closed() {
+	if rt, ok := h.runtimes[meta.ID]; ok && runtimeBackend(rt) != nil && runtimeBackend(rt).Alive() {
 		view.ProcessAlive = true
 		for id, ap := range rt.approvals {
 			view.PendingApprovals = append(view.PendingApprovals, ApprovalView{
@@ -1760,6 +1867,15 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 	return view
 }
 
+func runtimeForKind(kind string) AgentRuntime {
+	switch kind {
+	case "codex":
+		return &codexAgentRuntime{}
+	default:
+		return nil
+	}
+}
+
 func applyRolloutStatus(view *AgentView) {
 	if view.nativeRuntimeRef == "" {
 		return
@@ -1767,7 +1883,15 @@ func applyRolloutStatus(view *AgentView) {
 	if view.Status == "running" && view.ProcessAlive {
 		return
 	}
-	latest, err := rollout.LatestTurn(view.nativeRuntimeRef)
+	kind := view.RuntimeBinding.Kind
+	if kind == "" {
+		kind = "codex"
+	}
+	backend := runtimeForKind(kind)
+	if backend == nil || !backend.Capabilities().History {
+		return
+	}
+	latest, err := backend.LatestTurn(view.nativeRuntimeRef)
 	if err != nil || latest == nil || latest.ID == "" {
 		return
 	}

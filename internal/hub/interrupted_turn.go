@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/yan5xu/codex-loom/internal/rollout"
 )
 
 const restartInterruptedError = "interrupted: CodexLoom restarted while task was running"
@@ -29,7 +27,15 @@ func reconcileInterruptedTurn(meta *Agent) (*TurnSummary, bool) {
 		TurnID: meta.CurrentTurnID, Task: displayRolloutTask(meta.CurrentTask),
 		Status: "interrupted", CompletedAt: now(),
 	}
-	latest, err := rollout.LatestTurn(meta.RuntimeBinding.NativeRef)
+	kind := meta.RuntimeBinding.Kind
+	if kind == "" {
+		kind = "codex"
+	}
+	backend := runtimeForKind(kind)
+	if backend == nil || !backend.Capabilities().History {
+		return summary, true
+	}
+	latest, err := backend.LatestTurn(meta.RuntimeBinding.NativeRef)
 	if err != nil || latest == nil || latest.ID == "" {
 		return summary, true
 	}

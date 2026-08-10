@@ -404,13 +404,11 @@ func (h *Hub) injectDeveloperContext(agentID string, rt *runtime, content string
 	}
 	threadID := meta.RuntimeBinding.NativeRef
 	h.mu.Unlock()
-	_, err := rt.client.Request("thread/inject_items", map[string]any{
-		"threadId": threadID,
-		"items": []map[string]any{{
-			"type": "message", "role": "developer",
-			"content": []map[string]any{{"type": "input_text", "text": content}},
-		}},
-	}, h.effectiveDeveloperContextTimeout())
+	backend := runtimeBackend(rt)
+	if backend == nil {
+		return errf(500, "Agent Runtime is unavailable")
+	}
+	err := backend.InjectDeveloperContext(threadID, content, h.effectiveDeveloperContextTimeout())
 	if err != nil {
 		if codex.IsRequestTimeout(err) {
 			h.markThreadControlIndeterminate(rt, threadID, "thread/inject_items")

@@ -1,6 +1,30 @@
 import { describe, expect, it } from "vitest";
 import { emptyFeed, reduceFeed, summarizeTask } from "./feed";
 
+describe("Runtime-normalized live events", () => {
+  it("renders the normalized event and ignores its raw Codex compatibility duplicate", () => {
+    const normalized = reduceFeed(emptyFeed, {
+      seq: 1,
+      ts: "2026-08-10T00:00:00Z",
+      type: "loom/text-delta",
+      data: { itemId: "answer-1", delta: "hello" },
+    });
+    expect(normalized.blocks).toEqual([
+      { kind: "agent", id: "answer-1", ts: "2026-08-10T00:00:00Z", text: "hello", streaming: true },
+    ]);
+    const state = reduceFeed(normalized, {
+      seq: 2,
+      ts: "2026-08-10T00:00:00Z",
+      type: "item/agentMessage/delta",
+      data: { itemId: "answer-1", delta: "hello", compatibility: true },
+    });
+
+    expect(state.blocks).toEqual([
+      { kind: "agent", id: "answer-1", ts: "2026-08-10T00:00:00Z", text: "hello", streaming: true },
+    ]);
+  });
+});
+
 describe("rollout history projection", () => {
   it("summarizes a Human Input response without exposing its XML envelope", () => {
     const text = `<human_input_response version="1" request_id="hrq_test" expectation="required">

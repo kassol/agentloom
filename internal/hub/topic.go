@@ -1164,7 +1164,7 @@ func (h *Hub) InterveneTopicTurn(id string, params TopicInterventionParams) (Top
 		h.mu.Unlock()
 		return TopicInterventionResult{}, errf(409, "%s has no active Turn for Topic %s", agent.Name, topic.ID)
 	}
-	turnID, threadID, client, agentID, agentName, responsibleID := rt.activeTurn.turnID, agent.RuntimeBinding.NativeRef, rt.client, agent.ID, agent.Name, topic.ResponsibleAgentID
+	turnID, threadID, agentID, agentName, responsibleID := rt.activeTurn.turnID, agent.RuntimeBinding.NativeRef, agent.ID, agent.Name, topic.ResponsibleAgentID
 	h.mu.Unlock()
 	if params.Action == "steer" {
 		var b strings.Builder
@@ -1175,7 +1175,7 @@ func (h *Hub) InterveneTopicTurn(id string, params TopicInterventionParams) (Top
 		}
 		writeXMLText(&b, "instruction", "This is a recorded correction to this active Turn, not a new Topic assignment. Continue within your scoped responsibility and return the resulting impact to the responsible Agent.")
 		b.WriteString("</owner_topic_intervention>")
-		if _, err := h.requestTurnSteer(client, threadID, turnID, b.String(), 30*time.Second); err != nil {
+		if _, err := h.requestTurnSteer(rt, threadID, turnID, b.String(), 30*time.Second); err != nil {
 			return TopicInterventionResult{}, errf(500, "steer active Turn: %s", err)
 		}
 	} else {

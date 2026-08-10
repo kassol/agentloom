@@ -815,7 +815,7 @@ function buildHistoryBlocks(turns: any[], keyPrefix: string): Block[] {
 
 export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
 	const rawType = ev.type || "";
-	const t = rawType === "hub/session-created"
+	let t = rawType === "hub/session-created"
 		? "loom/agent-created"
 		: rawType === "hub/session-killed"
 			? "loom/agent-archived"
@@ -823,6 +823,22 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
 				? `loom/${rawType.slice("hub/".length)}`
 				: rawType;
   const d = ev.data || {};
+
+  if ((d as any).compatibility === true && (
+    t === "turn/started" || t === "turn/completed" || t === "turn/failed" || t === "turn/aborted" ||
+    t === "item/started" || t === "item/updated" || t === "item/completed" ||
+    t === "item/agentMessage/delta" || t === "item/reasoning/delta"
+  )) return state;
+
+  switch (t) {
+    case "loom/text-delta": t = "item/agentMessage/delta"; break;
+    case "loom/reasoning-delta": t = "item/reasoning/delta"; break;
+    case "loom/text-completed":
+    case "loom/reasoning-completed":
+    case "loom/tool-completed": t = "item/completed"; break;
+    case "loom/tool-started": t = "item/started"; break;
+    case "loom/tool-updated": t = "item/updated"; break;
+  }
 
   switch (t) {
     case "__history__": {
