@@ -20,6 +20,7 @@
 //	outbox.ndjson        durable outbound message snapshots
 //	provider-operations.ndjson durable credential-mediated provider operation snapshots
 //	human-requests.ndjson durable Agent-to-human request snapshots
+//	approvals.ndjson      append-only Runtime Approval snapshots
 //	events/<id>.ndjson   append-only per-Agent event log, one JSON per line
 //
 // agents.json is a small registry, not a history store: Thread history lives in
@@ -477,6 +478,8 @@ func (s *Store) providerOperationsFile() string {
 }
 
 func (s *Store) humanRequestsFile() string { return filepath.Join(s.dir, "human-requests.ndjson") }
+
+func (s *Store) approvalsFile() string { return filepath.Join(s.dir, "approvals.ndjson") }
 
 func (s *Store) eventsFile(agentID string) string {
 	return filepath.Join(s.dir, "events", agentID+".ndjson")
@@ -994,6 +997,12 @@ func (s *Store) AppendHumanRequest(v any) error { return s.appendNDJSON(s.humanR
 
 func (s *Store) ReadHumanRequests(fn func(json.RawMessage)) error {
 	return s.readNDJSON(s.humanRequestsFile(), fn)
+}
+
+func (s *Store) AppendApproval(v any) error { return s.appendNDJSON(s.approvalsFile(), v) }
+
+func (s *Store) ReadApprovals(fn func(json.RawMessage)) error {
+	return s.readNDJSON(s.approvalsFile(), fn)
 }
 
 func (s *Store) appendNDJSON(path string, v any) error {

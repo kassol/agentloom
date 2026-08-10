@@ -3,6 +3,40 @@ import { Type } from "@earendil-works/pi-ai";
 
 type JsonRecord = Record<string, unknown>;
 
+const LOOM_APPROVAL_TITLE = "codex-loom:approval:v1";
+const LOOM_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
+const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+const LOOM_TOOLS = new Set([
+	"loom_agents_find",
+	"loom_message_send",
+	"loom_message_receive",
+	"loom_message_reply",
+	"loom_needs_you",
+	"loom_topic_list",
+	"loom_topic_get",
+	"loom_topic_create",
+	"loom_topic_participant_upsert",
+	"loom_topic_participant_remove",
+	"loom_topic_wait",
+	"loom_topic_resume",
+	"loom_topic_publish_progress",
+	"loom_topic_publish_result",
+]);
+
+function approvalPolicy(): "never" | "on-request" {
+	const value = process.env.CODEX_LOOM_APPROVAL_POLICY?.trim().toLowerCase();
+	if (!value || value === "never") return "never";
+	return "on-request";
+}
+
+function approvalBlockReason(decision: string | undefined, aborted: boolean): string {
+	if (aborted || decision === "abort") return "Loom Approval aborted before the tool executed";
+	if (decision === "timeout") return "Loom Approval timed out before the tool executed";
+	if (decision === "deny") return "Loom Approval denied before the tool executed";
+	if (decision === undefined) return "Loom Approval timed out or was cancelled before the tool executed";
+	return "Loom Approval returned an unsupported decision before the tool executed";
+}
+
 function environment(): { apiURL: string; agentID: string } {
 	const apiURL = process.env.CODEX_LOOM_API_URL?.replace(/\/$/, "");
 	const agentID = process.env.CODEX_LOOM_AGENT_ID;
@@ -36,6 +70,19 @@ function topicBelongsToAgent(topic: JsonRecord, agentID: string): boolean {
 }
 
 export default function loomCollaboration(pi: ExtensionAPI) {
+	pi.on("tool_call", async (event, ctx) => {
+		if (approvalPolicy() === "never" || READ_ONLY_TOOLS.has(event.toolName) || LOOM_TOOLS.has(event.toolName)) return;
+		const decision = await ctx.ui.input(LOOM_APPROVAL_TITLE, JSON.stringify({
+			version: 1,
+			operation: "request_approval",
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			input: event.input,
+		}), { signal: ctx.signal, timeout: LOOM_APPROVAL_TIMEOUT_MS });
+		if (decision === "approve") return;
+		return { block: true, reason: approvalBlockReason(decision, ctx.signal?.aborted === true) };
+	});
+
 	pi.registerTool({
 		name: "loom_agents_find",
 		label: "Find Loom Agents",

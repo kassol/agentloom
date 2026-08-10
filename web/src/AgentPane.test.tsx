@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Agent } from "./types";
 
@@ -6,7 +6,7 @@ const virtualizerHarness = vi.hoisted(() => ({
   options: [] as Array<Record<string, unknown>>,
   instance: {
     getTotalSize: vi.fn(() => 0),
-    getVirtualItems: vi.fn(() => []),
+    getVirtualItems: vi.fn((): any[] => []),
     measureElement: vi.fn(),
     resizeItem: vi.fn(),
     scrollToIndex: vi.fn(),
@@ -66,6 +66,8 @@ const props = {
 describe("AgentPane scroll restoration", () => {
   beforeEach(() => {
     virtualizerHarness.options.length = 0;
+	virtualizerHarness.instance.getVirtualItems.mockReturnValue([]);
+	virtualizerHarness.instance.getTotalSize.mockReturnValue(0);
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(performance.now()), 0));
     vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -114,7 +116,7 @@ describe("AgentPane scroll restoration", () => {
       runtimeBinding: { kind: "pi" },
       runtimeCapabilities: {
         history: true, causalSteer: false, interrupt: true, goal: false, remote: false,
-        usage: false, provider: false, compaction: false, approval: false, skills: false,
+        usage: false, provider: false, compaction: false, approval: true, skills: false,
         naming: false, archive: false, sandbox: false, imageInput: false,
       },
     };
@@ -127,6 +129,9 @@ describe("AgentPane scroll restoration", () => {
     expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();
     expect(view.getByText("Provider").closest("label")?.querySelector("select")).toBeDisabled();
     expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
+	expect(view.getByText("Approval Policy").closest("label")?.querySelector("select")).toBeEnabled();
+	expect(view.getByText("Sandbox isolation is unsupported for the pi Runtime.")).toBeInTheDocument();
+	expect(view.getByText(/Approval controls individual tool actions only/)).toBeInTheDocument();
     expect(view.getByRole("button", { name: "Usage" })).toBeDisabled();
     expect(view.queryByText("History is unavailable for the pi Runtime.")).toBeNull();
     expect(view.getByText("Goal is unavailable for the pi Runtime.")).toBeInTheDocument();
@@ -140,5 +145,37 @@ describe("AgentPane scroll restoration", () => {
 	const requestedURLs = vi.mocked(fetch).mock.calls.map(([input]) => typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url);
 	expect(requestedURLs.some((url) => url.includes("/thread/history"))).toBe(true);
 	expect(requestedURLs.some((url) => url.includes("/compact"))).toBe(false);
+  });
+
+  it("restores a Pi Approval card from the Agent snapshot without Codex wording", async () => {
+	virtualizerHarness.instance.getVirtualItems.mockReturnValue([
+	  { index: 0, key: "approval:ap-agent-scroll-a1", start: 0, size: 120, end: 120, lane: 0 },
+	]);
+	virtualizerHarness.instance.getTotalSize.mockReturnValue(120);
+	const piAgent: Agent = {
+	  ...testAgent,
+	  runtimeBinding: { kind: "pi" },
+	  pendingApprovals: [{
+		approvalId: "ap-agent-scroll-a1", agentId: "agent-scroll", turnId: "turn-1", runtimeKind: "pi",
+		method: "tool/bash", params: { command: "pwd" }, status: "pending", requestedAt: "2026-08-10T00:00:00Z",
+	  }],
+	};
+	const view = render(<AgentPane {...props} agent={piAgent} active />);
+
+	expect(await view.findByText("pi Runtime requests approval")).toBeInTheDocument();
+	expect(view.queryByText("codex requests approval")).toBeNull();
+	fireEvent.click(view.getByRole("button", { name: "approve" }));
+	fireEvent.click(view.getByRole("button", { name: "reject" }));
+	await waitFor(() => {
+	  const calls = vi.mocked(fetch).mock.calls;
+	  expect(calls).toContainEqual([
+		"/api/agents/agent-scroll/thread/approvals/ap-agent-scroll-a1",
+		expect.objectContaining({ method: "POST", body: JSON.stringify({ decision: "approve" }) }),
+	  ]);
+	  expect(calls).toContainEqual([
+		"/api/agents/agent-scroll/thread/approvals/ap-agent-scroll-a1",
+		expect.objectContaining({ method: "POST", body: JSON.stringify({ decision: "deny" }) }),
+	  ]);
+	});
   });
 });

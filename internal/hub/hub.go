@@ -115,10 +115,18 @@ type AgentView struct {
 type SessionView = AgentView
 
 type ApprovalView struct {
-	ApprovalID string          `json:"approvalId"`
-	Method     string          `json:"method"`
-	Params     json.RawMessage `json:"params"`
-	TS         string          `json:"ts"`
+	ApprovalID      string          `json:"approvalId"`
+	AgentID         string          `json:"agentId"`
+	TurnID          string          `json:"turnId,omitempty"`
+	RuntimeKind     string          `json:"runtimeKind"`
+	Method          string          `json:"method"`
+	Params          json.RawMessage `json:"params"`
+	Status          string          `json:"status"`
+	Decision        string          `json:"decision,omitempty"`
+	RequestedAt     string          `json:"requestedAt"`
+	ResolvedAt      string          `json:"resolvedAt,omitempty"`
+	ResolutionError string          `json:"resolutionError,omitempty"`
+	TS              string          `json:"ts,omitempty"` // compatibility alias for requestedAt
 }
 
 type ActiveAgent struct {
@@ -231,11 +239,14 @@ type commRecord struct {
 	Message AgentMessage `json:"message"`
 }
 
+type approvalRecord struct {
+	Approval ApprovalView `json:"approval"`
+}
+
 type approval struct {
-	rpcID  json.RawMessage
-	method string
-	params json.RawMessage
-	ts     string
+	rpcID   json.RawMessage // retained for compact-state compatibility
+	respond func(decision string) error
+	done    chan struct{}
 }
 
 type turnState struct {
@@ -321,6 +332,8 @@ type Hub struct {
 	outboxOrder             []string
 	providerOperations      map[string]*ProviderOperation
 	providerOperationOrder  []string
+	approvals               map[string]*ApprovalView
+	approvalOrder           []string
 	humanRequests           map[string]*HumanRequest
 	humanRequestOrder       []string
 	goals                   map[string]*ThreadGoal
@@ -451,6 +464,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		attempts:               map[string]*HandlingAttempt{},
 		outbox:                 map[string]*OutboxItem{},
 		providerOperations:     map[string]*ProviderOperation{},
+		approvals:              map[string]*ApprovalView{},
 		humanRequests:          map[string]*HumanRequest{},
 		goals:                  map[string]*ThreadGoal{},
 		seqs:                   map[string]int64{},
@@ -546,6 +560,12 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	}
 	if err := h.loadProviderOperations(); err != nil {
 		return nil, fmt.Errorf("load provider operations: %w", err)
+	}
+	if err := h.loadApprovals(); err != nil {
+		return nil, fmt.Errorf("load Approvals: %w", err)
+	}
+	if err := h.recoverPendingApprovals(!options.Passive); err != nil {
+		return nil, fmt.Errorf("recover pending Approvals: %w", err)
 	}
 	if err := h.loadComms(); err != nil {
 		return nil, fmt.Errorf("load communications: %w", err)
@@ -1089,6 +1109,11 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 			func(event RuntimeEvent) { h.onRuntimeEvent(rt, event) },
 			func(err error) { h.onRuntimeFailure(rt, err) },
 		)
+	}
+	if source, ok := runtimeBackend(rt).(RuntimeApprovalSource); ok {
+		source.SetRuntimeApprovalHandler(func(request RuntimeApprovalRequest) {
+			h.onRuntimeApprovalRequest(rt, request)
+		})
 	}
 	h.runtimes[meta.ID] = rt
 	if !h.startWorkerLocked(func() { h.initRuntime(meta.ID, rt) }) {
@@ -1670,63 +1695,157 @@ func (h *Hub) emitRuntimeEventsLocked(meta *Agent, rt *runtime, events []Runtime
 
 func (h *Hub) onServerRequest(rt *runtime, id json.RawMessage, method string, params json.RawMessage) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	meta := h.agents[rt.agentID]
 	if strings.Contains(strings.ToLower(method), "approval") {
-		apID := "ap-" + strings.Trim(string(id), `"`)
-		rt.approvals[apID] = &approval{rpcID: id, method: method, params: params, ts: now()}
+		turnID, runtimeKind := "", ""
 		if rt.activeTurn != nil && !rt.activeTurn.finished {
-			rt.activeTurn.lastActivity = time.Now()
+			turnID = rt.activeTurn.turnID
 		}
 		if meta != nil {
-			h.emitLocked(meta.ID, "loom/approval-requested", map[string]any{
-				"approvalId": apID,
-				"method":     method,
-				"params":     params,
-			})
+			runtimeKind = meta.RuntimeBinding.Kind
 		}
+		respond := func(decision string) error {
+			if rt.client == nil {
+				return nil
+			}
+			return rt.client.Respond(id, map[string]any{"decision": codexApprovalDecision(decision)})
+		}
+		created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{
+			AgentID: rt.agentID, TurnID: turnID, RuntimeKind: runtimeKind, Method: method, Params: params,
+		}, respond)
+		if err != nil {
+			if meta != nil {
+				h.emitLocked(meta.ID, "loom/error", map[string]any{"message": "persist Approval request: " + err.Error()})
+			}
+			h.mu.Unlock()
+			return
+		}
+		rt.approvals[created.ApprovalID].rpcID = append(json.RawMessage(nil), id...)
+		h.mu.Unlock()
 		return
 	}
 	// Unknown server->client request: answer with an error so codex won't hang.
 	if meta != nil {
 		h.emitLocked(meta.ID, "loom/server-request", map[string]any{"method": method, "params": params})
 	}
-	_ = rt.client.RespondError(id, -32601, "CodexLoom does not handle "+method)
+	client := rt.client
+	h.mu.Unlock()
+	if client != nil {
+		_ = client.RespondError(id, -32601, "CodexLoom does not handle "+method)
+	}
+}
+
+func (h *Hub) onRuntimeApprovalRequest(rt *runtime, request RuntimeApprovalRequest) {
+	h.mu.Lock()
+	meta := h.agents[rt.agentID]
+	if meta == nil || h.runtimes[rt.agentID] != rt || rt.activeTurn == nil || rt.activeTurn.finished {
+		if request.Respond != nil {
+			h.startWorkerLocked(func() { _ = request.Respond("abort") })
+		}
+		h.mu.Unlock()
+		return
+	}
+	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{
+		AgentID: rt.agentID, TurnID: rt.activeTurn.turnID, RuntimeKind: meta.RuntimeBinding.Kind,
+		Method: request.Method, Params: request.Params,
+	}, request.Respond)
+	if err != nil {
+		h.emitLocked(meta.ID, "loom/error", map[string]any{"message": "persist Approval request: " + err.Error()})
+		h.mu.Unlock()
+		return
+	}
+	waiter := rt.approvals[created.ApprovalID]
+	if request.Timeout > 0 && waiter != nil {
+		agentID, approvalID, timeout, stop := meta.ID, created.ApprovalID, request.Timeout, h.stop
+		h.startWorkerLocked(func() {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				_, _ = h.ResolveApproval(agentID, approvalID, "timeout")
+			case <-waiter.done:
+			case <-stop:
+			}
+		})
+	}
+	h.mu.Unlock()
 }
 
 func (h *Hub) ResolveApproval(key, approvalID, decision string) (map[string]any, error) {
+	decision, status, ok := normalizeApprovalDecision(decision)
+	if !ok {
+		return nil, errf(400, "unsupported Approval decision: %s", decision)
+	}
 	h.mu.Lock()
 	meta := h.resolveLocked(key)
 	if meta == nil {
 		h.mu.Unlock()
 		return nil, errf(404, "agent not found: %s", key)
 	}
+	current := h.approvals[approvalID]
+	if current == nil || current.AgentID != meta.ID || current.Status != "pending" {
+		h.mu.Unlock()
+		return nil, errf(404, "no pending approval %s", approvalID)
+	}
 	rt := h.runtimes[meta.ID]
 	if rt == nil {
 		h.mu.Unlock()
-		return nil, errf(404, "no pending approval %s", approvalID)
+		return nil, errf(409, "Approval %s cannot be resumed because its Runtime is unavailable", approvalID)
 	}
 	ap, ok := rt.approvals[approvalID]
 	if !ok {
 		h.mu.Unlock()
-		return nil, errf(404, "no pending approval %s", approvalID)
+		return nil, errf(409, "Approval %s cannot be resumed because its Runtime request is unavailable", approvalID)
 	}
+	next := *current
+	next.Status = status
+	next.Decision = decision
+	next.ResolvedAt = now()
+	next.ResolutionError = ""
+	if err := h.commitApprovalLocked(next); err != nil {
+		// The durable terminal append failed. Stop presenting the request as
+		// actionable in this process and deny it so the Runtime is not blocked.
+		next.Status = "aborted"
+		next.Decision = "abort"
+		next.ResolutionError = "persist Approval terminal state: " + err.Error()
+		h.approvals[approvalID] = &next
+		closeApprovalWaiter(ap)
+		delete(rt.approvals, approvalID)
+		h.emitLocked(meta.ID, "loom/error", map[string]any{"message": next.ResolutionError})
+		h.emitLocked(meta.ID, "loom/approval-resolved", approvalEventPayload(next))
+		respond := ap.respond
+		h.mu.Unlock()
+		if respond != nil {
+			_ = respond("abort")
+		}
+		return nil, errf(500, "%s", next.ResolutionError)
+	}
+	closeApprovalWaiter(ap)
 	delete(rt.approvals, approvalID)
-	// codex 0.142.5 availableDecisions are "accept" / "cancel" (see protocol doc).
-	d := "cancel"
-	if decision == "accept" || decision == "approve" {
-		d = "accept"
-	}
-	h.emitLocked(meta.ID, "loom/approval-resolved", map[string]any{
-		"approvalId": approvalID, "decision": d, "method": ap.method,
-	})
-	client := rt.client
+	respond := ap.respond
 	h.mu.Unlock()
 
-	if err := client.Respond(ap.rpcID, map[string]any{"decision": d}); err != nil {
-		return nil, errf(500, "respond approval: %s", err)
+	if respond != nil {
+		if err := respond(decision); err != nil {
+			h.mu.Lock()
+			failed := next
+			failed.Status = "aborted"
+			failed.Decision = "abort"
+			failed.ResolvedAt = now()
+			failed.ResolutionError = "respond Approval: " + err.Error()
+			if appendErr := h.commitApprovalLocked(failed); appendErr != nil {
+				failed.ResolutionError += "; persist failure: " + appendErr.Error()
+				h.approvals[approvalID] = &failed
+			}
+			h.emitLocked(meta.ID, "loom/approval-resolved", approvalEventPayload(failed))
+			h.mu.Unlock()
+			return nil, errf(500, "%s", failed.ResolutionError)
+		}
 	}
-	return map[string]any{"approvalId": approvalID, "decision": d}, nil
+	h.mu.Lock()
+	h.emitLocked(meta.ID, "loom/approval-resolved", approvalEventPayload(next))
+	h.mu.Unlock()
+	return map[string]any{"approvalId": approvalID, "decision": decision, "status": status}, nil
 }
 
 func (h *Hub) finishTurnLocked(meta *Agent, rt *runtime, status, errMsg string) {
@@ -1749,6 +1868,7 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 	turn.finished = true
 	close(turn.stopWatchdog)
 	rt.activeTurn = nil
+	h.abortTurnApprovalsLocked(meta.ID, turn.turnID, rt, "the Runtime Turn ended before the Approval was resolved")
 	rt.approvals = map[string]*approval{}
 
 	evType := "loom/turn-completed"
@@ -1917,13 +2037,9 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 		copy := *goal
 		view.Goal = &copy
 	}
+	view.PendingApprovals = h.pendingApprovalsLocked(meta.ID)
 	if rt, ok := h.runtimes[meta.ID]; ok && runtimeBackend(rt) != nil && runtimeBackend(rt).Alive() {
 		view.ProcessAlive = true
-		for id, ap := range rt.approvals {
-			view.PendingApprovals = append(view.PendingApprovals, ApprovalView{
-				ApprovalID: id, Method: ap.method, Params: ap.params, TS: ap.ts,
-			})
-		}
 	}
 	return view
 }

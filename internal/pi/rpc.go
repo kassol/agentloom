@@ -32,6 +32,12 @@ type RPCResponse struct {
 	Error   string
 }
 
+type ExtensionUIResponse struct {
+	ID        string
+	Value     string
+	Cancelled bool
+}
+
 type rpcResult struct {
 	response RPCResponse
 	err      error
@@ -47,6 +53,7 @@ type RPC struct {
 	stdin     io.WriteCloser
 	onEvent   func(json.RawMessage)
 	onFailure func(error)
+	events    chan json.RawMessage
 
 	mu      sync.Mutex
 	nextID  uint64
@@ -97,9 +104,19 @@ func SpawnRPC(options RPCOptions) (*RPC, error) {
 		cmd: command, stdin: stdin, onEvent: options.OnEvent, onFailure: options.OnFailure,
 		pending: map[string]pendingCommand{},
 	}
+	if options.OnEvent != nil {
+		rpc.events = make(chan json.RawMessage, 256)
+	}
 	if err := command.Start(); err != nil {
 		_ = stdin.Close()
 		return nil, fmt.Errorf("start Pi RPC: %w", err)
+	}
+	if rpc.events != nil {
+		go func() {
+			for event := range rpc.events {
+				rpc.onEvent(event)
+			}
+		}()
 	}
 	go rpc.read(stdout)
 	go func() {
@@ -169,6 +186,50 @@ func (r *RPC) Request(ctx context.Context, command string, fields map[string]any
 	}
 }
 
+// RespondExtensionUI writes Pi's correlated dialog response without creating
+// an RPC command waiter. Pi resolves the matching Extension UI promise and
+// intentionally sends no acknowledgement for this one-way protocol message.
+func (r *RPC) RespondExtensionUI(response ExtensionUIResponse) error {
+	if strings.TrimSpace(response.ID) == "" {
+		return errors.New("Pi Extension UI response id is required")
+	}
+	if response.Cancelled && response.Value != "" {
+		return errors.New("Pi Extension UI response cannot contain both value and cancelled")
+	}
+	if !response.Cancelled && response.Value == "" {
+		return errors.New("Pi Extension UI response value is required")
+	}
+	r.mu.Lock()
+	if r.failed != nil {
+		err := r.failed
+		r.mu.Unlock()
+		return err
+	}
+	if r.closing {
+		r.mu.Unlock()
+		return errors.New("Pi RPC process is closed")
+	}
+	r.mu.Unlock()
+	message := map[string]any{"type": "extension_ui_response", "id": response.ID}
+	if response.Cancelled {
+		message["cancelled"] = true
+	} else {
+		message["value"] = response.Value
+	}
+	line, err := json.Marshal(message)
+	if err == nil {
+		r.writeMu.Lock()
+		_, err = r.stdin.Write(append(line, '\n'))
+		r.writeMu.Unlock()
+	}
+	if err != nil {
+		err = fmt.Errorf("write Pi Extension UI response %s: %w", response.ID, err)
+		r.fail(err)
+		return err
+	}
+	return nil
+}
+
 func (r *RPC) Close() {
 	r.closeOnce.Do(func() {
 		r.mu.Lock()
@@ -193,6 +254,9 @@ func (r *RPC) Alive() bool {
 }
 
 func (r *RPC) read(stdout io.Reader) {
+	if r.events != nil {
+		defer close(r.events)
+	}
 	reader := bufio.NewReaderSize(stdout, 64<<10)
 	for {
 		line, err := reader.ReadString('\n')
@@ -235,8 +299,8 @@ func (r *RPC) handleLine(raw json.RawMessage) {
 		return
 	}
 	if envelope.Type != "response" {
-		if r.onEvent != nil {
-			r.onEvent(append(json.RawMessage(nil), raw...))
+		if r.events != nil {
+			r.events <- append(json.RawMessage(nil), raw...)
 		}
 		return
 	}

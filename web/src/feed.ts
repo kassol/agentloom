@@ -1,7 +1,7 @@
 // feed.ts turns the raw CodexLoom event stream into renderable blocks.
 // Items are keyed by itemId so streamed deltas, item/updated and
 // item/completed all land on the same block.
-import type { LoomEvent } from "./types";
+import type { Approval, LoomEvent } from "./types";
 import { splitTrailingLoomContext } from "./pages/agent/LoomContextView";
 
 export interface ExternalAttachment {
@@ -178,7 +178,7 @@ export type Block =
 export interface FeedState {
   blocks: Block[];
   index: Record<string, number>;
-  approvals: Record<string, { method: string; params: any }>;
+  approvals: Record<string, Approval>;
 }
 
 export const emptyFeed: FeedState = { blocks: [], index: {}, approvals: {} };
@@ -843,18 +843,26 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
   }
 
   switch (t) {
+    case "__approvals_snapshot__": {
+      const approvals = Object.fromEntries(
+        ((d as any).approvals || [])
+          .filter((approval: Approval) => approval.status === "pending")
+          .map((approval: Approval) => [approval.approvalId, approval]),
+      );
+      return { ...state, approvals };
+    }
     case "__history__": {
       // Seed past turns from the rollout. Guard: if real live content already
       // arrived (in-progress turn streamed in before this async seed resolved),
       // do NOT wipe it. Only "sys" markers like "— live —" don't count.
       if (state.blocks.some((b) => b.kind !== "sys")) return state;
       const blocks = buildHistoryBlocks((d as any).turns || [], "h");
-      return { blocks, index: {}, approvals: {} };
+      return { blocks, index: {}, approvals: state.approvals };
     }
     case "__history_reconcile__": {
       const blocks = buildHistoryBlocks((d as any).turns || [], "r");
       const artifacts = state.blocks.filter((block) => block.kind === "artifact");
-	  return { blocks: interleaveArtifacts([...blocks, ...artifacts]), index: {}, approvals: {} };
+	  return { blocks: interleaveArtifacts([...blocks, ...artifacts]), index: {}, approvals: state.approvals };
     }
 	case "__published_artifacts__": {
 	  let next = state;
@@ -918,7 +926,7 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
     case "loom/agent-archived":
       return sys(state, ev.ts, "warn", "agent archived");
     case "loom/approval-requested": {
-      const approvals = { ...state.approvals, [d.approvalId]: { method: d.method, params: d.params } };
+      const approvals = { ...state.approvals, [d.approvalId]: d as Approval };
       return sys({ ...state, approvals }, ev.ts, "warn", `⚠ approval requested: ${d.method}`);
     }
     case "loom/approval-resolved": {
@@ -927,7 +935,7 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
       return sys(
         { ...state, approvals },
         ev.ts,
-        d.decision === "accept" ? "ok" : "warn",
+        d.decision === "approve" || d.decision === "accept" ? "ok" : "warn",
         `approval ${d.decision}`,
       );
     }

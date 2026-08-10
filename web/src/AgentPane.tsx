@@ -2,7 +2,7 @@ import { ArrowDown, ArrowUpRight, BarChart3, CalendarClock, Check, ChevronRight,
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type ConversationMembership, type HumanRequest, type InboxEntry, type ModelProvider, type PlatformConnection, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
+import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ConversationMembership, type HumanRequest, type InboxEntry, type ModelProvider, type PlatformConnection, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
 import { emptyFeed, reduceFeed } from "./feed";
 import type { Block } from "./feed";
 import type { LoomEvent } from "./types";
@@ -42,7 +42,7 @@ type MembershipDraft = {
 };
 
 type FeedRow =
-  | { key: string; kind: "approval"; id: string; approval: { method: string; params: any } }
+  | { key: string; kind: "approval"; id: string; approval: Approval }
   | { key: string; kind: "block"; block: Block };
 
 type PendingArtifact = {
@@ -259,6 +259,10 @@ export function AgentPane({
   useEffect(() => {
     attachmentsRef.current = attachments;
   }, [attachments]);
+
+  useEffect(() => {
+    dispatch({ type: "__approvals_snapshot__", ts: "", data: { approvals: agent.pendingApprovals } } as any);
+  }, [agent.id, agent.pendingApprovals]);
 
   useEffect(() => {
     if (answeringRequest && !humanRequests.some((request) => request.id === answeringRequest.id)) {
@@ -759,6 +763,7 @@ export function AgentPane({
   const resolveApproval = async (approvalId: string, decision: string) => {
     try {
       await api("POST", `/api/agents/${agent.id}/thread/approvals/${approvalId}`, { decision });
+	  onAgentUpdated({ ...agent, pendingApprovals: agent.pendingApprovals.filter((approval) => approval.approvalId !== approvalId) });
     } catch (err: any) {
       onError(err.message);
     }
@@ -1117,6 +1122,12 @@ export function AgentPane({
                     <select value={sandboxDraft} onChange={(e) => setSandboxDraft(e.target.value)} disabled={running || !agent.runtimeCapabilities.sandbox} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
                       <option value="danger-full-access">danger-full-access</option><option value="workspace-write">workspace-write</option><option value="read-only">read-only</option>
                     </select>
+					{!agent.runtimeCapabilities.sandbox ? (
+					  <span className="mt-2 block rounded-md bg-warning/10 px-2 py-1.5 text-[11px] leading-4 text-warning">
+						<span>Sandbox isolation is unsupported for the {agent.runtimeBinding.kind} Runtime.</span>{" "}
+						<span>Approval controls individual tool actions only; it does not isolate filesystem, processes, network, credentials, or Extensions.</span>
+					  </span>
+					) : null}
                   </label>
                   <label className="mb-3 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Approval Policy</span>
@@ -1264,20 +1275,20 @@ export function AgentPane({
                     {row.kind === "approval" ? (
                       <div className="my-1 rounded-md border border-warning/30 bg-warning/5 px-4 py-3 shadow-card">
                         <div className="mb-2 text-sm">
-                          <span className="text-warning">⚠</span> <b>codex requests approval</b> —{" "}
+						  <span className="text-warning">⚠</span> <b>{row.approval.runtimeKind || agent.runtimeBinding.kind} Runtime requests approval</b> —{" "}
                           <span className="font-mono text-[12px]">{row.approval.method}</span>
                         </div>
                         <pre className="mb-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-muted/50 px-3 py-2 font-mono text-[12px] text-muted-foreground">
                           {JSON.stringify(row.approval.params, null, 2)}
                         </pre>
                         <button
-                          onClick={() => resolveApproval(row.id, "accept")}
+						  onClick={() => resolveApproval(row.id, "approve")}
                           className="mr-2 rounded-md bg-primary px-3.5 py-1.5 text-[13px] font-medium text-primary-foreground transition-colors hover:opacity-90"
                         >
                           approve
                         </button>
                         <button
-                          onClick={() => resolveApproval(row.id, "reject")}
+						  onClick={() => resolveApproval(row.id, "deny")}
                           className="rounded-md px-3.5 py-1.5 text-[13px] text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
                         >
                           reject

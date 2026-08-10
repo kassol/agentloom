@@ -110,6 +110,178 @@ func TestPiAgentCompletesLiveLoomTurnOnlyAfterAgentSettled(t *testing.T) {
 	h.Shutdown()
 }
 
+func TestPiApprovalUsesCanonicalLoomTurnAndExecutesToolOnlyAfterApprove(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	configureFakePiHubRPC(t, "approval")
+	h := testHub(st)
+	h.stop = make(chan struct{})
+	defer h.Shutdown()
+
+	agent, err := h.CreateAgent(CreateParams{
+		Name: "pi-approval", Cwd: t.TempDir(), RuntimeKind: "pi", ApprovalPolicy: "on-request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := h.SendTask(agent.ID, "run the gated tool", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var approval ApprovalView
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		view, getErr := h.GetAgent(agent.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if len(view.PendingApprovals) == 1 {
+			approval = view.PendingApprovals[0]
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if approval.ApprovalID == "" {
+		t.Fatal("Pi tool did not produce a pending Loom Approval")
+	}
+	if approval.TurnID != result.TurnID || approval.RuntimeKind != "pi" || approval.Method != "tool/bash" ||
+		!strings.Contains(string(approval.Params), `"toolCallId":"call-approval-1"`) ||
+		!strings.Contains(string(approval.Params), `"command":"touch approval-effect"`) {
+		t.Fatalf("Pi Approval = %#v, canonical Turn = %q", approval, result.TurnID)
+	}
+	if _, err := os.Stat(os.Getenv("FAKE_PI_TOOL_EFFECT_FILE")); !os.IsNotExist(err) {
+		t.Fatalf("tool executed before Approval: %v", err)
+	}
+	if _, err := h.ResolveApproval(agent.ID, approval.ApprovalID, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	waitForPiFile(t, os.Getenv("FAKE_PI_TOOL_EFFECT_FILE"))
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		view, _ := h.GetAgent(agent.ID)
+		if view.LastTurn != nil {
+			if view.LastTurn.TurnID != result.TurnID || view.LastTurn.Status != "completed" || len(view.PendingApprovals) != 0 {
+				t.Fatalf("resolved Pi Turn = %#v, pending=%#v", view.LastTurn, view.PendingApprovals)
+			}
+			terminal := h.approvals[approval.ApprovalID]
+			if terminal == nil || terminal.Status != "approved" || terminal.Decision != "approve" {
+				t.Fatalf("durable Approval terminal = %#v", terminal)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("approved Pi Turn did not settle")
+}
+
+func TestPiApprovalPolicyNeverProceedsWithoutDurableApproval(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	configureFakePiHubRPC(t, "approval-never")
+	h := testHub(st)
+	h.stop = make(chan struct{})
+	defer h.Shutdown()
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-never", Cwd: t.TempDir(), RuntimeKind: "pi", ApprovalPolicy: "never"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !agent.RuntimeCapabilities.Approval {
+		t.Fatalf("Pi capabilities = %#v", agent.RuntimeCapabilities)
+	}
+	if _, err := h.SendTask(agent.ID, "run without prompting", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	waitForPiFile(t, os.Getenv("FAKE_PI_TOOL_EFFECT_FILE"))
+	h.mu.Lock()
+	approvalCount := len(h.approvals)
+	h.mu.Unlock()
+	if approvalCount != 0 {
+		t.Fatalf("policy never created %d durable Approvals", approvalCount)
+	}
+}
+
+func TestPiApprovalDenyAndTimeoutFailClosedBeforeToolExecution(t *testing.T) {
+	for _, test := range []struct {
+		name, scenario, decision, status string
+	}{
+		{name: "deny", scenario: "approval-deny", decision: "deny", status: "denied"},
+		{name: "timeout", scenario: "approval-timeout", decision: "", status: "timed_out"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			configureFakePiHubRPC(t, test.scenario)
+			h := testHub(st)
+			h.stop = make(chan struct{})
+			defer h.Shutdown()
+			agent, err := h.CreateAgent(CreateParams{Name: "pi-" + test.name, Cwd: t.TempDir(), RuntimeKind: "pi", ApprovalPolicy: "on-request"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.SendTask(agent.ID, "run gated tool", time.Second); err != nil {
+				t.Fatal(err)
+			}
+			approval := waitForPendingPiApproval(t, h, agent.ID)
+			if test.decision != "" {
+				if _, err := h.ResolveApproval(agent.ID, approval.ApprovalID, test.decision); err != nil {
+					t.Fatal(err)
+				}
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				h.mu.Lock()
+				terminal := h.approvals[approval.ApprovalID]
+				status := ""
+				if terminal != nil {
+					status = terminal.Status
+				}
+				h.mu.Unlock()
+				if status == test.status {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			h.mu.Lock()
+			terminal := h.approvals[approval.ApprovalID]
+			h.mu.Unlock()
+			if terminal == nil || terminal.Status != test.status {
+				t.Fatalf("durable Approval terminal = %#v, want %s", terminal, test.status)
+			}
+			if _, err := os.Stat(os.Getenv("FAKE_PI_TOOL_EFFECT_FILE")); !os.IsNotExist(err) {
+				t.Fatalf("tool executed after %s: %v", test.name, err)
+			}
+		})
+	}
+}
+
+func waitForPendingPiApproval(t *testing.T, h *Hub, agentID string) ApprovalView {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		view, err := h.GetAgent(agentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(view.PendingApprovals) == 1 {
+			return view.PendingApprovals[0]
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("Pi tool did not produce a pending Loom Approval")
+	return ApprovalView{}
+}
+
 func TestPiRuntimeExplicitlyLoadsLoomExtensionWithoutDisablingNativeResources(t *testing.T) {
 	configureFakePiHubRPC(t, "happy")
 	dataDir := t.TempDir()
@@ -896,6 +1068,7 @@ func configureFakePiHubRPC(t *testing.T, scenario string) {
 	t.Setenv("FAKE_PI_START_ARGS_FILE", filepath.Join(dir, "start-args"))
 	t.Setenv("FAKE_PI_RUNTIME_ENV_FILE", filepath.Join(dir, "runtime-env"))
 	t.Setenv("FAKE_PI_STEER_FILE", filepath.Join(dir, "steer"))
+	t.Setenv("FAKE_PI_TOOL_EFFECT_FILE", filepath.Join(dir, "tool-effect"))
 }
 
 func TestFakePiHubRPCProcess(t *testing.T) {
@@ -983,6 +1156,40 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 	}
 	serveOneFakePiEntries(t, reader, sessionFile)
 	if crashInitial || scenario == "crash-ambiguous" {
+		return
+	}
+	if strings.HasPrefix(scenario, "approval") {
+		fmt.Print("{\"type\":\"agent_start\"}\n")
+		payload, _ := json.Marshal(map[string]any{
+			"version": 1, "operation": "request_approval", "toolCallId": "call-approval-1",
+			"toolName": "bash", "input": map[string]any{"command": "touch approval-effect"},
+		})
+		timeout := 5000
+		if scenario == "approval-timeout" {
+			timeout = 150
+		}
+		event, _ := json.Marshal(map[string]any{
+			"type": "extension_ui_request", "id": "ui-approval-1", "method": "input",
+			"title": "codex-loom:approval:v1", "placeholder": string(payload), "timeout": timeout,
+		})
+		fmt.Println(string(event))
+		readFakePiCommand(t, reader, &command)
+		if command["type"] != "extension_ui_response" || command["id"] != "ui-approval-1" {
+			os.Exit(36)
+		}
+		decision, _ := command["value"].(string)
+		if decision == "approve" {
+			_ = os.WriteFile(os.Getenv("FAKE_PI_TOOL_EFFECT_FILE"), []byte("executed"), 0o600)
+			fmt.Print("{\"type\":\"tool_execution_start\",\"toolCallId\":\"call-approval-1\",\"toolName\":\"bash\",\"args\":{\"command\":\"touch approval-effect\"}}\n")
+			fmt.Print("{\"type\":\"tool_execution_end\",\"toolCallId\":\"call-approval-1\",\"toolName\":\"bash\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"executed\"}]},\"isError\":false}\n")
+		} else if decision != "deny" && decision != "timeout" && decision != "abort" {
+			os.Exit(37)
+		}
+		fmt.Print("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n")
+		fmt.Print("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"approved\"}]}}\n")
+		fmt.Print("{\"type\":\"agent_end\"}\n")
+		fmt.Print("{\"type\":\"agent_settled\"}\n")
+		serveFakePiHistory(reader, sessionFile)
 		return
 	}
 	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "steer" {

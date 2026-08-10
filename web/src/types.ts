@@ -7,8 +7,16 @@ export interface LoomEvent {
 
 export interface Approval {
   approvalId: string;
+  agentId: string;
+  turnId?: string;
+  runtimeKind: string;
   method: string;
   params: any;
+  status: string;
+  decision?: string;
+  requestedAt: string;
+  resolvedAt?: string;
+  resolutionError?: string;
   ts?: string;
 }
 

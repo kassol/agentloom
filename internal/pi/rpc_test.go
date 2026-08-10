@@ -81,6 +81,73 @@ func TestRPCProcessReceivesScopedEnvironment(t *testing.T) {
 	}
 }
 
+func TestRPCReaderCorrelatesCommandWhileExtensionUIEventHandlerIsBlocked(t *testing.T) {
+	handlerStarted := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	rpc, err := SpawnRPC(RPCOptions{
+		Bin: fakeRPCBin(t, "blocked-extension-ui-handler"), Cwd: t.TempDir(),
+		OnEvent: func(json.RawMessage) {
+			handlerStarted <- struct{}{}
+			<-releaseHandler
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rpc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	response, err := rpc.Request(ctx, "get_state", nil)
+	if err != nil {
+		close(releaseHandler)
+		t.Fatalf("get_state waited behind extension UI handling: %v", err)
+	}
+	if !response.Success {
+		close(releaseHandler)
+		t.Fatalf("get_state response = %#v", response)
+	}
+	select {
+	case <-handlerStarted:
+	case <-ctx.Done():
+		close(releaseHandler)
+		t.Fatal("extension UI event was not dispatched")
+	}
+	close(releaseHandler)
+}
+
+func TestRPCWritesCorrelatedOneWayExtensionUIResponse(t *testing.T) {
+	events := make(chan json.RawMessage, 4)
+	rpc, err := SpawnRPC(RPCOptions{
+		Bin: fakeRPCBin(t, "extension-ui-response"), Cwd: t.TempDir(),
+		OnEvent: func(raw json.RawMessage) { events <- raw },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rpc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := rpc.Request(ctx, "get_state", nil); err != nil {
+		t.Fatal(err)
+	}
+	request := <-events
+	if !strings.Contains(string(request), `"id":"ui-approval-1"`) {
+		t.Fatalf("extension UI request = %s", request)
+	}
+	if err := rpc.RespondExtensionUI(ExtensionUIResponse{ID: "ui-approval-1", Value: "approve"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case raw := <-events:
+		if !strings.Contains(string(raw), `"value":"approve"`) {
+			t.Fatalf("observed response = %s", raw)
+		}
+	case <-ctx.Done():
+		t.Fatal("fake Pi did not receive the extension UI response")
+	}
+}
+
 func TestRPCProcessReportsProtocolDriftMalformedOutputAndExit(t *testing.T) {
 	for _, scenario := range []string{"wrong-id", "malformed", "unterminated", "exit"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -171,6 +238,20 @@ func TestFakePiRPCProcess(t *testing.T) {
 		return
 	case "exit":
 		os.Exit(23)
+	}
+	if os.Getenv("FAKE_PI_RPC_SCENARIO") == "blocked-extension-ui-handler" || os.Getenv("FAKE_PI_RPC_SCENARIO") == "extension-ui-response" {
+		fmt.Print(`{"type":"extension_ui_request","id":"ui-approval-1","method":"input","title":"codex-loom-approval-v1","placeholder":"{}"}` + "\n")
+		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":"/loom/pi/agent/session.jsonl"}}`+"\n", id)
+		responseLine, _ := reader.ReadString('\n')
+		if os.Getenv("FAKE_PI_RPC_SCENARIO") == "extension-ui-response" {
+			var response map[string]any
+			if json.Unmarshal([]byte(responseLine), &response) != nil || response["type"] != "extension_ui_response" || response["id"] != "ui-approval-1" || response["value"] != "approve" {
+				os.Exit(25)
+			}
+			fmt.Printf(`{"type":"extension_ui_response_seen","value":%q}`+"\n", response["value"])
+			_, _ = reader.ReadString('\n')
+		}
+		return
 	}
 	if os.Getenv("FAKE_PI_RPC_SCENARIO") == "environment" {
 		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"agent":%q}}`+"\n", id, os.Getenv("CODEX_LOOM_AGENT_ID"))

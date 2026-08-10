@@ -29,12 +29,12 @@ func TestAgentDetailReportsTruthfulPiRuntimeCapabilities(t *testing.T) {
 	response := topicRequest(t, server, http.MethodGet, "/api/agents/agent-pi", nil, http.StatusOK)
 	agent := response["agent"].(map[string]any)
 	capabilities := agent["runtimeCapabilities"].(map[string]any)
-	for _, capability := range []string{"history", "causalSteer", "interrupt"} {
+	for _, capability := range []string{"history", "causalSteer", "interrupt", "approval"} {
 		if capabilities[capability] != true {
 			t.Fatalf("Pi %s capability = %#v", capability, capabilities[capability])
 		}
 	}
-	for _, capability := range []string{"goal", "remote", "usage", "provider", "compaction", "approval", "skills", "naming", "archive", "sandbox", "imageInput"} {
+	for _, capability := range []string{"goal", "remote", "usage", "provider", "compaction", "skills", "naming", "archive", "sandbox", "imageInput"} {
 		if value, exists := capabilities[capability]; !exists || value != false {
 			t.Fatalf("Pi %s capability = %#v, exists=%v", capability, value, exists)
 		}
@@ -66,7 +66,6 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 		{name: "Provider switch", method: http.MethodPost, path: "/api/agents/agent-pi/provider", body: `{"providerId":"openai"}`, capability: "Provider"},
 		{name: "manual compaction", method: http.MethodPost, path: "/api/agents/agent-pi/compact", capability: "compaction"},
 		{name: "sandbox config", method: http.MethodPatch, path: "/api/agents/agent-pi/config", body: `{"sandbox":"read-only"}`, capability: "sandbox"},
-		{name: "approval config", method: http.MethodPatch, path: "/api/agents/agent-pi/config", body: `{"approvalPolicy":"never"}`, capability: "approval"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,5 +76,10 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 				t.Fatalf("%s %s = %d %s, want explicit unsupported %s conflict", tt.method, tt.path, response.Code, response.Body.String(), tt.capability)
 			}
 		})
+	}
+	response := topicRequest(t, server, http.MethodPatch, "/api/agents/agent-pi/config", map[string]any{"approvalPolicy": "on-request"}, http.StatusOK)
+	agent := response["agent"].(map[string]any)
+	if agent["approvalPolicy"] != "on-request" {
+		t.Fatalf("Pi Approval policy = %#v", agent["approvalPolicy"])
 	}
 }

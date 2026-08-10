@@ -4,8 +4,9 @@ func (h *Hub) Shutdown() {
 	h.shutdownOnce.Do(func() {
 		h.mu.Lock()
 		h.stopping = true
-		for _, rt := range h.runtimes {
+		for agentID, rt := range h.runtimes {
 			if rt.activeTurn != nil && !rt.activeTurn.finished {
+				h.abortTurnApprovalsLocked(agentID, rt.activeTurn.turnID, rt, "CodexLoom shut down before the Approval was resolved")
 				rt.activeTurn.finished = true
 				if rt.activeTurn.stopWatchdog != nil {
 					close(rt.activeTurn.stopWatchdog)

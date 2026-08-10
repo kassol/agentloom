@@ -25,7 +25,9 @@ type piAgentRuntime struct {
 	rpc              *pi.RPC
 	onEvent          func(RuntimeEvent)
 	onFailure        func(error)
+	onApproval       func(RuntimeApprovalRequest)
 	developerContext string
+	approvalPolicy   string
 	messageSequence  uint64
 	currentMessage   uint64
 	pendingTerminal  RuntimeEvent
@@ -45,6 +47,12 @@ func newPiAgentRuntime(agentID, dataDir, apiURL string) *piAgentRuntime {
 func (r *piAgentRuntime) SetRuntimeEventHandlers(onEvent func(RuntimeEvent), onFailure func(error)) {
 	r.mu.Lock()
 	r.onEvent, r.onFailure = onEvent, onFailure
+	r.mu.Unlock()
+}
+
+func (r *piAgentRuntime) SetRuntimeApprovalHandler(onApproval func(RuntimeApprovalRequest)) {
+	r.mu.Lock()
+	r.onApproval = onApproval
 	r.mu.Unlock()
 }
 
@@ -108,7 +116,12 @@ func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) 
 	}
 	rpc, err := pi.SpawnRPC(pi.RPCOptions{
 		Cwd: request.Cwd, Args: args,
-		Env:     map[string]string{"CODEX_LOOM_AGENT_ID": r.agentID, "CODEX_LOOM_API_URL": r.apiURL},
+		Env: map[string]string{
+			"CODEX_LOOM_AGENT_ID": r.agentID, "CODEX_LOOM_API_URL": r.apiURL,
+			// The process stays prepared to intercept side effects; the current
+			// Turn policy below decides whether Loom needs Owner input.
+			"CODEX_LOOM_APPROVAL_POLICY": "on-request",
+		},
 		OnEvent: r.handleEvent,
 		OnFailure: func(err error) {
 			r.mu.Lock()
@@ -182,6 +195,10 @@ func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	r.currentMessage = 0
 	r.settled = make(chan struct{})
 	r.abortRequested = false
+	r.approvalPolicy = strings.ToLower(strings.TrimSpace(request.ApprovalPolicy))
+	if r.approvalPolicy == "" {
+		r.approvalPolicy = "never"
+	}
 	r.mu.Unlock()
 	for _, input := range request.Input {
 		switch input.Kind {
@@ -311,6 +328,9 @@ func (r *piAgentRuntime) NormalizeEvent(_ string, raw json.RawMessage) []Runtime
 }
 
 func (r *piAgentRuntime) handleEvent(raw json.RawMessage) {
+	if r.handleApprovalEvent(raw) {
+		return
+	}
 	r.mu.Lock()
 	events, terminal := r.normalizeEventLocked(raw)
 	if terminal.Kind != "" {
@@ -345,6 +365,66 @@ func (r *piAgentRuntime) handleEvent(raw json.RawMessage) {
 	if settled != nil {
 		close(settled)
 	}
+}
+
+func (r *piAgentRuntime) handleApprovalEvent(raw json.RawMessage) bool {
+	var envelope struct {
+		Type        string `json:"type"`
+		ID          string `json:"id"`
+		Method      string `json:"method"`
+		Title       string `json:"title"`
+		Placeholder string `json:"placeholder"`
+		Timeout     int64  `json:"timeout"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil || envelope.Type != "extension_ui_request" ||
+		envelope.Method != "input" || envelope.Title != "codex-loom:approval:v1" {
+		return false
+	}
+	var payload struct {
+		Version    int             `json:"version"`
+		Operation  string          `json:"operation"`
+		ToolCallID string          `json:"toolCallId"`
+		ToolName   string          `json:"toolName"`
+		Input      json.RawMessage `json:"input"`
+	}
+	valid := json.Unmarshal([]byte(envelope.Placeholder), &payload) == nil && payload.Version == 1 &&
+		payload.Operation == "request_approval" && strings.TrimSpace(payload.ToolCallID) != "" && strings.TrimSpace(payload.ToolName) != ""
+	r.mu.Lock()
+	rpc, policy, handler, failure := r.rpc, r.approvalPolicy, r.onApproval, r.onFailure
+	r.mu.Unlock()
+	respond := func(decision string) error {
+		if rpc == nil {
+			return errors.New("Pi RPC process is unavailable")
+		}
+		return rpc.RespondExtensionUI(pi.ExtensionUIResponse{ID: envelope.ID, Value: decision})
+	}
+	if !valid || envelope.ID == "" {
+		if err := respond("abort"); err != nil && failure != nil {
+			failure(err)
+		}
+		return true
+	}
+	if policy == "never" {
+		if err := respond("approve"); err != nil && failure != nil {
+			failure(err)
+		}
+		return true
+	}
+	if handler == nil {
+		if err := respond("abort"); err != nil && failure != nil {
+			failure(err)
+		}
+		return true
+	}
+	timeout := time.Duration(envelope.Timeout) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	handler(RuntimeApprovalRequest{
+		Method: "tool/" + payload.ToolName, Params: append(json.RawMessage(nil), []byte(envelope.Placeholder)...),
+		Timeout: timeout, Respond: respond,
+	})
+	return true
 }
 
 func (r *piAgentRuntime) normalizeEventLocked(raw json.RawMessage) ([]RuntimeEvent, RuntimeEvent) {
@@ -566,7 +646,7 @@ func (r *piAgentRuntime) Capabilities() RuntimeCapabilities {
 	r.mu.Lock()
 	imageInput := r.imageInput
 	r.mu.Unlock()
-	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true, ImageInput: imageInput}
+	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true, Approval: true, ImageInput: imageInput}
 }
 
 func (r *piAgentRuntime) Close() {

@@ -31,6 +31,20 @@ type RuntimeEventSource interface {
 	SetRuntimeEventHandlers(func(RuntimeEvent), func(error))
 }
 
+// RuntimeApprovalSource is implemented by Runtimes that surface a proposed
+// side effect before execution. The request deliberately carries no native
+// Turn identity: Hub binds it to the currently active canonical Loom Turn.
+type RuntimeApprovalSource interface {
+	SetRuntimeApprovalHandler(func(RuntimeApprovalRequest))
+}
+
+type RuntimeApprovalRequest struct {
+	Method  string
+	Params  json.RawMessage
+	Timeout time.Duration
+	Respond func(decision string) error
+}
+
 // RuntimeInterruptedTurnInspector is an optional Runtime capability used only
 // after process loss. It inspects durable native history without advancing the
 // conversation so Hub can decide whether automatic recovery is safe.

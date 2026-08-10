@@ -52,6 +52,28 @@ describe("Runtime-normalized live events", () => {
   });
 });
 
+describe("durable Approval projection", () => {
+  it("restores pending Approvals from the Agent snapshot across history seeding", () => {
+    const approval = {
+      approvalId: "ap-agent-1-a1", agentId: "agent-1", turnId: "turn-1", runtimeKind: "pi",
+      method: "tool/bash", params: { command: "pwd" }, status: "pending", requestedAt: "2026-08-10T00:00:00Z",
+    };
+    const restored = reduceFeed(emptyFeed, {
+      seq: 0, ts: "", type: "__approvals_snapshot__", data: { approvals: [approval] },
+    });
+    const seeded = reduceFeed(restored, {
+      seq: 0, ts: "", type: "__history__", data: { turns: [] },
+    });
+
+    expect(seeded.approvals).toEqual({ [approval.approvalId]: approval });
+    const resolved = reduceFeed(seeded, {
+      seq: 1, ts: "2026-08-10T00:01:00Z", type: "loom/approval-resolved",
+      data: { approvalId: approval.approvalId, decision: "approve", status: "approved" },
+    });
+    expect(resolved.approvals).toEqual({});
+  });
+});
+
 describe("rollout history projection", () => {
   it("summarizes a Human Input response without exposing its XML envelope", () => {
     const text = `<human_input_response version="1" request_id="hrq_test" expectation="required">

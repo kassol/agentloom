@@ -215,6 +215,7 @@ func testHub(st *store.Store) *Hub {
 		organizationLinks:   map[string]*OrganizationRelationship{},
 		collaborationGroups: map[string]*CollaborationGroup{},
 		connections:         map[string]*PlatformConnection{},
+		approvals:           map[string]*ApprovalView{},
 		humanRequests:       map[string]*HumanRequest{},
 		goals:               map[string]*ThreadGoal{},
 		seqs:                map[string]int64{},
