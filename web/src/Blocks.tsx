@@ -367,7 +367,8 @@ export function BlockView({ block }: { block: Block }) {
 
     // Command execution uses one frame; request and output are separated by rules.
     case "command": {
-      const finished = block.exitCode !== null || block.status === "completed" || block.status === "failed";
+      const interrupted = block.status === "interrupted";
+      const finished = block.exitCode !== null || block.status === "completed" || block.status === "failed" || interrupted;
       const ok = block.exitCode === 0;
       return (
         <details className="my-2 overflow-hidden rounded-md border border-border bg-card shadow-card">
@@ -379,8 +380,8 @@ export function BlockView({ block }: { block: Block }) {
                   ok ? "bg-success/10 text-success" : "bg-destructive/10 text-destructive"
                 }`}
               >
-                exit {block.exitCode ?? "?"}
-                {block.durationMs != null ? ` · ${block.durationMs}ms` : ""}
+                {interrupted ? "interrupted" : `exit ${block.exitCode ?? "?"}`}
+                {!interrupted && block.durationMs != null ? ` · ${block.durationMs}ms` : ""}
               </span>
             ) : (
               <span className="flex shrink-0 items-center gap-1.5 rounded-md bg-warning/10 px-2 py-0.5 text-[10.5px] font-medium text-warning">

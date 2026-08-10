@@ -362,16 +362,24 @@ func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	if _, err := rpc.Request(ctx, "prompt", prompt); err != nil {
 		return "", err
 	}
-	entries, leafID, err := r.piSessionEntries(request.NativeRef)
-	if err != nil {
-		return "", fmt.Errorf("read Pi prompt entry: %w", err)
-	}
-	nativeUserEntryID, err := latestPiUserEntryID(entries, leafID)
-	if err != nil {
-		return "", fmt.Errorf("read Pi prompt entry: %w", err)
-	}
-	if nativeUserEntryID == "" || nativeUserEntryID == previousUserEntryID {
-		return "", errors.New("Pi accepted prompt without a new native user entry")
+	var nativeUserEntryID string
+	for nativeUserEntryID == "" || nativeUserEntryID == previousUserEntryID {
+		entries, leafID, err := r.piSessionEntries(request.NativeRef)
+		if err != nil {
+			return "", fmt.Errorf("read Pi prompt entry: %w", err)
+		}
+		nativeUserEntryID, err = latestPiUserEntryID(entries, leafID)
+		if err != nil {
+			return "", fmt.Errorf("read Pi prompt entry: %w", err)
+		}
+		if nativeUserEntryID != "" && nativeUserEntryID != previousUserEntryID {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "", errors.New("Pi accepted prompt without a new native user entry")
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
 	r.mu.Lock()
 	if r.settled != nil {

@@ -735,6 +735,8 @@ export default function App() {
                       lastTurn: Object.prototype.hasOwnProperty.call(d, "lastTurn") ? d.lastTurn || undefined : s.lastTurn,
                       model: d.model ?? s.model,
                       providerId: d.providerId ?? s.providerId,
+					  processAlive: d.processAlive ?? s.processAlive,
+					  runtimeCapabilities: d.runtimeCapabilities ?? s.runtimeCapabilities,
                       effort: d.effort ?? s.effort,
                       sandbox: d.sandbox ?? s.sandbox,
                       approvalPolicy: d.approvalPolicy ?? s.approvalPolicy,

@@ -146,6 +146,21 @@ describe("AgentPane scroll restoration", () => {
 	expect(scrollTop).toBe(250);
   });
 
+	it("reconciles the current history page after a Turn is interrupted", async () => {
+	render(<AgentPane {...props} active />);
+	await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/thread/history?count=25&offset=0"), expect.anything()));
+	vi.mocked(fetch).mockClear();
+
+	publishThreadEvent(testAgent.id, {
+	  seq: 2,
+	  ts: "2026-08-10T00:00:02Z",
+	  type: "loom/turn-interrupted",
+	  data: { turnId: "turn-2" },
+	});
+
+	await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/thread/history?count=25&offset=0"), expect.anything()));
+  });
+
   it("shows the immutable Runtime kind in the Inspector", () => {
 	const view = render(<AgentPane {...props} active configRequestNonce={1} />);
 	expect(view.getByText("Runtime kind").nextElementSibling).toHaveTextContent("codex");
@@ -171,6 +186,7 @@ describe("AgentPane scroll restoration", () => {
     const piAgent: Agent = {
       ...testAgent,
       runtimeBinding: { kind: "pi" },
+	  processAlive: false,
       runtimeCapabilities: {
         history: true, causalSteer: false, interrupt: true, goal: false, remote: false,
         usage: false, provider: true, compaction: false, approval: true, skills: false,
@@ -180,7 +196,7 @@ describe("AgentPane scroll restoration", () => {
     const view = render(<AgentPane {...props} agent={piAgent} onError={onError} active configRequestNonce={1} />);
 
     expect(view.getByText("Runtime capabilities")).toBeInTheDocument();
-    expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Unavailable");
+    expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Checked on start");
     expect(view.getByText("History").nextElementSibling).toHaveTextContent("Available");
     expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Unavailable");
     expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();

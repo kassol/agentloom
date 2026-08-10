@@ -442,6 +442,42 @@ func TestPiAgentSendsSupportedImagesAsNativeRPCContent(t *testing.T) {
 	if !strings.Contains(prompt.Message, document.Path) {
 		t.Fatalf("generic file was not path-only guidance: %s", data)
 	}
+	history, err := h.History(agent.ID, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachments, _ := history.Turns[0].Items[0]["attachments"].([]map[string]any)
+	if len(attachments) != 2 || attachments[0]["id"] != image.ID || attachments[0]["url"] != image.URL || attachments[1]["id"] != document.ID {
+		t.Fatalf("Pi history attachments = %#v", attachments)
+	}
+}
+
+func TestPiAgentWaitsForAcceptedImagePromptToCreateNativeUserEntry(t *testing.T) {
+	configureFakePiHubRPC(t, "image-entry-delayed")
+	runtime := newPiAgentRuntime("agent-pi", t.TempDir(), "http://127.0.0.1:6123")
+	defer runtime.Close()
+	nativeRef, err := runtime.Create(RuntimeBindingRequest{Name: "Pi Vision", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imagePath := filepath.Join(t.TempDir(), "diagram.png")
+	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nativeTurnID, err := runtime.StartTurn(RuntimeTurnRequest{
+		NativeRef: nativeRef,
+		Input: []RuntimeInput{
+			{Kind: RuntimeInputText, Text: "Review this image"},
+			{Kind: RuntimeInputLocalImage, Path: imagePath, MimeType: "image/png"},
+		},
+		Timeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nativeTurnID != "user-1" {
+		t.Fatalf("native Turn ID = %q, want user-1", nativeTurnID)
+	}
 }
 
 func TestPiProtocolFailureReconcilesDurableFailedTurn(t *testing.T) {
@@ -1153,7 +1189,7 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 	var command map[string]any
 	readFakePiCommand(t, reader, &command)
 	id, _ := command["id"].(string)
-	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "image" {
+	if scenario := os.Getenv("FAKE_PI_HUB_SCENARIO"); scenario == "image" || scenario == "image-entry-delayed" {
 		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q,"model":{"id":"vision","input":["text","image"]}}}`+"\n", id, sessionFile, sessionID)
 	} else {
 		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q}}`+"\n", id, sessionFile, sessionID)
@@ -1184,7 +1220,9 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 		answer, stopReason = "", "error"
 	}
 	crashInitial := scenario == "crash-clean" && !strings.Contains(message, "<loom_turn_recovery")
-	if crashInitial {
+	if scenario == "image-entry-delayed" {
+		// Pi may acknowledge the prompt before its session entry is observable.
+	} else if crashInitial {
 		appendFakePiInterruptedTurn(t, sessionFile, message, false)
 	} else if scenario == "crash-ambiguous" {
 		appendFakePiInterruptedTurn(t, sessionFile, message, true)
@@ -1192,6 +1230,12 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 		appendFakePiTurn(t, sessionFile, message, answer, stopReason)
 	}
 	fmt.Printf(`{"id":%q,"type":"response","command":"prompt","success":true}`+"\n", id)
+	if scenario == "image-entry-delayed" {
+		serveOneFakePiEntries(t, reader, sessionFile)
+		appendFakePiTurn(t, sessionFile, message, answer, stopReason)
+		serveFakePiHistory(reader, sessionFile)
+		return
+	}
 	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "settle-before-entries" {
 		var entriesCommand map[string]any
 		readFakePiCommand(t, reader, &entriesCommand)

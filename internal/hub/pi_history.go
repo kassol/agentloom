@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
@@ -282,10 +283,15 @@ func projectPiHistory(entries []piSessionEntry, leafID string) (RuntimeHistory, 
 			if turn != nil && turn.Status == "running" {
 				turn.Status = "completed"
 			}
-			visibleText := piVisibleUserText(piContentText(blocks))
+			userText := piContentText(blocks)
+			visibleText := piVisibleUserText(userText)
+			item := map[string]any{"type": "user", "text": visibleText, "timestamp": entry.Timestamp}
+			if attachments := piUserAttachments(userText); len(attachments) > 0 {
+				item["attachments"] = attachments
+			}
 			history.Turns = append(history.Turns, RuntimeHistoryTurn{
 				ID: entry.ID, Status: "running", StartedAt: entry.Timestamp, UpdatedAt: entry.Timestamp,
-				Task: visibleText, Items: []map[string]any{{"type": "user", "text": visibleText, "timestamp": entry.Timestamp}},
+				Task: visibleText, Items: []map[string]any{item},
 			})
 			turn = &history.Turns[len(history.Turns)-1]
 			commands = map[string]map[string]any{}
@@ -387,6 +393,42 @@ func piVisibleUserText(text string) string {
 		}
 	}
 	return text
+}
+
+func piUserAttachments(text string) []map[string]any {
+	start := strings.LastIndex(text, "<loom_context")
+	if start < 0 {
+		return nil
+	}
+	const closeTag = "</loom_context>"
+	end := strings.Index(text[start:], closeTag)
+	if end < 0 {
+		return nil
+	}
+	end += start + len(closeTag)
+	var context struct {
+		Turn struct {
+			Attachments []struct {
+				ID       string `xml:"id,attr"`
+				Name     string `xml:"name,attr"`
+				MimeType string `xml:"mime_type,attr"`
+				Size     int64  `xml:"size,attr"`
+				Path     string `xml:"path,attr"`
+				URL      string `xml:"url,attr"`
+			} `xml:"attachments>attachment"`
+		} `xml:"loom_turn_context"`
+	}
+	if xml.Unmarshal([]byte(text[start:end]), &context) != nil {
+		return nil
+	}
+	attachments := make([]map[string]any, 0, len(context.Turn.Attachments))
+	for _, attachment := range context.Turn.Attachments {
+		attachments = append(attachments, map[string]any{
+			"id": attachment.ID, "name": attachment.Name, "mimeType": attachment.MimeType,
+			"size": attachment.Size, "path": attachment.Path, "url": attachment.URL,
+		})
+	}
+	return attachments
 }
 
 func addPiUsage(current *RuntimeTokenUsage, message piSessionMessage) *RuntimeTokenUsage {

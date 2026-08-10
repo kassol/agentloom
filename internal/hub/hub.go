@@ -37,6 +37,7 @@ const (
 	schedulerDefaultTZ        = "Asia/Shanghai"
 	subscriberBuffer          = 1024
 	edgeCreatedAt             = "1970-01-01T00:00:00Z"
+	piShutdownInterruptError  = "Pi RPC process exited: signal: interrupt"
 )
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -515,17 +516,22 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 			return nil, fmt.Errorf("load agents: Agent %s uses the unsupported legacy Codex-only format; recreate the Agent", id)
 		}
 	}
-	providerSwitchRecovered := false
+	agentRegistryRecovered := false
 	for _, meta := range h.agents {
+		if meta.RuntimeBinding.Kind == "pi" && meta.Status == "idle" && meta.LastError == piShutdownInterruptError && meta.LastTurn != nil && meta.LastTurn.Status == "completed" {
+			meta.LastError = ""
+			meta.UpdatedAt = now()
+			agentRegistryRecovered = true
+		}
 		if meta.PendingProviderSwitch == nil {
 			continue
 		}
 		meta.PendingProviderSwitch = nil
 		meta.LastError = "an interrupted Provider switch was rolled back to the previous binding"
 		meta.UpdatedAt = now()
-		providerSwitchRecovered = true
+		agentRegistryRecovered = true
 	}
-	if providerSwitchRecovered && !options.Passive {
+	if agentRegistryRecovered && !options.Passive {
 		if err := h.persistAgentsLocked(); err != nil {
 			return nil, fmt.Errorf("recover interrupted Provider switch: %w", err)
 		}
@@ -987,24 +993,30 @@ func (h *Hub) emitLocked(agentID, typ string, data any) store.Event {
 }
 
 func (h *Hub) emitStatusLocked(meta *Agent, status string) {
+	processAlive := false
+	if rt := h.runtimes[meta.ID]; rt != nil && runtimeBackend(rt) != nil {
+		processAlive = runtimeBackend(rt).Alive()
+	}
 	data := map[string]any{
-		"id":             meta.ID,
-		"name":           meta.Name,
-		"cwd":            meta.Cwd,
-		"threadId":       meta.ThreadID,
-		"runtimeKind":    meta.RuntimeBinding.Kind,
-		"source":         meta.Source,
-		"status":         status,
-		"currentTask":    meta.CurrentTask,
-		"currentTurnId":  meta.CurrentTurnID,
-		"lastError":      meta.LastError,
-		"lastTurn":       meta.LastTurn,
-		"model":          meta.Model,
-		"effort":         meta.Effort,
-		"sandbox":        meta.Sandbox,
-		"approvalPolicy": meta.ApprovalPolicy,
-		"providerId":     meta.ProviderID,
-		"updatedAt":      meta.UpdatedAt,
+		"id":                  meta.ID,
+		"name":                meta.Name,
+		"cwd":                 meta.Cwd,
+		"threadId":            meta.ThreadID,
+		"runtimeKind":         meta.RuntimeBinding.Kind,
+		"source":              meta.Source,
+		"status":              status,
+		"currentTask":         meta.CurrentTask,
+		"currentTurnId":       meta.CurrentTurnID,
+		"lastError":           meta.LastError,
+		"lastTurn":            meta.LastTurn,
+		"model":               meta.Model,
+		"effort":              meta.Effort,
+		"sandbox":             meta.Sandbox,
+		"approvalPolicy":      meta.ApprovalPolicy,
+		"providerId":          meta.ProviderID,
+		"processAlive":        processAlive,
+		"runtimeCapabilities": h.runtimeCapabilitiesLocked(meta),
+		"updatedAt":           meta.UpdatedAt,
 	}
 	data["goal"] = h.goals[meta.ID]
 	h.emitGlobalLocked("loom/agent-status", data)
@@ -1541,6 +1553,10 @@ func (h *Hub) onRuntimeFailure(rt *runtime, err error) {
 		return
 	}
 	h.mu.Lock()
+	if h.stopping {
+		h.mu.Unlock()
+		return
+	}
 	meta := h.agents[rt.agentID]
 	if meta == nil {
 		h.mu.Unlock()

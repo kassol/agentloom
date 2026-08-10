@@ -481,14 +481,16 @@ export function AgentPane({
         return;
       }
       dispatch(event);
-      if (event.type === "turn/completed" || event.type.endsWith("turn-completed")) {
+      if (["turn/completed", "turn/failed", "turn/aborted", "loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted"].includes(event.type)) {
         if (!agent.runtimeCapabilities.history) return;
         window.setTimeout(() => {
-          api("GET", `/api/agents/${agent.id}/thread/history?count=1&offset=0`)
+          const count = Math.max(PAGE, loadedRef.current);
+          api("GET", `/api/agents/${agent.id}/thread/history?count=${count}&offset=0`)
             .then((history) => {
-              if (!cancelled && history.turns?.[0]) {
-                dispatch({ type: "__turn_usage__", ts: "", data: { turn: history.turns[0] } } as any);
-              }
+			  if (cancelled) return;
+			  totalRef.current = history.total || 0;
+			  loadedRef.current = (history.turns || []).length;
+			  dispatch({ type: "__history_reconcile__", ts: "", data: history } as any);
             })
             .catch(() => {});
         }, 100);
@@ -1093,7 +1095,7 @@ export function AgentPane({
 						["Sandbox configuration", agent.runtimeCapabilities.sandbox],
 						["Manual compaction", agent.runtimeCapabilities.compaction],
 					  ] as Array<[string, boolean]>).map(([label, available]) => (
-						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{available ? "Available" : "Unavailable"}</span></div>
+						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{available ? "Available" : label === "Image input" && agent.runtimeBinding.kind === "pi" && !agent.processAlive ? "Checked on start" : "Unavailable"}</span></div>
 					  ))}
 					</div>
 				  </div>

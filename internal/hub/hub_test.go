@@ -56,6 +56,91 @@ func TestAgentEventIsMultiplexedToGlobalSubscribers(t *testing.T) {
 	}
 }
 
+func TestAgentStatusIncludesLiveRuntimeCapabilities(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(st)
+	defer h.Shutdown()
+	global, cancel := h.SubscribeGlobal()
+	defer cancel()
+	capabilities := RuntimeCapabilities{History: true, ImageInput: true}
+	meta := &Agent{ID: "agent-1", Name: "worker", RuntimeBinding: RuntimeBinding{Kind: "pi"}}
+	h.mu.Lock()
+	h.runtimes[meta.ID] = &runtime{agentID: meta.ID, agentRuntime: &fakeAgentRuntime{capabilities: &capabilities}}
+	h.emitStatusLocked(meta, "idle")
+	h.mu.Unlock()
+
+	select {
+	case event := <-global:
+		var payload struct {
+			ProcessAlive        bool                `json:"processAlive"`
+			RuntimeCapabilities RuntimeCapabilities `json:"runtimeCapabilities"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if !payload.ProcessAlive || !payload.RuntimeCapabilities.History || !payload.RuntimeCapabilities.ImageInput {
+			t.Fatalf("runtime status payload = %#v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("global subscriber did not receive Agent status")
+	}
+}
+
+func TestRuntimeFailureDuringShutdownIsIgnored(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(st)
+	meta := &Agent{
+		ID: "agent-1", Name: "worker", Status: "idle", RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: "/tmp/pi.jsonl"},
+		LastTurn: &TurnSummary{TurnID: "turn-1", Status: "completed"},
+	}
+	rt := &runtime{agentID: meta.ID, agentRuntime: &fakeAgentRuntime{}}
+	h.agents[meta.ID] = meta
+	h.runtimes[meta.ID] = rt
+	h.stopping = true
+
+	h.onRuntimeFailure(rt, errors.New("Pi RPC process exited: signal: interrupt"))
+
+	if meta.LastError != "" {
+		t.Fatalf("shutdown Runtime failure persisted as LastError: %q", meta.LastError)
+	}
+}
+
+func TestOpenRepairsPersistedPiShutdownInterrupt(t *testing.T) {
+	t.Setenv("PINIX_EDGE_NAMES", filepath.Join(t.TempDir(), "missing.json"))
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAgents(map[string]*Agent{
+		"agent-1": {
+			ID: "agent-1", Name: "worker", Cwd: t.TempDir(), ThreadID: "loom-thread-1", Status: "idle",
+			RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: "/tmp/pi.jsonl"},
+			LastError:      "Pi RPC process exited: signal: interrupt",
+			LastTurn:       &TurnSummary{TurnID: "turn-1", Status: "completed"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Open(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Shutdown()
+	view, err := h.GetAgent("agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.LastError != "" {
+		t.Fatalf("repaired LastError = %q", view.LastError)
+	}
+}
+
 func TestCompletedNotificationWithFailedTurnStatusProjectsFailure(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
