@@ -56,6 +56,19 @@ The default review question is: does this complexity solve a current user
 problem or a demonstrated reachable failure, or does it only defend against an
 attacker who already controls the local Owner account?
 
+## Frontend package manager
+
+The WebUI uses pnpm 11.1.2, pinned by the `packageManager` field in
+`web/package.json`. Use `web/pnpm-lock.yaml` as the only frontend lockfile and
+install dependencies with `pnpm --dir web install --frozen-lockfile`.
+
+- Run frontend scripts with pnpm, for example `pnpm --dir web test` and
+  `pnpm --dir web run dev`.
+- Do not add or regenerate npm or Yarn lockfiles.
+- `make build` remains the canonical production build and embed entrypoint. It
+  verifies the pnpm version, performs a frozen install, builds the WebUI, then
+  compiles and verifies the embedded Go binary.
+
 ## Production build and restart
 
 CodexLoom embeds `internal/webui/dist` into the Go server binary at compile
