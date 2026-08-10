@@ -16,6 +16,30 @@ _Avoid_: User, administrator, operator
 The execution system that advances an Agent's Thread through Turns without owning the Agent's identity or collaboration records.
 _Avoid_: Provider, model, Agent
 
+**Runtime Contract**:
+The runtime-neutral agreement that defines what Loom may require from every Agent Runtime and how Loom discovers optional Runtime behavior.
+_Avoid_: Runtime interface, parity layer, adapter API
+
+**Runtime Capability**:
+A behavior that an Agent Runtime truthfully declares so Loom can expose, gate, or reject the corresponding Owner experience.
+_Avoid_: Feature flag, fake parity
+
+**Capability Snapshot**:
+The current, scoped truth about Runtime Capabilities after combining the Runtime kind, active binding, model, and configuration.
+_Avoid_: Static feature matrix, creation-time capability
+
+**Runtime Host Driver**:
+The component that installs, starts, supervises, and closes an Agent Runtime host without defining Thread or Turn semantics.
+_Avoid_: Agent Runtime, Runtime Contract
+
+**Canonical Runtime Event**:
+A typed Loom-owned execution event used by Hub and product read models; native Runtime payloads remain diagnostic data.
+_Avoid_: Raw event, compatibility event
+
+**Indeterminate Runtime Outcome**:
+A Runtime operation whose acceptance or side effects cannot yet be proven after timeout, disconnect, or process failure and therefore requires reconciliation.
+_Avoid_: Failed Turn, safe retry
+
 **Runtime Binding**:
 The durable association between an Agent and its Agent Runtime's native conversation.
 _Avoid_: Thread ID, provider binding
