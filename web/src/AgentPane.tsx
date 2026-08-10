@@ -2,7 +2,7 @@ import { ArrowDown, ArrowUpRight, BarChart3, CalendarClock, Check, ChevronRight,
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ConversationMembership, type HumanRequest, type InboxEntry, type ModelProvider, type PlatformConnection, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
+import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ConversationMembership, type HumanRequest, type InboxEntry, type ModelProvider, type PlatformConnection, type RuntimeModel, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
 import { emptyFeed, reduceFeed } from "./feed";
 import type { Block } from "./feed";
 import type { LoomEvent } from "./types";
@@ -114,6 +114,8 @@ export function AgentPane({
   const [providerDraft, setProviderDraft] = useState(agent.providerId || "openai");
   const [modelDraft, setModelDraft] = useState(agent.model || "");
   const [modelCustomOpen, setModelCustomOpen] = useState(isCustomModel(agent.model || "", agent.providerId, modelProviders));
+	const [runtimeModels, setRuntimeModels] = useState<RuntimeModel[]>([]);
+	const [runtimeModelCurrent, setRuntimeModelCurrent] = useState<RuntimeModel | null>(null);
   const [effortDraft, setEffortDraft] = useState(agent.effort || "");
   const [sandboxDraft, setSandboxDraft] = useState(agent.sandbox || "danger-full-access");
   const [approvalDraft, setApprovalDraft] = useState(agent.approvalPolicy || "never");
@@ -309,6 +311,23 @@ export function AgentPane({
       cancelled = true;
     };
   }, [configOpen, agent.id]);
+
+	useEffect(() => {
+	  if (!configOpen || configSection !== "runtime" || agent.runtimeBinding.kind !== "pi") return;
+	  let cancelled = false;
+	  api("GET", `/api/agents/${agent.id}/runtime/models`)
+		.then((data) => {
+		  if (cancelled) return;
+		  const current = data.current as RuntimeModel;
+		  setRuntimeModels((data.models || []) as RuntimeModel[]);
+		  setRuntimeModelCurrent(current);
+		  setProviderDraft(current.provider);
+		  setModelDraft(current.id);
+		  setModelCustomOpen(false);
+		})
+		.catch((err: Error) => { if (!cancelled) onError(err.message); });
+	  return () => { cancelled = true; };
+	}, [configOpen, configSection, agent.id, agent.runtimeBinding.kind]);
 
   const refreshConnections = async () => {
     const [addressData, connectionData, membershipData] = await Promise.all([
@@ -783,7 +802,15 @@ export function AgentPane({
     setSavingConfig(true);
     try {
       let updated = agent;
-      if (providerDraft !== (agent.providerId || "openai")) {
+	  const piRuntime = agent.runtimeBinding.kind === "pi";
+	  if (piRuntime && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id)) {
+		const state = await api("POST", `/api/agents/${agent.id}/runtime/model`, {
+		  provider: providerDraft,
+		  model: modelDraft.trim(),
+		});
+		setRuntimeModelCurrent(state.current as RuntimeModel);
+		setRuntimeModels((state.models || []) as RuntimeModel[]);
+	  } else if (!piRuntime && providerDraft !== (agent.providerId || "openai")) {
         const switched = await api("POST", `/api/agents/${agent.id}/provider`, {
           providerId: providerDraft,
           model: modelDraft.trim(),
@@ -791,7 +818,10 @@ export function AgentPane({
         updated = switched.agent as Agent;
         onAgentUpdated(updated);
       }
-      const data = await api("PATCH", `/api/agents/${agent.id}/config`, {
+	  const data = await api("PATCH", `/api/agents/${agent.id}/config`, piRuntime ? {
+		name: nextName,
+		approvalPolicy: approvalDraft,
+	  } : {
         name: nextName,
         model: modelDraft.trim(),
         effort: effortDraft,
@@ -913,6 +943,7 @@ export function AgentPane({
   };
 
   const running = agent.status === "running";
+	const piRuntime = agent.runtimeBinding.kind === "pi";
   const heldMessages = pendingWork.filter((entry) => entry.internalMessage?.handlingStatus === "interrupted" || entry.internalMessage?.handlingStatus === "failed");
   const currentProviderId = agent.providerId || "openai";
   const selectableProviders = modelProviders.some((provider) => provider.id === currentProviderId)
@@ -930,6 +961,11 @@ export function AgentPane({
   const reasoningEfforts = selectedModelDetail?.reasoningEfforts?.length ? selectedModelDetail.reasoningEfforts : FALLBACK_REASONING_EFFORTS;
   const modelPresetValue = modelCustomOpen || isCustomModel(modelDraft, providerDraft, selectableProviders) ? CUSTOM_MODEL_VALUE : modelDraft;
   const providerChanged = providerDraft !== (agent.providerId || "openai");
+	const piProviders = [...new Set(runtimeModels.map((model) => model.provider))];
+	const piModels = runtimeModels.filter((model) => model.provider === providerDraft);
+	const runtimeModelChanged = piRuntime
+	  ? providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id
+	  : providerChanged;
   const profileDirty = Boolean(
     profile &&
       (identityDraft.trim() !== (profile.identity || "") ||
@@ -1061,7 +1097,18 @@ export function AgentPane({
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Provider</span>
-                    <select
+					{piRuntime ? <select
+					  value={providerDraft}
+					  onChange={(event) => {
+						const provider = event.target.value;
+						setProviderDraft(provider);
+						setModelDraft(runtimeModels.find((model) => model.provider === provider)?.id || "");
+					  }}
+					  disabled={running || runtimeModels.length === 0}
+					  className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
+					>
+					  {piProviders.map((provider) => <option key={provider} value={provider}>{provider}</option>)}
+					</select> : <select
                       value={providerDraft}
                       onChange={(event) => {
                         const nextProvider = event.target.value;
@@ -1076,11 +1123,18 @@ export function AgentPane({
                       className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
                     >
                       {selectableProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
-                    </select>
+					</select>}
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Model</span>
-                    <select
+					{piRuntime ? <select
+					  value={modelDraft}
+					  onChange={(event) => setModelDraft(event.target.value)}
+					  disabled={running || piModels.length === 0}
+					  className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
+					>
+					  {piModels.map((model) => <option key={`${model.provider}/${model.id}`} value={model.id}>{model.id}</option>)}
+					</select> : <><select
                       value={modelPresetValue}
                       onChange={(e) => {
                         if (e.target.value === CUSTOM_MODEL_VALUE) {
@@ -1098,7 +1152,7 @@ export function AgentPane({
                         <option key={option.label} value={option.value}>{option.label}</option>
                       ))}
                       <option value={CUSTOM_MODEL_VALUE}>Custom...</option>
-                    </select>
+					</select>
                     {modelCustomOpen && (
                       <input
                         value={modelDraft}
@@ -1108,11 +1162,11 @@ export function AgentPane({
                         spellCheck={false}
                         className="mt-2 h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition placeholder:text-muted-foreground/60 focus:ring-ring/25 disabled:opacity-60"
                       />
-                    )}
+					)}</>}
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Thinking Effort</span>
-                    <select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running || !agent.runtimeCapabilities.provider} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+					<select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={piRuntime || running || !agent.runtimeCapabilities.provider} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
                       <option value="">default{selectedModelDetail?.defaultReasoningEffort ? ` (${selectedModelDetail.defaultReasoningEffort})` : ""}</option>
                       {reasoningEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
                     </select>
@@ -1136,7 +1190,7 @@ export function AgentPane({
                     </select>
                   </label>
                   {running && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] text-warning">Config can be changed after this turn finishes.</div>}
-                  {providerChanged && !running && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] leading-4 text-warning">Switching Provider cold-resumes this primary Thread and briefly restarts the shared Codex runtime. Every Agent must be idle with no pending approval or active Goal.</div>}
+				  {runtimeModelChanged && !running && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] leading-4 text-warning">{piRuntime ? "The next Turn will use this Pi model; the existing Agent, Session, Profile, and history stay unchanged." : "Switching Provider cold-resumes this primary Thread and briefly restarts the shared Codex runtime. Every Agent must be idle with no pending approval or active Goal."}</div>}
                   <div className="flex justify-end gap-2">
                     <button onClick={() => setConfigOpen(false)} className="rounded-md px-2.5 py-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted">Cancel</button>
                     <button onClick={saveConfig} disabled={running || savingConfig} className="rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-medium text-primary-foreground transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60">{savingConfig ? "Saving" : "Save"}</button>

@@ -227,6 +227,16 @@ func (h *Hub) rollbackProviderSwitch(agentID string, previous Agent, cause error
 // binding. The shared CodexHost is restarted, so all Agent Turns, approvals and
 // active Goals must be quiescent before the operation begins.
 func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (AgentView, error) {
+	h.mu.Lock()
+	agent := h.resolveLocked(key)
+	piRuntime := agent != nil && agent.RuntimeBinding.Kind == "pi"
+	h.mu.Unlock()
+	if piRuntime {
+		if _, err := h.SwitchRuntimeModel(key, RuntimeModelSelection{Provider: params.ProviderID, Model: params.Model}); err != nil {
+			return AgentView{}, err
+		}
+		return h.GetAgent(key)
+	}
 	providerID, model, err := normalizeProviderSwitchBinding(params)
 	if err != nil {
 		return AgentView{}, err
@@ -245,7 +255,7 @@ func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (Agen
 		h.mu.Unlock()
 		return AgentView{}, errf(409, "another Agent Provider switch is in progress")
 	}
-	agent := h.resolveLocked(key)
+	agent = h.resolveLocked(key)
 	if agent == nil {
 		h.mu.Unlock()
 		return AgentView{}, errf(404, "agent not found: %s", key)

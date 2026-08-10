@@ -35,6 +35,8 @@ type piAgentRuntime struct {
 	activeNativeTurn string
 	abortRequested   bool
 	imageInput       bool
+	currentModel     RuntimeModel
+	availableModels  []RuntimeModel
 }
 
 func newPiAgentRuntime(agentID, dataDir, apiURL string) *piAgentRuntime {
@@ -89,11 +91,17 @@ func (r *piAgentRuntime) Resume(request RuntimeBindingRequest, timeout time.Dura
 }
 
 type piSessionState struct {
-	SessionFile string `json:"sessionFile"`
-	SessionID   string `json:"sessionId"`
-	Model       *struct {
-		Input []string `json:"input"`
-	} `json:"model,omitempty"`
+	SessionFile string          `json:"sessionFile"`
+	SessionID   string          `json:"sessionId"`
+	Model       *piRuntimeModel `json:"model,omitempty"`
+}
+
+type piRuntimeModel struct {
+	Provider      string   `json:"provider"`
+	ID            string   `json:"id"`
+	Input         []string `json:"input"`
+	ContextWindow int      `json:"contextWindow"`
+	Reasoning     bool     `json:"reasoning"`
 }
 
 func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) (piSessionState, error) {
@@ -165,8 +173,76 @@ func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) 
 	}
 	r.mu.Lock()
 	r.imageInput = imageInput
+	if state.Model != nil {
+		r.currentModel = runtimeModel(*state.Model)
+	}
 	r.mu.Unlock()
 	return state, nil
+}
+
+func runtimeModel(model piRuntimeModel) RuntimeModel {
+	return RuntimeModel{Provider: model.Provider, ID: model.ID, ContextWindow: model.ContextWindow, Reasoning: model.Reasoning}
+}
+
+func (r *piAgentRuntime) models(timeout time.Duration) (RuntimeModelState, error) {
+	r.mu.Lock()
+	rpc, current := r.rpc, r.currentModel
+	r.mu.Unlock()
+	if rpc == nil {
+		return RuntimeModelState{}, errors.New("Pi Runtime is not running")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	response, err := rpc.Request(ctx, "get_available_models", nil)
+	if err != nil {
+		return RuntimeModelState{}, err
+	}
+	var data struct {
+		Models []piRuntimeModel `json:"models"`
+	}
+	if err := json.Unmarshal(response.Data, &data); err != nil {
+		return RuntimeModelState{}, fmt.Errorf("Pi get_available_models returned unsupported data: %w", err)
+	}
+	models := make([]RuntimeModel, 0, len(data.Models))
+	for _, model := range data.Models {
+		models = append(models, runtimeModel(model))
+	}
+	r.mu.Lock()
+	r.availableModels = models
+	r.mu.Unlock()
+	return RuntimeModelState{Current: current, Models: models}, nil
+}
+
+func (r *piAgentRuntime) switchModel(selection RuntimeModelSelection, timeout time.Duration) (RuntimeModelState, error) {
+	r.mu.Lock()
+	rpc := r.rpc
+	r.mu.Unlock()
+	if rpc == nil {
+		return RuntimeModelState{}, errors.New("Pi Runtime is not running")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	response, err := rpc.Request(ctx, "set_model", map[string]any{"provider": selection.Provider, "modelId": selection.Model})
+	if err != nil {
+		return RuntimeModelState{}, err
+	}
+	var model piRuntimeModel
+	if err := json.Unmarshal(response.Data, &model); err != nil || model.Provider == "" || model.ID == "" {
+		return RuntimeModelState{}, fmt.Errorf("Pi set_model returned unsupported model: %s", response.Data)
+	}
+	imageInput := false
+	for _, input := range model.Input {
+		if input == "image" {
+			imageInput = true
+			break
+		}
+	}
+	r.mu.Lock()
+	r.currentModel = runtimeModel(model)
+	r.imageInput = imageInput
+	models := append([]RuntimeModel(nil), r.availableModels...)
+	r.mu.Unlock()
+	return RuntimeModelState{Current: runtimeModel(model), Models: models}, nil
 }
 
 func (r *piAgentRuntime) InjectDeveloperContext(_ string, content string, _ time.Duration) error {
@@ -646,7 +722,7 @@ func (r *piAgentRuntime) Capabilities() RuntimeCapabilities {
 	r.mu.Lock()
 	imageInput := r.imageInput
 	r.mu.Unlock()
-	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true, Approval: true, ImageInput: imageInput}
+	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true, Approval: true, Provider: true, ImageInput: imageInput}
 }
 
 func (r *piAgentRuntime) Close() {

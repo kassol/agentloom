@@ -371,6 +371,10 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 		h.mu.Unlock()
 		return AgentView{}, errf(409, "Agent Runtime kind is immutable")
 	}
+	if meta.RuntimeBinding.Kind == "pi" && (p.ProviderID != nil || p.Model != nil || p.Effort != nil) {
+		h.mu.Unlock()
+		return AgentView{}, errf(409, "Pi model settings must be changed through the Runtime model switch operation")
+	}
 	capabilities := h.runtimeCapabilitiesLocked(meta)
 	if p.Sandbox != nil && !capabilities.Sandbox {
 		h.mu.Unlock()

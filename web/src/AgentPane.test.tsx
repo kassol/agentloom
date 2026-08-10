@@ -111,12 +111,24 @@ describe("AgentPane scroll restoration", () => {
 
   it("shows Pi capability limits and disables unsupported Runtime controls", () => {
 	const onError = vi.fn();
+	vi.mocked(fetch).mockImplementation(async (input) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  if (url.includes("/runtime/models")) return new Response(JSON.stringify({
+		current: { provider: "openai-codex", id: "gpt-5.4-mini", reasoning: true },
+		models: [
+		  { provider: "openai-codex", id: "gpt-5.4-mini", reasoning: true },
+		  { provider: "xai", id: "grok-4.5", reasoning: true },
+		],
+	  }), { status: 200, headers: { "Content-Type": "application/json" } });
+	  const body = url.includes("/thread/history") ? { total: 0, turns: [] } : url.includes("/config") ? { agent: piAgent } : { artifacts: [] };
+	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
     const piAgent: Agent = {
       ...testAgent,
       runtimeBinding: { kind: "pi" },
       runtimeCapabilities: {
         history: true, causalSteer: false, interrupt: true, goal: false, remote: false,
-        usage: false, provider: false, compaction: false, approval: true, skills: false,
+        usage: false, provider: true, compaction: false, approval: true, skills: false,
         naming: false, archive: false, sandbox: false, imageInput: false,
       },
     };
@@ -127,7 +139,9 @@ describe("AgentPane scroll restoration", () => {
     expect(view.getByText("History").nextElementSibling).toHaveTextContent("Available");
     expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Unavailable");
     expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();
-    expect(view.getByText("Provider").closest("label")?.querySelector("select")).toBeDisabled();
+    expect(view.getByText("Provider switching").nextElementSibling).toHaveTextContent("Available");
+	const provider = view.getByText("Provider").closest("label")?.querySelector("select") as HTMLSelectElement;
+	const model = view.getByText("Model").closest("label")?.querySelector("select") as HTMLSelectElement;
     expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
 	expect(view.getByText("Approval Policy").closest("label")?.querySelector("select")).toBeEnabled();
 	expect(view.getByText("Sandbox isolation is unsupported for the pi Runtime.")).toBeInTheDocument();
@@ -135,16 +149,30 @@ describe("AgentPane scroll restoration", () => {
     expect(view.getByRole("button", { name: "Usage" })).toBeDisabled();
     expect(view.queryByText("History is unavailable for the pi Runtime.")).toBeNull();
     expect(view.getByText("Goal is unavailable for the pi Runtime.")).toBeInTheDocument();
-    expect(view.queryByRole("button", { name: "Set a Goal" })).toBeNull();
+	expect(view.queryByRole("button", { name: "Set a Goal" })).toBeNull();
 
-	const task = view.getByRole("textbox", { name: "task message" });
-	fireEvent.change(task, { target: { value: "/compact" } });
-	fireEvent.click(view.getByRole("button", { name: "send task" }));
-	expect(onError).toHaveBeenCalledWith("Manual compaction is unavailable for the pi Runtime");
+	return waitFor(() => {
+	  expect(provider).toBeEnabled();
+	  expect(model).toBeEnabled();
+	  expect(provider).toHaveValue("openai-codex");
+	}).then(async () => {
+	  fireEvent.change(provider, { target: { value: "xai" } });
+	  expect(model).toHaveValue("grok-4.5");
+	  fireEvent.click(view.getByRole("button", { name: "Save" }));
+	  await waitFor(() => expect(vi.mocked(fetch).mock.calls).toContainEqual([
+		"/api/agents/agent-scroll/runtime/model",
+		expect.objectContaining({ method: "POST", body: JSON.stringify({ provider: "xai", model: "grok-4.5" }) }),
+	  ]));
 
-	const requestedURLs = vi.mocked(fetch).mock.calls.map(([input]) => typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url);
-	expect(requestedURLs.some((url) => url.includes("/thread/history"))).toBe(true);
-	expect(requestedURLs.some((url) => url.includes("/compact"))).toBe(false);
+	  const task = view.getByRole("textbox", { name: "task message" });
+	  fireEvent.change(task, { target: { value: "/compact" } });
+	  fireEvent.click(view.getByRole("button", { name: "send task" }));
+	  expect(onError).toHaveBeenCalledWith("Manual compaction is unavailable for the pi Runtime");
+
+	  const requestedURLs = vi.mocked(fetch).mock.calls.map(([input]) => typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url);
+	  expect(requestedURLs.some((url) => url.includes("/thread/history"))).toBe(true);
+	  expect(requestedURLs.some((url) => url.includes("/compact"))).toBe(false);
+	});
   });
 
   it("restores a Pi Approval card from the Agent snapshot without Codex wording", async () => {

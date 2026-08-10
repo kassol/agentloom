@@ -94,6 +94,27 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, 200, map[string]any{"agent": agent})
 	})
+	mux.HandleFunc("GET /api/agents/{key}/runtime/models", func(w http.ResponseWriter, r *http.Request) {
+		models, err := s.hub.GetRuntimeModels(r.PathValue("key"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, models)
+	})
+	mux.HandleFunc("POST /api/agents/{key}/runtime/model", func(w http.ResponseWriter, r *http.Request) {
+		var body hub.RuntimeModelSelection
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		models, err := s.hub.SwitchRuntimeModel(r.PathValue("key"), body)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, models)
+	})
 	mux.HandleFunc("POST /api/agents/{key}/compact", func(w http.ResponseWriter, r *http.Request) {
 		result, err := s.hub.CompactAgentThread(r.PathValue("key"))
 		if err != nil {

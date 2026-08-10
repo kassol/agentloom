@@ -29,12 +29,12 @@ func TestAgentDetailReportsTruthfulPiRuntimeCapabilities(t *testing.T) {
 	response := topicRequest(t, server, http.MethodGet, "/api/agents/agent-pi", nil, http.StatusOK)
 	agent := response["agent"].(map[string]any)
 	capabilities := agent["runtimeCapabilities"].(map[string]any)
-	for _, capability := range []string{"history", "causalSteer", "interrupt", "approval"} {
+	for _, capability := range []string{"history", "causalSteer", "interrupt", "approval", "provider"} {
 		if capabilities[capability] != true {
 			t.Fatalf("Pi %s capability = %#v", capability, capabilities[capability])
 		}
 	}
-	for _, capability := range []string{"goal", "remote", "usage", "provider", "compaction", "skills", "naming", "archive", "sandbox", "imageInput"} {
+	for _, capability := range []string{"goal", "remote", "usage", "compaction", "skills", "naming", "archive", "sandbox", "imageInput"} {
 		if value, exists := capabilities[capability]; !exists || value != false {
 			t.Fatalf("Pi %s capability = %#v, exists=%v", capability, value, exists)
 		}
@@ -63,7 +63,6 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 		{name: "read Goal", method: http.MethodGet, path: "/api/agents/agent-pi/goal", capability: "Goal"},
 		{name: "update Goal", method: http.MethodPut, path: "/api/agents/agent-pi/goal", body: `{"objective":"ship"}`, capability: "Goal"},
 		{name: "clear Goal", method: http.MethodDelete, path: "/api/agents/agent-pi/goal", capability: "Goal"},
-		{name: "Provider switch", method: http.MethodPost, path: "/api/agents/agent-pi/provider", body: `{"providerId":"openai"}`, capability: "Provider"},
 		{name: "manual compaction", method: http.MethodPost, path: "/api/agents/agent-pi/compact", capability: "compaction"},
 		{name: "sandbox config", method: http.MethodPatch, path: "/api/agents/agent-pi/config", body: `{"sandbox":"read-only"}`, capability: "sandbox"},
 	}
@@ -76,6 +75,12 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 				t.Fatalf("%s %s = %d %s, want explicit unsupported %s conflict", tt.method, tt.path, response.Code, response.Body.String(), tt.capability)
 			}
 		})
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/agents/agent-pi/runtime/model", strings.NewReader(`{"provider":"xai"}`))
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "provider and model are required") {
+		t.Fatalf("invalid Pi Runtime model switch = %d %s", recorder.Code, recorder.Body.String())
 	}
 	response := topicRequest(t, server, http.MethodPatch, "/api/agents/agent-pi/config", map[string]any{"approvalPolicy": "on-request"}, http.StatusOK)
 	agent := response["agent"].(map[string]any)

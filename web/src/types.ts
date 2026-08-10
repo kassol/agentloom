@@ -67,6 +67,13 @@ export interface RuntimeCapabilities {
   imageInput: boolean;
 }
 
+export interface RuntimeModel {
+  provider: string;
+  id: string;
+  contextWindow?: number;
+  reasoning: boolean;
+}
+
 export interface ModelProvider {
   id: string;
   name: string;
