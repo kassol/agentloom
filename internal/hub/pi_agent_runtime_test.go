@@ -982,6 +982,38 @@ func TestPiHistoryProjectsOnlyActiveBranchAndKeepsPreCompactionTurns(t *testing.
 	}
 }
 
+func TestPiHistoryKeepsCausalAgentMessageSteerInOriginalTurn(t *testing.T) {
+	sessionFile := filepath.Join(t.TempDir(), "session.jsonl")
+	contents := strings.Join([]string{
+		`{"type":"session","version":3,"id":"session-1","timestamp":"2026-08-10T01:00:00.000Z","cwd":"/tmp/work"}`,
+		`{"type":"message","id":"user-1","parentId":null,"timestamp":"2026-08-10T01:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"review Pi runtime"}]}}`,
+		`{"type":"message","id":"assistant-1","parentId":"user-1","timestamp":"2026-08-10T01:00:02.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"bash","arguments":{"command":"sleep 30"}}],"stopReason":"toolUse"}}`,
+		`{"type":"message","id":"result-1","parentId":"assistant-1","timestamp":"2026-08-10T01:00:03.000Z","message":{"role":"toolResult","toolCallId":"call-1","toolName":"bash","content":[{"type":"text","text":"done"}],"isError":false}}`,
+		`{"type":"message","id":"steer-1","parentId":"result-1","timestamp":"2026-08-10T01:00:04.000Z","message":{"role":"user","content":[{"type":"text","text":"<agent_message version=\"1\" id=\"msg_reply\" response=\"required\" status=\"answered\">\n  <from>codex-agent</from>\n  <to>pi-agent</to>\n  <reply_to>msg_root</reply_to>\n  <body><![CDATA[review complete]]></body>\n</agent_message>"}]}}`,
+		`{"type":"message","id":"assistant-2","parentId":"steer-1","timestamp":"2026-08-10T01:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"integrated review"}],"stopReason":"stop"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(sessionFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := newPiAgentRuntime("agent-1", t.TempDir(), "")
+	history, err := runtime.ReadHistory(sessionFile, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history.Total != 1 || len(history.Turns) != 1 {
+		t.Fatalf("Pi causal-steer history = %#v, want one Turn", history)
+	}
+	turn := history.Turns[0]
+	if turn.ID != "user-1" || turn.Status != "completed" {
+		t.Fatalf("Pi causal-steer Turn = %#v", turn)
+	}
+	encoded, _ := json.Marshal(turn)
+	if !strings.Contains(string(encoded), "msg_reply") || !strings.Contains(string(encoded), "integrated review") || strings.Contains(string(encoded), `"id":"steer-1"`) {
+		t.Fatalf("Pi causal-steer projection = %s", encoded)
+	}
+}
+
 func TestPiVisibleHistoryHidesManagedMessageAndTopicContextEnvelope(t *testing.T) {
 	prompt := `<loom_developer_context version="1">profile</loom_developer_context>` + "\n\n" +
 		`Review the incident.` + "\n\n" +

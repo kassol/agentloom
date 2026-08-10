@@ -280,14 +280,19 @@ func projectPiHistory(entries []piSessionEntry, leafID string) (RuntimeHistory, 
 		blocks := piMessageContent(message.Content)
 		switch message.Role {
 		case "user":
-			if turn != nil && turn.Status == "running" {
-				turn.Status = "completed"
-			}
 			userText := piContentText(blocks)
 			visibleText := piVisibleUserText(userText)
 			item := map[string]any{"type": "user", "text": visibleText, "timestamp": entry.Timestamp}
 			if attachments := piUserAttachments(userText); len(attachments) > 0 {
 				item["attachments"] = attachments
+			}
+			if turn != nil && turn.Status == "running" && piCausalAgentMessage(userText) {
+				turn.Items = append(turn.Items, item)
+				turn.UpdatedAt = entry.Timestamp
+				continue
+			}
+			if turn != nil && turn.Status == "running" {
+				turn.Status = "completed"
 			}
 			history.Turns = append(history.Turns, RuntimeHistoryTurn{
 				ID: entry.ID, Status: "running", StartedAt: entry.Timestamp, UpdatedAt: entry.Timestamp,
@@ -346,6 +351,11 @@ func projectPiHistory(entries []piSessionEntry, leafID string) (RuntimeHistory, 
 	}
 	history.Total = len(history.Turns)
 	return history, nil
+}
+
+func piCausalAgentMessage(text string) bool {
+	text = strings.TrimSpace(text)
+	return strings.HasPrefix(text, "<agent_message ") && strings.HasSuffix(text, "</agent_message>")
 }
 
 func piMessageContent(raw json.RawMessage) []piContentBlock {
