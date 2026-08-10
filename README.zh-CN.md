@@ -71,12 +71,15 @@ CodexLoom 当前首先服务一个高级个人 Owner。外部协作者可以通�
 ## Quick Start
 
 CodexLoom 当前是本地优先、自托管产品。从源码启动前，请先安装 `codex`
-CLI 并使用 ChatGPT 身份登录，然后运行：
+CLI 和 Pi `0.84.1` 或更新版本，并使用 ChatGPT 身份登录，然后运行：
 
 ```sh
 make release
 ./bin/codex-loom
 ```
+
+每次启动都必须具备 Pi。若 Pi 不在 `PATH`，请用 `PI_BIN` 指定其可执行文件；
+CodexLoom 只校验最低版本，不会自动安装或更新 Pi。
 
 ### Owner 的 WebUI 路径
 

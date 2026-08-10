@@ -91,12 +91,17 @@ the primary product direction.
 ## Quick Start
 
 CodexLoom is currently local-first and self-hosted. To start it from source,
-install the `codex` CLI, sign in with a ChatGPT account, and run:
+install the `codex` CLI and Pi `0.84.1` or newer, sign in with a ChatGPT
+account, and run:
 
 ```sh
 make release
 ./bin/codex-loom
 ```
+
+Pi is required at every startup. If it is not in `PATH`, set `PI_BIN` to its
+executable; CodexLoom verifies the minimum version but never installs or
+updates Pi.
 
 ### Owner Path in the WebUI
 
