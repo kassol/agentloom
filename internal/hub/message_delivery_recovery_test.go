@@ -164,8 +164,12 @@ func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterResta
 	waitForMessageDelivery(t, h2, message.ID, "delivered")
 	recovered := mustAgentMessage(t, h2, message.ID)
 	if recovered.ID != message.ID || recovered.DeliveryStatus != "delivered" || recovered.DeliveryMode != "turn_start" ||
-		recovered.DeliveredTurnID != "turn-recovered" || recovered.HandlingStatus != "running" || len(recovered.HandlingAttempts) != 1 {
+		recovered.DeliveredTurnID == "" || recovered.DeliveredTurnID == "turn-recovered" || recovered.HandlingStatus != "running" || len(recovered.HandlingAttempts) != 1 ||
+		recovered.HandlingAttempts[0].TurnID != recovered.DeliveredTurnID {
 		t.Fatalf("recovered Message = %#v", recovered)
+	}
+	if got := h2.agents["agent-target"].RuntimeTurnBindings[recovered.DeliveredTurnID]; got != "turn-recovered" {
+		t.Fatalf("recovered native Turn binding = %q, want turn-recovered", got)
 	}
 	if recovered.TopicID != message.TopicID || recovered.SourceTurnID != message.SourceTurnID || recovered.Status != "open" {
 		t.Fatalf("recovery lost causal lineage: %#v", recovered)

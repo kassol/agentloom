@@ -22,6 +22,12 @@ func (h *Hub) Shutdown() {
 		h.workers.Wait()
 		h.mu.Lock()
 		host := h.codexHost
+		backends := make([]AgentRuntime, 0, len(h.runtimes))
+		for _, rt := range h.runtimes {
+			if backend := runtimeBackend(rt); backend != nil {
+				backends = append(backends, backend)
+			}
+		}
 		h.codexHost = nil
 		h.remoteRuntime = nil
 		ownedStore := h.st
@@ -32,12 +38,9 @@ func (h *Hub) Shutdown() {
 		h.mu.Unlock()
 		if host != nil {
 			host.client.Close()
-		} else if h.agentRuntimeFactory != nil {
-			for _, rt := range h.runtimes {
-				if backend := runtimeBackend(rt); backend != nil {
-					backend.Close()
-				}
-			}
+		}
+		for _, backend := range backends {
+			backend.Close()
 		}
 		if h.writerOwnership != nil {
 			h.writerOwnership.Release()

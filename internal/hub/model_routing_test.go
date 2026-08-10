@@ -177,19 +177,20 @@ func TestTerminalModelRouteFailureIsClassifiedWithoutRetryNotification(t *testin
 	h := testHub(st)
 	h.stopping = true
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", ThreadID: "thread-1", ProviderID: "custom", Model: "Display-Only",
-		Status: "running", CurrentTurnID: "turn-1", CurrentTask: "Do work", CreatedAt: now(), UpdatedAt: now(),
+		ID: "agent-1", Name: "worker", ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"}, ProviderID: "custom", Model: "Display-Only",
+		RuntimeTurnBindings: map[string]string{"turn-loom-1": "turn-1"},
+		Status:              "running", CurrentTurnID: "turn-loom-1", CurrentTask: "Do work", CreatedAt: now(), UpdatedAt: now(),
 	}
 	rt := &runtime{
 		agentID: "agent-1", approvals: map[string]*approval{},
-		activeTurn: &turnState{turnID: "turn-1", task: "Do work", startedAt: time.Now(), stopWatchdog: make(chan struct{})},
+		activeTurn: &turnState{turnID: "turn-loom-1", nativeTurnID: "turn-1", task: "Do work", startedAt: time.Now(), stopWatchdog: make(chan struct{})},
 	}
 	h.onNotification(rt, "turn/completed", json.RawMessage(`{
 		"threadId":"thread-1",
 		"turn":{"id":"turn-1","status":"failed","error":{"message":"503: No available channel for model Display-Only under group default"}}
 	}`))
 	view := h.agents["agent-1"]
-	if view.LastTurn == nil || view.LastTurn.Status != "failed" || !strings.Contains(view.LastError, `model ID "Display-Only"`) {
+	if view.LastTurn == nil || view.LastTurn.TurnID != "turn-loom-1" || view.LastTurn.Status != "failed" || !strings.Contains(view.LastError, `model ID "Display-Only"`) {
 		t.Fatalf("terminal model route classification = %#v", view)
 	}
 }
@@ -212,10 +213,11 @@ func TestManagedProvidersAreNotClassifiedAsCustomModelRouteFailures(t *testing.T
 			h := testHub(st)
 			h.stopping = true
 			h.agents["agent-1"] = &Agent{
-				ID: "agent-1", Name: "worker", ThreadID: "thread-1", ProviderID: tc.providerID, Model: tc.model,
-				Status: "running", CurrentTurnID: "turn-1", CurrentTask: "Do work", CreatedAt: now(), UpdatedAt: now(),
+				ID: "agent-1", Name: "worker", ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"}, ProviderID: tc.providerID, Model: tc.model,
+				RuntimeTurnBindings: map[string]string{"turn-loom-1": "turn-1"},
+				Status:              "running", CurrentTurnID: "turn-loom-1", CurrentTask: "Do work", CreatedAt: now(), UpdatedAt: now(),
 			}
-			turn := &turnState{turnID: "turn-1", task: "Do work", startedAt: time.Now(), stopWatchdog: make(chan struct{})}
+			turn := &turnState{turnID: "turn-loom-1", nativeTurnID: "turn-1", task: "Do work", startedAt: time.Now(), stopWatchdog: make(chan struct{})}
 			rt := &runtime{agentID: "agent-1", approvals: map[string]*approval{}, activeTurn: turn}
 			detail := fmt.Sprintf("503: No available channel for model %s under group default", tc.model)
 			h.onNotification(rt, "error", json.RawMessage(fmt.Sprintf(`{
@@ -229,6 +231,9 @@ func TestManagedProvidersAreNotClassifiedAsCustomModelRouteFailures(t *testing.T
 			}`, detail)))
 			if got := h.agents["agent-1"].LastError; got != detail {
 				t.Fatalf("managed Provider terminal error = %q, want raw error %q", got, detail)
+			}
+			if last := h.agents["agent-1"].LastTurn; last == nil || last.TurnID != "turn-loom-1" || last.Status != "failed" {
+				t.Fatalf("managed Provider last Turn = %#v", last)
 			}
 		})
 	}
@@ -294,6 +299,76 @@ func TestDelayedModelRouteStopDoesNotInterruptSuccessorTurn(t *testing.T) {
 		rt.activeTurn = nil
 	}
 	h.mu.Unlock()
+}
+
+func TestModelRouteInterruptWaitsForAuthoritativeNativeTurnID(t *testing.T) {
+	logPath := installFakeSharedCodexHost(t)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	defer h.Shutdown()
+	host, err := h.ensureCodexHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := &turnState{
+		turnID: "turn-loom", task: "Original work", startedAt: time.Now(), lastActivity: time.Now(),
+		stopWatchdog: make(chan struct{}),
+	}
+	rt := &runtime{
+		agentID: "agent-1", client: host.client, hostGeneration: host.generation,
+		ready: host.ready, approvals: map[string]*approval{}, activeTurn: turn,
+	}
+	h.mu.Lock()
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "worker", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-model-route-fence"},
+		Status: "running", CurrentTurnID: turn.turnID, CurrentTask: turn.task, CreatedAt: now(), UpdatedAt: now(),
+	}
+	h.runtimes["agent-1"] = rt
+	h.mu.Unlock()
+
+	type result struct {
+		interrupted bool
+		err         error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		interrupted, err := h.interruptTurnIfActive("agent-1", turn, "permanent model route failure")
+		resultCh <- result{interrupted: interrupted, err: err}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		h.mu.Lock()
+		waiting := turn.nativeTurnReady != nil
+		h.mu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("route interrupt did not wait for the native Turn binding")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	h.mu.Lock()
+	h.bindActiveNativeTurnIDLocked(h.agents["agent-1"], turn, "turn-successor")
+	turn.startedConfirmed = true
+	h.mu.Unlock()
+
+	select {
+	case got := <-resultCh:
+		if got.err != nil || !got.interrupted {
+			t.Fatalf("interrupt result = (%t, %v), want (true, nil)", got.interrupted, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("route interrupt did not resume after native Turn binding")
+	}
+	if got := countRequestMethod(t, logPath, "turn/interrupt"); got != 1 {
+		t.Fatalf("turn/interrupt requests = %d, want 1", got)
+	}
 }
 
 func modelRoutingTestHub(t *testing.T, model string) (string, *Hub) {

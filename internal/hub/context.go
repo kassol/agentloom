@@ -383,6 +383,22 @@ func (h *Hub) prepareTurnContext(agentID string, source turnContextSource, artif
 	if err != nil {
 		return TurnContextPlan{}, err
 	}
+	h.mu.Lock()
+	runtimeKind := ""
+	if agent := h.agents[agentID]; agent != nil {
+		runtimeKind = agent.RuntimeBinding.Kind
+	}
+	h.mu.Unlock()
+	if runtimeKind == "pi" {
+		developerContext := renderPiDeveloperContext(compiledAt, developerPayload)
+		if len(developerContext) > maxDeveloperContextBytes {
+			return TurnContextPlan{}, errf(409, "compiled Loom Developer context is %d bytes; maximum is %d bytes and it will not be truncated", len(developerContext), maxDeveloperContextBytes)
+		}
+		return TurnContextPlan{
+			DeveloperContext: developerContext,
+			InputContext:     renderLoomInputContext(compiledAt, ContextEpoch{}, source, contextFragmentsForChannel(fragments, fragments, "input"), artifacts, nil),
+		}, nil
+	}
 	h.contextCoverageMu.Lock()
 	defer h.contextCoverageMu.Unlock()
 	history, err := h.contextHistory(threadID, rollout.ContextHistoryQuery{})
@@ -459,6 +475,13 @@ func (h *Hub) prepareTurnContext(agentID string, source turnContextSource, artif
 		InputContext:     inputContext,
 		Attempt:          cloneContextAttempt(attempt),
 	}, nil
+}
+
+func renderPiDeveloperContext(compiledAt, payload string) string {
+	if strings.TrimSpace(payload) == "" {
+		return ""
+	}
+	return `<loom_developer_context version="1" compiled_at="` + xmlEscape(compiledAt) + `" complete="true" atomic="true">` + "\n" + payload + "\n</loom_developer_context>"
 }
 
 func contextFragmentsForChannel(all, selected []contextFragment, channel string) []contextFragment {
@@ -845,7 +868,10 @@ func renderLoomInputContext(compiledAt string, epoch ContextEpoch, source turnCo
 	}
 
 	var b strings.Builder
-	b.WriteString(`<loom_context version="1" compiled_at="` + xmlEscape(compiledAt) + `" epoch_id="` + xmlEscape(epoch.ID) + `"`)
+	b.WriteString(`<loom_context version="1" compiled_at="` + xmlEscape(compiledAt) + `"`)
+	if epoch.ID != "" {
+		b.WriteString(` epoch_id="` + xmlEscape(epoch.ID) + `"`)
+	}
 	if len(fragments) > 0 && attempt != nil {
 		b.WriteByte(' ')
 		b.WriteString(contextDeliveryMarker(attempt.ID, "input"))

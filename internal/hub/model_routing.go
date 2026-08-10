@@ -68,22 +68,40 @@ func (h *Hub) scheduleModelRouteInterruptLocked(agentID string, turn *turnState,
 // In particular, it never follows an app-server active-Turn mismatch to a
 // successor Turn.
 func (h *Hub) interruptTurnIfActive(agentID string, expected *turnState, reason string) (bool, error) {
-	h.mu.Lock()
-	meta := h.agents[agentID]
-	rt := h.runtimes[agentID]
-	if meta == nil || rt == nil || expected == nil || expected.finished || rt.activeTurn != expected {
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	var rt *runtime
+	var threadID, turnID string
+	for turnID == "" {
+		h.mu.Lock()
+		meta := h.agents[agentID]
+		rt = h.runtimes[agentID]
+		if meta == nil || rt == nil || expected == nil || expected.finished || rt.activeTurn != expected {
+			h.mu.Unlock()
+			return false, nil
+		}
+		threadID = meta.RuntimeBinding.NativeRef
+		turnID = expected.nativeTurnID
+		if turnID != "" {
+			h.mu.Unlock()
+			break
+		}
+		if expected.nativeTurnReady == nil {
+			expected.nativeTurnReady = make(chan struct{})
+		}
+		ready := expected.nativeTurnReady
+		stopped := expected.stopWatchdog
 		h.mu.Unlock()
-		return false, nil
-	}
-	threadID := meta.RuntimeBinding.NativeRef
-	turnID := expected.turnID
-	client := rt.client
-	h.mu.Unlock()
 
-	if turnID == "" {
-		return false, fmt.Errorf("model routing error Turn is still starting")
+		select {
+		case <-ready:
+		case <-stopped:
+			return false, nil
+		case <-deadline.C:
+			return false, fmt.Errorf("model routing error Turn is still starting")
+		}
 	}
-	_, err := client.Request("turn/interrupt", map[string]any{
+	_, err := rt.client.Request("turn/interrupt", map[string]any{
 		"threadId": threadID,
 		"turnId":   turnID,
 	}, 10*time.Second)

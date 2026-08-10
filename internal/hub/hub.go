@@ -72,6 +72,7 @@ type Agent struct {
 	Cwd                   string                  `json:"cwd"`
 	ThreadID              string                  `json:"threadId"`
 	RuntimeBinding        RuntimeBinding          `json:"runtimeBinding"`
+	RuntimeTurnBindings   map[string]string       `json:"runtimeTurnBindings,omitempty"`
 	Sandbox               string                  `json:"sandbox"`
 	ApprovalPolicy        string                  `json:"approvalPolicy"`
 	ProviderID            string                  `json:"providerId,omitempty"`
@@ -106,6 +107,7 @@ type AgentView struct {
 	Goal                *ThreadGoal         `json:"goal,omitempty"`
 	LastSeq             int64               `json:"lastSeq"`
 	nativeRuntimeRef    string
+	nativeTurnBindings  map[string]string
 }
 
 // SessionView is the pre-CodexLoom compatibility name.
@@ -237,6 +239,8 @@ type approval struct {
 
 type turnState struct {
 	turnID            string
+	nativeTurnID      string
+	nativeTurnReady   chan struct{}
 	startedConfirmed  bool
 	task              string
 	source            string
@@ -1037,7 +1041,7 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 			return nil, err
 		}
 		rt = &runtime{agentID: meta.ID, agentRuntime: backend, ready: make(chan struct{}), approvals: map[string]*approval{}}
-	} else {
+	} else if meta.RuntimeBinding.Kind == "codex" {
 		host, err := h.ensureCodexHostLocked()
 		if err != nil {
 			return nil, err
@@ -1046,6 +1050,16 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 			agentID: meta.ID, agentRuntime: host.agentRuntime, client: host.client, hostGeneration: host.generation,
 			ready: make(chan struct{}), approvals: map[string]*approval{},
 		}
+	} else if meta.RuntimeBinding.Kind == "pi" {
+		rt = &runtime{agentID: meta.ID, agentRuntime: newPiAgentRuntime(meta.ID, h.st.Dir()), ready: make(chan struct{}), approvals: map[string]*approval{}}
+	} else {
+		return nil, errf(400, "unsupported Runtime kind %q", meta.RuntimeBinding.Kind)
+	}
+	if source, ok := runtimeBackend(rt).(RuntimeEventSource); ok {
+		source.SetRuntimeEventHandlers(
+			func(event RuntimeEvent) { h.onRuntimeEvent(rt, event) },
+			func(err error) { h.onRuntimeFailure(rt, err) },
+		)
 	}
 	h.runtimes[meta.ID] = rt
 	if !h.startWorkerLocked(func() { h.initRuntime(meta.ID, rt) }) {
@@ -1230,7 +1244,7 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 	}
 	h.mu.Unlock()
 	if strings.TrimSpace(threadID) == "" {
-		return errf(409, "agent has no Codex Thread binding")
+		return errf(409, "agent has no Runtime conversation binding")
 	}
 	backend := runtimeBackend(rt)
 	if backend == nil {
@@ -1243,7 +1257,7 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 		if codex.IsRequestTimeout(err) {
 			h.markThreadControlIndeterminate(rt, threadID, "thread/resume")
 		}
-		return errf(500, "resume Codex Thread: %s", err)
+		return errf(500, "resume Runtime conversation: %s", err)
 	}
 	h.mu.Lock()
 	if h.runtimes[agentID] == rt {
@@ -1371,89 +1385,49 @@ func displayLoomControlTask(text string) (string, bool) {
 	}
 }
 
-func (h *Hub) adoptRemoteTurnLocked(meta *Agent, rt *runtime, turnID string) *turnState {
+func (h *Hub) adoptRemoteTurnLocked(meta *Agent, rt *runtime, nativeTurnID string) *turnState {
 	turn := &turnState{
-		turnID: turnID, startedConfirmed: true, task: "Remote turn", source: "remote",
+		turnID: newIntegrationID("turn"), nativeTurnID: nativeTurnID, startedConfirmed: true, task: "Remote turn", source: "remote",
 		startedAt: time.Now(), lastActivity: time.Now(), stopWatchdog: make(chan struct{}),
 	}
+	h.recordRuntimeTurnBindingLocked(meta, turn.turnID, nativeTurnID)
 	rt.activeTurn = turn
 	meta.Status = "running"
 	meta.CurrentTask = turn.task
-	meta.CurrentTurnID = turnID
+	meta.CurrentTurnID = turn.turnID
 	meta.LastError = ""
 	meta.UpdatedAt = now()
 	h.persistRuntimeProjectionLocked()
 	h.emitStatusLocked(meta, "running")
 	h.emitLocked(meta.ID, "loom/turn-started", map[string]any{
-		"turnId": turnID, "task": turn.task, "source": turn.source,
+		"turnId": turn.turnID, "task": turn.task, "source": turn.source,
 		"providerId": publicProviderID(meta.ProviderID), "model": meta.Model,
 	})
 	return turn
 }
 
-// rebindActiveTurnIDLocked reconciles a locally reserved Turn with the
-// authoritative id emitted by app-server. The associated Inbox/Message
-// records must move with it or completion would leave the work item hanging.
-func (h *Hub) rebindActiveTurnIDLocked(meta *Agent, turn *turnState, turnID string) {
-	turnID = strings.TrimSpace(turnID)
-	if turn == nil || turn.finished || turnID == "" || turn.turnID == turnID {
+func (h *Hub) bindActiveNativeTurnIDLocked(meta *Agent, turn *turnState, nativeTurnID string) {
+	nativeTurnID = strings.TrimSpace(nativeTurnID)
+	if turn == nil || turn.finished || nativeTurnID == "" || turn.nativeTurnID == nativeTurnID {
 		return
 	}
-	previousTurnID := turn.turnID
-	turn.turnID = turnID
-	h.rebindContextAttemptTurn(meta.RuntimeBinding.NativeRef, turn.contextAttemptID, previousTurnID, turnID)
-
-	// Establish records that are still at the pre-start boundary first.
-	h.markInboxAttemptRunningLocked(turn)
-	if err := h.markAgentMessageHandlingRunningLocked(turn, meta.ID); err != nil {
-		log.Printf("[codex-loom] establish reconciled message handling %s: %v", turn.agentMessageID, err)
+	firstBinding := turn.nativeTurnID == ""
+	turn.nativeTurnID = nativeTurnID
+	if firstBinding && turn.nativeTurnReady != nil {
+		close(turn.nativeTurnReady)
 	}
-
-	if attempt := h.attempts[turn.attemptID]; attempt != nil &&
-		(attempt.TurnID == "" || attempt.TurnID == previousTurnID) {
-		next := *attempt
-		next.TurnID = turnID
-		if err := h.commitAttemptLocked(next); err != nil {
-			log.Printf("[codex-loom] persist reconciled Inbox attempt %s: %v", next.ID, err)
-		}
-	}
-	if message := h.comms[turn.agentMessageID]; message != nil {
-		next := *message
-		next.HandlingAttempts = cloneAgentMessageHandlingAttempts(message.HandlingAttempts)
-		changed := false
-		if next.DeliveredTurnID == "" || next.DeliveredTurnID == previousTurnID {
-			next.DeliveredTurnID = turnID
-			changed = true
-		}
-		for i := range next.HandlingAttempts {
-			attempt := &next.HandlingAttempts[i]
-			if (turn.handlingAttemptID != "" && attempt.ID == turn.handlingAttemptID) ||
-				(turn.handlingAttemptID == "" && next.ActiveHandlingID != "" && attempt.ID == next.ActiveHandlingID) {
-				if attempt.TurnID == "" || attempt.TurnID == previousTurnID {
-					attempt.TurnID = turnID
-					changed = true
-				}
-				break
-			}
-		}
-		if changed {
-			next.UpdatedAt = now()
-			if err := h.commitAgentMessageLocked(next); err != nil {
-				log.Printf("[codex-loom] persist reconciled message handling %s: %v", next.ID, err)
-			}
-		}
-	}
-
-	meta.Status = "running"
-	meta.CurrentTurnID = turnID
-	meta.UpdatedAt = now()
+	h.recordRuntimeTurnBindingLocked(meta, turn.turnID, nativeTurnID)
 	h.persistRuntimeProjectionLocked()
-	if previousTurnID != "" {
-		log.Printf("[codex-loom] reconciled active Turn for %s: %s -> %s", meta.Name, previousTurnID, turnID)
-		h.emitLocked(meta.ID, "loom/turn-reconciled", map[string]any{
-			"previousTurnId": previousTurnID, "turnId": turnID, "source": turn.source,
-		})
+}
+
+func (h *Hub) recordRuntimeTurnBindingLocked(meta *Agent, turnID, nativeTurnID string) {
+	if meta == nil || turnID == "" || nativeTurnID == "" {
+		return
 	}
+	if meta.RuntimeTurnBindings == nil {
+		meta.RuntimeTurnBindings = map[string]string{}
+	}
+	meta.RuntimeTurnBindings[turnID] = nativeTurnID
 }
 
 func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage) {
@@ -1464,39 +1438,85 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 		return
 	}
 	runtimeEvents := normalizeRuntimeEvents(rt, method, params)
-	var runtimeEvent RuntimeEvent
-	if len(runtimeEvents) > 0 {
-		runtimeEvent = runtimeEvents[0]
+	for _, runtimeEvent := range runtimeEvents {
+		h.onRuntimeEventLocked(meta, rt, runtimeEvent, method, params)
 	}
-	turnID := runtimeEvent.NativeTurnID
+	// Codex reports model-route failures as raw `error` notifications. They do
+	// not normalize into a RuntimeEvent, but still need to affect the active
+	// Turn exactly once.
+	if method == "error" && rt.activeTurn != nil && !rt.activeTurn.finished && rt.activeTurn.forcedFailure == "" {
+		if failure, interrupt := customProviderModelRouteFailure(meta.ProviderID, meta.Model, params); failure != "" {
+			rt.activeTurn.forcedFailure = failure
+			if interrupt {
+				h.scheduleModelRouteInterruptLocked(meta.ID, rt.activeTurn, failure)
+			}
+		}
+	}
+	if method == "thread/goal/updated" || method == "thread/goal/cleared" {
+		h.onGoalNotificationLocked(meta.ID, method, params)
+	}
+	if len(runtimeEvents) > 0 {
+		h.emitLocked(meta.ID, method, runtimeCompatibilityPayload(params))
+	} else {
+		h.emitLocked(meta.ID, method, params)
+	}
+}
 
-	if runtimeEvent.Kind == RuntimeTurnStarted && turnID != "" {
+func (h *Hub) onRuntimeEvent(rt *runtime, event RuntimeEvent) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta := h.agents[rt.agentID]
+	if meta != nil {
+		h.onRuntimeEventLocked(meta, rt, event, "", nil)
+	}
+}
+
+func (h *Hub) onRuntimeFailure(rt *runtime, err error) {
+	if err == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta := h.agents[rt.agentID]
+	if meta == nil {
+		return
+	}
+	if rt.activeTurn == nil || rt.activeTurn.finished {
+		meta.LastError = err.Error()
+		meta.UpdatedAt = now()
+		h.persistRuntimeProjectionLocked()
+		h.emitLocked(meta.ID, "loom/runtime-failed", map[string]any{"error": err.Error()})
+		return
+	}
+	h.onRuntimeEventLocked(meta, rt, RuntimeEvent{Kind: RuntimeTurnFailed, Error: err.Error()}, "", nil)
+}
+
+func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent RuntimeEvent, method string, params json.RawMessage) {
+	nativeTurnID := runtimeEvent.NativeTurnID
+
+	if runtimeEvent.Kind == RuntimeTurnStarted {
 		switch turn := rt.activeTurn; {
 		case turn == nil || turn.finished:
-			h.adoptRemoteTurnLocked(meta, rt, turnID)
-		case turn.turnID == "":
-			h.rebindActiveTurnIDLocked(meta, turn, turnID)
+			if nativeTurnID != "" {
+				h.adoptRemoteTurnLocked(meta, rt, nativeTurnID)
+			}
+		case turn.nativeTurnID == "":
+			h.bindActiveNativeTurnIDLocked(meta, turn, nativeTurnID)
 			turn.startedConfirmed = true
-		case turn.turnID == turnID:
+		case nativeTurnID == "", turn.nativeTurnID == nativeTurnID:
 			turn.startedConfirmed = true
 		case !turn.startedConfirmed:
-			// turn/start may answer with a stale id immediately before the
-			// authoritative notification arrives. Preserve the local work
-			// context and move every linked record to the notified id.
-			h.rebindActiveTurnIDLocked(meta, turn, turnID)
+			h.bindActiveNativeTurnIDLocked(meta, turn, nativeTurnID)
 			turn.startedConfirmed = true
 		default:
-			// A confirmed Turn was superseded without its terminal event being
-			// observed. Close only that stale projection, then adopt the actual
-			// app-server Turn. Pending workers will see the new active Turn.
 			previousTurnID := turn.turnID
-			h.finishTurnLocked(meta, rt, "interrupted", "superseded by active Turn "+turnID)
-			h.adoptRemoteTurnLocked(meta, rt, turnID)
-			log.Printf("[codex-loom] adopted successor Turn for %s: %s -> %s", meta.Name, previousTurnID, turnID)
+			h.finishTurnLocked(meta, rt, "interrupted", "superseded by active Runtime Turn "+nativeTurnID)
+			h.adoptRemoteTurnLocked(meta, rt, nativeTurnID)
+			log.Printf("[codex-loom] adopted successor Turn for %s after %s", meta.Name, previousTurnID)
 		}
 	}
 	activeEvent := rt.activeTurn != nil && !rt.activeTurn.finished &&
-		(turnID == "" || rt.activeTurn.turnID == "" || rt.activeTurn.turnID == turnID)
+		(nativeTurnID == "" || rt.activeTurn.nativeTurnID == nativeTurnID)
 	if text := runtimeEvent.Text; runtimeEvent.Kind == RuntimeUserInput && text != "" && activeEvent {
 		task := displayUserTask(text)
 		rt.activeTurn.task = task
@@ -1505,48 +1525,29 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 		h.persistRuntimeProjectionLocked()
 		h.emitStatusLocked(meta, "running")
 	}
-	if method == "thread/goal/updated" || method == "thread/goal/cleared" {
-		h.onGoalNotificationLocked(meta.ID, method, params)
-	}
-
 	if activeEvent {
 		rt.activeTurn.lastActivity = time.Now()
 		if runtimeEvent.Kind == RuntimeTextCompleted && runtimeEvent.Text != "" {
 			rt.activeTurn.finalAnswer = runtimeEvent.Text
 		}
-		if turnID != "" && rt.activeTurn.turnID == "" {
-			h.rebindActiveTurnIDLocked(meta, rt.activeTurn, turnID)
-		}
 		if runtimeEventIsModelProduced(runtimeEvent.Kind) {
 			h.observeContextModelEventLocked(meta, rt.activeTurn)
 		}
-		if method == "error" && rt.activeTurn.forcedFailure == "" {
-			if failure, interrupt := customProviderModelRouteFailure(meta.ProviderID, meta.Model, params); failure != "" {
-				rt.activeTurn.forcedFailure = failure
-				if interrupt {
-					h.scheduleModelRouteInterruptLocked(meta.ID, rt.activeTurn, failure)
-				}
-			}
-		}
 	}
 
-	h.emitRuntimeEventsLocked(meta, rt, runtimeEvents)
-	if len(runtimeEvents) > 0 {
-		h.emitLocked(meta.ID, method, runtimeCompatibilityPayload(params))
-	} else {
-		h.emitLocked(meta.ID, method, params)
-	}
+	h.emitRuntimeEventsLocked(meta, rt, []RuntimeEvent{runtimeEvent})
 
 	switch runtimeEvent.Kind {
 	case RuntimeTurnCompleted, RuntimeTurnFailed, RuntimeTurnInterrupted:
 		if rt.activeTurn == nil || rt.activeTurn.finished {
 			return
 		}
-		if turnID != "" && rt.activeTurn.turnID == "" {
-			h.rebindActiveTurnIDLocked(meta, rt.activeTurn, turnID)
+		if nativeTurnID != "" && rt.activeTurn.nativeTurnID == "" {
+			log.Printf("[codex-loom] ignored terminal event without an authoritative Runtime Turn binding on %s: event=%s", meta.Name, nativeTurnID)
+			return
 		}
-		if turnID != "" && rt.activeTurn.turnID != "" && rt.activeTurn.turnID != turnID {
-			log.Printf("[codex-loom] ignored terminal event for stale Turn on %s: active=%s event=%s", meta.Name, rt.activeTurn.turnID, turnID)
+		if nativeTurnID != "" && rt.activeTurn.nativeTurnID != "" && rt.activeTurn.nativeTurnID != nativeTurnID {
+			log.Printf("[codex-loom] ignored terminal event for stale Runtime Turn on %s: active=%s event=%s", meta.Name, rt.activeTurn.nativeTurnID, nativeTurnID)
 			return
 		}
 		status := "completed"
@@ -1843,8 +1844,13 @@ func (h *Hub) finishAgentMessageTurnLocked(turn *turnState, status, errMsg strin
 // ---- public API ----
 
 func (h *Hub) viewLocked(meta *Agent) AgentView {
-	view := AgentView{Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID], nativeRuntimeRef: meta.RuntimeBinding.NativeRef}
+	bindings := make(map[string]string, len(meta.RuntimeTurnBindings))
+	for turnID, nativeTurnID := range meta.RuntimeTurnBindings {
+		bindings[turnID] = nativeTurnID
+	}
+	view := AgentView{Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID], nativeRuntimeRef: meta.RuntimeBinding.NativeRef, nativeTurnBindings: bindings}
 	view.RuntimeBinding.NativeRef = ""
+	view.RuntimeTurnBindings = nil
 	backend := runtimeForKind(meta.RuntimeBinding.Kind)
 	if rt := h.runtimes[meta.ID]; rt != nil {
 		backend = runtimeBackend(rt)
@@ -1871,6 +1877,8 @@ func runtimeForKind(kind string) AgentRuntime {
 	switch kind {
 	case "codex":
 		return &codexAgentRuntime{}
+	case "pi":
+		return &piAgentRuntime{}
 	default:
 		return nil
 	}
@@ -1895,6 +1903,7 @@ func applyRolloutStatus(view *AgentView) {
 	if err != nil || latest == nil || latest.ID == "" {
 		return
 	}
+	latest.ID = loomTurnIDFor(view, latest.ID)
 	// A restart-interrupted Turn remains visible until explicitly continued or
 	// dismissed. Its rollout has no terminal event by definition, so do not
 	// mistake a recently-written orphan for a live external Turn.

@@ -35,8 +35,9 @@ func TestSharedCodexHostRoutesRemoteTurnIntoAgentEvents(t *testing.T) {
 	for time.Now().Before(deadline) {
 		h.mu.Lock()
 		last := h.agents["agent-1"].LastTurn
+		settled := last != nil && h.agents["agent-1"].RuntimeTurnBindings[last.TurnID] == "turn-remote"
 		h.mu.Unlock()
-		if last != nil && last.TurnID == "turn-remote" {
+		if settled {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -50,7 +51,8 @@ func TestSharedCodexHostRoutesRemoteTurnIntoAgentEvents(t *testing.T) {
 	if host == nil || runtime == nil || runtime.client != host.client {
 		t.Fatalf("Agent runtime is not attached to the shared CodexHost")
 	}
-	if agent.Status != "idle" || agent.LastTurn == nil || agent.LastTurn.TurnID != "turn-remote" {
+	if agent.Status != "idle" || agent.LastTurn == nil || agent.LastTurn.TurnID == "turn-remote" ||
+		agent.RuntimeTurnBindings[agent.LastTurn.TurnID] != "turn-remote" {
 		t.Fatalf("Agent state after Remote turn = %#v", agent)
 	}
 
@@ -137,7 +139,8 @@ func TestSharedCodexHostAdoptsRemoteResumedThreadOnTurnStart(t *testing.T) {
 	if adopted == nil {
 		t.Fatal("Remote resumed Thread was not adopted")
 	}
-	if adopted.Status != "running" || adopted.CurrentTurnID != "turn-resumed" || adopted.Source != "remote" {
+	if adopted.Status != "running" || adopted.CurrentTurnID == "" || adopted.CurrentTurnID == "turn-resumed" ||
+		adopted.RuntimeTurnBindings[adopted.CurrentTurnID] != "turn-resumed" || adopted.Source != "remote" {
 		t.Fatalf("adopted Agent = %#v", adopted)
 	}
 	if adopted.Cwd != "/tmp/remote-project" || adopted.Name != "mobile-research" {
@@ -159,13 +162,14 @@ func TestInterruptRetriesWithAuthoritativeActiveTurnID(t *testing.T) {
 	}
 
 	turn := &turnState{
-		turnID: "turn-stale", task: "Investigate", source: "owner", startedAt: time.Now(),
+		turnID: "turn-loom", nativeTurnID: "turn-stale", task: "Investigate", source: "owner", startedAt: time.Now(),
 		stopWatchdog: make(chan struct{}),
 	}
 	h.mu.Lock()
 	h.agents["agent-race"] = &Agent{
 		ID: "agent-race", Name: "race", ThreadID: "loom-thr-interrupt-race", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-interrupt-race"}, Status: "running",
-		CurrentTurnID: "turn-stale", CurrentTask: "Investigate", CreatedAt: now(), UpdatedAt: now(),
+		RuntimeTurnBindings: map[string]string{"turn-loom": "turn-stale"},
+		CurrentTurnID:       "turn-loom", CurrentTask: "Investigate", CreatedAt: now(), UpdatedAt: now(),
 	}
 	h.runtimes["agent-race"] = &runtime{
 		agentID: "agent-race", client: host.client, hostGeneration: host.generation,
@@ -194,7 +198,8 @@ func TestInterruptRetriesWithAuthoritativeActiveTurnID(t *testing.T) {
 	h.mu.Lock()
 	meta := *h.agents["agent-race"]
 	h.mu.Unlock()
-	if meta.Status != "idle" || meta.LastTurn == nil || meta.LastTurn.TurnID != "turn-actual" || meta.LastTurn.Status != "interrupted" {
+	if meta.Status != "idle" || meta.LastTurn == nil || meta.LastTurn.TurnID != "turn-loom" || meta.LastTurn.Status != "interrupted" ||
+		meta.RuntimeTurnBindings["turn-loom"] != "turn-actual" {
 		t.Fatalf("Agent after reconciled interrupt = %#v", meta)
 	}
 	if got := countRequestMethod(t, logPath, "turn/interrupt"); got != 2 {
@@ -328,8 +333,11 @@ func TestSendTaskResumesCachedThreadBeforeTurnStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.TurnID != "turn-stale" {
-		t.Fatalf("turn id = %q, want turn-stale", result.TurnID)
+	if result.TurnID == "" || result.TurnID == "turn-stale" {
+		t.Fatalf("Loom turn id = %q", result.TurnID)
+	}
+	if got := h.agents["agent-stale"].RuntimeTurnBindings[result.TurnID]; got != "turn-stale" {
+		t.Fatalf("native Turn binding = %q, want turn-stale", got)
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("cached Thread was not resumed before turn/start: %v", err)
@@ -342,6 +350,9 @@ func TestSendTaskResumesCachedThreadBeforeTurnStart(t *testing.T) {
 		t.Fatalf("thread/resume binding = %#v, want deepseek/deepseek-v4-flash", resume)
 	}
 	turn := lastRequestParams(t, logPath, "turn/start")
+	if turn["threadId"] != "thr-stale" {
+		t.Fatalf("turn/start threadId = %#v, want thr-stale", turn["threadId"])
+	}
 	policy, ok := turn["sandboxPolicy"].(map[string]any)
 	if !ok || policy["type"] != "dangerFullAccess" {
 		t.Fatalf("turn/start sandboxPolicy = %#v, want dangerFullAccess", turn["sandboxPolicy"])
@@ -418,7 +429,7 @@ func TestSendTaskDoesNotPinSkillsForExternalFacingAgent(t *testing.T) {
 	defer h.Shutdown()
 	h.addresses = map[string]*AgentAddress{}
 	h.agents["agent-external"] = &Agent{
-		ID: "agent-external", Name: "external", Cwd: "/tmp/one", ThreadID: "thr-stale",
+		ID: "agent-external", Name: "external", Cwd: "/tmp/one", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		CreatedAt: now(), UpdatedAt: now(),
 	}

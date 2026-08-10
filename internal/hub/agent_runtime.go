@@ -24,6 +24,13 @@ type AgentRuntime interface {
 	Close()
 }
 
+// RuntimeEventSource is implemented by per-Agent Runtimes that deliver
+// normalized events directly instead of sharing CodexHost's notification
+// connection. Hub remains the owner of Turn causality and terminal state.
+type RuntimeEventSource interface {
+	SetRuntimeEventHandlers(func(RuntimeEvent), func(error))
+}
+
 type RuntimeBindingRequest struct {
 	NativeRef          string
 	Name               string

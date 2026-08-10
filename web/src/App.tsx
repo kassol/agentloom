@@ -582,6 +582,7 @@ export default function App() {
   const [newName, setNewName] = useState("");
   const [newCwd, setNewCwd] = useState("");
   const [newDomain, setNewDomain] = useState("");
+	const [newRuntimeKind, setNewRuntimeKind] = useState<"codex" | "pi">("codex");
   const [newProviderId, setNewProviderId] = useState("openai");
   const [newModel, setNewModel] = useState("");
   const [newEffort, setNewEffort] = useState("");
@@ -773,7 +774,7 @@ export default function App() {
       showToast("working directory must be an absolute path");
       return;
     }
-    if (!creatableProviders.some((provider) => provider.id === newProviderId)) {
+    if (newRuntimeKind === "codex" && !creatableProviders.some((provider) => provider.id === newProviderId)) {
       showToast("configure and verify a model Provider first");
       return;
     }
@@ -781,10 +782,10 @@ export default function App() {
     try {
       const data = await api("POST", "/api/agents", {
         name: newName.trim(), cwd: newCwd.trim(),
-		providerId: newProviderId === "openai" ? "" : newProviderId,
-		runtimeKind: "codex",
-        model: newModel.trim(),
-        effort: newEffort,
+		providerId: newRuntimeKind === "codex" && newProviderId !== "openai" ? newProviderId : "",
+		runtimeKind: newRuntimeKind,
+        model: newRuntimeKind === "codex" ? newModel.trim() : "",
+        effort: newRuntimeKind === "codex" ? newEffort : "",
       });
       if (newDomain.trim()) {
         await api("PUT", `/api/agents/${encodeURIComponent(data.agent.id)}/profile`, { identity: "", domain: newDomain.trim(), scope: "", expectedVersion: 0 });
@@ -1482,10 +1483,12 @@ export default function App() {
 			</label>
 			<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
 				Runtime
-				<select value="codex" disabled className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px] disabled:opacity-60">
+				<select value={newRuntimeKind} onChange={(event) => setNewRuntimeKind(event.target.value as "codex" | "pi")} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px]">
 					<option value="codex">Codex</option>
+					<option value="pi">Pi</option>
 				</select>
 			</label>
+			{newRuntimeKind === "codex" ? <>
             <div className="grid gap-3 sm:grid-cols-2">
               <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
                 Provider
@@ -1522,13 +1525,14 @@ export default function App() {
                 </select>
               </label>;
             })()}
+			</> : <div className="rounded-md bg-muted/40 px-3 py-2 text-[11px] leading-4 text-muted-foreground">Pi inherits its native model, authentication, settings, skills, and extensions.</div>}
             <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
               Domain <span className="font-normal text-muted-foreground/70">optional</span>
               <textarea value={newDomain} onChange={(event) => setNewDomain(event.target.value)} placeholder="The enduring subject this Agent will maintain" rows={3} className="w-full resize-y rounded-sm border border-input bg-background px-3 py-2 text-[12px] leading-5 outline-none focus:border-ring focus:ring-2 focus:ring-ring/15" />
             </label>
           </div>
           <DialogFooter showCloseButton>
-            <Button onClick={create} disabled={creatingAgent || creatableProviders.length === 0}>{creatingAgent ? <span className="spinner size-3" /> : <Plus />}{creatingAgent ? "Creating" : "Create agent"}</Button>
+            <Button onClick={create} disabled={creatingAgent || (newRuntimeKind === "codex" && creatableProviders.length === 0)}>{creatingAgent ? <span className="spinner size-3" /> : <Plus />}{creatingAgent ? "Creating" : "Create agent"}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

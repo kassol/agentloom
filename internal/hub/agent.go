@@ -161,8 +161,11 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 	if p.RuntimeKind == "" {
 		return AgentView{}, errf(400, "runtimeKind is required")
 	}
-	if p.RuntimeKind != "codex" {
+	if p.RuntimeKind != "codex" && p.RuntimeKind != "pi" {
 		return AgentView{}, errf(400, "unsupported Runtime kind %q", p.RuntimeKind)
+	}
+	if p.RuntimeKind == "pi" && (strings.TrimSpace(p.ProviderID) != "" || strings.TrimSpace(p.Model) != "" || strings.TrimSpace(p.Effort) != "") {
+		return AgentView{}, errf(400, "Pi Runtime inherits its native model settings; providerId, model, and effort are Codex-only")
 	}
 	if !nameRe.MatchString(p.Name) {
 		return AgentView{}, errf(400, "name must match [a-zA-Z0-9_-]+")
@@ -211,8 +214,9 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 	}
 	meta := &Agent{
 		ID: id, Name: p.Name, Cwd: p.Cwd, ThreadID: newIntegrationID("thr"),
-		RuntimeBinding: RuntimeBinding{Kind: p.RuntimeKind},
-		Sandbox:        p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort,
+		RuntimeBinding:      RuntimeBinding{Kind: p.RuntimeKind},
+		RuntimeTurnBindings: map[string]string{},
+		Sandbox:             p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort,
 		Status: "idle", CreatedAt: now(), UpdatedAt: now(),
 	}
 	h.agents[id] = meta
@@ -232,9 +236,9 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 		persistErr := h.persistAgentsLocked()
 		h.mu.Unlock()
 		if persistErr != nil {
-			return AgentView{}, errf(500, "failed to start codex thread: %s; remove failed Agent: %s", err, persistErr)
+			return AgentView{}, errf(500, "failed to start Runtime binding: %s; remove failed Agent: %s", err, persistErr)
 		}
-		return AgentView{}, errf(500, "failed to start codex thread: %s", err)
+		return AgentView{}, errf(500, "failed to start Runtime binding: %s", err)
 	}
 
 	h.mu.Lock()
@@ -268,7 +272,7 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	if p.ID == "" || p.Name == "" || p.Cwd == "" || p.ThreadID == "" || p.RuntimeBinding.Kind == "" || p.RuntimeBinding.NativeRef == "" {
 		return AgentView{}, errf(400, "id, name, cwd, threadId, and Runtime Binding are required")
 	}
-	if p.RuntimeBinding.Kind != "codex" {
+	if p.RuntimeBinding.Kind != "codex" && p.RuntimeBinding.Kind != "pi" {
 		return AgentView{}, errf(400, "unsupported Runtime kind %q", p.RuntimeBinding.Kind)
 	}
 	if !nameRe.MatchString(p.Name) {
@@ -483,6 +487,9 @@ func (h *Hub) SyncThreadNames() error {
 	h.mu.Lock()
 	byThreadID := make(map[string]namedThread, len(h.agents))
 	for _, meta := range h.agents {
+		if meta.RuntimeBinding.Kind != "codex" {
+			continue
+		}
 		if strings.TrimSpace(meta.RuntimeBinding.NativeRef) == "" || strings.TrimSpace(meta.Name) == "" {
 			continue
 		}
@@ -727,6 +734,7 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 		return SendResult{}, errf(409, "agent %q is already running a task", meta.Name)
 	}
 	turn := &turnState{
+		turnID:         newIntegrationID("turn"),
 		task:           taskText,
 		source:         turnSource(inboxItemID, agentMessageID),
 		inboxItemID:    inboxItemID,
@@ -753,7 +761,7 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 	meta.Source = "" // adopting an edge mirror into CodexLoom's own registry
 	meta.Status = "running"
 	meta.CurrentTask = taskText
-	meta.CurrentTurnID = ""
+	meta.CurrentTurnID = turn.turnID
 	meta.LastError = ""
 	meta.UpdatedAt = now()
 	if err := h.persistAgentsLocked(); err != nil {
@@ -800,15 +808,21 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 		return SendResult{}, errf(500, "turn/start failed: %s", err)
 	}
 	h.mu.Lock()
-	if turnID != "" && turn.turnID == "" && !turn.finished {
-		turn.turnID = turnID
-		h.markInboxAttemptRunningLocked(turn)
-		if m := h.agents[agentID]; m != nil {
-			m.CurrentTurnID = turnID
-			h.persistRuntimeProjectionLocked()
-		}
+	if turn.finished {
+		canonicalTurnID := turn.turnID
+		h.mu.Unlock()
+		return SendResult{Dispatched: true, AgentID: agentID, SessionID: agentID, TurnID: canonicalTurnID}, nil
 	}
-	if agentMessageID != "" && turnID != "" && !turn.finished {
+	if turnID != "" && !turn.finished {
+		// A turn/started notification can race ahead of the turn/start response.
+		// Once that notification confirmed a native Turn, a stale response must
+		// not replace the authoritative binding.
+		if turn.nativeTurnID == "" || !turn.startedConfirmed {
+			h.bindActiveNativeTurnIDLocked(meta, turn, turnID)
+		}
+		h.markInboxAttemptRunningLocked(turn)
+	}
+	if agentMessageID != "" && !turn.finished {
 		if err := h.markAgentMessageHandlingRunningLocked(turn, agentID); err != nil {
 			log.Printf("[codex-loom] save started message handling %s: %v", agentMessageID, err)
 		}
@@ -965,7 +979,8 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	turn := rt.activeTurn
 	agentID := meta.ID
 	threadID := meta.RuntimeBinding.NativeRef
-	turnID := turn.turnID
+	turnID := turn.nativeTurnID
+	runtimeKind := meta.RuntimeBinding.Kind
 	backend := runtimeBackend(rt)
 	heldMessageID := turn.agentMessageID
 	heldSubject := ""
@@ -974,7 +989,7 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	}
 	h.mu.Unlock()
 
-	if turnID == "" {
+	if turnID == "" && runtimeKind != "pi" {
 		return InterruptResult{}, errf(409, "active Turn is still starting; retry shortly")
 	}
 	interrupt := func(targetTurnID string) error {
@@ -992,13 +1007,13 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 		if currentMeta != nil && currentRuntime == rt && rt.activeTurn != nil && !rt.activeTurn.finished {
 			current := rt.activeTurn
 			switch {
-			case current.turnID == actualTurnID:
+			case current.nativeTurnID == actualTurnID:
 				retryTurn = current
-			case current.turnID == turnID && !current.startedConfirmed:
-				h.rebindActiveTurnIDLocked(currentMeta, current, actualTurnID)
+			case current.nativeTurnID == turnID && !current.startedConfirmed:
+				h.bindActiveNativeTurnIDLocked(currentMeta, current, actualTurnID)
 				current.startedConfirmed = true
 				retryTurn = current
-			case current.turnID == turnID:
+			case current.nativeTurnID == turnID:
 				h.finishTurnLocked(currentMeta, rt, "interrupted", "superseded by active Turn "+actualTurnID)
 				retryTurn = h.adoptRemoteTurnLocked(currentMeta, rt, actualTurnID)
 			}
@@ -1096,10 +1111,13 @@ func (h *Hub) ArchiveAgent(key string) (map[string]any, error) {
 	killed.Status = "killed"
 	h.emitStatusLocked(&killed, "killed")
 	h.mu.Unlock()
+	if backend := runtimeBackend(rt); backend != nil && meta.RuntimeBinding.Kind != "codex" {
+		backend.Close()
+	}
 
 	// Codex Thread archival is a consequence of the committed Loom state. A
 	// failure here does not resurrect the governance entity.
-	if rt != nil && !rt.client.Closed() && waitReady(rt) == nil {
+	if rt != nil && rt.client != nil && !rt.client.Closed() && waitReady(rt) == nil {
 		_, _ = rt.client.Request("thread/archive", map[string]any{"threadId": threadID}, 10*time.Second)
 	}
 	return map[string]any{"archived": true, "killed": true, "id": agentID, "name": name}, nil
@@ -1161,9 +1179,7 @@ type TurnDetail struct {
 	Items          []map[string]any    `json:"items"`
 }
 
-// GetTurn locates a Turn globally by its stable Codex Turn ID. Rollout files
-// remain the history source of truth; Loom contributes the owning Agent and
-// any durable work reference that started the Turn.
+// GetTurn locates a Loom Turn while the Runtime remains the history source.
 func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
 	turnID = strings.TrimSpace(turnID)
 	if turnID == "" {
@@ -1194,7 +1210,8 @@ func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
 		if backend == nil || !backend.Capabilities().History {
 			continue
 		}
-		turn, err := backend.ReadTurn(agent.nativeRuntimeRef, turnID)
+		nativeTurnID := nativeTurnIDFor(&agent, turnID)
+		turn, err := backend.ReadTurn(agent.nativeRuntimeRef, nativeTurnID)
 		if err != nil {
 			if !errors.Is(err, rollout.ErrTurnNotFound) && !errors.Is(err, rollout.ErrRolloutNotFound) && lookupErr == nil {
 				lookupErr = fmt.Errorf("Agent %s (%s): %w", agent.Name, agent.ThreadID, err)
@@ -1206,7 +1223,7 @@ func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
 			items = []map[string]any{}
 		}
 		detail := TurnDetail{
-			ID: turn.ID, AgentID: agent.ID, Agent: agent.Name, ThreadID: agent.ThreadID,
+			ID: turnID, AgentID: agent.ID, Agent: agent.Name, ThreadID: agent.ThreadID,
 			Cwd: agent.Cwd, Status: turn.Status, StartedAt: turn.StartedAt, CompletedAt: turn.CompletedAt,
 			Model: turn.Model, Usage: rolloutTokenUsage(turn.Usage), UsageUpdatedAt: turn.UsageUpdatedAt, Items: items,
 		}
@@ -1305,6 +1322,9 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 		return hist, nil
 	}
 	all := window.Turns
+	for i := range all {
+		all[i].ID = loomTurnIDFor(&view, all[i].ID)
+	}
 	hist.Total = window.Total
 	if len(all) > 0 && all[len(all)-1].Status == "running" && hist.Status != "running" {
 		if latest, err := backend.LatestTurn(threadID); err == nil && latest != nil && latest.Status == "running" && externalTurnLooksLive(threadID, latest.UpdatedAt) {
@@ -1327,6 +1347,26 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 		hist.Turns = append(hist.Turns, turn)
 	}
 	return hist, nil
+}
+
+func nativeTurnIDFor(view *AgentView, turnID string) string {
+	if view != nil {
+		if nativeTurnID := view.nativeTurnBindings[turnID]; nativeTurnID != "" {
+			return nativeTurnID
+		}
+	}
+	return turnID
+}
+
+func loomTurnIDFor(view *AgentView, nativeTurnID string) string {
+	if view != nil {
+		for turnID, candidate := range view.nativeTurnBindings {
+			if candidate == nativeTurnID {
+				return turnID
+			}
+		}
+	}
+	return nativeTurnID
 }
 
 func rolloutTokenUsage(usage *RuntimeTokenUsage) *rollout.TokenUsage {

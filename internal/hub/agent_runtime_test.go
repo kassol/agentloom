@@ -2,6 +2,8 @@ package hub
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ type fakeAgentRuntime struct {
 	closed                                          bool
 	binding                                         string
 	history                                         RuntimeHistory
+	interruptedNative                               string
 }
 
 func (f *fakeAgentRuntime) Alive() bool { return !f.closed }
@@ -34,8 +37,9 @@ func (f *fakeAgentRuntime) Steer(string, string, string, time.Duration) (string,
 	f.steered = true
 	return "native-turn-1", nil
 }
-func (f *fakeAgentRuntime) Interrupt(string, string, time.Duration) error {
+func (f *fakeAgentRuntime) Interrupt(_ string, nativeTurnID string, _ time.Duration) error {
 	f.interrupted = true
+	f.interruptedNative = nativeTurnID
 	return nil
 }
 func (f *fakeAgentRuntime) NormalizeEvent(string, json.RawMessage) []RuntimeEvent { return nil }
@@ -77,27 +81,72 @@ func TestHubRoutesCoreExecutionThroughAgentRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fake.resumed || !fake.started || result.TurnID != "native-turn-1" {
+	if !fake.resumed || !fake.started || result.TurnID == "" || result.TurnID == "native-turn-1" {
 		t.Fatalf("send result = %#v, resumed=%v started=%v", result, fake.resumed, fake.started)
+	}
+	if got := h.agents[agent.ID].RuntimeTurnBindings[result.TurnID]; got != "native-turn-1" {
+		t.Fatalf("durable Runtime Turn binding = %q", got)
 	}
 
 	history, err := h.History(agent.ID, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if history.Total != 1 || len(history.Turns) != 1 || history.Turns[0].ID != "native-turn-1" {
+	if history.Total != 1 || len(history.Turns) != 1 || history.Turns[0].ID != result.TurnID {
 		t.Fatalf("History = %#v", history)
 	}
 
 	if _, err := h.Interrupt(agent.ID, "stop"); err != nil {
 		t.Fatal(err)
 	}
-	if !fake.interrupted {
-		t.Fatal("Interrupt did not reach Agent Runtime")
+	if !fake.interrupted || fake.interruptedNative != "native-turn-1" {
+		t.Fatalf("Interrupt native Turn = %q", fake.interruptedNative)
 	}
 	h.Shutdown()
 	if !fake.closed {
 		t.Fatal("Shutdown did not close Agent Runtime")
+	}
+}
+
+func TestCodexHistoryAndReadTranslateLoomAndNativeTurnIDs(t *testing.T) {
+	sessions := t.TempDir()
+	nativeThreadID := "native-thread-map"
+	nativeTurnID := "native-turn-map"
+	loomTurnID := "turn_loom_map"
+	day := filepath.Join(sessions, "2026", "08", "10")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(day, "rollout-2026-08-10T00-00-00-"+nativeThreadID+".jsonl")
+	rolloutData := `{"timestamp":"2026-08-10T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"native-turn-map"}}
+{"timestamp":"2026-08-10T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"mapped work"}}
+{"timestamp":"2026-08-10T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"native-turn-map"}}
+`
+	if err := os.WriteFile(rolloutPath, []byte(rolloutData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_SESSIONS_DIR", sessions)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "worker", Cwd: t.TempDir(), ThreadID: "thr-loom", Status: "idle",
+		RuntimeBinding:      RuntimeBinding{Kind: "codex", NativeRef: nativeThreadID},
+		RuntimeTurnBindings: map[string]string{loomTurnID: nativeTurnID},
+	}
+	history, err := h.History("agent-1", 10, 0)
+	if err != nil || len(history.Turns) != 1 || history.Turns[0].ID != loomTurnID {
+		t.Fatalf("mapped History = %#v, err=%v", history, err)
+	}
+	detail, err := h.GetTurn(loomTurnID)
+	if err != nil || detail.ID != loomTurnID {
+		t.Fatalf("mapped GetTurn = %#v, err=%v", detail, err)
+	}
+	legacyDetail, err := h.GetTurn(nativeTurnID)
+	if err != nil || legacyDetail.ID != nativeTurnID {
+		t.Fatalf("native compatibility GetTurn = %#v, err=%v", legacyDetail, err)
 	}
 }
 

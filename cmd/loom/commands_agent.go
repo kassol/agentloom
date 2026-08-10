@@ -286,6 +286,7 @@ func cmdCreate(a args) {
 		"providerId":     a.flags["provider"],
 		"model":          a.flags["model"],
 		"effort":         a.flags["effort"],
+		"runtimeKind":    defaultValue(a.flags["runtime"], "codex"),
 	})
 	if err != nil {
 		fail(err)

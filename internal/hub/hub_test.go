@@ -64,14 +64,15 @@ func TestCompletedNotificationWithFailedTurnStatusProjectsFailure(t *testing.T) 
 	h := testHub(st)
 	h.stopping = true
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", ThreadID: "thread-1", Status: "running",
-		CurrentTurnID: "turn-1", CurrentTask: "Do work", CreatedAt: now(), UpdatedAt: now(),
+		ID: "agent-1", Name: "worker", ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"}, Status: "running",
+		RuntimeTurnBindings: map[string]string{"turn-loom-1": "turn-1"},
+		CurrentTurnID:       "turn-loom-1", CurrentTask: "Do work", CreatedAt: now(), UpdatedAt: now(),
 	}
 	rt := &runtime{
 		agentID:   "agent-1",
 		approvals: map[string]*approval{},
 		activeTurn: &turnState{
-			turnID: "turn-1", task: "Do work", startedAt: time.Now(), stopWatchdog: make(chan struct{}),
+			turnID: "turn-loom-1", nativeTurnID: "turn-1", task: "Do work", startedAt: time.Now(), stopWatchdog: make(chan struct{}),
 		},
 	}
 	h.onNotification(rt, "turn/completed", json.RawMessage(`{
@@ -83,7 +84,7 @@ func TestCompletedNotificationWithFailedTurnStatusProjectsFailure(t *testing.T) 
 	if meta.Status != "idle" || meta.LastError != "model is unavailable" {
 		t.Fatalf("agent failure projection = %#v", meta)
 	}
-	if meta.LastTurn == nil || meta.LastTurn.Status != "failed" || meta.LastTurn.TurnID != "turn-1" {
+	if meta.LastTurn == nil || meta.LastTurn.Status != "failed" || meta.LastTurn.TurnID != "turn-loom-1" {
 		t.Fatalf("last turn = %#v", meta.LastTurn)
 	}
 	events, err := st.ReadEvents("agent-1", 0, 20)
@@ -102,7 +103,7 @@ func TestCompletedNotificationWithFailedTurnStatusProjectsFailure(t *testing.T) 
 	}
 }
 
-func TestTurnStartedNotificationRebindsStaleResponseIDAndLinkedWork(t *testing.T) {
+func TestTurnStartedNotificationBindsNativeIDWithoutRewritingLoomCausality(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -111,21 +112,21 @@ func TestTurnStartedNotificationRebindsStaleResponseIDAndLinkedWork(t *testing.T
 	h.stopping = true
 	h.attempts = map[string]*HandlingAttempt{}
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "research", ThreadID: "thread-1", Status: "running",
-		CurrentTurnID: "turn-stale", CurrentTask: "Investigate", CreatedAt: now(), UpdatedAt: now(),
+		ID: "agent-1", Name: "research", ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"}, Status: "running",
+		CurrentTurnID: "turn-loom", CurrentTask: "Investigate", CreatedAt: now(), UpdatedAt: now(),
 	}
 	h.attempts["att-1"] = &HandlingAttempt{
-		ID: "att-1", InboxItemID: "inb-1", AgentID: "agent-1", Status: "running", TurnID: "turn-stale", StartedAt: now(),
+		ID: "att-1", InboxItemID: "inb-1", AgentID: "agent-1", Status: "running", TurnID: "turn-loom", StartedAt: now(),
 	}
 	h.comms["msg-1"] = &AgentMessage{
-		ID: "msg-1", ToAgentID: "agent-1", DeliveryStatus: "delivered", DeliveredTurnID: "turn-stale",
+		ID: "msg-1", ToAgentID: "agent-1", DeliveryStatus: "delivered", DeliveredTurnID: "turn-loom",
 		HandlingStatus: "running", ActiveHandlingID: "matt-1", UpdatedAt: now(),
 		HandlingAttempts: []AgentMessageHandlingAttempt{{
-			ID: "matt-1", TurnID: "turn-stale", Status: "running", StartedAt: now(),
+			ID: "matt-1", TurnID: "turn-loom", Status: "running", StartedAt: now(),
 		}},
 	}
 	turn := &turnState{
-		turnID: "turn-stale", task: "Investigate", source: "internal", attemptID: "att-1",
+		turnID: "turn-loom", nativeTurnID: "turn-stale", task: "Investigate", source: "internal", attemptID: "att-1",
 		agentMessageID: "msg-1", handlingAttemptID: "matt-1", startedAt: time.Now(),
 		stopWatchdog: make(chan struct{}),
 	}
@@ -136,21 +137,24 @@ func TestTurnStartedNotificationRebindsStaleResponseIDAndLinkedWork(t *testing.T
 		"threadId":"thread-1","turn":{"id":"turn-actual","status":"inProgress"}
 	}`))
 
-	if rt.activeTurn != turn || turn.turnID != "turn-actual" || !turn.startedConfirmed {
-		t.Fatalf("active Turn = %#v, want same confirmed Turn rebound to turn-actual", rt.activeTurn)
+	if rt.activeTurn != turn || turn.turnID != "turn-loom" || turn.nativeTurnID != "turn-actual" || !turn.startedConfirmed {
+		t.Fatalf("active Turn = %#v, want stable Loom Turn bound to turn-actual", rt.activeTurn)
 	}
 	if turn.task != "Investigate" || turn.source != "internal" {
-		t.Fatalf("rebind lost local work context: %#v", turn)
+		t.Fatalf("native binding update lost local work context: %#v", turn)
 	}
-	if got := h.agents["agent-1"].CurrentTurnID; got != "turn-actual" {
+	if got := h.agents["agent-1"].CurrentTurnID; got != "turn-loom" {
 		t.Fatalf("Agent current Turn = %q", got)
 	}
-	if got := h.attempts["att-1"].TurnID; got != "turn-actual" {
+	if got := h.agents["agent-1"].RuntimeTurnBindings["turn-loom"]; got != "turn-actual" {
+		t.Fatalf("native Turn binding = %q", got)
+	}
+	if got := h.attempts["att-1"].TurnID; got != "turn-loom" {
 		t.Fatalf("Inbox attempt Turn = %q", got)
 	}
 	message := h.comms["msg-1"]
-	if message.DeliveredTurnID != "turn-actual" || len(message.HandlingAttempts) != 1 || message.HandlingAttempts[0].TurnID != "turn-actual" {
-		t.Fatalf("message handling was not rebound: %#v", message)
+	if message.DeliveredTurnID != "turn-loom" || len(message.HandlingAttempts) != 1 || message.HandlingAttempts[0].TurnID != "turn-loom" {
+		t.Fatalf("message handling lost Loom causality: %#v", message)
 	}
 }
 
@@ -162,11 +166,12 @@ func TestStaleTerminalNotificationDoesNotFinishCurrentTurn(t *testing.T) {
 	h := testHub(st)
 	h.stopping = true
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "research", ThreadID: "thread-1", Status: "running",
-		CurrentTurnID: "turn-current", CurrentTask: "Current work", CreatedAt: now(), UpdatedAt: now(),
+		ID: "agent-1", Name: "research", ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"}, Status: "running",
+		RuntimeTurnBindings: map[string]string{"turn-current": "native-turn-current"},
+		CurrentTurnID:       "turn-current", CurrentTask: "Current work", CreatedAt: now(), UpdatedAt: now(),
 	}
 	turn := &turnState{
-		turnID: "turn-current", startedConfirmed: true, task: "Current work", source: "owner",
+		turnID: "turn-current", nativeTurnID: "native-turn-current", startedConfirmed: true, task: "Current work", source: "owner",
 		startedAt: time.Now(), stopWatchdog: make(chan struct{}),
 	}
 	rt := &runtime{agentID: "agent-1", approvals: map[string]*approval{}, activeTurn: turn}

@@ -52,10 +52,16 @@ func TestThreadArtifactsStageSendAndPublish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.TurnID != "turn-stale" {
-		t.Fatalf("turn ID = %q", result.TurnID)
+	if result.TurnID == "" || result.TurnID == "turn-stale" {
+		t.Fatalf("Loom turn ID = %q", result.TurnID)
+	}
+	if got := h.agents["agent-artifacts"].RuntimeTurnBindings[result.TurnID]; got != "turn-stale" {
+		t.Fatalf("native Turn binding = %q, want turn-stale", got)
 	}
 	turn := lastRequestParams(t, logPath, "turn/start")
+	if turn["threadId"] != "thr-stale" {
+		t.Fatalf("turn/start threadId = %#v, want thr-stale", turn["threadId"])
+	}
 	input, ok := turn["input"].([]any)
 	if !ok || len(input) != 3 {
 		t.Fatalf("artifact input = %#v", turn["input"])
