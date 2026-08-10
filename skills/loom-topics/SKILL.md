@@ -124,4 +124,4 @@ An intervention is an audited process correction. It does not change Topic statu
 
 ## Read supplied context
 
-`<loom_topic_context>` contains a bounded current brief, your Topic responsibility, waiting state, key links, and activity delta since your last Topic delivery. Treat it as coordination context, not a replacement for current provider reads or your own Thread history. Do not poll the Topic; linked Messages and Triggers resume the right Agent.
+`<loom_topic_context>` contains a bounded current brief, your Topic responsibility, waiting state, key links, and activity delta since your last Topic delivery. When you are the Responsible Agent it also contains the current Participant roster and each bounded responsibility; a Participant receives only its own responsibility. Treat it as coordination context, not a replacement for current provider reads or your own Thread history. Do not poll the Topic; linked Messages and Triggers resume the right Agent.

@@ -962,8 +962,11 @@ func (h *Hub) topicContextEnvelope(topicID, agentID string) (string, int64, erro
 	events := make([]TopicEvent, 0, 8)
 	for _, event := range topic.Events {
 		if event.Seq > cursor {
-			events = append(events, event)
 			deliveredCursor = event.Seq
+			if agentID != topic.ResponsibleAgentID && strings.HasPrefix(event.Type, "participant_") && event.AgentID != agentID {
+				continue
+			}
+			events = append(events, event)
 			if len(events) == 8 {
 				break
 			}
@@ -976,6 +979,15 @@ func (h *Hub) topicContextEnvelope(topicID, agentID string) (string, int64, erro
 	writeXMLCDATA(&b, "purpose", topic.Purpose)
 	writeXMLCDATA(&b, "completion_boundary", topic.CompletionBoundary)
 	writeXMLCDATA(&b, "your_responsibility", responsibility)
+	if agentID == topic.ResponsibleAgentID && len(topic.Participants) > 0 {
+		b.WriteString("  <participants>\n")
+		for _, participant := range topic.Participants {
+			b.WriteString(`    <participant agent_id="` + xmlEscape(participant.AgentID) + `" name="` + xmlEscape(participant.Agent) + `">` + "\n")
+			writeXMLCDATA(&b, "responsibility", participant.Responsibility)
+			b.WriteString("    </participant>\n")
+		}
+		b.WriteString("  </participants>\n")
+	}
 	writeXMLCDATA(&b, "brief_summary", topic.CurrentBrief.Summary)
 	if topic.CurrentBrief.CurrentState != "" {
 		writeXMLCDATA(&b, "current_state", topic.CurrentBrief.CurrentState)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -293,6 +294,94 @@ func TestTopicOwnerSteerTargetsExactParticipantTurnAndRecordsIntervention(t *tes
 	}
 }
 
+func TestPiResponsibleCoordinatesCodexParticipantAndOwnerIntervenesExactLoomTurn(t *testing.T) {
+	configureFakePiHubRPC(t, "steer")
+	h := topicTestHub(t)
+	h.stop = make(chan struct{})
+	defer h.Shutdown()
+
+	piLead, err := h.CreateAgent(CreateParams{Name: "pi-topic-lead", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	topic, err := h.CreateTopic(CreateTopicParams{
+		Title: "Mixed Runtime release", Purpose: "Coordinate Pi integration of Codex evidence.", CompletionBoundary: "The bounded evidence is integrated.",
+		ResponsibleAgent: piLead.ID, CreatedBy: piLead.ID,
+		Participants: []TopicParticipantParams{{Agent: "edge", Responsibility: "Verify the Codex-owned client boundary."}},
+		InitialBrief: TopicBriefDraft{Summary: "The responsible Pi Agent must route and integrate participant work."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ownerTurn, err := h.SendTopicInput(topic.ID, TopicInputParams{Text: "Ask the Codex participant for bounded evidence, then integrate it.", TimeoutSec: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeTurnID := h.agents[piLead.ID].RuntimeTurnBindings[ownerTurn.TurnID]
+	if nativeTurnID == "" || nativeTurnID == ownerTurn.TurnID {
+		t.Fatalf("Pi Turn identity Loom=%q native=%q", ownerTurn.TurnID, nativeTurnID)
+	}
+	active, err := h.GetTopic(topic.ID)
+	if err != nil || len(active.ActiveTurns) != 1 || active.ActiveTurns[0].AgentID != piLead.ID || active.ActiveTurns[0].TurnID != ownerTurn.TurnID {
+		t.Fatalf("Pi active Topic work = %#v, err=%v", active.ActiveTurns, err)
+	}
+	prompt, err := os.ReadFile(os.Getenv("FAKE_PI_PROMPT_FILE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Ask the Codex participant", "<participants>", `agent_id="edge"`, "Verify the Codex-owned client boundary."} {
+		if !strings.Contains(string(prompt), want) {
+			t.Fatalf("Pi Responsible prompt missing %q:\n%s", want, prompt)
+		}
+	}
+
+	dispatched, err := h.SendAgentMessage(CommParams{
+		From: piLead.ID, To: "edge", Subject: "Verify client boundary", Body: "Return only the bounded client evidence.", Response: "required",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dispatched.Message.TopicID != topic.ID || dispatched.Message.SourceTurnID != ownerTurn.TurnID || dispatched.Message.ToAgentID != "edge" {
+		t.Fatalf("mixed Runtime Topic Message = %#v", dispatched.Message)
+	}
+
+	intervention, err := h.InterveneTopicTurn(topic.ID, TopicInterventionParams{
+		Agent: piLead.ID, Action: "steer", Text: "Keep Codex work bounded to the assigned client evidence.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intervention.TurnID != ownerTurn.TurnID || intervention.Event.Ref == nil || intervention.Event.Ref.ID != ownerTurn.TurnID {
+		t.Fatalf("Pi intervention lost canonical Loom Turn: %#v", intervention)
+	}
+	steer, err := os.ReadFile(os.Getenv("FAKE_PI_STEER_FILE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(steer), `turn_id="`+ownerTurn.TurnID+`"`) || strings.Contains(string(steer), nativeTurnID) {
+		t.Fatalf("Pi intervention steer exposed wrong Turn identity: %s", steer)
+	}
+
+	waiting, err := h.UpdateTopic(topic.ID, UpdateTopicParams{
+		Actor: piLead.ID, ExpectedVersion: topic.Version,
+		WaitingOn: &TopicWaitingOn{Kind: "agent-message", RefID: dispatched.Message.ID, Summary: "Waiting for bounded Codex evidence.", ResumeAction: "Read the reply and integrate it."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting.Status != TopicStatusWaiting || waiting.WaitingOn == nil {
+		t.Fatalf("Pi waiting Topic = %#v", waiting)
+	}
+	resumed, err := h.UpdateTopic(topic.ID, UpdateTopicParams{Actor: piLead.ID, ExpectedVersion: waiting.Version, ClearWaiting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Status != TopicStatusActive || resumed.WaitingOn != nil || resumed.ResponsibleAgentID != piLead.ID {
+		t.Fatalf("Pi resumed Topic = %#v", resumed)
+	}
+}
+
 func TestTopicClearWaitingReactivatesTopic(t *testing.T) {
 	h := topicTestHub(t)
 	topic := createClipTopic(t, h)
@@ -335,6 +424,34 @@ func TestTopicContextDeliversLargeDeltaWithoutSkippingEvents(t *testing.T) {
 	}
 	if strings.Count(second, `<event seq=`) == 0 || nextCursor != h.topics[topic.ID].NextEventSeq {
 		t.Fatalf("second delta count=%d cursor=%d latest=%d", strings.Count(second, `<event seq=`), nextCursor, h.topics[topic.ID].NextEventSeq)
+	}
+}
+
+func TestTopicContextGivesResponsibleFullRosterAndParticipantOnlyOwnResponsibility(t *testing.T) {
+	h := topicTestHub(t)
+	topic := createClipTopic(t, h)
+	if _, err := h.AddTopicParticipant(topic.ID, "parall-dev-lead", TopicParticipantParams{
+		Agent: "other", Responsibility: "Own deployment evidence.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	responsible, _, err := h.topicContextEnvelope(topic.ID, "lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"<participants>", `agent_id="edge"`, "Own packaged client smoke.", `agent_id="other"`, "Own deployment evidence."} {
+		if !strings.Contains(responsible, want) {
+			t.Fatalf("Responsible context missing %q:\n%s", want, responsible)
+		}
+	}
+
+	participant, _, err := h.topicContextEnvelope(topic.ID, "edge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(participant, "Own packaged client smoke.") || strings.Contains(participant, "Own deployment evidence.") || strings.Contains(participant, "<participants>") {
+		t.Fatalf("Participant context escaped bounded responsibility:\n%s", participant)
 	}
 }
 

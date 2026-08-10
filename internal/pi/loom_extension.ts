@@ -30,6 +30,11 @@ function result(value: unknown) {
 	return { content: [{ type: "text" as const, text }], details: value };
 }
 
+function topicBelongsToAgent(topic: JsonRecord, agentID: string): boolean {
+	if (topic.responsibleAgentId === agentID) return true;
+	return ((topic.participants ?? []) as JsonRecord[]).some((participant) => participant.agentId === agentID);
+}
+
 export default function loomCollaboration(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "loom_agents_find",
@@ -127,6 +132,131 @@ export default function loomCollaboration(pi: ExtensionAPI) {
 			return result(await request("/api/comms/messages", signal, {
 				method: "POST",
 				body: JSON.stringify({ from: agentID, replyTo: params.messageId, subject: params.subject, body: params.body }),
+			}));
+		},
+	});
+
+	pi.registerTool({
+		name: "loom_topic_list",
+		label: "List Loom Topics",
+		description: "List durable Topics in which this Agent is Responsible or a bounded Participant.",
+		parameters: Type.Object({
+			status: Type.Optional(Type.Union([
+				Type.Literal("active"), Type.Literal("waiting"), Type.Literal("resolved"), Type.Literal("archived"),
+			])),
+		}),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			const query = new URLSearchParams({ agent: agentID, view: "summary" });
+			if (params.status) query.set("status", params.status);
+			return result(await request(`/api/topics?${query}`, signal));
+		},
+	});
+
+	pi.registerTool({
+		name: "loom_topic_get",
+		label: "Get Loom Topic",
+		description: "Read the authoritative brief, responsibilities, waiting state, active work, and audit history for one Topic.",
+		parameters: Type.Object({ topicId: Type.String() }),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			const response = await request(`/api/topics/${encodeURIComponent(params.topicId)}`, signal);
+			const topic = (response.topic ?? {}) as JsonRecord;
+			if (!topicBelongsToAgent(topic, agentID)) throw new Error("Loom Topic does not belong to this Agent");
+			return result(response);
+		},
+	});
+
+	pi.registerTool({
+		name: "loom_topic_create",
+		label: "Create Loom Topic",
+		description: "Create a durable Topic owned by this Agent, with a completion boundary and bounded Participants.",
+		promptGuidelines: ["Create a Topic only for bounded shared coordination; remain accountable for integrating all participant work."],
+		parameters: Type.Object({
+			title: Type.String(),
+			purpose: Type.String(),
+			completionBoundary: Type.String(),
+			initialSummary: Type.String(),
+			currentState: Type.Optional(Type.String()),
+			nextStep: Type.Optional(Type.String()),
+			limitations: Type.Optional(Type.String()),
+			participants: Type.Optional(Type.Array(Type.Object({
+				agent: Type.String({ description: "Participant Agent ID or name" }),
+				responsibility: Type.String({ description: "Bounded Topic responsibility" }),
+			}))),
+		}),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			return result(await request("/api/topics", signal, {
+				method: "POST",
+				body: JSON.stringify({
+					title: params.title, purpose: params.purpose, completionBoundary: params.completionBoundary,
+					responsibleAgent: agentID, createdBy: agentID, participants: params.participants ?? [],
+					initialBrief: {
+						summary: params.initialSummary, currentState: params.currentState,
+						nextStep: params.nextStep, limitations: params.limitations,
+					},
+				}),
+			}));
+		},
+	});
+
+	pi.registerTool({
+		name: "loom_topic_participant_upsert",
+		label: "Set Loom Topic Participant",
+		description: "Add a Participant or replace that Participant's bounded responsibility. Only the Responsible Agent may do this.",
+		parameters: Type.Object({ topicId: Type.String(), agent: Type.String(), responsibility: Type.String() }),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			return result(await request(`/api/topics/${encodeURIComponent(params.topicId)}/participants`, signal, {
+				method: "POST",
+				body: JSON.stringify({ actor: agentID, agent: params.agent, responsibility: params.responsibility }),
+			}));
+		},
+	});
+
+	pi.registerTool({
+		name: "loom_topic_participant_remove",
+		label: "Remove Loom Topic Participant",
+		description: "Remove a bounded Participant from a Topic. Only the Responsible Agent may do this.",
+		parameters: Type.Object({ topicId: Type.String(), agent: Type.String() }),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			const query = new URLSearchParams({ actor: agentID });
+			return result(await request(`/api/topics/${encodeURIComponent(params.topicId)}/participants/${encodeURIComponent(params.agent)}?${query}`, signal, { method: "DELETE" }));
+		},
+	});
+
+	pi.registerTool({
+		name: "loom_topic_wait",
+		label: "Wait Loom Topic",
+		description: "Record the external condition a Topic is waiting on and the action required to resume it.",
+		parameters: Type.Object({
+			topicId: Type.String(), expectedVersion: Type.Optional(Type.Number()),
+			kind: Type.String(), refId: Type.Optional(Type.String()), summary: Type.String(), resumeAction: Type.Optional(Type.String()),
+		}),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			return result(await request(`/api/topics/${encodeURIComponent(params.topicId)}`, signal, {
+				method: "PATCH",
+				body: JSON.stringify({
+					actor: agentID, expectedVersion: params.expectedVersion,
+					waitingOn: { kind: params.kind, refId: params.refId, summary: params.summary, resumeAction: params.resumeAction },
+				}),
+			}));
+		},
+	});
+
+	pi.registerTool({
+		name: "loom_topic_resume",
+		label: "Resume Loom Topic",
+		description: "Clear a Topic waiting condition and return it to the existing active coordination state.",
+		parameters: Type.Object({ topicId: Type.String(), expectedVersion: Type.Optional(Type.Number()) }),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			return result(await request(`/api/topics/${encodeURIComponent(params.topicId)}`, signal, {
+				method: "PATCH",
+				body: JSON.stringify({ actor: agentID, expectedVersion: params.expectedVersion, clearWaiting: true }),
 			}));
 		},
 	});

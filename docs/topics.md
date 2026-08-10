@@ -57,6 +57,7 @@ loom topic create \
 - 当前 versioned brief；
 - waiting_on；
 - 自己是 Responsible 还是 Participant，以及自己的责任；
+- 当自己是 Responsible 时，当前 Participants 及其 bounded responsibilities；普通 Participant 不会收到其他 Participant 的责任；
 - 少量关键 links；
 - 自该 Agent 上次收到 Topic context 之后的有界 activity delta。
 

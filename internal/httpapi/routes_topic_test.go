@@ -63,6 +63,55 @@ func TestTopicHTTPRoundTripAndResultBoundary(t *testing.T) {
 	}
 }
 
+func TestPiResponsibleTopicWaitingAndResumeStayRuntimeNeutralOverHTTP(t *testing.T) {
+	t.Setenv("PINIX_EDGE_NAMES", t.TempDir()+"/missing.json")
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAgents(map[string]*hub.Agent{
+		"pi-lead": {
+			ID: "pi-lead", Name: "pi-topic-lead", Cwd: t.TempDir(), ThreadID: "loom-thread-pi-lead",
+			RuntimeBinding: hub.RuntimeBinding{Kind: "pi", NativeRef: "/loom/pi/session.jsonl"}, Status: "idle",
+		},
+		"codex-edge": {
+			ID: "codex-edge", Name: "codex-edge", Cwd: t.TempDir(), ThreadID: "loom-thread-codex-edge",
+			RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "codex-thread"}, Status: "idle",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := hub.New(st)
+	defer h.Shutdown()
+	server := New(h, st, fstest.MapFS{"index.html": {Data: []byte("ok")}}).Handler()
+
+	created := topicRequest(t, server, http.MethodPost, "/api/topics", map[string]any{
+		"title": "Mixed Runtime coordination", "purpose": "Let Pi integrate bounded Codex evidence", "completionBoundary": "Evidence is integrated",
+		"responsibleAgent": "pi-lead", "createdBy": "pi-lead",
+		"participants": []map[string]any{{"agent": "codex-edge", "responsibility": "Return client evidence only"}},
+		"initialBrief": map[string]any{"summary": "Pi owns integration"},
+	}, http.StatusCreated)["topic"].(map[string]any)
+	topicID := created["id"].(string)
+	if created["responsibleAgentId"] != "pi-lead" || created["status"] != hub.TopicStatusActive {
+		t.Fatalf("created Pi Topic = %#v", created)
+	}
+
+	waiting := topicRequest(t, server, http.MethodPatch, "/api/topics/"+topicID, map[string]any{
+		"actor": "pi-lead", "expectedVersion": 1,
+		"waitingOn": map[string]any{"kind": "agent-message", "refId": "msg_codex", "summary": "Waiting for Codex evidence", "resumeAction": "Integrate the reply"},
+	}, http.StatusOK)["topic"].(map[string]any)
+	if waiting["status"] != hub.TopicStatusWaiting || waiting["waitingOn"].(map[string]any)["refId"] != "msg_codex" {
+		t.Fatalf("waiting Pi Topic = %#v", waiting)
+	}
+
+	resumed := topicRequest(t, server, http.MethodPatch, "/api/topics/"+topicID, map[string]any{
+		"actor": "pi-lead", "expectedVersion": 2, "clearWaiting": true,
+	}, http.StatusOK)["topic"].(map[string]any)
+	if resumed["status"] != hub.TopicStatusActive || resumed["waitingOn"] != nil || resumed["responsibleAgentId"] != "pi-lead" {
+		t.Fatalf("resumed Pi Topic = %#v", resumed)
+	}
+}
+
 func topicRequest(t *testing.T, handler http.Handler, method, path string, body any, wantStatus int) map[string]any {
 	t.Helper()
 	var payload bytes.Buffer
