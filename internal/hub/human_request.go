@@ -71,6 +71,18 @@ type CreateHumanRequestParams struct {
 	TopicID     string               `json:"topicId,omitempty"`
 }
 
+// HumanRequestCausality lets Loom reserve a durable request identity before
+// dispatching work that may be retried after a restart. It is intentionally
+// separate from CreateHumanRequestParams so HTTP callers cannot author Loom's
+// Turn and Thread links.
+type HumanRequestCausality struct {
+	ID           string
+	ThreadID     string
+	SourceTurnID string
+	SourceTask   string
+	TopicID      string
+}
+
 type AnswerHumanRequestParams struct {
 	Answer string `json:"answer"`
 }
@@ -143,50 +155,103 @@ func (h *Hub) appendHumanRequestLocked(request HumanRequest) error {
 }
 
 func (h *Hub) CreateHumanRequest(params CreateHumanRequestParams) (HumanRequest, error) {
+	request, _, err := h.createOrGetHumanRequest(params, HumanRequestCausality{})
+	return request, err
+}
+
+// CreateOrGetHumanRequest creates a Human Request with a caller-reserved ID,
+// or returns the durable request already stored under that ID. This gives
+// crash reconciliation one idempotent boundary without exposing causal fields
+// through the public HTTP create route.
+func (h *Hub) CreateOrGetHumanRequest(params CreateHumanRequestParams, causality HumanRequestCausality) (HumanRequest, bool, error) {
+	causality.ID = strings.TrimSpace(causality.ID)
+	if causality.ID == "" {
+		return HumanRequest{}, false, errf(400, "human request ID is required")
+	}
+	return h.createOrGetHumanRequest(params, causality)
+}
+
+func (h *Hub) createOrGetHumanRequest(params CreateHumanRequestParams, causality HumanRequestCausality) (HumanRequest, bool, error) {
 	params.Agent = strings.TrimSpace(params.Agent)
 	params.Question = strings.TrimSpace(params.Question)
 	params.Context = strings.TrimSpace(params.Context)
 	params.BlockedWork = strings.TrimSpace(params.BlockedWork)
 	params.Expectation = strings.ToLower(strings.TrimSpace(params.Expectation))
+	params.TopicID = strings.TrimSpace(params.TopicID)
+	causality.ThreadID = strings.TrimSpace(causality.ThreadID)
+	causality.SourceTurnID = strings.TrimSpace(causality.SourceTurnID)
+	causality.SourceTask = strings.TrimSpace(causality.SourceTask)
+	causality.TopicID = strings.TrimSpace(causality.TopicID)
 	if params.Agent == "" {
-		return HumanRequest{}, errf(400, "agent is required")
+		return HumanRequest{}, false, errf(400, "agent is required")
 	}
 	if params.Question == "" {
-		return HumanRequest{}, errf(400, "question is required")
+		return HumanRequest{}, false, errf(400, "question is required")
 	}
 	if params.Expectation == "" {
 		params.Expectation = HumanRequestRequired
 	}
 	if params.Expectation != HumanRequestRequired && params.Expectation != HumanRequestOptional {
-		return HumanRequest{}, errf(400, "expectation must be required or optional")
+		return HumanRequest{}, false, errf(400, "expectation must be required or optional")
 	}
 	if len(params.Options) > 8 {
-		return HumanRequest{}, errf(400, "at most 8 options are allowed")
+		return HumanRequest{}, false, errf(400, "at most 8 options are allowed")
 	}
 	options := make([]HumanRequestOption, 0, len(params.Options))
 	for _, option := range params.Options {
 		option.Label = strings.TrimSpace(option.Label)
 		option.Description = strings.TrimSpace(option.Description)
 		if option.Label == "" {
-			return HumanRequest{}, errf(400, "option label is required")
+			return HumanRequest{}, false, errf(400, "option label is required")
 		}
 		options = append(options, option)
+	}
+	if causality.TopicID != "" && params.TopicID != "" && causality.TopicID != params.TopicID {
+		return HumanRequest{}, false, errf(400, "Topic causality does not match requested Topic")
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	agent := h.resolveLocked(params.Agent)
 	if agent == nil {
-		return HumanRequest{}, errf(404, "agent not found: %s", params.Agent)
+		return HumanRequest{}, false, errf(404, "agent not found: %s", params.Agent)
+	}
+	if causality.ThreadID != "" && causality.ThreadID != agent.ThreadID {
+		return HumanRequest{}, false, errf(409, "human request Thread does not match Agent %s", agent.Name)
+	}
+	threadID := agent.ThreadID
+	if causality.ThreadID != "" {
+		threadID = causality.ThreadID
+	}
+	if causality.ID != "" {
+		if existing := h.humanRequests[causality.ID]; existing != nil {
+			if existing.AgentID != agent.ID || existing.ThreadID != threadID || existing.SourceTurnID != causality.SourceTurnID || existing.TopicID != causality.TopicID {
+				return HumanRequest{}, false, errf(409, "human request %s already exists with different causality", causality.ID)
+			}
+			return cloneHumanRequest(*existing), false, nil
+		}
 	}
 	stamp := now()
+	requestID := causality.ID
+	if requestID == "" {
+		requestID = newIntegrationID("hrq")
+	}
+	sourceTurnID := agent.CurrentTurnID
+	if causality.SourceTurnID != "" {
+		sourceTurnID = causality.SourceTurnID
+	}
+	sourceTask := agent.CurrentTask
+	if causality.SourceTask != "" {
+		sourceTask = causality.SourceTask
+	}
 	request := HumanRequest{
-		ID:             newIntegrationID("hrq"),
+		ID:             requestID,
 		AgentID:        agent.ID,
 		AgentName:      agent.Name,
-		ThreadID:       agent.ThreadID,
-		SourceTurnID:   agent.CurrentTurnID,
-		SourceTask:     agent.CurrentTask,
+		ThreadID:       threadID,
+		SourceTurnID:   sourceTurnID,
+		SourceTask:     sourceTask,
+		TopicID:        causality.TopicID,
 		Expectation:    params.Expectation,
 		Question:       params.Question,
 		Context:        params.Context,
@@ -197,17 +262,24 @@ func (h *Hub) CreateHumanRequest(params CreateHumanRequestParams) (HumanRequest,
 		CreatedAt:      stamp,
 		UpdatedAt:      stamp,
 	}
-	if params.TopicID != "" {
-		topic := h.topics[strings.TrimSpace(params.TopicID)]
+	if request.TopicID == "" {
+		request.TopicID = params.TopicID
+	}
+	if request.TopicID != "" {
+		topic := h.topics[request.TopicID]
 		if topic == nil || !topicHasAgent(topic, agent.ID, agent.ID) {
-			return HumanRequest{}, errf(403, "Agent %s is not part of Topic %s", agent.Name, params.TopicID)
+			return HumanRequest{}, false, errf(403, "Agent %s is not part of Topic %s", agent.Name, request.TopicID)
 		}
 		request.TopicID = topic.ID
 	}
-	if request.SourceTurnID == "" {
-		if rt := h.runtimes[agent.ID]; rt != nil && rt.activeTurn != nil && !rt.activeTurn.finished {
-			request.SourceTurnID = rt.activeTurn.turnID
-			request.SourceTask = rt.activeTurn.task
+	if rt := h.runtimes[agent.ID]; rt != nil && rt.activeTurn != nil && !rt.activeTurn.finished {
+		if request.SourceTurnID == "" || request.SourceTurnID == rt.activeTurn.turnID {
+			if request.SourceTurnID == "" {
+				request.SourceTurnID = rt.activeTurn.turnID
+			}
+			if request.SourceTask == "" {
+				request.SourceTask = rt.activeTurn.task
+			}
 			if request.TopicID == "" {
 				request.TopicID = rt.activeTurn.topicID
 			}
@@ -217,9 +289,9 @@ func (h *Hub) CreateHumanRequest(params CreateHumanRequestParams) (HumanRequest,
 		request.BlockedWork = request.SourceTask
 	}
 	if err := h.appendHumanRequestLocked(request); err != nil {
-		return HumanRequest{}, errf(500, "persist human request: %s", err)
+		return HumanRequest{}, false, errf(500, "persist human request: %s", err)
 	}
-	return cloneHumanRequest(request), nil
+	return cloneHumanRequest(request), true, nil
 }
 
 func (h *Hub) ListHumanRequests(agentKey, state string) ([]HumanRequest, error) {

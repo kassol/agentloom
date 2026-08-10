@@ -180,6 +180,7 @@ func TestTopicCausalFieldsInheritIntoMessageAndHumanRequest(t *testing.T) {
 	h := topicTestHub(t)
 	topic := createClipTopic(t, h)
 	h.agents["edge"].Status = "running"
+	h.agents["edge"].CurrentTurnID = "turn-edge"
 	h.agents["lead"].Status = "running"
 	h.runtimes["edge"] = &runtime{activeTurn: &turnState{turnID: "turn-edge", topicID: topic.ID, task: "Run packaged smoke", startedAt: time.Now(), stopWatchdog: make(chan struct{})}}
 

@@ -137,6 +137,42 @@ export default function loomCollaboration(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "loom_needs_you",
+		label: "Ask Loom Owner",
+		description: "Create a durable Needs You request for an Owner fact, decision, or authorization that blocks the current work.",
+		promptGuidelines: [
+			"Use loom_needs_you only when current work requires Owner input; calling it ends the current Turn and Loom resumes the same Agent Thread after the Owner answers.",
+		],
+		parameters: Type.Object({
+			question: Type.String({ description: "The specific question the Owner must answer" }),
+			context: Type.Optional(Type.String({ description: "Concise context the Owner needs to decide" })),
+			blockedWork: Type.Optional(Type.String({ description: "The work that cannot continue without this answer" })),
+			expectation: Type.Optional(Type.Union([Type.Literal("required"), Type.Literal("optional")])),
+			options: Type.Optional(Type.Array(Type.Object({
+				label: Type.String(),
+				description: Type.Optional(Type.String()),
+			}))),
+			topicId: Type.Optional(Type.String({ description: "Related Loom Topic ID, when this work belongs to a Topic" })),
+		}),
+		async execute(_id, params, signal) {
+			const { agentID } = environment();
+			const value = await request("/api/human-requests", signal, {
+				method: "POST",
+				body: JSON.stringify({
+					agent: agentID,
+					question: params.question,
+					context: params.context,
+					blockedWork: params.blockedWork,
+					expectation: params.expectation ?? "required",
+					options: params.options ?? [],
+					topicId: params.topicId,
+				}),
+			});
+			return { ...result(value), terminate: true };
+		},
+	});
+
+	pi.registerTool({
 		name: "loom_topic_list",
 		label: "List Loom Topics",
 		description: "List durable Topics in which this Agent is Responsible or a bounded Participant.",

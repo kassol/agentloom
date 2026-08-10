@@ -221,6 +221,13 @@ export function NeedsYouPane({
                 <div className="mx-auto max-w-[760px] px-4 py-5 md:px-8 md:py-8">
                   <h2 className="font-serif text-[26px] leading-tight text-foreground md:text-[30px]">{selected.question}</h2>
                   {selected.context ? <div className="mt-5 border-l-2 border-border pl-4 text-[13px] leading-6 text-foreground/80"><MarkdownContent content={selected.context} /></div> : null}
+                  {selected.threadId || selected.sourceTurnId || selected.resumedTurnId ? (
+                    <section className="mt-5 grid gap-2 border-t border-border pt-3 font-mono text-[9.5px] text-muted-foreground" aria-label="Request causality">
+                      {selected.threadId ? <div className="grid min-w-0 grid-cols-[110px_minmax(0,1fr)] gap-2"><span>Thread</span><span className="truncate text-foreground/75" title={selected.threadId}>{selected.threadId}</span></div> : null}
+                      {selected.sourceTurnId ? <div className="grid min-w-0 grid-cols-[110px_minmax(0,1fr)] gap-2"><span>Predecessor Turn</span><span className="truncate text-foreground/75" title={selected.sourceTurnId}>{selected.sourceTurnId}</span></div> : null}
+                      {selected.resumedTurnId ? <div className="grid min-w-0 grid-cols-[110px_minmax(0,1fr)] gap-2"><span>Continued by Turn</span><span className="truncate text-foreground/75" title={selected.resumedTurnId}>{selected.resumedTurnId}</span></div> : null}
+                    </section>
+                  ) : null}
                   {selected.blockedWork ? (
                     <section className="mt-6 border-y border-border bg-card/40 px-3 py-3">
                       <div className="font-mono text-[9px] uppercase text-muted-foreground">Waiting on this answer</div>
