@@ -252,6 +252,25 @@ describe("AgentPane scroll restoration", () => {
 	});
   });
 
+  it("rejects unsupported images when they are attached but keeps other files", () => {
+	const onError = vi.fn();
+	const piAgent: Agent = {
+	  ...testAgent,
+	  runtimeBinding: { kind: "pi" },
+	  runtimeCapabilities: { ...testAgent.runtimeCapabilities, imageInput: false },
+	};
+	const view = render(<AgentPane {...props} agent={piAgent} onError={onError} active />);
+	const input = view.container.querySelector('input[type="file"]') as HTMLInputElement;
+	const image = new File(["image"], "screen.png", { type: "image/png", lastModified: 1 });
+	const text = new File(["notes"], "notes.txt", { type: "text/plain", lastModified: 2 });
+
+	fireEvent.change(input, { target: { files: [image, text] } });
+
+	expect(onError).toHaveBeenCalledWith("screen.png cannot be attached because the current pi model does not support image input");
+	expect(view.queryByText("screen.png")).toBeNull();
+	expect(view.getByText("notes.txt")).toBeInTheDocument();
+  });
+
   it("restores a Pi Approval card from the Agent snapshot without Codex wording", async () => {
 	virtualizerHarness.instance.getVirtualItems.mockReturnValue([
 	  { index: 0, key: "row-0", start: 0, size: 120, end: 120, lane: 0 },

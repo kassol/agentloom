@@ -632,6 +632,10 @@ export function AgentPane({
     for (const file of files) {
       const id = `${file.name}:${file.size}:${file.lastModified}`;
       if (existing.has(id)) continue;
+      if (file.type.startsWith("image/") && !agent.runtimeCapabilities.imageInput) {
+        onError(`${file.name} cannot be attached because the current ${agent.runtimeBinding.kind} model does not support image input`);
+        continue;
+      }
       if (file.size <= 0 || file.size > MAX_TURN_ARTIFACT_BYTES) {
         onError(`${file.name} must be between 1 byte and 25 MB`);
         continue;
