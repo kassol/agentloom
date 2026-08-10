@@ -19,6 +19,7 @@ import (
 type piAgentRuntime struct {
 	agentID string
 	dataDir string
+	apiURL  string
 
 	mu               sync.Mutex
 	rpc              *pi.RPC
@@ -29,12 +30,16 @@ type piAgentRuntime struct {
 	currentMessage   uint64
 	pendingTerminal  RuntimeEvent
 	settled          chan struct{}
+	activeNativeTurn string
 	abortRequested   bool
 	imageInput       bool
 }
 
-func newPiAgentRuntime(agentID, dataDir string) *piAgentRuntime {
-	return &piAgentRuntime{agentID: agentID, dataDir: dataDir}
+func newPiAgentRuntime(agentID, dataDir, apiURL string) *piAgentRuntime {
+	if strings.TrimSpace(apiURL) == "" {
+		apiURL = "http://127.0.0.1:4870"
+	}
+	return &piAgentRuntime{agentID: agentID, dataDir: dataDir, apiURL: strings.TrimRight(apiURL, "/")}
 }
 
 func (r *piAgentRuntime) SetRuntimeEventHandlers(onEvent func(RuntimeEvent), onFailure func(error)) {
@@ -88,7 +93,11 @@ func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) 
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 		return piSessionState{}, fmt.Errorf("create Pi session directory: %w", err)
 	}
-	args := []string{"--session-dir", sessionDir, "--approve"}
+	extensionPath, err := pi.MaterializeLoomExtension(r.dataDir)
+	if err != nil {
+		return piSessionState{}, err
+	}
+	args := []string{"--session-dir", sessionDir, "--approve", "--extension", extensionPath}
 	if nativeRef == "" {
 		args = append(args, "--session-id", r.agentID)
 		if request.Name != "" {
@@ -99,6 +108,7 @@ func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) 
 	}
 	rpc, err := pi.SpawnRPC(pi.RPCOptions{
 		Cwd: request.Cwd, Args: args,
+		Env:     map[string]string{"CODEX_LOOM_AGENT_ID": r.agentID, "CODEX_LOOM_API_URL": r.apiURL},
 		OnEvent: r.handleEvent,
 		OnFailure: func(err error) {
 			r.mu.Lock()
@@ -230,11 +240,37 @@ func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	if nativeUserEntryID == "" || nativeUserEntryID == previousUserEntryID {
 		return "", errors.New("Pi accepted prompt without a new native user entry")
 	}
+	r.mu.Lock()
+	if r.settled != nil {
+		r.activeNativeTurn = nativeUserEntryID
+	}
+	r.mu.Unlock()
 	return nativeUserEntryID, nil
 }
 
-func (r *piAgentRuntime) Steer(string, string, string, time.Duration) (string, error) {
-	return "", errors.New("Pi Runtime does not support causal steering")
+func (r *piAgentRuntime) Steer(_ string, expectedNativeTurnID, input string, timeout time.Duration) (string, error) {
+	r.mu.Lock()
+	rpc := r.rpc
+	activeNativeTurn := r.activeNativeTurn
+	r.mu.Unlock()
+	if rpc == nil || !rpc.Alive() {
+		return "", errors.New("Pi RPC process is unavailable")
+	}
+	if expectedNativeTurnID == "" || activeNativeTurn != expectedNativeTurnID {
+		return "", errors.New("Pi active native Turn changed before causal steer")
+	}
+	if strings.TrimSpace(input) == "" {
+		return "", errors.New("Pi steer message is required")
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if _, err := rpc.Request(ctx, "steer", map[string]any{"message": input}); err != nil {
+		return "", err
+	}
+	return expectedNativeTurnID, nil
 }
 
 func (r *piAgentRuntime) Interrupt(_ string, _ string, timeout time.Duration) error {
@@ -296,6 +332,7 @@ func (r *piAgentRuntime) handleEvent(raw json.RawMessage) {
 		events = append(events, terminal)
 		settled = r.settled
 		r.settled = nil
+		r.activeNativeTurn = ""
 		r.abortRequested = false
 	}
 	handler := r.onEvent
@@ -529,7 +566,7 @@ func (r *piAgentRuntime) Capabilities() RuntimeCapabilities {
 	r.mu.Lock()
 	imageInput := r.imageInput
 	r.mu.Unlock()
-	return RuntimeCapabilities{History: true, Interrupt: true, ImageInput: imageInput}
+	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true, ImageInput: imageInput}
 }
 
 func (r *piAgentRuntime) Close() {

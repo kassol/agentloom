@@ -29,12 +29,12 @@ func TestAgentDetailReportsTruthfulPiRuntimeCapabilities(t *testing.T) {
 	response := topicRequest(t, server, http.MethodGet, "/api/agents/agent-pi", nil, http.StatusOK)
 	agent := response["agent"].(map[string]any)
 	capabilities := agent["runtimeCapabilities"].(map[string]any)
-	for _, capability := range []string{"history", "interrupt"} {
+	for _, capability := range []string{"history", "causalSteer", "interrupt"} {
 		if capabilities[capability] != true {
 			t.Fatalf("Pi %s capability = %#v", capability, capabilities[capability])
 		}
 	}
-	for _, capability := range []string{"causalSteer", "goal", "remote", "usage", "provider", "compaction", "approval", "skills", "naming", "archive", "sandbox", "imageInput"} {
+	for _, capability := range []string{"goal", "remote", "usage", "provider", "compaction", "approval", "skills", "naming", "archive", "sandbox", "imageInput"} {
 		if value, exists := capabilities[capability]; !exists || value != false {
 			t.Fatalf("Pi %s capability = %#v, exists=%v", capability, value, exists)
 		}

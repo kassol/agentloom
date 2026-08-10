@@ -19,6 +19,7 @@ type fakeAgentRuntime struct {
 	binding                                         string
 	history                                         RuntimeHistory
 	interruptedNative                               string
+	steeredNativeRef, steeredExpected, steeredInput string
 	capabilities                                    *RuntimeCapabilities
 	lastTurnRequest                                 RuntimeTurnRequest
 }
@@ -38,9 +39,10 @@ func (f *fakeAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error)
 	f.lastTurnRequest = request
 	return "native-turn-1", nil
 }
-func (f *fakeAgentRuntime) Steer(string, string, string, time.Duration) (string, error) {
+func (f *fakeAgentRuntime) Steer(nativeRef, expectedNativeTurnID, input string, _ time.Duration) (string, error) {
 	f.steered = true
-	return "native-turn-1", nil
+	f.steeredNativeRef, f.steeredExpected, f.steeredInput = nativeRef, expectedNativeTurnID, input
+	return expectedNativeTurnID, nil
 }
 func (f *fakeAgentRuntime) Interrupt(_ string, nativeTurnID string, _ time.Duration) error {
 	f.interrupted = true

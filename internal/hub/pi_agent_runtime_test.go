@@ -110,6 +110,91 @@ func TestPiAgentCompletesLiveLoomTurnOnlyAfterAgentSettled(t *testing.T) {
 	h.Shutdown()
 }
 
+func TestPiRuntimeExplicitlyLoadsLoomExtensionWithoutDisablingNativeResources(t *testing.T) {
+	configureFakePiHubRPC(t, "happy")
+	dataDir := t.TempDir()
+	runtime := newPiAgentRuntime("agent-pi", dataDir, "http://127.0.0.1:6123")
+	defer runtime.Close()
+	if _, err := runtime.Create(RuntimeBindingRequest{Name: "Pi Worker", Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(os.Getenv("FAKE_PI_START_ARGS_FILE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	extensionPath := filepath.Join(dataDir, "pi", "runtime", "loom-extension.ts")
+	if strings.Count(string(args), "--extension\t"+extensionPath) != 1 {
+		t.Fatalf("Pi args do not explicitly load one Loom Extension: %q", args)
+	}
+	for _, disabled := range []string{"--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates"} {
+		if strings.Contains(string(args), disabled) {
+			t.Fatalf("Pi args disable inherited resource %q: %q", disabled, args)
+		}
+	}
+	environment, err := os.ReadFile(os.Getenv("FAKE_PI_RUNTIME_ENV_FILE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(environment) != "agent-pi\nhttp://127.0.0.1:6123" {
+		t.Fatalf("Pi Loom environment = %q", environment)
+	}
+}
+
+func TestPiRuntimeUsesHubLocalAPIURL(t *testing.T) {
+	configureFakePiHubRPC(t, "happy")
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h, err := OpenWithOptions(st, OpenOptions{RuntimeAPIURL: "http://127.0.0.1:6234"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Shutdown()
+	if _, err := h.CreateAgent(CreateParams{Name: "pi-api", Cwd: t.TempDir(), RuntimeKind: "pi"}); err != nil {
+		t.Fatal(err)
+	}
+	environment, err := os.ReadFile(os.Getenv("FAKE_PI_RUNTIME_ENV_FILE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(environment), "\nhttp://127.0.0.1:6234") {
+		t.Fatalf("Pi API URL environment = %q", environment)
+	}
+}
+
+func TestPiRuntimeSteersExactActiveNativeTurn(t *testing.T) {
+	configureFakePiHubRPC(t, "steer")
+	dataDir := t.TempDir()
+	runtime := newPiAgentRuntime("agent-pi", dataDir, "http://127.0.0.1:6123")
+	defer runtime.Close()
+	nativeRef, err := runtime.Create(RuntimeBindingRequest{Name: "Pi Worker", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeTurnID, err := runtime.StartTurn(RuntimeTurnRequest{
+		NativeRef: nativeRef, Input: []RuntimeInput{{Kind: RuntimeInputText, Text: "request help"}}, Timeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.Capabilities().CausalSteer {
+		t.Fatalf("Pi capabilities = %#v", runtime.Capabilities())
+	}
+	accepted, err := runtime.Steer(nativeRef, nativeTurnID, "causal reply", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted != nativeTurnID {
+		t.Fatalf("accepted native Turn = %q, want %q", accepted, nativeTurnID)
+	}
+	steer, err := os.ReadFile(os.Getenv("FAKE_PI_STEER_FILE"))
+	if err != nil || string(steer) != "causal reply" {
+		t.Fatalf("Pi native steer = %q, err=%v", steer, err)
+	}
+}
+
 func TestPiAgentSendsSupportedImagesAsNativeRPCContent(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -198,7 +283,7 @@ func TestPiProtocolFailureFailsActiveLoomTurn(t *testing.T) {
 }
 
 func TestPiRuntimeNormalizesStreamingTextReasoningAndToolLifecycle(t *testing.T) {
-	runtime := newPiAgentRuntime("agent-1", t.TempDir())
+	runtime := newPiAgentRuntime("agent-1", t.TempDir(), "")
 	rawEvents := []string{
 		`{"type":"message_start","message":{"role":"assistant","content":[]}}`,
 		`{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"checking"}}`,
@@ -394,7 +479,7 @@ func TestPiHistoryProjectsOnlyActiveBranchAndKeepsPreCompactionTurns(t *testing.
 		t.Fatal(err)
 	}
 
-	runtime := newPiAgentRuntime("agent-1", t.TempDir())
+	runtime := newPiAgentRuntime("agent-1", t.TempDir(), "")
 	history, err := runtime.ReadHistory(sessionFile, 10, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -605,6 +690,9 @@ func configureFakePiHubRPC(t *testing.T, scenario string) {
 	t.Setenv("FAKE_PI_ABORT_READY_FILE", filepath.Join(dir, "abort-ready"))
 	t.Setenv("FAKE_PI_PROMPTS_FILE", filepath.Join(dir, "prompts"))
 	t.Setenv("FAKE_PI_RESUME_FILE", filepath.Join(dir, "resume"))
+	t.Setenv("FAKE_PI_START_ARGS_FILE", filepath.Join(dir, "start-args"))
+	t.Setenv("FAKE_PI_RUNTIME_ENV_FILE", filepath.Join(dir, "runtime-env"))
+	t.Setenv("FAKE_PI_STEER_FILE", filepath.Join(dir, "steer"))
 }
 
 func TestFakePiHubRPCProcess(t *testing.T) {
@@ -617,6 +705,8 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 		_ = starts.Close()
 	}
 	args := os.Args
+	_ = os.WriteFile(os.Getenv("FAKE_PI_START_ARGS_FILE"), []byte(strings.Join(args, "\t")), 0o600)
+	_ = os.WriteFile(os.Getenv("FAKE_PI_RUNTIME_ENV_FILE"), []byte(os.Getenv("CODEX_LOOM_AGENT_ID")+"\n"+os.Getenv("CODEX_LOOM_API_URL")), 0o600)
 	sessionDir := argumentValue(args, "--session-dir")
 	sessionID := argumentValue(args, "--session-id")
 	resumedSession := argumentValue(args, "--session")
@@ -681,6 +771,18 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 		return
 	}
 	serveOneFakePiEntries(t, reader, sessionFile)
+	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "steer" {
+		fmt.Print("{\"type\":\"agent_start\"}\n")
+		readFakePiCommand(t, reader, &command)
+		id, _ = command["id"].(string)
+		if command["type"] != "steer" {
+			os.Exit(35)
+		}
+		_ = os.WriteFile(os.Getenv("FAKE_PI_STEER_FILE"), []byte(fmt.Sprint(command["message"])), 0o600)
+		fmt.Printf(`{"id":%q,"type":"response","command":"steer","success":true}`+"\n", id)
+		_, _ = reader.ReadString('\n')
+		return
+	}
 	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "abort" {
 		fmt.Print("{\"type\":\"agent_start\"}\n")
 		fmt.Print("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n")

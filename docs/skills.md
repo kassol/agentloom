@@ -8,7 +8,7 @@ CodexLoom 当前内置十个 Skill：
 
 | Skill | 使用者 | 作用 |
 |---|---|---|
-| `loom-communication` | 所有 CodexLoom Agent | 找到领域负责人，发送 request/notification，回复消息，理解普通排队与因果回复进入 active Turn 的边界；禁止手写 Agent Message XML，也禁止用 sleep/轮询等待回复 |
+| `loom-communication` | Codex Agent；Pi Agent 使用 Loom Extension 的结构化工具 | 找到领域负责人，发送 request/notification，回复消息，理解普通排队与因果回复进入 active Turn 的边界；禁止手写 Agent Message XML，也禁止用 sleep/轮询等待回复 |
 | `loom-needs-you` | 所有 CodexLoom Agent | 在确实需要用户决定、事实或授权时创建持久 Human Request，区分 required/optional；请求后结束 Turn，不用原生悬挂式提问，也不 sleep/轮询 |
 | `domain-agent-coaching` | Loom Coach，也可供其他 Agent 自省 | 用证据和提问梳理长期 Identity、Domain、Scope、Organization 和 Collaboration，不替业务负责人做决定 |
 | `loom-integrations` | 管理外部身份或排查外部消息的 Agent | 用 CLI 检查和配置 Connection、Address、群/DM Membership、触发和回复策略，并用真实 Inbox/Outbox 验证投递 |
@@ -20,6 +20,8 @@ CodexLoom 当前内置十个 Skill：
 | `loom-topics` | 负责或参与跨 Turn、跨 Agent 持续事项的 Agent | 判断何时需要 Topic，维护 Responsible/Participant 边界、versioned brief、waiting 和证据；通过带 Topic ID 的 Message、Needs You 与 Trigger 保持因果连续性 |
 
 源文件在 `skills/<name>/`。每个 Skill 只有 Codex 需要的 `SKILL.md` 和 UI 元数据 `agents/openai.yaml`，随 CodexLoom 二进制一起内嵌和版本管理。
+
+Pi Agent 继续继承 Pi 原生 settings、Skills 与用户 Extensions。CodexLoom 只额外显式加载一个 Loom-owned Extension；当前它提供 Agent discovery 与 Message send、receive、reply 工具，并复用同一套持久 Message HTTP/SSE 控制面。
 
 ## 四种上下文的边界
 

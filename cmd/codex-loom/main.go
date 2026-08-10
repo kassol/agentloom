@@ -48,7 +48,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
-	h, err := hub.OpenWithOptions(st, hub.OpenOptions{Passive: *canary})
+	h, err := hub.OpenWithOptions(st, hub.OpenOptions{Passive: *canary, RuntimeAPIURL: fmt.Sprintf("http://127.0.0.1:%d", *port)})
 	if err != nil {
 		_ = st.Close()
 		log.Fatalf("open Hub state: %v", err)

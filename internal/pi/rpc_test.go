@@ -60,6 +60,27 @@ func TestRPCProcessCorrelatesCommandsAndForwardsLFDelimitedEvents(t *testing.T) 
 	}
 }
 
+func TestRPCProcessReceivesScopedEnvironment(t *testing.T) {
+	t.Setenv("CODEX_LOOM_AGENT_ID", "")
+	rpc, err := SpawnRPC(RPCOptions{
+		Bin: fakeRPCBin(t, "environment"), Cwd: t.TempDir(),
+		Env: map[string]string{"CODEX_LOOM_AGENT_ID": "agent-pi"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rpc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	state, err := rpc.Request(ctx, "get_state", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(state.Data), `"agent":"agent-pi"`) {
+		t.Fatalf("child environment = %s", state.Data)
+	}
+}
+
 func TestRPCProcessReportsProtocolDriftMalformedOutputAndExit(t *testing.T) {
 	for _, scenario := range []string{"wrong-id", "malformed", "unterminated", "exit"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -151,8 +172,12 @@ func TestFakePiRPCProcess(t *testing.T) {
 	case "exit":
 		os.Exit(23)
 	}
+	if os.Getenv("FAKE_PI_RPC_SCENARIO") == "environment" {
+		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"agent":%q}}`+"\n", id, os.Getenv("CODEX_LOOM_AGENT_ID"))
+		_, _ = reader.ReadString('\n')
+		return
+	}
 	fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":"/loom/pi/agent/session.jsonl","sessionId":"session-1"}}`+"\n", id)
-
 	line, err = reader.ReadString('\n')
 	if err != nil || json.Unmarshal([]byte(line), &command) != nil || command["type"] != "prompt" || command["message"] != "hello" {
 		os.Exit(24)

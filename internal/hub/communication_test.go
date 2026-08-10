@@ -98,6 +98,86 @@ func TestReplySteersExactSourceTurnAndBypassesOrdinaryQueue(t *testing.T) {
 	}
 }
 
+func TestCausalReplyUsesNativeTurnAtRuntimeAndPersistsLoomTurn(t *testing.T) {
+	h := communicationTestHub(t)
+	root, reply := causalReplyFixture()
+	h.comms[root.ID], h.comms[reply.ID] = root, reply
+	h.commOrder = []string{root.ID, reply.ID}
+	backend := &fakeAgentRuntime{}
+	h.runtimes["agent-a"] = &runtime{
+		agentRuntime: backend,
+		activeTurn:   &turnState{turnID: "turn-alpha", nativeTurnID: "native-turn-alpha"},
+	}
+
+	delivered, ok := h.tryDeliverReplyToActiveTurn("agent-a", time.Second)
+	if !ok || delivered == nil {
+		t.Fatalf("delivery = %#v, %v", delivered, ok)
+	}
+	if backend.steeredNativeRef != "thread-alpha" || backend.steeredExpected != "native-turn-alpha" {
+		t.Fatalf("Runtime steer target = %q %q", backend.steeredNativeRef, backend.steeredExpected)
+	}
+	if delivered.DeliveredTurnID != "turn-alpha" {
+		t.Fatalf("durable delivered Turn = %q, want Loom Turn", delivered.DeliveredTurnID)
+	}
+}
+
+func TestMixedRuntimeMessageDeliveryHandlingAndCausalReturn(t *testing.T) {
+	h := communicationTestHub(t)
+	h.agents["agent-a"].RuntimeBinding.Kind = "pi"
+	h.agents["agent-a"].Status = "running"
+	h.agents["agent-b"].RuntimeBinding.Kind = "codex"
+	h.agents["agent-b"].Status = "idle"
+	piBackend := &fakeAgentRuntime{}
+	codexBackend := &fakeAgentRuntime{}
+	piReady, codexReady := make(chan struct{}), make(chan struct{})
+	close(piReady)
+	close(codexReady)
+	h.runtimes["agent-a"] = &runtime{
+		agentID: "agent-a", agentRuntime: piBackend, ready: piReady,
+		activeTurn: &turnState{turnID: "turn-pi", nativeTurnID: "native-turn-pi", startedAt: time.Now(), stopWatchdog: make(chan struct{})},
+	}
+	h.runtimes["agent-b"] = &runtime{agentID: "agent-b", agentRuntime: codexBackend, ready: codexReady}
+
+	request, err := h.SendAgentMessage(CommParams{
+		From: "agent-a", To: "agent-b", Subject: "Need Codex review", Body: "Review the Runtime contract.", Response: "required",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := request.Message
+	if root.SourceTurnID != "turn-pi" || root.DeliveryStatus != "delivered" || root.DeliveryMode != "turn_start" || root.HandlingStatus != "running" {
+		t.Fatalf("mixed Runtime request = %#v", root)
+	}
+	if h.agents["agent-b"].Status != "running" || !codexBackend.started {
+		t.Fatalf("Codex receiver did not start handling: agent=%#v runtime=%#v", h.agents["agent-b"], codexBackend)
+	}
+
+	reply, err := h.SendAgentMessage(CommParams{From: "agent-b", ReplyTo: root.ID, Body: "The narrow contract is correct."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Message.ReplyTo != root.ID || reply.Message.DeliveryMode != "turn_steer" || reply.Message.DeliveredTurnID != "turn-pi" {
+		t.Fatalf("mixed Runtime causal reply = %#v", reply.Message)
+	}
+	if !piBackend.steered || piBackend.steeredExpected != "native-turn-pi" {
+		t.Fatalf("Pi causal return = %#v", piBackend)
+	}
+	answered, err := h.GetAgentMessage(root.ID)
+	if err != nil || answered.Status != "answered" || answered.Resolution != "reply" {
+		t.Fatalf("answered root = %#v, err=%v", answered, err)
+	}
+
+	ordinary, err := h.SendAgentMessage(CommParams{
+		From: "agent-c", To: "agent-a", Subject: "Unrelated work", Body: "Handle later.", Response: "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ordinary.Message.DeliveryStatus != "queued" || ordinary.Message.DeliveryMode != "" {
+		t.Fatalf("ordinary busy Message = %#v", ordinary.Message)
+	}
+}
+
 func TestSteerFailureLeavesReplyQueued(t *testing.T) {
 	h := communicationTestHub(t)
 	root, reply := causalReplyFixture()

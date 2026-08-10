@@ -287,6 +287,7 @@ func (s *subscriber) close() {
 type Hub struct {
 	st              *store.Store
 	passive         bool
+	runtimeAPIURL   string
 	writerOwnership *store.WritableOwnership
 
 	mu                      sync.Mutex
@@ -384,7 +385,8 @@ func New(st *store.Store) *Hub {
 // canaries: it loads projections without importing external registries,
 // reconciling live runtime state, or starting workers.
 type OpenOptions struct {
-	Passive bool
+	Passive       bool
+	RuntimeAPIURL string
 }
 
 // Open loads all durable projections before starting background work. Required
@@ -421,6 +423,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	h := &Hub{
 		st:                     st,
 		passive:                options.Passive,
+		runtimeAPIURL:          options.RuntimeAPIURL,
 		writerOwnership:        ownership,
 		agents:                 map[string]*Agent{},
 		agentSkillConfigs:      map[string]*AgentSkillConfig{},
@@ -1051,7 +1054,7 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 			ready: make(chan struct{}), approvals: map[string]*approval{},
 		}
 	} else if meta.RuntimeBinding.Kind == "pi" {
-		rt = &runtime{agentID: meta.ID, agentRuntime: newPiAgentRuntime(meta.ID, h.st.Dir()), ready: make(chan struct{}), approvals: map[string]*approval{}}
+		rt = &runtime{agentID: meta.ID, agentRuntime: newPiAgentRuntime(meta.ID, h.st.Dir(), h.runtimeAPIURL), ready: make(chan struct{}), approvals: map[string]*approval{}}
 	} else {
 		return nil, errf(400, "unsupported Runtime kind %q", meta.RuntimeBinding.Kind)
 	}

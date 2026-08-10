@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -78,5 +79,49 @@ func TestRealRPCSmoke(t *testing.T) {
 	}
 	if text != "PI_SMOKE_OK" {
 		t.Fatalf("assistant = %q", text)
+	}
+}
+
+func TestRealLoomExtensionLoads(t *testing.T) {
+	bin := os.Getenv("PI_REAL_BIN")
+	if bin == "" {
+		t.Skip("set PI_REAL_BIN to run the real Pi Extension smoke")
+	}
+	dataDir := t.TempDir()
+	extensionPath, err := MaterializeLoomExtension(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errors := make(chan string, 1)
+	rpc, err := SpawnRPC(RPCOptions{
+		Bin: bin, Cwd: t.TempDir(),
+		Args: []string{
+			"--session-dir", filepath.Join(dataDir, "sessions"), "--session-id", "loom-issue-9-extension-smoke",
+			"--extension", extensionPath, "--approve",
+		},
+		Env: map[string]string{"CODEX_LOOM_AGENT_ID": "agent-smoke", "CODEX_LOOM_API_URL": "http://127.0.0.1:1"},
+		OnEvent: func(raw json.RawMessage) {
+			var event struct {
+				Type  string `json:"type"`
+				Error string `json:"error"`
+			}
+			if json.Unmarshal(raw, &event) == nil && event.Type == "extension_error" {
+				errors <- event.Error
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rpc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := rpc.Request(ctx, "get_state", nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case message := <-errors:
+		t.Fatalf("Loom Pi Extension failed to load: %s", message)
+	case <-time.After(500 * time.Millisecond):
 	}
 }

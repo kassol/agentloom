@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ type RPCOptions struct {
 	Bin       string
 	Cwd       string
 	Args      []string
+	Env       map[string]string
 	OnEvent   func(json.RawMessage)
 	OnFailure func(error)
 }
@@ -65,6 +67,21 @@ func SpawnRPC(options RPCOptions) (*RPC, error) {
 	args := append([]string{"--mode", "rpc"}, options.Args...)
 	command := exec.Command(bin, args...)
 	command.Dir = options.Cwd
+	command.Env = append([]string(nil), os.Environ()...)
+	for key, value := range options.Env {
+		prefix := key + "="
+		replaced := false
+		for index, entry := range command.Env {
+			if strings.HasPrefix(entry, prefix) {
+				command.Env[index] = prefix + value
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			command.Env = append(command.Env, prefix+value)
+		}
+	}
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("open Pi RPC stdin: %w", err)

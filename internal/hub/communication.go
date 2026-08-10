@@ -816,7 +816,24 @@ func (h *Hub) requestTurnSteer(rt *runtime, threadID, expectedTurnID, input stri
 	if backend == nil {
 		return "", errors.New("Agent Runtime is unavailable")
 	}
-	return backend.Steer(threadID, expectedTurnID, input, timeout)
+	h.mu.Lock()
+	if rt.activeTurn == nil || rt.activeTurn.finished || rt.activeTurn.turnID != expectedTurnID {
+		h.mu.Unlock()
+		return "", errors.New("active Loom Turn changed before causal steer")
+	}
+	expectedNativeTurnID := rt.activeTurn.nativeTurnID
+	h.mu.Unlock()
+	if expectedNativeTurnID == "" {
+		return "", errors.New("active Turn has no native Runtime binding for causal steer")
+	}
+	acceptedNativeTurnID, err := backend.Steer(threadID, expectedNativeTurnID, input, timeout)
+	if err != nil {
+		return "", err
+	}
+	if acceptedNativeTurnID != expectedNativeTurnID {
+		return "", fmt.Errorf("Agent Runtime steered native Turn %s, expected %s", acceptedNativeTurnID, expectedNativeTurnID)
+	}
+	return expectedTurnID, nil
 }
 
 func (h *Hub) failQueuedForTarget(target string, cause error) {
