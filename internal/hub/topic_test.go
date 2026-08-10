@@ -100,9 +100,9 @@ func topicTestHub(t *testing.T) *Hub {
 	}
 	h := testHub(st)
 	h.topics = map[string]*Topic{}
-	h.agents["lead"] = &Agent{ID: "lead", Name: "parall-dev-lead", ThreadID: "thread-lead", Status: "idle", CreatedAt: now(), UpdatedAt: now()}
-	h.agents["edge"] = &Agent{ID: "edge", Name: "parall-edge-dev", ThreadID: "thread-edge", Status: "idle", CreatedAt: now(), UpdatedAt: now()}
-	h.agents["other"] = &Agent{ID: "other", Name: "other", ThreadID: "thread-other", Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	h.agents["lead"] = &Agent{ID: "lead", Name: "parall-dev-lead", ThreadID: "loom-thread-lead", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-lead"}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	h.agents["edge"] = &Agent{ID: "edge", Name: "parall-edge-dev", ThreadID: "loom-thread-edge", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-edge"}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	h.agents["other"] = &Agent{ID: "other", Name: "other", ThreadID: "loom-thread-other", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-other"}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
 	return h
 }
 
@@ -219,7 +219,8 @@ func TestSendTopicInputUsesConciseDisplayTaskAndFullModelContext(t *testing.T) {
 	logPath := installFakeSharedCodexHost(t)
 	h := topicTestHub(t)
 	defer h.Shutdown()
-	h.agents["lead"].ThreadID = "thr-stale"
+	h.agents["lead"].ThreadID = "loom-thr-stale"
+	h.agents["lead"].RuntimeBinding.NativeRef = "thr-stale"
 	h.agents["lead"].Cwd = "/tmp/stale"
 	topic := createClipTopic(t, h)
 

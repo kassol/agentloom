@@ -412,9 +412,9 @@ func communicationTestHub(t *testing.T) *Hub {
 		t.Fatal(err)
 	}
 	h := testHub(st)
-	h.agents["agent-a"] = &Agent{ID: "agent-a", Name: "alpha", ThreadID: "thread-alpha", Status: "running"}
-	h.agents["agent-b"] = &Agent{ID: "agent-b", Name: "beta", ThreadID: "thread-beta", Status: "idle"}
-	h.agents["agent-c"] = &Agent{ID: "agent-c", Name: "gamma", ThreadID: "thread-gamma", Status: "idle"}
+	h.agents["agent-a"] = &Agent{ID: "agent-a", Name: "alpha", ThreadID: "loom-thread-alpha", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-alpha"}, Status: "running"}
+	h.agents["agent-b"] = &Agent{ID: "agent-b", Name: "beta", ThreadID: "loom-thread-beta", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-beta"}, Status: "idle"}
+	h.agents["agent-c"] = &Agent{ID: "agent-c", Name: "gamma", ThreadID: "loom-thread-gamma", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-gamma"}, Status: "idle"}
 	h.runtimes["agent-a"] = &runtime{activeTurn: &turnState{turnID: "turn-alpha"}}
 	return h
 }

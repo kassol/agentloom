@@ -14,8 +14,8 @@ func TestSyncThreadNamesSendsPersistedNames(t *testing.T) {
 	logPath := installFakeCodexNameServer(t)
 	h := &Hub{
 		agents: map[string]*Agent{
-			"a": {ID: "a", Name: "agent-a", ThreadID: "thread-b"},
-			"b": {ID: "b", Name: "agent-b", ThreadID: "thread-a"},
+			"a": {ID: "a", Name: "agent-a", ThreadID: "loom-thread-b", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-b"}},
+			"b": {ID: "b", Name: "agent-b", ThreadID: "loom-thread-a", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-a"}},
 			"c": {ID: "c", Name: "no-thread"},
 		},
 	}
@@ -42,7 +42,7 @@ func TestUpdateConfigSyncsRenamedThread(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := testHub(st)
-	h.agents["sess"] = &Agent{ID: "sess", Name: "old-name", ThreadID: "thread-1", Status: "idle"}
+	h.agents["sess"] = &Agent{ID: "sess", Name: "old-name", ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"}, Status: "idle"}
 	name := "new-name"
 
 	view, err := h.UpdateConfig("sess", ConfigParams{Name: &name})

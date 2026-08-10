@@ -56,7 +56,7 @@ func TestSwitchAgentProviderColdResumesSameThread(t *testing.T) {
 		}
 		var data map[string]any
 		_ = json.Unmarshal(event.Data, &data)
-		switched = data["previousProviderId"] == "openai" && data["providerId"] == "deepseek" && data["threadId"] == "thr-stale"
+		switched = data["previousProviderId"] == "openai" && data["providerId"] == "deepseek" && data["threadId"] == "loom-thr-stale"
 	}
 	if !switched {
 		t.Fatalf("Provider switch event missing: %#v", events)
@@ -190,8 +190,8 @@ func TestSwitchAgentProviderRejectsActiveGoal(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := testHub(st)
-	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: "thr-1", Status: "idle"}
-	h.goals["agent-1"] = &ThreadGoal{ThreadID: "thr-1", Status: GoalStatusActive}
+	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: "loom-thr-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-1"}, Status: "idle"}
+	h.goals["agent-1"] = &ThreadGoal{ThreadID: "loom-thr-1", Status: GoalStatusActive}
 	_, err = h.SwitchAgentProvider("agent-1", ProviderSwitchParams{ProviderID: "openai", Model: "gpt-5.6"})
 	if err == nil || !strings.Contains(err.Error(), "active Goal") {
 		t.Fatalf("active Goal switch error = %v", err)

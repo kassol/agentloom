@@ -26,7 +26,7 @@ func TestBuildWorkloadOverviewCombinesActivityWaitAndBacklog(t *testing.T) {
 	t.Setenv("CODEX_SESSIONS_DIR", sessions)
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	snapshot := workloadSnapshot{
-		agents: []Agent{{ID: "agent-1", Name: "research", ThreadID: threadID, Status: "running", CreatedAt: "2026-07-15T00:00:00Z"}},
+		agents: []Agent{{ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "running", CreatedAt: "2026-07-15T00:00:00Z"}},
 		messages: []AgentMessage{
 			{ID: "msg-1", ToAgentID: "agent-1", CreatedAt: "2026-07-15T03:00:00Z", DeliveredAt: "2026-07-15T03:10:00Z", DeliveryStatus: "delivered"},
 			{ID: "msg-2", ToAgentID: "agent-1", ScheduleID: "sched-1", ScheduledAt: "2026-07-15T04:00:00Z", CreatedAt: "2026-07-15T03:59:00Z", DeliveredAt: "2026-07-15T04:30:00Z", DeliveryStatus: "delivered"},
@@ -76,7 +76,7 @@ func TestBuildWorkloadOverviewExcludesUnavailableActivityFromIdleDenominator(t *
 	t.Setenv("CODEX_SESSIONS_DIR", t.TempDir())
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	overview := buildWorkloadOverview(workloadSnapshot{
-		agents: []Agent{{ID: "agent-1", Name: "missing", ThreadID: "missing-thread", CreatedAt: "2026-07-15T00:00:00Z"}},
+		agents: []Agent{{ID: "agent-1", Name: "missing", ThreadID: "loom-missing-thread", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "missing-thread"}, CreatedAt: "2026-07-15T00:00:00Z"}},
 	}, 1, now)
 
 	if overview.ObservedSeconds != 0 || overview.IdleProxyPercent != 0 {
@@ -91,7 +91,7 @@ func TestBuildWorkloadOverviewIncludesBacklogOlderThanWindow(t *testing.T) {
 	t.Setenv("CODEX_SESSIONS_DIR", t.TempDir())
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	overview := buildWorkloadOverview(workloadSnapshot{
-		agents: []Agent{{ID: "agent-1", Name: "queued", ThreadID: "missing-thread"}},
+		agents: []Agent{{ID: "agent-1", Name: "queued", ThreadID: "loom-missing-thread", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "missing-thread"}}},
 		messages: []AgentMessage{{
 			ID: "msg-old", ToAgentID: "agent-1", CreatedAt: "2026-06-01T00:00:00Z", DeliveryStatus: "queued",
 		}},
@@ -127,7 +127,7 @@ func TestBuildWorkloadOverviewRangeSeparatesHistoricalSamplesFromCurrentBacklog(
 	endExclusive := start.AddDate(0, 0, 1)
 	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 	overview := buildWorkloadOverviewRange(workloadSnapshot{
-		agents: []Agent{{ID: "agent-1", Name: "research", ThreadID: threadID, CreatedAt: "2026-07-14T00:00:00Z"}},
+		agents: []Agent{{ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, CreatedAt: "2026-07-14T00:00:00Z"}},
 		messages: []AgentMessage{
 			{ID: "msg-selected", ToAgentID: "agent-1", CreatedAt: "2026-07-15T03:00:00Z", DeliveredAt: "2026-07-15T03:10:00Z", DeliveryStatus: "delivered"},
 			{ID: "msg-outside", ToAgentID: "agent-1", CreatedAt: "2026-07-16T03:00:00Z", DeliveredAt: "2026-07-16T03:30:00Z", DeliveryStatus: "delivered"},
@@ -172,7 +172,7 @@ func TestBuildWorkloadOverviewRangeClipsTodayAtNow(t *testing.T) {
 	endExclusive := start.AddDate(0, 0, 1)
 	now := start.Add(12 * time.Hour)
 	overview := buildWorkloadOverviewRange(workloadSnapshot{
-		agents: []Agent{{ID: "agent-1", Name: "research", ThreadID: threadID, CreatedAt: "2026-07-15T00:00:00Z"}},
+		agents: []Agent{{ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, CreatedAt: "2026-07-15T00:00:00Z"}},
 	}, start, endExclusive, now)
 
 	if !overview.Live || overview.ObservedSeconds != 12*60*60 || overview.ExecutingSeconds != 60*60 {

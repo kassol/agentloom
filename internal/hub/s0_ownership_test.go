@@ -56,7 +56,7 @@ func TestS0PassiveOpenAndShutdownLeaveWholeTreeByteExact(t *testing.T) {
 		}
 	}
 	write("agents.json", map[string]any{"agent": map[string]any{
-		"id": "agent", "name": "agent", "threadId": "thread", "status": "running", "pendingProviderSwitch": map[string]any{"providerId": "old"},
+		"id": "agent", "name": "agent", "threadId": "loom-thread", "runtimeBinding": map[string]any{"kind": "codex", "nativeRef": "thread"}, "status": "running", "pendingProviderSwitch": map[string]any{"providerId": "old"},
 	}})
 	write("topics.json", map[string]any{"topic": map[string]any{"id": "topic", "title": "legacy", "status": "active"}})
 	write("triggers.json", map[string]any{"trigger": map[string]any{"id": "trigger", "agentId": "agent", "state": "pending"}})

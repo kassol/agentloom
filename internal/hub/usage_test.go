@@ -57,7 +57,7 @@ func TestBuildAgentUsageSeparatesTodayPeriodAndLifetime(t *testing.T) {
 	const threadID = "usage-thread"
 	writeUsageRollout(t, threadID)
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
-	agent := AgentView{Agent: Agent{ID: "agent-1", Name: "research", ThreadID: threadID, Status: "idle"}}
+	agent := AgentView{Agent: Agent{ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle"}, nativeRuntimeRef: threadID}
 
 	usage := buildAgentUsage(agent, 7, now)
 	if !usage.Available {
@@ -85,13 +85,13 @@ func TestBuildAgentUsageSeparatesSameThreadByProviderTimeline(t *testing.T) {
 	writeUsageRollout(t, threadID)
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	agent := AgentView{Agent: Agent{
-		ID: "agent-1", Name: "research", ThreadID: threadID, Status: "idle",
+		ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle",
 		ProviderID: "deepseek", Model: deepSeekModel,
 		ProviderHistory: []ProviderBindingChange{{
 			PreviousProviderID: "openai", PreviousModel: "gpt-5.6",
 			ProviderID: "deepseek", Model: deepSeekModel, SwitchedAt: "2026-07-13T00:00:00Z",
 		}},
-	}}
+	}, nativeRuntimeRef: threadID}
 
 	usage := buildAgentUsage(agent, 7, now)
 	if len(usage.Models) != 2 {
@@ -114,13 +114,13 @@ func TestBuildAgentUsageDoesNotMergeSameModelAcrossProviders(t *testing.T) {
 	writeSameModelProviderUsageRollout(t, threadID)
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	agent := AgentView{Agent: Agent{
-		ID: "agent-1", Name: "research", ThreadID: threadID, Status: "idle",
+		ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle",
 		ProviderID: "deepseek", Model: "shared-model",
 		ProviderHistory: []ProviderBindingChange{{
 			PreviousProviderID: "openai", PreviousModel: "shared-model",
 			ProviderID: "deepseek", Model: "shared-model", SwitchedAt: "2026-07-13T00:00:00Z",
 		}},
-	}}
+	}, nativeRuntimeRef: threadID}
 
 	usage := buildAgentUsage(agent, 7, now)
 	groups := map[string]int64{}
@@ -149,7 +149,7 @@ func TestBuildAgentUsageRangeSelectsHistoricalDayAndPreviousDay(t *testing.T) {
 	start := time.Date(2026, 7, 13, 0, 0, 0, 0, location)
 	endExclusive := start.AddDate(0, 0, 1)
 	now := time.Date(2026, 7, 14, 12, 0, 0, 0, location)
-	agent := AgentView{Agent: Agent{ID: "agent-1", Name: "research", ThreadID: threadID, Status: "idle"}}
+	agent := AgentView{Agent: Agent{ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle"}, nativeRuntimeRef: threadID}
 
 	usage := buildAgentUsageRange(agent, start, endExclusive, now)
 	if usage.Period.TotalTokens != 90 {
