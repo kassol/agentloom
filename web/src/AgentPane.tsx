@@ -538,7 +538,9 @@ export function AgentPane({
         };
         const startedAt = Date.now();
         const settleRestore = () => {
+		  if (!restoringScrollRef.current) return;
           restorePosition();
+		  savedScrollTopRef.current = el.scrollTop;
           el.dispatchEvent(new Event("scroll"));
           if (Date.now() - startedAt >= 1_800) {
             restoringScrollRef.current = false;
@@ -562,7 +564,10 @@ export function AgentPane({
   const onScroll = () => {
     const el = feedRef.current;
     if (!el) return;
-    if (restoringScrollRef.current) return;
+	if (restoringScrollRef.current) {
+	  if (Math.abs(el.scrollTop - savedScrollTopRef.current) < 2) return;
+	  restoringScrollRef.current = false;
+	}
     const previousTop = savedScrollTopRef.current;
     const movedUp = el.scrollTop < previousTop - 1;
     const distance = el.scrollHeight - el.scrollTop - el.clientHeight;

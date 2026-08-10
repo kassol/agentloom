@@ -21,6 +21,7 @@ vi.mock("@tanstack/react-virtual", () => ({
 }));
 
 import { AgentPane } from "./AgentPane";
+import { publishThreadEvent } from "./thread-events";
 
 const testAgent: Agent = {
   id: "agent-scroll",
@@ -101,6 +102,48 @@ describe("AgentPane scroll restoration", () => {
     expect(latestOptions?.enabled).toBe(true);
     expect(latestOptions?.initialOffset).toBeTypeOf("function");
     expect((latestOptions?.initialOffset as () => number)()).toBe(900);
+  });
+
+  it("lets the Owner take over scrolling while an unpinned Feed is settling", async () => {
+	virtualizerHarness.instance.getVirtualItems.mockReturnValue([
+	  { index: 0, key: "row-0", start: 0, size: 1_000, end: 1_000, lane: 0 },
+	]);
+	virtualizerHarness.instance.getTotalSize.mockReturnValue(1_000);
+	vi.mocked(fetch).mockImplementation(async (input) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  const body = url.includes("/thread/history")
+		? { total: 1, turns: [{ items: [{ type: "user", text: "Latest work" }] }] }
+		: { artifacts: [] };
+	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+	const view = render(<AgentPane {...props} active />);
+	await view.findByText("Latest work");
+	const feed = view.container.querySelector("main .overflow-y-auto") as HTMLDivElement;
+	let scrollTop = 400;
+	Object.defineProperties(feed, {
+	  clientHeight: { configurable: true, value: 600 },
+	  scrollHeight: { configurable: true, value: 2_000 },
+	  scrollTop: {
+		configurable: true,
+		get: () => scrollTop,
+		set: (value: number) => { scrollTop = value; },
+	  },
+	});
+	fireEvent.scroll(feed);
+	await new Promise((resolve) => window.setTimeout(resolve, 10));
+
+	publishThreadEvent(testAgent.id, {
+	  seq: 1,
+	  ts: "2026-08-10T00:00:01Z",
+	  type: "loom/text-delta",
+	  data: { itemId: "answer-1", delta: "streaming" },
+	});
+	await new Promise((resolve) => window.setTimeout(resolve, 10));
+	scrollTop = 250;
+	fireEvent.scroll(feed);
+	await new Promise((resolve) => window.setTimeout(resolve, 180));
+
+	expect(scrollTop).toBe(250);
   });
 
   it("shows the immutable Runtime kind in the Inspector", () => {
