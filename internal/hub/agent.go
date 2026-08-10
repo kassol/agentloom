@@ -119,6 +119,7 @@ func (h *Hub) RunningSessions() []RunningSession { return h.ActiveAgents() }
 type CreateParams struct {
 	Name           string `json:"name"`
 	Cwd            string `json:"cwd"`
+	RuntimeKind    string `json:"runtimeKind"`
 	Sandbox        string `json:"sandbox"`
 	ApprovalPolicy string `json:"approvalPolicy"`
 	ProviderID     string `json:"providerId"`
@@ -130,16 +131,17 @@ type CreateParams struct {
 // creating a replacement identity or starting a Turn. Profiles and team
 // relationships are stored independently and reconnect through the stable ID.
 type RestoreAgentParams struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	Cwd            string `json:"cwd"`
-	ThreadID       string `json:"threadId"`
-	Sandbox        string `json:"sandbox"`
-	ApprovalPolicy string `json:"approvalPolicy"`
-	ProviderID     string `json:"providerId"`
-	Model          string `json:"model"`
-	Effort         string `json:"effort"`
-	CreatedAt      string `json:"createdAt"`
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	Cwd            string         `json:"cwd"`
+	ThreadID       string         `json:"threadId"`
+	RuntimeBinding RuntimeBinding `json:"runtimeBinding"`
+	Sandbox        string         `json:"sandbox"`
+	ApprovalPolicy string         `json:"approvalPolicy"`
+	ProviderID     string         `json:"providerId"`
+	Model          string         `json:"model"`
+	Effort         string         `json:"effort"`
+	CreatedAt      string         `json:"createdAt"`
 }
 
 type ConfigParams struct {
@@ -149,11 +151,19 @@ type ConfigParams struct {
 	Sandbox        *string `json:"sandbox"`
 	ApprovalPolicy *string `json:"approvalPolicy"`
 	ProviderID     *string `json:"providerId"`
+	RuntimeKind    *string `json:"runtimeKind"`
 }
 
 func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 	if p.Name == "" || p.Cwd == "" {
 		return AgentView{}, errf(400, "name and cwd are required")
+	}
+	p.RuntimeKind = strings.TrimSpace(p.RuntimeKind)
+	if p.RuntimeKind == "" {
+		return AgentView{}, errf(400, "runtimeKind is required")
+	}
+	if p.RuntimeKind != "codex" {
+		return AgentView{}, errf(400, "unsupported Runtime kind %q", p.RuntimeKind)
 	}
 	if !nameRe.MatchString(p.Name) {
 		return AgentView{}, errf(400, "name must match [a-zA-Z0-9_-]+")
@@ -201,8 +211,9 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 		return AgentView{}, errf(409, "agent %q already exists", p.Name)
 	}
 	meta := &Agent{
-		ID: id, Name: p.Name, Cwd: p.Cwd,
-		Sandbox: p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort,
+		ID: id, Name: p.Name, Cwd: p.Cwd, ThreadID: newIntegrationID("thr"),
+		RuntimeBinding: RuntimeBinding{Kind: p.RuntimeKind},
+		Sandbox:        p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort,
 		Status: "idle", CreatedAt: now(), UpdatedAt: now(),
 	}
 	h.agents[id] = meta
@@ -229,7 +240,7 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 
 	h.mu.Lock()
 	if err := h.persistAgentsLocked(); err != nil {
-		threadID := meta.ThreadID
+		threadID := meta.RuntimeBinding.NativeRef
 		delete(h.agents, id)
 		delete(h.runtimes, id)
 		delete(h.seqs, id)
@@ -240,7 +251,7 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 		return AgentView{}, errf(500, "save agent: %s", err)
 	}
 	h.emitLocked(id, "loom/agent-created", map[string]any{
-		"id": id, "name": meta.Name, "cwd": meta.Cwd, "threadId": meta.ThreadID, "providerId": meta.ProviderID,
+		"id": id, "name": meta.Name, "cwd": meta.Cwd, "threadId": meta.ThreadID, "runtimeKind": meta.RuntimeBinding.Kind, "providerId": meta.ProviderID,
 	})
 	h.emitStatusLocked(meta, meta.Status)
 	view := h.viewLocked(meta)
@@ -253,8 +264,13 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	p.Name = strings.TrimSpace(p.Name)
 	p.Cwd = strings.TrimSpace(p.Cwd)
 	p.ThreadID = strings.TrimSpace(p.ThreadID)
-	if p.ID == "" || p.Name == "" || p.Cwd == "" || p.ThreadID == "" {
-		return AgentView{}, errf(400, "id, name, cwd, and threadId are required")
+	p.RuntimeBinding.Kind = strings.TrimSpace(p.RuntimeBinding.Kind)
+	p.RuntimeBinding.NativeRef = strings.TrimSpace(p.RuntimeBinding.NativeRef)
+	if p.ID == "" || p.Name == "" || p.Cwd == "" || p.ThreadID == "" || p.RuntimeBinding.Kind == "" || p.RuntimeBinding.NativeRef == "" {
+		return AgentView{}, errf(400, "id, name, cwd, threadId, and Runtime Binding are required")
+	}
+	if p.RuntimeBinding.Kind != "codex" {
+		return AgentView{}, errf(400, "unsupported Runtime kind %q", p.RuntimeBinding.Kind)
 	}
 	if !nameRe.MatchString(p.Name) {
 		return AgentView{}, errf(400, "name must match [a-zA-Z0-9_-]+")
@@ -293,12 +309,12 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 		return AgentView{}, errf(409, "agent %q already exists", p.Name)
 	}
 	for _, existing := range h.agents {
-		if existing.ThreadID == p.ThreadID {
-			return AgentView{}, errf(409, "thread %q is already bound to agent %q", p.ThreadID, existing.Name)
+		if existing.ThreadID == p.ThreadID || existing.RuntimeBinding.NativeRef == p.RuntimeBinding.NativeRef {
+			return AgentView{}, errf(409, "Thread or Runtime Binding is already bound to agent %q", existing.Name)
 		}
 	}
 	meta := &Agent{
-		ID: p.ID, Name: p.Name, Cwd: p.Cwd, ThreadID: p.ThreadID,
+		ID: p.ID, Name: p.Name, Cwd: p.Cwd, ThreadID: p.ThreadID, RuntimeBinding: p.RuntimeBinding,
 		Sandbox: p.Sandbox, ApprovalPolicy: p.ApprovalPolicy,
 		ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort,
 		Status: "idle", CreatedAt: p.CreatedAt, UpdatedAt: now(),
@@ -311,7 +327,7 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 		return AgentView{}, errf(500, "save restored agent: %s", err)
 	}
 	h.emitLocked(p.ID, "loom/agent-restored", map[string]any{
-		"id": p.ID, "name": p.Name, "cwd": p.Cwd, "threadId": p.ThreadID, "providerId": p.ProviderID,
+		"id": p.ID, "name": p.Name, "cwd": p.Cwd, "threadId": p.ThreadID, "runtimeKind": p.RuntimeBinding.Kind, "providerId": p.ProviderID,
 	})
 	h.emitStatusLocked(meta, meta.Status)
 	return h.viewLocked(meta), nil
@@ -330,6 +346,10 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 	if meta.Status == "running" {
 		h.mu.Unlock()
 		return AgentView{}, errf(409, "agent %q is running; config changes apply between Turns", meta.Name)
+	}
+	if p.RuntimeKind != nil && strings.TrimSpace(*p.RuntimeKind) != meta.RuntimeBinding.Kind {
+		h.mu.Unlock()
+		return AgentView{}, errf(409, "Agent Runtime kind is immutable")
 	}
 
 	nextName := meta.Name
@@ -365,7 +385,7 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 	}
 	if p.ProviderID != nil {
 		nextProviderID = normalizeProviderID(*p.ProviderID)
-		if nextProviderID != meta.ProviderID && strings.TrimSpace(meta.ThreadID) != "" {
+		if nextProviderID != meta.ProviderID && strings.TrimSpace(meta.RuntimeBinding.NativeRef) != "" {
 			h.mu.Unlock()
 			return AgentView{}, errf(409, "agent %q already has a primary Thread; use the Provider switch operation", meta.Name)
 		}
@@ -421,7 +441,7 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 	}
 	h.emitStatusLocked(meta, meta.Status)
 	view := h.viewLocked(meta)
-	threadID := meta.ThreadID
+	threadID := meta.RuntimeBinding.NativeRef
 	rt := h.runtimes[meta.ID]
 	h.mu.Unlock()
 
@@ -464,12 +484,12 @@ func (h *Hub) SyncThreadNames() error {
 	h.mu.Lock()
 	byThreadID := make(map[string]namedThread, len(h.agents))
 	for _, meta := range h.agents {
-		if strings.TrimSpace(meta.ThreadID) == "" || strings.TrimSpace(meta.Name) == "" {
+		if strings.TrimSpace(meta.RuntimeBinding.NativeRef) == "" || strings.TrimSpace(meta.Name) == "" {
 			continue
 		}
-		current, exists := byThreadID[meta.ThreadID]
+		current, exists := byThreadID[meta.RuntimeBinding.NativeRef]
 		if !exists || (current.source == "edge" && meta.Source != "edge") {
-			byThreadID[meta.ThreadID] = namedThread{id: meta.ThreadID, name: meta.Name, source: meta.Source}
+			byThreadID[meta.RuntimeBinding.NativeRef] = namedThread{id: meta.RuntimeBinding.NativeRef, name: meta.Name, source: meta.Source}
 		}
 	}
 	h.mu.Unlock()
@@ -746,7 +766,7 @@ func (h *Hub) sendTaskWithContext(key, text string, artifactIDs []string, inacti
 	rt.activeTurn = turn
 	h.emitLocked(agentID, "loom/user-message", map[string]any{"text": visibleText, "attachments": artifacts, "topicId": topicID})
 	h.emitStatusLocked(meta, "running")
-	threadID, approvalPolicy, sandbox, model, effort := meta.ThreadID, meta.ApprovalPolicy, meta.Sandbox, meta.Model, meta.Effort
+	threadID, approvalPolicy, sandbox, model, effort := meta.RuntimeBinding.NativeRef, meta.ApprovalPolicy, meta.Sandbox, meta.Model, meta.Effort
 	h.mu.Unlock()
 	rt.startMu.Unlock()
 
@@ -966,7 +986,7 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	}
 	turn := rt.activeTurn
 	agentID := meta.ID
-	threadID := meta.ThreadID
+	threadID := meta.RuntimeBinding.NativeRef
 	turnID := turn.turnID
 	client := rt.client
 	heldMessageID := turn.agentMessageID
@@ -1073,7 +1093,7 @@ func (h *Hub) ArchiveAgent(key string) (map[string]any, error) {
 	}
 	rt := h.runtimes[agentID]
 	hasActive := rt != nil && rt.activeTurn != nil && !rt.activeTurn.finished
-	threadID := meta.ThreadID
+	threadID := meta.RuntimeBinding.NativeRef
 	name := meta.Name
 	h.mu.Unlock()
 
@@ -1193,7 +1213,7 @@ func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
 
 	var lookupErr error
 	for _, agent := range agents {
-		turn, err := rollout.ReadTurn(agent.ThreadID, turnID)
+		turn, err := rollout.ReadTurn(agent.nativeRuntimeRef, turnID)
 		if err != nil {
 			if !errors.Is(err, rollout.ErrTurnNotFound) && !errors.Is(err, rollout.ErrRolloutNotFound) && lookupErr == nil {
 				lookupErr = fmt.Errorf("Agent %s (%s): %w", agent.Name, agent.ThreadID, err)
@@ -1211,7 +1231,7 @@ func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
 		if detail.Status == "running" && (agent.Status != "running" || agent.CurrentTurnID != turnID) {
 			detail.Status = "interrupted"
 		}
-		if report, usageErr := rollout.ReadUsage(agent.ThreadID); usageErr == nil {
+		if report, usageErr := rollout.ReadUsage(agent.nativeRuntimeRef); usageErr == nil {
 			for _, activity := range report.Activity {
 				if activity.TurnID != turnID {
 					continue
@@ -1310,8 +1330,8 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 	h.mu.Unlock()
 	applyRolloutStatus(&view)
 
-	threadID := view.ThreadID
-	hist := History{ID: view.ID, Name: view.Name, Cwd: view.Cwd, ThreadID: threadID, Status: view.Status}
+	threadID := view.nativeRuntimeRef
+	hist := History{ID: view.ID, Name: view.Name, Cwd: view.Cwd, ThreadID: view.ThreadID, Status: view.Status}
 
 	if threadID == "" {
 		return hist, nil // no thread started yet → no rollout, no history

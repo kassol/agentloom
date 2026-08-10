@@ -17,7 +17,7 @@ func TestCompactAgentThreadStartsCodexCompaction(t *testing.T) {
 	h := testHub(st)
 	defer h.Shutdown()
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "thr-stale",
+		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		CreatedAt: now(), UpdatedAt: now(),
 	}
@@ -29,7 +29,7 @@ func TestCompactAgentThreadStartsCodexCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompactAgentThread: %v", err)
 	}
-	if !result.Started || result.ThreadID != "thr-stale" || result.AgentName != "worker" {
+	if !result.Started || result.ThreadID != "loom-thr-stale" || result.AgentName != "worker" {
 		t.Fatalf("compact result = %#v", result)
 	}
 	compact := lastRequestParams(t, logPath, "thread/compact/start")

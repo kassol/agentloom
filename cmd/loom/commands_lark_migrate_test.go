@@ -30,7 +30,7 @@ func TestLarkMigrateCLIEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := h.CreateAgent(hub.CreateParams{Name: "lark-test-agent", Cwd: dir})
+	agent, err := h.CreateAgent(hub.CreateParams{Name: "lark-test-agent", Cwd: dir, RuntimeKind: "codex"})
 	if err != nil {
 		t.Fatal(err)
 	}

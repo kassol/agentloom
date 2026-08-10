@@ -23,7 +23,7 @@ func TestSharedCodexHostRoutesRemoteTurnIntoAgentEvents(t *testing.T) {
 	defer h.Shutdown()
 	h.loadRemoteLocked()
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "research", Cwd: "/tmp/research", ThreadID: "thr-shared",
+		ID: "agent-1", Name: "research", Cwd: "/tmp/research", ThreadID: "loom-thr-shared", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-shared"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		CreatedAt: now(), UpdatedAt: now(),
 	}
@@ -116,7 +116,7 @@ func TestSharedCodexHostAdoptsRemoteResumedThreadOnTurnStart(t *testing.T) {
 		h.mu.Lock()
 		hydrated := false
 		for _, agent := range h.agents {
-			hydrated = hydrated || agent.ThreadID == "thr-resumed" && agent.Cwd == "/tmp/remote-project"
+			hydrated = hydrated || agent.RuntimeBinding.NativeRef == "thr-resumed" && agent.Cwd == "/tmp/remote-project"
 		}
 		h.mu.Unlock()
 		if hydrated {
@@ -129,7 +129,7 @@ func TestSharedCodexHostAdoptsRemoteResumedThreadOnTurnStart(t *testing.T) {
 	defer h.mu.Unlock()
 	var adopted *Agent
 	for _, agent := range h.agents {
-		if agent.ThreadID == "thr-resumed" {
+		if agent.RuntimeBinding.NativeRef == "thr-resumed" {
 			adopted = agent
 			break
 		}
@@ -164,7 +164,7 @@ func TestInterruptRetriesWithAuthoritativeActiveTurnID(t *testing.T) {
 	}
 	h.mu.Lock()
 	h.agents["agent-race"] = &Agent{
-		ID: "agent-race", Name: "race", ThreadID: "thr-interrupt-race", Status: "running",
+		ID: "agent-race", Name: "race", ThreadID: "loom-thr-interrupt-race", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-interrupt-race"}, Status: "running",
 		CurrentTurnID: "turn-stale", CurrentTask: "Investigate", CreatedAt: now(), UpdatedAt: now(),
 	}
 	h.runtimes["agent-race"] = &runtime{
@@ -213,18 +213,28 @@ func TestTwoAgentsShareOneCodexHost(t *testing.T) {
 	h := testHub(st)
 	defer h.Shutdown()
 
-	first, err := h.CreateAgent(CreateParams{Name: "one", Cwd: "/tmp/one"})
+	first, err := h.CreateAgent(CreateParams{Name: "one", Cwd: "/tmp/one", RuntimeKind: "codex"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := h.CreateAgent(CreateParams{
-		Name: "two", Cwd: "/tmp/two", ProviderID: "deepseek", Model: "deepseek-v4-flash",
+		Name: "two", Cwd: "/tmp/two", RuntimeKind: "codex", ProviderID: "deepseek", Model: "deepseek-v4-flash",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.ThreadID != "thr-one" || second.ThreadID != "thr-two" {
-		t.Fatalf("Thread bindings = %q, %q", first.ThreadID, second.ThreadID)
+	if first.ThreadID == "" || second.ThreadID == "" || first.ThreadID == "thr-one" || second.ThreadID == "thr-two" {
+		t.Fatalf("Loom Thread identities = %q, %q", first.ThreadID, second.ThreadID)
+	}
+	if first.RuntimeBinding.Kind != "codex" || first.RuntimeBinding.NativeRef != "" {
+		t.Fatalf("public Runtime Binding = %#v, want redacted Codex binding", first.RuntimeBinding)
+	}
+	var persisted map[string]*Agent
+	if err := st.LoadAgents(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted[first.ID].RuntimeBinding.NativeRef != "thr-one" || persisted[second.ID].RuntimeBinding.NativeRef != "thr-two" {
+		t.Fatalf("persisted native Runtime references = %#v, %#v", persisted[first.ID].RuntimeBinding, persisted[second.ID].RuntimeBinding)
 	}
 
 	h.mu.Lock()
@@ -290,7 +300,7 @@ func TestSendTaskResumesCachedThreadBeforeTurnStart(t *testing.T) {
 	h := testHub(st)
 	defer h.Shutdown()
 	h.agents["agent-stale"] = &Agent{
-		ID: "agent-stale", Name: "stale", Cwd: "/tmp/stale", ThreadID: "thr-stale",
+		ID: "agent-stale", Name: "stale", Cwd: "/tmp/stale", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		ProviderID: "deepseek", Model: "deepseek-v4-flash",
 		CreatedAt: now(), UpdatedAt: now(),
@@ -379,7 +389,7 @@ func TestDeepSeekAgentRejectsAttachmentsBeforeTurnStart(t *testing.T) {
 	h := testHub(st)
 	defer h.Shutdown()
 	agent, err := h.CreateAgent(CreateParams{
-		Name: "two", Cwd: "/tmp/two", ProviderID: "deepseek", Model: "deepseek-v4-flash",
+		Name: "two", Cwd: "/tmp/two", RuntimeKind: "codex", ProviderID: "deepseek", Model: "deepseek-v4-flash",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -557,12 +567,12 @@ func TestAgentSkillDisableIsScopedPersistedAndCompiledIntoColdResume(t *testing.
 	}
 	h := testHub(st)
 
-	cici, err := h.CreateAgent(CreateParams{Name: "cici-web", Cwd: "/tmp/one"})
+	cici, err := h.CreateAgent(CreateParams{Name: "cici-web", Cwd: "/tmp/one", RuntimeKind: "codex"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.RestoreAgent(RestoreAgentParams{
-		ID: "other-agent", Name: "coze-user", Cwd: "/tmp/one", ThreadID: "thr-other",
+		ID: "other-agent", Name: "coze-user", Cwd: "/tmp/one", ThreadID: "loom-thr-other", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-other"},
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -75,7 +75,7 @@ func (h *Hub) interruptTurnIfActive(agentID string, expected *turnState, reason 
 		h.mu.Unlock()
 		return false, nil
 	}
-	threadID := meta.ThreadID
+	threadID := meta.RuntimeBinding.NativeRef
 	turnID := expected.turnID
 	client := rt.client
 	h.mu.Unlock()

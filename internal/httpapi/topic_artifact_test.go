@@ -21,8 +21,8 @@ func TestTopicArtifactRoutesExposePreviewableLinkedArtifacts(t *testing.T) {
 	}
 	stamp := nowForTest()
 	if err := st.SaveAgents(map[string]*hub.Agent{
-		"lead":  {ID: "lead", Name: "lead", ThreadID: "thread-lead", Status: "idle", CreatedAt: stamp, UpdatedAt: stamp},
-		"maker": {ID: "maker", Name: "maker", ThreadID: "thread-maker", Status: "idle", CreatedAt: stamp, UpdatedAt: stamp},
+		"lead":  {ID: "lead", Name: "lead", ThreadID: "loom-thread-lead", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-lead"}, Status: "idle", CreatedAt: stamp, UpdatedAt: stamp},
+		"maker": {ID: "maker", Name: "maker", ThreadID: "loom-thread-maker", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-maker"}, Status: "idle", CreatedAt: stamp, UpdatedAt: stamp},
 	}); err != nil {
 		t.Fatal(err)
 	}

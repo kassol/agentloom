@@ -308,7 +308,7 @@ func (h *Hub) currentContextFragments(agentID string, compiledAt string) ([]cont
 			},
 			XML: relationshipXML,
 		},
-	}, agent.ThreadID, agent.Name, developerPayload, nil
+	}, agent.RuntimeBinding.NativeRef, agent.Name, developerPayload, nil
 }
 
 type directRelationshipSnapshot struct {
@@ -618,7 +618,7 @@ func (h *Hub) observeContextModelEventLocked(meta *Agent, turn *turnState) {
 	h.contextCoverageMu.Lock()
 	defer h.contextCoverageMu.Unlock()
 	var ledger ContextCoverageLedger
-	if err := h.st.LoadContextCoverage(meta.ThreadID, &ledger); err != nil || ledger.Pending == nil {
+	if err := h.st.LoadContextCoverage(meta.RuntimeBinding.NativeRef, &ledger); err != nil || ledger.Pending == nil {
 		return
 	}
 	if ledger.Pending.ID != turn.contextAttemptID || ledger.Pending.EpochID != turn.contextEpochID {
@@ -632,7 +632,7 @@ func (h *Hub) observeContextModelEventLocked(meta *Agent, turn *turnState) {
 		ledger.Pending.ModelEventObservedAt = now()
 		ledger.Pending.State = "model_observed"
 		ledger.UpdatedAt = ledger.Pending.ModelEventObservedAt
-		if err := h.st.SaveContextCoverage(meta.ThreadID, ledger); err != nil {
+		if err := h.st.SaveContextCoverage(meta.RuntimeBinding.NativeRef, ledger); err != nil {
 			return
 		}
 		observedNow = true
@@ -655,15 +655,17 @@ func (h *Hub) ContextCoverage(key string) (ContextCoverageLedger, error) {
 		h.mu.Unlock()
 		return ContextCoverageLedger{}, errf(404, "agent not found: %s", key)
 	}
-	agentID, threadID := agent.ID, agent.ThreadID
+	agentID, threadID, runtimeRef := agent.ID, agent.ThreadID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	h.contextCoverageMu.Lock()
 	defer h.contextCoverageMu.Unlock()
-	history, err := h.contextHistory(threadID, rollout.ContextHistoryQuery{})
+	history, err := h.contextHistory(runtimeRef, rollout.ContextHistoryQuery{})
 	if err != nil {
 		return ContextCoverageLedger{}, err
 	}
-	return h.loadContextCoverage(agentID, threadID, history, false)
+	ledger, err := h.loadContextCoverage(agentID, runtimeRef, history, false)
+	ledger.ThreadID = threadID
+	return ledger, err
 }
 
 func (h *Hub) ExplainContext(key string) (ContextExplainView, error) {

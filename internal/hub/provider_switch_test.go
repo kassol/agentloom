@@ -19,7 +19,7 @@ func TestSwitchAgentProviderColdResumesSameThread(t *testing.T) {
 	h := testHub(st)
 	defer h.Shutdown()
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "thr-stale",
+		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		CreatedAt: now(), UpdatedAt: now(),
 	}
@@ -31,7 +31,7 @@ func TestSwitchAgentProviderColdResumesSameThread(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.ID != "agent-1" || view.ThreadID != "thr-stale" || view.ProviderID != "deepseek" || view.Model != deepSeekModel {
+	if view.ID != "agent-1" || view.ThreadID != "loom-thr-stale" || view.ProviderID != "deepseek" || view.Model != deepSeekModel {
 		t.Fatalf("switched Agent = %#v", view.Agent)
 	}
 	if view.PendingProviderSwitch != nil || len(view.ProviderHistory) != 1 {
@@ -72,7 +72,7 @@ func TestSwitchAgentProviderRollsBackWhenColdResumeFails(t *testing.T) {
 	h := testHub(st)
 	defer h.Shutdown()
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "thr-stale",
+		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		ProviderID: "deepseek", Model: deepSeekModel, CreatedAt: now(), UpdatedAt: now(),
 	}
@@ -108,7 +108,7 @@ func TestSwitchAgentProviderToOpenAIRepairsReasoningContent(t *testing.T) {
 	h := testHub(st)
 	defer h.Shutdown()
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: threadID,
+		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		ProviderID: "deepseek", Model: deepSeekModel, CreatedAt: now(), UpdatedAt: now(),
 	}
@@ -155,7 +155,7 @@ func TestSwitchAgentProviderToOpenAIRestoresRolloutOnFailure(t *testing.T) {
 	h := testHub(st)
 	defer h.Shutdown()
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: threadID,
+		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		ProviderID: "deepseek", Model: deepSeekModel, CreatedAt: now(), UpdatedAt: now(),
 	}

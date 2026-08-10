@@ -4,7 +4,7 @@ import type { Agent, InboxEntry } from "./types";
 
 function agent(status: string, goalStatus?: Agent["goal"] extends infer G ? any : never): Agent {
   return {
-    id: "a1", name: "research", cwd: "/tmp", threadId: "t1", sandbox: "danger-full-access",
+	id: "a1", name: "research", cwd: "/tmp", threadId: "t1", runtimeBinding: { kind: "codex" }, sandbox: "danger-full-access",
     approvalPolicy: "never", status, currentTask: "", currentTurnId: "", lastError: "",
     createdAt: "2026-07-17T00:00:00Z", updatedAt: "2026-07-17T00:00:00Z", processAlive: true,
     pendingApprovals: [], lastSeq: 0,

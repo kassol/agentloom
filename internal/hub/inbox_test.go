@@ -625,7 +625,7 @@ func TestExternalInboxLiveProjectionUsesDisplayEnvelope(t *testing.T) {
 	h.addresses = map[string]*AgentAddress{}
 	h.memberships = map[string]*ConversationMembership{}
 	h.agents["agent-lark"] = &Agent{
-		ID: "agent-lark", Name: "lark-agent", Cwd: "/tmp/stale", ThreadID: "thr-stale",
+		ID: "agent-lark", Name: "lark-agent", Cwd: "/tmp/stale", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		CreatedAt: now(), UpdatedAt: now(),
 	}
@@ -1217,7 +1217,7 @@ func stringsContains(value, fragment string) bool {
 func seedInboxAgent(t *testing.T, h *Hub, id, name string) {
 	t.Helper()
 	h.mu.Lock()
-	h.agents[id] = &Agent{ID: id, Name: name, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	h.agents[id] = &Agent{ID: id, Name: name, ThreadID: "loom-" + id, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-" + id}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
 	h.persistRuntimeProjectionLocked()
 	h.mu.Unlock()
 }

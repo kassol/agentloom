@@ -51,7 +51,8 @@ func (h *Hub) CompactAgentThread(key string) (ThreadCompactResult, error) {
 		return ThreadCompactResult{}, errf(409, "agent %q has an active Goal; pause it before compacting", agent.Name)
 	}
 	agentID, agentName := agent.ID, agent.Name
-	threadID, sandbox, cwd := strings.TrimSpace(agent.ThreadID), agent.Sandbox, agent.Cwd
+	loomThreadID := agent.ThreadID
+	threadID, sandbox, cwd := strings.TrimSpace(agent.RuntimeBinding.NativeRef), agent.Sandbox, agent.Cwd
 	providerID, model := effectiveProviderBinding(agent)
 	disabledSkillPaths := h.disabledSkillPathsLocked(agent.ID)
 	h.mu.Unlock()
@@ -73,9 +74,9 @@ func (h *Hub) CompactAgentThread(key string) (ThreadCompactResult, error) {
 	h.mu.Lock()
 	if agent := h.agents[agentID]; agent != nil {
 		h.emitLocked(agentID, "loom/agent-compacted", map[string]any{
-			"agentId": agentID, "agentName": agentName, "threadId": threadID,
+			"agentId": agentID, "agentName": agentName, "threadId": loomThreadID,
 		})
 	}
 	h.mu.Unlock()
-	return ThreadCompactResult{AgentID: agentID, AgentName: agentName, ThreadID: threadID, Started: true}, nil
+	return ThreadCompactResult{AgentID: agentID, AgentName: agentName, ThreadID: loomThreadID, Started: true}, nil
 }

@@ -36,9 +36,7 @@ func TestSetupLarkCreatesDurableAddressAndGroupRoleIdempotently(t *testing.T) {
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{
-		ID: "agent-lark", Name: "lark-agent", Cwd: t.TempDir(), ThreadID: "thread-lark",
-	}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-lark", "lark-agent", t.TempDir(), "thread-lark")); err != nil {
 		t.Fatal(err)
 	}
 	s := New(h, st, nil)

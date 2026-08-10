@@ -17,7 +17,7 @@ func TestContextHTTPPromptAndCoverageRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*hub.Agent{
-		"one": {ID: "one", Name: "one", Cwd: t.TempDir(), ThreadID: "thread-one", Status: "idle"},
+		"one": {ID: "one", Name: "one", Cwd: t.TempDir(), ThreadID: "loom-thread-one", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-one"}, Status: "idle"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func TestContextHTTPPromptAndCoverageRoundTrip(t *testing.T) {
 		t.Fatalf("context explain = %#v", explain)
 	}
 	coverage := topicRequest(t, server, http.MethodGet, "/api/agents/one/context/coverage", nil, http.StatusOK)["coverage"].(map[string]any)
-	if coverage["threadId"] != "thread-one" || coverage["epoch"].(map[string]any)["id"] != "initial:thread-one" {
+	if coverage["threadId"] != "loom-thread-one" || coverage["epoch"].(map[string]any)["id"] != "initial:thread-one" {
 		t.Fatalf("coverage = %#v", coverage)
 	}
 	cleared := topicRequest(t, server, http.MethodDelete, "/api/context/agent-prompt?expectedVersion=3", nil, http.StatusOK)["prompt"].(map[string]any)

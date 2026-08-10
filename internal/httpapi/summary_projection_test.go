@@ -18,7 +18,7 @@ func TestWorkspaceSummaryEndpointsKeepDetailOutOfListResponses(t *testing.T) {
 	managedContext := `<loom_context version="1"><payload>` + string(make([]byte, 2_048)) + `</payload></loom_context>`
 	if err := st.SaveAgents(map[string]*hub.Agent{
 		"lead": {
-			ID: "lead", Name: "summary-lead", Cwd: t.TempDir(), ThreadID: "thread-lead", Status: "idle",
+			ID: "lead", Name: "summary-lead", Cwd: t.TempDir(), ThreadID: "loom-thread-lead", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-lead"}, Status: "idle",
 			CurrentTask:     "Review the candidate\n\n" + managedContext,
 			LastTurn:        &hub.TurnSummary{TurnID: "turn-1", Task: "Completed work\n\n" + managedContext, Status: "completed"},
 			ProviderHistory: []hub.ProviderBindingChange{{PreviousProviderID: "deepseek", ProviderID: "", SwitchedAt: "2026-08-01T00:00:00Z"}},

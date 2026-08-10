@@ -27,6 +27,7 @@ const testAgent: Agent = {
   name: "agent-scroll",
   cwd: "/workspace/agent-scroll",
   threadId: "thread-scroll",
+  runtimeBinding: { kind: "codex" },
   sandbox: "workspace-write",
   approvalPolicy: "on-request",
   status: "idle",
@@ -93,5 +94,11 @@ describe("AgentPane scroll restoration", () => {
     expect(latestOptions?.enabled).toBe(true);
     expect(latestOptions?.initialOffset).toBeTypeOf("function");
     expect((latestOptions?.initialOffset as () => number)()).toBe(900);
+  });
+
+  it("shows the immutable Runtime kind in the Inspector", () => {
+	const view = render(<AgentPane {...props} active configRequestNonce={1} />);
+	expect(view.getByText("Runtime kind").nextElementSibling).toHaveTextContent("codex");
+	expect(view.queryByDisplayValue("codex")).toBeNull();
   });
 });

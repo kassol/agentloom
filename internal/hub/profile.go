@@ -402,7 +402,7 @@ func (h *Hub) injectDeveloperContext(agentID string, rt *runtime, content string
 		h.mu.Unlock()
 		return errf(404, "agent vanished")
 	}
-	threadID := meta.ThreadID
+	threadID := meta.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	_, err := rt.client.Request("thread/inject_items", map[string]any{
 		"threadId": threadID,

@@ -226,10 +226,10 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time) A
 		AgentID: agent.ID, AgentName: agent.Name, ThreadID: agent.ThreadID, Status: agent.Status,
 		LatestProviderID: publicProviderID(agent.ProviderID), Daily: emptyUsageDays(start, days), Models: []UsageModel{},
 	}
-	if strings.TrimSpace(agent.ThreadID) == "" {
+	if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" {
 		return result
 	}
-	report, err := rollout.ReadUsage(agent.ThreadID)
+	report, err := rollout.ReadUsage(agent.RuntimeBinding.NativeRef)
 	if err != nil {
 		return result
 	}
@@ -237,7 +237,7 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time) A
 	if len(agent.ProviderHistory) > 0 {
 		historyVersion += ":" + agent.ProviderHistory[len(agent.ProviderHistory)-1].SwitchedAt
 	}
-	cacheKey := agent.ThreadID + "\x00" + strconv.Itoa(days) + "\x00" + start.Format("2006-01-02") + "\x00" + endExclusive.Format("2006-01-02") + "\x00" + now.Location().String() + "\x00" + publicProviderID(agent.ProviderID) + "\x00" + historyVersion
+	cacheKey := agent.RuntimeBinding.NativeRef + "\x00" + strconv.Itoa(days) + "\x00" + start.Format("2006-01-02") + "\x00" + endExclusive.Format("2006-01-02") + "\x00" + now.Location().String() + "\x00" + publicProviderID(agent.ProviderID) + "\x00" + historyVersion
 	if cached, ok := cachedAgentUsage(cacheKey, report); ok {
 		result = cached
 		result.AgentID = agent.ID

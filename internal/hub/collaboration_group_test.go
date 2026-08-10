@@ -13,9 +13,9 @@ func TestCollaborationGroupLifecyclePreservesPairwiseRelationships(t *testing.T)
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*Agent{
-		"lead":     {ID: "lead", Name: "parall-dev-lead", Cwd: t.TempDir(), ThreadID: "thread-lead", Status: "idle"},
-		"platform": {ID: "platform", Name: "parall-platform-dev", Cwd: t.TempDir(), ThreadID: "thread-platform", Status: "idle"},
-		"edge":     {ID: "edge", Name: "parall-edge-dev", Cwd: t.TempDir(), ThreadID: "thread-edge", Status: "idle"},
+		"lead":     {ID: "lead", Name: "parall-dev-lead", Cwd: t.TempDir(), ThreadID: "loom-thread-lead", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-lead"}, Status: "idle"},
+		"platform": {ID: "platform", Name: "parall-platform-dev", Cwd: t.TempDir(), ThreadID: "loom-thread-platform", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-platform"}, Status: "idle"},
+		"edge":     {ID: "edge", Name: "parall-edge-dev", Cwd: t.TempDir(), ThreadID: "loom-thread-edge", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-edge"}, Status: "idle"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -99,8 +99,8 @@ func TestCollaborationGroupValidationAndVersionGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*Agent{
-		"one": {ID: "one", Name: "one", Cwd: t.TempDir(), ThreadID: "thread-one", Status: "idle"},
-		"two": {ID: "two", Name: "two", Cwd: t.TempDir(), ThreadID: "thread-two", Status: "idle"},
+		"one": {ID: "one", Name: "one", Cwd: t.TempDir(), ThreadID: "loom-thread-one", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-one"}, Status: "idle"},
+		"two": {ID: "two", Name: "two", Cwd: t.TempDir(), ThreadID: "loom-thread-two", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-two"}, Status: "idle"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestActiveCollaborationGroupProtectsAgentAndArchivedGroupPreservesMemberID(
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*Agent{
-		"one": {ID: "one", Name: "one", Cwd: t.TempDir(), ThreadID: "thread-one", Status: "idle"},
+		"one": {ID: "one", Name: "one", Cwd: t.TempDir(), ThreadID: "loom-thread-one", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-one"}, Status: "idle"},
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -60,14 +60,19 @@ type TurnSummary struct {
 	CompletedAt string `json:"completedAt"`
 }
 
-// Agent is CodexLoom's stable governance entity. ThreadID is its primary Codex
-// execution binding; Profile, links and external addresses remain attached to
-// the Agent even if that binding is migrated later.
+type RuntimeBinding struct {
+	Kind      string `json:"kind"`
+	NativeRef string `json:"nativeRef,omitempty"`
+}
+
+// Agent is CodexLoom's stable governance entity. ThreadID is owned by Loom;
+// RuntimeBinding is the durable association to a Runtime-native conversation.
 type Agent struct {
 	ID                    string                  `json:"id"`
 	Name                  string                  `json:"name"`
 	Cwd                   string                  `json:"cwd"`
 	ThreadID              string                  `json:"threadId"`
+	RuntimeBinding        RuntimeBinding          `json:"runtimeBinding"`
 	Sandbox               string                  `json:"sandbox"`
 	ApprovalPolicy        string                  `json:"approvalPolicy"`
 	ProviderID            string                  `json:"providerId,omitempty"`
@@ -100,6 +105,7 @@ type AgentView struct {
 	PendingApprovals []ApprovalView `json:"pendingApprovals"`
 	Goal             *ThreadGoal    `json:"goal,omitempty"`
 	LastSeq          int64          `json:"lastSeq"`
+	nativeRuntimeRef string
 }
 
 // SessionView is the pre-CodexLoom compatibility name.
@@ -466,6 +472,11 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	}
 	if h.agents == nil {
 		h.agents = map[string]*Agent{}
+	}
+	for id, meta := range h.agents {
+		if meta == nil || strings.TrimSpace(meta.ThreadID) == "" || strings.TrimSpace(meta.RuntimeBinding.Kind) == "" || strings.TrimSpace(meta.RuntimeBinding.NativeRef) == "" {
+			return nil, fmt.Errorf("load agents: Agent %s uses the unsupported legacy Codex-only format; recreate the Agent", id)
+		}
 	}
 	providerSwitchRecovered := false
 	for _, meta := range h.agents {
@@ -834,7 +845,7 @@ func (h *Hub) importEdgeLocked() {
 	takenThreads := map[string]bool{}
 	for _, meta := range h.agents {
 		taken[meta.Name] = true
-		if threadID := strings.TrimSpace(meta.ThreadID); threadID != "" {
+		if threadID := strings.TrimSpace(meta.RuntimeBinding.NativeRef); threadID != "" {
 			takenThreads[threadID] = true
 		}
 	}
@@ -848,8 +859,9 @@ func (h *Hub) importEdgeLocked() {
 			continue
 		}
 		h.agents[id] = &Agent{
-			ID: id, Name: a.Name, Cwd: a.Cwd, ThreadID: threadID,
-			Sandbox: "danger-full-access", ApprovalPolicy: "never",
+			ID: id, Name: a.Name, Cwd: a.Cwd, ThreadID: "thr_" + id,
+			RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID},
+			Sandbox:        "danger-full-access", ApprovalPolicy: "never",
 			Status: "idle", Source: "edge",
 			CreatedAt: edgeCreatedAt, UpdatedAt: now(),
 		}
@@ -914,6 +926,7 @@ func (h *Hub) emitStatusLocked(meta *Agent, status string) {
 		"name":           meta.Name,
 		"cwd":            meta.Cwd,
 		"threadId":       meta.ThreadID,
+		"runtimeKind":    meta.RuntimeBinding.Kind,
 		"source":         meta.Source,
 		"status":         status,
 		"currentTask":    meta.CurrentTask,
@@ -999,7 +1012,7 @@ func (h *Hub) LastSeq(key string) int64 {
 
 // getRuntimeLocked returns an Agent binding to the shared CodexHost.
 func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
-	if err := h.threadControlFailureLocked(meta.ThreadID); err != nil {
+	if err := h.threadControlFailureLocked(meta.RuntimeBinding.NativeRef); err != nil {
 		return nil, err
 	}
 	if rt, ok := h.runtimes[meta.ID]; ok && !rt.client.Closed() {
@@ -1041,7 +1054,7 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		rt.initErr = errf(404, "agent vanished")
 		return
 	}
-	threadID, threadName, sandbox, cwd := meta.ThreadID, meta.Name, meta.Sandbox, meta.Cwd
+	threadID, threadName, sandbox, cwd := meta.RuntimeBinding.NativeRef, meta.Name, meta.Sandbox, meta.Cwd
 	providerID, model := effectiveProviderBinding(meta)
 	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
 	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
@@ -1076,7 +1089,7 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		h.mu.Lock()
 		if m := h.agents[agentID]; m != nil {
 			previous := *m
-			m.ThreadID = threadID
+			m.RuntimeBinding.NativeRef = threadID
 			m.UpdatedAt = now()
 			if err := h.persistAgentsLocked(); err != nil {
 				*m = previous
@@ -1178,7 +1191,7 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 		h.mu.Unlock()
 		return errf(404, "agent vanished")
 	}
-	threadID, sandbox, cwd := meta.ThreadID, meta.Sandbox, meta.Cwd
+	threadID, sandbox, cwd := meta.RuntimeBinding.NativeRef, meta.Sandbox, meta.Cwd
 	providerID, model := effectiveProviderBinding(meta)
 	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
 	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
@@ -1348,7 +1361,7 @@ func (h *Hub) rebindActiveTurnIDLocked(meta *Agent, turn *turnState, turnID stri
 	}
 	previousTurnID := turn.turnID
 	turn.turnID = turnID
-	h.rebindContextAttemptTurn(meta.ThreadID, turn.contextAttemptID, previousTurnID, turnID)
+	h.rebindContextAttemptTurn(meta.RuntimeBinding.NativeRef, turn.contextAttemptID, previousTurnID, turnID)
 
 	// Establish records that are still at the pre-start boundary first.
 	h.markInboxAttemptRunningLocked(turn)
@@ -1730,7 +1743,8 @@ func (h *Hub) finishAgentMessageTurnLocked(turn *turnState, status, errMsg strin
 // ---- public API ----
 
 func (h *Hub) viewLocked(meta *Agent) AgentView {
-	view := AgentView{Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID]}
+	view := AgentView{Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID], nativeRuntimeRef: meta.RuntimeBinding.NativeRef}
+	view.RuntimeBinding.NativeRef = ""
 	if goal := h.goals[meta.ID]; goal != nil {
 		copy := *goal
 		view.Goal = &copy
@@ -1747,13 +1761,13 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 }
 
 func applyRolloutStatus(view *AgentView) {
-	if view.ThreadID == "" {
+	if view.nativeRuntimeRef == "" {
 		return
 	}
 	if view.Status == "running" && view.ProcessAlive {
 		return
 	}
-	latest, err := rollout.LatestTurn(view.ThreadID)
+	latest, err := rollout.LatestTurn(view.nativeRuntimeRef)
 	if err != nil || latest == nil || latest.ID == "" {
 		return
 	}
@@ -1765,7 +1779,7 @@ func applyRolloutStatus(view *AgentView) {
 	}
 	switch latest.Status {
 	case "running":
-		if !externalTurnLooksLive(view.ThreadID, latest.UpdatedAt) {
+		if !externalTurnLooksLive(view.nativeRuntimeRef, latest.UpdatedAt) {
 			view.Status = "interrupted"
 			view.CurrentTask = ""
 			view.CurrentTurnID = ""

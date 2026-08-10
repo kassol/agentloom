@@ -71,10 +71,10 @@ func (h *Hub) DailyActivity(start, endExclusive time.Time, bucketMinutes int) Da
 
 	reports := make(map[string]*rollout.UsageReport, len(agents))
 	for _, agent := range agents {
-		if strings.TrimSpace(agent.ThreadID) == "" {
+		if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" {
 			continue
 		}
-		if report, err := rollout.ReadUsage(agent.ThreadID); err == nil {
+		if report, err := rollout.ReadUsage(agent.RuntimeBinding.NativeRef); err == nil {
 			reports[agent.ID] = report
 		}
 	}

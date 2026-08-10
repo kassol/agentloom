@@ -41,8 +41,8 @@ func TestAddressLifecycleAndTransferAPIReturnManagedReceipts(t *testing.T) {
 		t.Fatal(err)
 	}
 	agents := map[string]*hub.Agent{
-		"agent-a": {ID: "agent-a", Name: "alpha", Status: "idle", CreatedAt: "2026-08-06T00:00:00Z", UpdatedAt: "2026-08-06T00:00:00Z"},
-		"agent-b": {ID: "agent-b", Name: "beta", Status: "idle", CreatedAt: "2026-08-06T00:00:00Z", UpdatedAt: "2026-08-06T00:00:00Z"},
+		"agent-a": {ID: "agent-a", Name: "alpha", ThreadID: "loom-thread-a", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-a"}, Status: "idle", CreatedAt: "2026-08-06T00:00:00Z", UpdatedAt: "2026-08-06T00:00:00Z"},
+		"agent-b": {ID: "agent-b", Name: "beta", ThreadID: "loom-thread-b", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-b"}, Status: "idle", CreatedAt: "2026-08-06T00:00:00Z", UpdatedAt: "2026-08-06T00:00:00Z"},
 	}
 	if err := st.SaveAgents(agents); err != nil {
 		t.Fatal(err)

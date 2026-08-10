@@ -294,7 +294,7 @@ func buildAgentWorkload(agent Agent, samples []workloadQueueSample, start time.T
 		AgentID: agent.ID, AgentName: agent.Name, Status: agent.Status,
 		Daily: emptyWorkloadDays(start, days), Sources: []WorkloadSource{}, Evidence: []WorkloadEvidence{},
 	}
-	report, err := rollout.ReadUsage(agent.ThreadID)
+	report, err := rollout.ReadUsage(agent.RuntimeBinding.NativeRef)
 	if err == nil {
 		workload.ActivityAvailable = true
 		workload.ObservedSeconds = maxDurationSeconds(rangeEnd.Sub(observedStart))

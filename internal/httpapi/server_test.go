@@ -13,6 +13,10 @@ import (
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
+func restoreCodexAgentParams(id, name, cwd, nativeRef string) hub.RestoreAgentParams {
+	return hub.RestoreAgentParams{ID: id, Name: name, Cwd: cwd, ThreadID: "loom-" + nativeRef, RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: nativeRef}}
+}
+
 func TestConnectorCommandStreamIsExclusivePerConnection(t *testing.T) {
 	s := &Server{activeConnectors: map[string]struct{}{}}
 	if !s.acquireConnector("conn-a") {
@@ -84,6 +88,43 @@ func TestCodexLoomAgentAPIAndLegacySessionAlias(t *testing.T) {
 		if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
 			t.Fatalf("GET %s JSON: %v", path, err)
 		}
+	}
+}
+
+func TestAgentRuntimeKindIsRequiredAndImmutable(t *testing.T) {
+	t.Setenv("PINIX_EDGE_NAMES", t.TempDir()+"/missing.json")
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := hub.New(st)
+	defer h.Shutdown()
+	server := New(h, st, fstest.MapFS{"index.html": {Data: []byte("ok")}}).Handler()
+
+	create := httptest.NewRequest(http.MethodPost, "/api/agents", strings.NewReader(`{"name":"worker","cwd":"/tmp"}`))
+	created := httptest.NewRecorder()
+	server.ServeHTTP(created, create)
+	if created.Code != http.StatusBadRequest || !strings.Contains(created.Body.String(), "runtime") {
+		t.Fatalf("POST /api/agents = %d %s, want required Runtime error", created.Code, created.Body.String())
+	}
+
+	if _, err := h.RestoreAgent(hub.RestoreAgentParams{
+		ID: "agent-1", Name: "worker", Cwd: "/tmp", ThreadID: "thread-1",
+		RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "codex-thread-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	update := httptest.NewRequest(http.MethodPatch, "/api/agents/agent-1/config", strings.NewReader(`{"runtimeKind":"pi"}`))
+	updated := httptest.NewRecorder()
+	server.ServeHTTP(updated, update)
+	if updated.Code != http.StatusConflict || !strings.Contains(updated.Body.String(), "immutable") {
+		t.Fatalf("PATCH Runtime kind = %d %s, want immutable error", updated.Code, updated.Body.String())
+	}
+
+	detail := httptest.NewRecorder()
+	server.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/api/agents/agent-1", nil))
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"runtimeBinding":{"kind":"codex"}`) || strings.Contains(detail.Body.String(), "codex-thread-1") {
+		t.Fatalf("GET Agent Runtime projection = %d %s", detail.Code, detail.Body.String())
 	}
 }
 

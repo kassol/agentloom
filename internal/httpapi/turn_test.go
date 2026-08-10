@@ -36,7 +36,7 @@ func TestTurnGetRouteFindsTurnWithoutAgentKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*hub.Agent{
-		"agent-1": {ID: "agent-1", Name: "worker", ThreadID: threadID, Status: "idle", CreatedAt: nowForTest(), UpdatedAt: nowForTest()},
+		"agent-1": {ID: "agent-1", Name: "worker", ThreadID: "loom-thread-1", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle", CreatedAt: nowForTest(), UpdatedAt: nowForTest()},
 	}); err != nil {
 		t.Fatal(err)
 	}

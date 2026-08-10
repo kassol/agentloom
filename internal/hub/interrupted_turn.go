@@ -29,7 +29,7 @@ func reconcileInterruptedTurn(meta *Agent) (*TurnSummary, bool) {
 		TurnID: meta.CurrentTurnID, Task: displayRolloutTask(meta.CurrentTask),
 		Status: "interrupted", CompletedAt: now(),
 	}
-	latest, err := rollout.LatestTurn(meta.ThreadID)
+	latest, err := rollout.LatestTurn(meta.RuntimeBinding.NativeRef)
 	if err != nil || latest == nil || latest.ID == "" {
 		return summary, true
 	}

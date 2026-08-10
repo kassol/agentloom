@@ -17,6 +17,7 @@ export interface Agent {
   name: string;
   cwd: string;
   threadId: string;
+  runtimeBinding: { kind: string };
   sandbox: string;
   approvalPolicy: string;
   providerId?: string;

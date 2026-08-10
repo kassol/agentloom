@@ -250,7 +250,7 @@ func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (Agen
 		h.mu.Unlock()
 		return AgentView{}, errf(404, "agent not found: %s", key)
 	}
-	if strings.TrimSpace(agent.ThreadID) == "" {
+	if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" {
 		h.mu.Unlock()
 		return AgentView{}, errf(409, "agent has no primary Thread binding")
 	}
@@ -317,7 +317,7 @@ func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (Agen
 		if h.st != nil {
 			backupDir = filepath.Join(h.st.Dir(), "backups", "provider-switch")
 		}
-		result, sanitizeErr := rollout.SanitizeReasoningContent(previous.ThreadID, backupDir)
+		result, sanitizeErr := rollout.SanitizeReasoningContent(previous.RuntimeBinding.NativeRef, backupDir)
 		if sanitizeErr != nil {
 			return AgentView{}, errf(500, "switch Provider: %s", h.rollbackProviderSwitch(agentID, previous, sanitizeErr, rolloutBackup))
 		}

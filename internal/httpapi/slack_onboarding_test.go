@@ -41,9 +41,7 @@ func TestSetupSlackCreatesDurableAddressAndChannelRoleIdempotently(t *testing.T)
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{
-		ID: "agent-slack", Name: "slack-agent", Cwd: t.TempDir(), ThreadID: "thread-slack",
-	}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-slack", "slack-agent", t.TempDir(), "thread-slack")); err != nil {
 		t.Fatal(err)
 	}
 	s := New(h, st, nil)

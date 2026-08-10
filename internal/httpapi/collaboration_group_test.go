@@ -16,8 +16,8 @@ func TestCollaborationGroupHTTPRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*hub.Agent{
-		"one": {ID: "one", Name: "one", Cwd: t.TempDir(), ThreadID: "thread-one", Status: "idle"},
-		"two": {ID: "two", Name: "two", Cwd: t.TempDir(), ThreadID: "thread-two", Status: "idle"},
+		"one": {ID: "one", Name: "one", Cwd: t.TempDir(), ThreadID: "loom-thread-one", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-one"}, Status: "idle"},
+		"two": {ID: "two", Name: "two", Cwd: t.TempDir(), ThreadID: "loom-thread-two", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-two"}, Status: "idle"},
 	}); err != nil {
 		t.Fatal(err)
 	}

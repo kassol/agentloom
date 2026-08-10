@@ -162,7 +162,7 @@ func (h *Hub) verifyRuntimeThreadControl(agentID string, rt *runtime) error {
 	if host == nil || rt == nil || host.generation != rt.hostGeneration || host.client != rt.client {
 		return errf(500, "CodexHost changed before Thread control started")
 	}
-	return h.threadControlFailureLocked(meta.ThreadID)
+	return h.threadControlFailureLocked(meta.RuntimeBinding.NativeRef)
 }
 
 func (h *Hub) materializeModelCatalog() (modelcatalog.Snapshot, error) {
@@ -392,7 +392,7 @@ func (h *Hub) runtimeForThreadLocked(threadID string) *runtime {
 		return nil
 	}
 	for id, meta := range h.agents {
-		if meta.ThreadID == threadID {
+		if meta.RuntimeBinding.NativeRef == threadID {
 			if rt := h.runtimes[id]; rt != nil {
 				return rt
 			}
@@ -435,7 +435,7 @@ func (h *Hub) bindOrAdoptStartedThreadLocked(params json.RawMessage) *runtime {
 	pendingCount := 0
 	for id, rt := range h.runtimes {
 		meta := h.agents[id]
-		if meta == nil || meta.ThreadID != "" || rt.hostGeneration != h.codexHost.generation {
+		if meta == nil || meta.RuntimeBinding.NativeRef != "" || rt.hostGeneration != h.codexHost.generation {
 			continue
 		}
 		if event.Thread.Cwd != "" && meta.Cwd != event.Thread.Cwd {
@@ -447,7 +447,7 @@ func (h *Hub) bindOrAdoptStartedThreadLocked(params json.RawMessage) *runtime {
 	if pendingCount == 1 {
 		if meta := h.agents[pending.agentID]; meta != nil {
 			previous := *meta
-			meta.ThreadID = threadID
+			meta.RuntimeBinding.NativeRef = threadID
 			meta.UpdatedAt = now()
 			if err := h.persistAgentsLocked(); err != nil {
 				*meta = previous
@@ -485,8 +485,9 @@ func (h *Hub) adoptThreadLocked(threadID, threadName, cwd string) *runtime {
 	_, _ = rand.Read(idBytes)
 	id := hex.EncodeToString(idBytes)
 	meta := &Agent{
-		ID: id, Name: name, Cwd: cwd, ThreadID: threadID,
-		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
+		ID: id, Name: name, Cwd: cwd, ThreadID: newIntegrationID("thr"),
+		RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID},
+		Sandbox:        "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		CreatedAt: now(), UpdatedAt: now(), Source: "remote",
 	}
 	h.agents[id] = meta
@@ -505,7 +506,7 @@ func (h *Hub) adoptThreadLocked(threadID, threadName, cwd string) *runtime {
 	}
 	h.runtimes[id] = rt
 	h.emitLocked(id, "loom/agent-created", map[string]any{
-		"id": id, "name": name, "cwd": meta.Cwd, "threadId": threadID, "source": "remote",
+		"id": id, "name": name, "cwd": meta.Cwd, "threadId": meta.ThreadID, "runtimeKind": "codex", "source": "remote",
 	})
 	h.emitStatusLocked(meta, meta.Status)
 	return rt
@@ -581,7 +582,7 @@ func (h *Hub) hydrateAdoptedAgent(generation uint64, agentID, threadID string) {
 		return
 	}
 	agent := h.agents[agentID]
-	if agent == nil || agent.ThreadID != threadID || agent.Source != "remote" {
+	if agent == nil || agent.RuntimeBinding.NativeRef != threadID || agent.Source != "remote" {
 		return
 	}
 	previous := *agent

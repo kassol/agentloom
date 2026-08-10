@@ -562,7 +562,7 @@ func contextTestHub(t *testing.T) (*Hub, *Agent) {
 	}
 	h := testHub(st)
 	agent := &Agent{
-		ID: "agent-context", Name: "context-agent", ThreadID: "thread-context",
+		ID: "agent-context", Name: "context-agent", ThreadID: "thread-context", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-context"},
 		Status: "idle", CreatedAt: now(), UpdatedAt: now(),
 	}
 	h.agents[agent.ID] = agent

@@ -24,7 +24,7 @@ func TestSetupParallCreatesStableIdentityAndMembershipIdempotently(t *testing.T)
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{ID: "agent-parall", Name: "parall-agent", Cwd: t.TempDir(), ThreadID: "thread-parall"}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-parall", "parall-agent", t.TempDir(), "thread-parall")); err != nil {
 		t.Fatal(err)
 	}
 	s := New(h, st, nil)
@@ -80,7 +80,7 @@ func TestSetupParallRejectsDirectChatBeforeCreatingExternalIdentity(t *testing.T
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{ID: "agent-parall", Name: "parall-agent", Cwd: t.TempDir(), ThreadID: "thread-parall"}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-parall", "parall-agent", t.TempDir(), "thread-parall")); err != nil {
 		t.Fatal(err)
 	}
 	_, err = New(h, st, nil).setupParall(context.Background(), parallSetupParams{Agent: "parall-agent", OrgID: "org_test", ExternalDisplayName: "Parall Lead", ChatID: "chat_dm"}, "http://127.0.0.1:4870")
@@ -144,7 +144,7 @@ func TestImportParallAgentWithoutOwnerIsIdempotent(t *testing.T) {
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{ID: "agent-community", Name: "ai-community", Cwd: t.TempDir(), ThreadID: "thread-community"}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-community", "ai-community", t.TempDir(), "thread-community")); err != nil {
 		t.Fatal(err)
 	}
 	s := New(h, st, nil)
@@ -180,7 +180,7 @@ func TestImportParallAgentReusesStoredCredentialWithoutKeyFile(t *testing.T) {
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{ID: "agent-community", Name: "ai-community", Cwd: t.TempDir(), ThreadID: "thread-community"}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-community", "ai-community", t.TempDir(), "thread-community")); err != nil {
 		t.Fatal(err)
 	}
 	result, err := New(h, st, nil).importParallAgent(context.Background(), parallImportParams{
@@ -205,7 +205,7 @@ func TestImportParallAgentDoesNotSendStoredCredentialToAnotherAPI(t *testing.T) 
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{ID: "agent-community", Name: "ai-community", Cwd: t.TempDir(), ThreadID: "thread-community"}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-community", "ai-community", t.TempDir(), "thread-community")); err != nil {
 		t.Fatal(err)
 	}
 	_, err = New(h, st, nil).importParallAgent(context.Background(), parallImportParams{
@@ -226,7 +226,7 @@ func TestImportParallAgentMigratesSingleLegacyIdentityInPlace(t *testing.T) {
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{ID: "agent-community", Name: "ai-community", Cwd: t.TempDir(), ThreadID: "thread-community"}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-community", "ai-community", t.TempDir(), "thread-community")); err != nil {
 		t.Fatal(err)
 	}
 	legacy, err := h.CreateConnection(hub.ConnectionParams{Provider: "parall", AccountRef: "org-agent:usr_external", CredentialRef: "env:PRLL_API_KEY"})
@@ -263,7 +263,7 @@ func TestImportParallAgentArchivesDuplicateIdentityAndConvergesMembership(t *tes
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{ID: "agent-community", Name: "ai-community", Cwd: t.TempDir(), ThreadID: "thread-community"}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-community", "ai-community", t.TempDir(), "thread-community")); err != nil {
 		t.Fatal(err)
 	}
 	legacy, err := h.CreateConnection(hub.ConnectionParams{Provider: "parall", AccountRef: "org-agent:usr_external", CredentialRef: "env:PRLL_API_KEY"})
@@ -359,7 +359,7 @@ func TestImportParallAgentRollsBackCredentialAndResourcesOnGatewayFailure(t *tes
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{ID: "agent-community", Name: "ai-community", Cwd: t.TempDir(), ThreadID: "thread-community"}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-community", "ai-community", t.TempDir(), "thread-community")); err != nil {
 		t.Fatal(err)
 	}
 	_, err = New(h, st, nil).importParallAgent(context.Background(), parallImportParams{
@@ -387,7 +387,7 @@ func TestImportParallAgentRestoresLegacyConnectionOnGatewayFailure(t *testing.T)
 	}
 	h := hub.New(st)
 	defer h.Shutdown()
-	if _, err := h.RestoreAgent(hub.RestoreAgentParams{ID: "agent-community", Name: "ai-community", Cwd: t.TempDir(), ThreadID: "thread-community"}); err != nil {
+	if _, err := h.RestoreAgent(restoreCodexAgentParams("agent-community", "ai-community", t.TempDir(), "thread-community")); err != nil {
 		t.Fatal(err)
 	}
 	legacy, err := h.CreateConnection(hub.ConnectionParams{Provider: "parall", AccountRef: "org_test", CredentialRef: "env:PRLL_API_KEY"})

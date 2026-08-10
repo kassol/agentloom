@@ -129,7 +129,7 @@ func TestGitHubCredentialAndTriggerHTTPFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*hub.Agent{
-		"agent-1": {ID: "agent-1", Name: "lead", ThreadID: "thread-1", Status: "idle", CreatedAt: "2026-07-19T00:00:00Z", UpdatedAt: "2026-07-19T00:00:00Z"},
+		"agent-1": {ID: "agent-1", Name: "lead", ThreadID: "loom-thread-1", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-1"}, Status: "idle", CreatedAt: "2026-07-19T00:00:00Z", UpdatedAt: "2026-07-19T00:00:00Z"},
 	}); err != nil {
 		t.Fatal(err)
 	}

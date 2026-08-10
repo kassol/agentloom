@@ -20,7 +20,7 @@ func TestCustomProviderModelRouteErrorStopsRetryAndReportsConfigurationFailure(t
 	h := testHub(st)
 	defer h.Shutdown()
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "thr-stale",
+		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		ProviderID: "custom", Model: "Example-Model", CreatedAt: now(), UpdatedAt: now(),
 	}
@@ -307,7 +307,7 @@ func modelRoutingTestHub(t *testing.T, model string) (string, *Hub) {
 	h := testHub(st)
 	t.Cleanup(h.Shutdown)
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "thr-stale",
+		ID: "agent-1", Name: "worker", Cwd: "/tmp/stale", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		ProviderID: "custom", Model: model, CreatedAt: now(), UpdatedAt: now(),
 	}

@@ -24,7 +24,7 @@ func TestRasterArtifactCanBeEmbeddedCrossOrigin(t *testing.T) {
 	stamp := nowForTest()
 	if err := st.SaveAgents(map[string]*hub.Agent{
 		"viewer": {
-			ID: "viewer", Name: "viewer", ThreadID: "thread-viewer",
+			ID: "viewer", Name: "viewer", ThreadID: "loom-thread-viewer", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-viewer"},
 			Status: "idle", CreatedAt: stamp, UpdatedAt: stamp,
 		},
 	}); err != nil {

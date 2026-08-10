@@ -267,7 +267,7 @@ function isAgentWorking(agent: Agent) {
 }
 
 function agentRuntimeLabel(agent: Agent) {
-  return executionLabel(agent).toLowerCase();
+	return agent.runtimeBinding.kind;
 }
 
 function interruptedAgentTitle(agent: Agent) {
@@ -725,7 +725,8 @@ export default function App() {
                       ...s,
                       name: d.name ?? s.name,
                       cwd: d.cwd ?? s.cwd,
-                      threadId: d.threadId ?? s.threadId,
+					  threadId: d.threadId ?? s.threadId,
+					  runtimeBinding: d.runtimeKind ? { kind: d.runtimeKind } : s.runtimeBinding,
                       status: d.status,
                       currentTask: d.currentTask || "",
                       currentTurnId: d.currentTurnId || "",
@@ -780,7 +781,8 @@ export default function App() {
     try {
       const data = await api("POST", "/api/agents", {
         name: newName.trim(), cwd: newCwd.trim(),
-        providerId: newProviderId === "openai" ? "" : newProviderId,
+		providerId: newProviderId === "openai" ? "" : newProviderId,
+		runtimeKind: "codex",
         model: newModel.trim(),
         effort: newEffort,
       });
@@ -1466,18 +1468,24 @@ export default function App() {
       <Dialog open={newAgentOpen} onOpenChange={setNewAgentOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Create agent</DialogTitle>
-            <DialogDescription>Create a long-lived domain agent backed by a Codex Thread.</DialogDescription>
+			<DialogTitle>Create agent</DialogTitle>
+			<DialogDescription>Create a long-lived domain agent with an immutable Runtime.</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
             <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
               Agent name
               <Input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="codex-research" spellCheck={false} />
             </label>
-            <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
-              Working directory
-              <Input value={newCwd} onChange={(event) => setNewCwd(event.target.value)} placeholder="/absolute/path/to/workspace" spellCheck={false} className="font-mono text-[12px]" />
-            </label>
+			<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
+				Working directory
+				<Input value={newCwd} onChange={(event) => setNewCwd(event.target.value)} placeholder="/absolute/path/to/workspace" spellCheck={false} className="font-mono text-[12px]" />
+			</label>
+			<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
+				Runtime
+				<select value="codex" disabled className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px] disabled:opacity-60">
+					<option value="codex">Codex</option>
+				</select>
+			</label>
             <div className="grid gap-3 sm:grid-cols-2">
               <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
                 Provider

@@ -28,15 +28,15 @@ func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterResta
 	h.developerContextTimeout = 75 * time.Millisecond
 	createdAt := now()
 	h.agents["agent-source"] = &Agent{
-		ID: "agent-source", Name: "source", ThreadID: "thread-source", Cwd: t.TempDir(),
+		ID: "agent-source", Name: "source", ThreadID: "loom-thread-source", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-source"}, Cwd: t.TempDir(),
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle", CreatedAt: createdAt, UpdatedAt: createdAt,
 	}
 	h.agents["agent-target"] = &Agent{
-		ID: "agent-target", Name: "target", ThreadID: "thread-target", Cwd: t.TempDir(),
+		ID: "agent-target", Name: "target", ThreadID: "loom-thread-target", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-target"}, Cwd: t.TempDir(),
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle", CreatedAt: createdAt, UpdatedAt: createdAt,
 	}
 	h.agents["agent-other"] = &Agent{
-		ID: "agent-other", Name: "other", ThreadID: "thread-other", Cwd: t.TempDir(),
+		ID: "agent-other", Name: "other", ThreadID: "loom-thread-other", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-other"}, Cwd: t.TempDir(),
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle", CreatedAt: createdAt, UpdatedAt: createdAt,
 	}
 	h.topics["topic-1"] = &Topic{
@@ -193,7 +193,7 @@ func TestAgentMessageResumeTimeoutAlsoFencesSameHost(t *testing.T) {
 	h.developerContextTimeout = 100 * time.Millisecond
 	stamp := now()
 	h.agents["agent-target"] = &Agent{
-		ID: "agent-target", Name: "target", ThreadID: "thread-target", Cwd: t.TempDir(),
+		ID: "agent-target", Name: "target", ThreadID: "loom-thread-target", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-target"}, Cwd: t.TempDir(),
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle", CreatedAt: stamp, UpdatedAt: stamp,
 	}
 	h.contextHistoryProbe = newContextHistoryHarness("initial:thread-target").probe

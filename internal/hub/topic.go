@@ -1164,7 +1164,7 @@ func (h *Hub) InterveneTopicTurn(id string, params TopicInterventionParams) (Top
 		h.mu.Unlock()
 		return TopicInterventionResult{}, errf(409, "%s has no active Turn for Topic %s", agent.Name, topic.ID)
 	}
-	turnID, threadID, client, agentID, agentName, responsibleID := rt.activeTurn.turnID, agent.ThreadID, rt.client, agent.ID, agent.Name, topic.ResponsibleAgentID
+	turnID, threadID, client, agentID, agentName, responsibleID := rt.activeTurn.turnID, agent.RuntimeBinding.NativeRef, rt.client, agent.ID, agent.Name, topic.ResponsibleAgentID
 	h.mu.Unlock()
 	if params.Action == "steer" {
 		var b strings.Builder

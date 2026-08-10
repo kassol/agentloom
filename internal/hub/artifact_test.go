@@ -20,7 +20,7 @@ func TestThreadArtifactsStageSendAndPublish(t *testing.T) {
 	h := testHub(st)
 	defer h.Shutdown()
 	h.agents["agent-artifacts"] = &Agent{
-		ID: "agent-artifacts", Name: "artifacts", Cwd: "/tmp/artifacts", ThreadID: "thr-stale",
+		ID: "agent-artifacts", Name: "artifacts", Cwd: "/tmp/artifacts", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"},
 		Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		CreatedAt: now(), UpdatedAt: now(),
 	}

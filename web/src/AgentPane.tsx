@@ -1003,9 +1003,13 @@ export function AgentPane({
                 <button onClick={() => setConfigSection("usage")} className={`h-7 rounded px-3 ${configSection === "usage" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Usage</button>
               </div>
 
-              {configSection === "runtime" ? (
-                <>
-                  <label className="mb-2 block">
+			  {configSection === "runtime" ? (
+				<>
+				  <div className="mb-2">
+					<span className="mb-1 block text-[11px] text-muted-foreground">Runtime kind</span>
+					<span className="block h-8 rounded-md bg-muted/50 px-2.5 py-2 font-mono text-[12px]">{agent.runtimeBinding.kind}</span>
+				  </div>
+				  <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Name</span>
                     <input
                       value={nameDraft}

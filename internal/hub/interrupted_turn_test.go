@@ -15,7 +15,7 @@ func TestOpenKeepsRestartInterruptedAgentVisible(t *testing.T) {
 	}
 	if err := st.SaveAgents(map[string]*Agent{
 		"agent-1": {
-			ID: "agent-1", Name: "worker", Cwd: t.TempDir(), ThreadID: "thread-1",
+			ID: "agent-1", Name: "worker", Cwd: t.TempDir(), ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"},
 			Status: "running", CurrentTask: "finish the release", CurrentTurnID: "turn-1",
 			CreatedAt: now(), UpdatedAt: now(),
 		},

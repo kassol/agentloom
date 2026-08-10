@@ -171,6 +171,9 @@ func (h *Hub) applyGoalLocked(agentID string, goal *ThreadGoal, emit bool) {
 		delete(h.goals, agentID)
 	} else {
 		copy := *goal
+		if agent := h.agents[agentID]; agent != nil {
+			copy.ThreadID = agent.ThreadID
+		}
 		h.goals[agentID] = &copy
 	}
 	if !emit {
@@ -194,12 +197,12 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 	h.mu.Lock()
 	targets := make([]target, 0, len(h.agents))
 	for _, agent := range h.agents {
-		if strings.TrimSpace(agent.ThreadID) == "" {
+		if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" {
 			continue
 		}
 		providerID, model := effectiveProviderBinding(agent)
 		targets = append(targets, target{
-			agentID: agent.ID, threadID: agent.ThreadID, sandbox: agent.Sandbox, cwd: agent.Cwd,
+			agentID: agent.ID, threadID: agent.RuntimeBinding.NativeRef, sandbox: agent.Sandbox, cwd: agent.Cwd,
 			provider: providerID, model: model,
 			disabledSkillPaths: h.disabledSkillPathsLocked(agent.ID),
 		})
@@ -251,7 +254,7 @@ func (h *Hub) GetGoal(key string) (*ThreadGoal, error) {
 		h.mu.Unlock()
 		return nil, errf(404, "agent not found: %s", key)
 	}
-	agentID, threadID := agent.ID, agent.ThreadID
+	agentID, threadID := agent.ID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	if strings.TrimSpace(threadID) == "" {
 		return nil, errf(409, "agent has no Codex Thread binding")
@@ -271,7 +274,10 @@ func (h *Hub) GetGoal(key string) (*ThreadGoal, error) {
 	h.mu.Lock()
 	h.applyGoalLocked(agentID, response.Goal, false)
 	h.mu.Unlock()
-	return cloneGoal(response.Goal), nil
+	h.mu.Lock()
+	goal := cloneGoal(h.goals[agentID])
+	h.mu.Unlock()
+	return goal, nil
 }
 
 func (h *Hub) UpdateGoal(key string, update GoalUpdateParams) (*ThreadGoal, error) {
@@ -315,7 +321,7 @@ func (h *Hub) UpdateGoal(key string, update GoalUpdateParams) (*ThreadGoal, erro
 		h.mu.Unlock()
 		return nil, errf(404, "agent not found: %s", key)
 	}
-	agentID, threadID := agent.ID, agent.ThreadID
+	agentID, threadID := agent.ID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	if strings.TrimSpace(threadID) == "" {
 		return nil, errf(409, "agent has no Codex Thread binding")
@@ -344,7 +350,10 @@ func (h *Hub) UpdateGoal(key string, update GoalUpdateParams) (*ThreadGoal, erro
 	if response.Goal.Status == GoalStatusActive {
 		h.startWorker(func() { h.resumeGoalThread(agentID, host.generation) })
 	}
-	return cloneGoal(&response.Goal), nil
+	h.mu.Lock()
+	goal := cloneGoal(h.goals[agentID])
+	h.mu.Unlock()
+	return goal, nil
 }
 
 func (h *Hub) ClearGoal(key string) (bool, error) {
@@ -358,7 +367,7 @@ func (h *Hub) ClearGoal(key string) (bool, error) {
 		h.mu.Unlock()
 		return false, errf(404, "agent not found: %s", key)
 	}
-	agentID, threadID := agent.ID, agent.ThreadID
+	agentID, threadID := agent.ID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	if strings.TrimSpace(threadID) == "" {
 		return false, errf(409, "agent has no Codex Thread binding")
@@ -398,7 +407,7 @@ func (h *Hub) resumeGoalThread(agentID string, generation uint64) {
 		h.mu.Unlock()
 		return
 	}
-	threadID, sandbox, cwd := agent.ThreadID, agent.Sandbox, agent.Cwd
+	threadID, sandbox, cwd := agent.RuntimeBinding.NativeRef, agent.Sandbox, agent.Cwd
 	providerID, model := effectiveProviderBinding(agent)
 	disabledSkillPaths := h.disabledSkillPathsLocked(agent.ID)
 	h.mu.Unlock()

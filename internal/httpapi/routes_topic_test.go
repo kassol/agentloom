@@ -19,8 +19,8 @@ func TestTopicHTTPRoundTripAndResultBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*hub.Agent{
-		"lead": {ID: "lead", Name: "parall-dev-lead", Cwd: t.TempDir(), ThreadID: "thread-lead", Status: "idle"},
-		"edge": {ID: "edge", Name: "parall-edge-dev", Cwd: t.TempDir(), ThreadID: "thread-edge", Status: "idle"},
+		"lead": {ID: "lead", Name: "parall-dev-lead", Cwd: t.TempDir(), ThreadID: "loom-thread-lead", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-lead"}, Status: "idle"},
+		"edge": {ID: "edge", Name: "parall-edge-dev", Cwd: t.TempDir(), ThreadID: "loom-thread-edge", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "thread-edge"}, Status: "idle"},
 	}); err != nil {
 		t.Fatal(err)
 	}

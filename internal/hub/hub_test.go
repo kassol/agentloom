@@ -210,14 +210,14 @@ func TestRestoreAgentKeepsStableIdentityAndDoesNotStartRuntime(t *testing.T) {
 
 	view, err := h.RestoreAgent(RestoreAgentParams{
 		ID: "a07193ea", Name: "parall-edge-dev", Cwd: "/tmp/parall-edge",
-		ThreadID: "019f53a7-5485-7733-87f8-5b513420f62a",
-		Model:    "gpt-5.6-sol", Effort: "high",
+		ThreadID: "loom-thread-restored", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "019f53a7-5485-7733-87f8-5b513420f62a"},
+		Model: "gpt-5.6-sol", Effort: "high",
 		CreatedAt: "2026-07-12T00:08:21Z",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.ID != "a07193ea" || view.ThreadID != "019f53a7-5485-7733-87f8-5b513420f62a" {
+	if view.ID != "a07193ea" || view.ThreadID != "loom-thread-restored" || view.RuntimeBinding.Kind != "codex" || view.RuntimeBinding.NativeRef != "" {
 		t.Fatalf("restored identity = %#v", view.Agent)
 	}
 	if view.Status != "idle" || view.ProcessAlive || view.CurrentTurnID != "" || view.CurrentTask != "" {
@@ -232,7 +232,7 @@ func TestRestoreAgentKeepsStableIdentityAndDoesNotStartRuntime(t *testing.T) {
 		t.Fatalf("persisted agents = %#v", persisted)
 	}
 	if _, err := h.RestoreAgent(RestoreAgentParams{
-		ID: "a07193ea", Name: "duplicate", Cwd: "/tmp/duplicate", ThreadID: "thread-duplicate",
+		ID: "a07193ea", Name: "duplicate", Cwd: "/tmp/duplicate", ThreadID: "loom-thread-duplicate", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-duplicate"},
 	}); err == nil {
 		t.Fatal("duplicate stable id restore succeeded")
 	}
@@ -261,6 +261,21 @@ func TestOpenRejectsCorruptRegistryWithoutOverwritingIt(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsLegacyAgentRegistryWithRecreateRequiredError(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), []byte(`{"legacy":{"id":"legacy","name":"legacy","cwd":"/tmp","threadId":"codex-thread"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Open(st)
+	if err == nil || !strings.Contains(err.Error(), "recreate") {
+		t.Fatalf("Open legacy registry error = %v, want recreate-required error", err)
+	}
+}
+
 func TestUpdateAgentConfigRollsBackWhenRegistryCommitFails(t *testing.T) {
 	t.Setenv("PINIX_EDGE_NAMES", filepath.Join(t.TempDir(), "missing.json"))
 	dataDir := t.TempDir()
@@ -271,7 +286,7 @@ func TestUpdateAgentConfigRollsBackWhenRegistryCommitFails(t *testing.T) {
 	h := New(st)
 	defer h.Shutdown()
 	if _, err := h.RestoreAgent(RestoreAgentParams{
-		ID: "agent-1", Name: "before", Cwd: "/tmp", ThreadID: "thread-1",
+		ID: "agent-1", Name: "before", Cwd: "/tmp", ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +321,7 @@ func TestUpdateAgentConfigRejectsProviderChangeForBoundThread(t *testing.T) {
 	}
 	h := New(st)
 	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", Cwd: t.TempDir(), ThreadID: "thread-1",
+		ID: "agent-1", Name: "worker", Cwd: t.TempDir(), ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"},
 		ProviderID: "deepseek", Model: "deepseek-v4-flash", Status: "idle",
 	}
 
@@ -336,7 +351,7 @@ func TestImportEdgeSkipsAliasForOwnedThread(t *testing.T) {
 	}
 	if err := st.SaveAgents(map[string]*Agent{
 		"owned": {
-			ID: "owned", Name: "renamed-in-loom", ThreadID: "thread-shared", Cwd: "/owned",
+			ID: "owned", Name: "renamed-in-loom", ThreadID: "loom-thread-shared", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-shared"}, Cwd: "/owned",
 			Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "idle",
 		},
 	}); err != nil {
@@ -362,7 +377,7 @@ func TestApplyRolloutStatusShowsRecentExternalRunningTurn(t *testing.T) {
 	writeTestRollout(t, dir, threadID, time.Now().UTC().Format(time.RFC3339Nano))
 	t.Setenv("CODEX_SESSIONS_DIR", dir)
 
-	view := AgentView{Agent: Agent{ThreadID: threadID, Status: "idle"}}
+	view := AgentView{Agent: Agent{ThreadID: "loom-" + threadID, Status: "idle"}, nativeRuntimeRef: threadID}
 	applyRolloutStatus(&view)
 
 	if view.Status != "running" {
@@ -402,7 +417,7 @@ func TestApplyRolloutStatusSummarizesCompletedTopicControlEnvelope(t *testing.T)
 	}
 	t.Setenv("CODEX_SESSIONS_DIR", dir)
 
-	view := AgentView{Agent: Agent{ThreadID: threadID, Status: "idle"}}
+	view := AgentView{Agent: Agent{ThreadID: "loom-" + threadID, Status: "idle"}, nativeRuntimeRef: threadID}
 	applyRolloutStatus(&view)
 	if view.LastTurn == nil || view.LastTurn.Task != "Verify the visible Topic task." {
 		t.Fatalf("last Turn = %#v", view.LastTurn)
@@ -415,7 +430,7 @@ func TestApplyRolloutStatusMarksStaleExternalRunningTurnInterrupted(t *testing.T
 	writeTestRollout(t, dir, threadID, "2000-01-01T00:00:00Z")
 	t.Setenv("CODEX_SESSIONS_DIR", dir)
 
-	view := AgentView{Agent: Agent{ThreadID: threadID, Status: "idle"}}
+	view := AgentView{Agent: Agent{ThreadID: "loom-" + threadID, Status: "idle"}, nativeRuntimeRef: threadID}
 	applyRolloutStatus(&view)
 
 	if view.Status != "interrupted" {
@@ -437,12 +452,12 @@ func TestApplyRolloutStatusMarksPersistedStaleRunningTurnInterrupted(t *testing.
 
 	view := AgentView{
 		Agent: Agent{
-			ThreadID:      threadID,
+			ThreadID:      "loom-" + threadID,
 			Status:        "running",
 			CurrentTask:   "old task",
 			CurrentTurnID: "turn-running",
 		},
-		ProcessAlive: false,
+		ProcessAlive: false, nativeRuntimeRef: threadID,
 	}
 	applyRolloutStatus(&view)
 
@@ -484,8 +499,8 @@ func TestGetTurnLocatesAgentAndDurableSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := testHub(st)
-	h.agents["agent-0"] = &Agent{ID: "agent-0", Name: "no-rollout", ThreadID: "thread-without-rollout", Status: "idle"}
-	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: threadID, Cwd: "/repo", Status: "idle"}
+	h.agents["agent-0"] = &Agent{ID: "agent-0", Name: "no-rollout", ThreadID: "loom-thread-without-rollout", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-without-rollout"}, Status: "idle"}
+	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Cwd: "/repo", Status: "idle"}
 	h.comms["msg-1"] = &AgentMessage{
 		ID: "msg-1", ToAgentID: "agent-1", DeliveryMode: "turn_start", DeliveredTurnID: "turn-running",
 		DeliveryStatus: "delivered", HandlingStatus: "interrupted", LastHandlingError: "CodexLoom restarted",
@@ -497,7 +512,7 @@ func TestGetTurnLocatesAgentAndDurableSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if turn.AgentID != "agent-1" || turn.Agent != "worker" || turn.ThreadID != threadID || turn.Status != "interrupted" {
+	if turn.AgentID != "agent-1" || turn.Agent != "worker" || turn.ThreadID != "loom-"+threadID || turn.Status != "interrupted" {
 		t.Fatalf("Turn identity/status = %#v", turn)
 	}
 	if turn.Source == nil || turn.Source.Kind != "internal" || turn.Source.ID != "msg-1" || turn.Source.TopicID != "tpc-1" {
@@ -521,7 +536,7 @@ func TestGetTurnPreservesRecentExternalRunningStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := testHub(st)
-	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: threadID, Status: "idle"}
+	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle"}
 
 	turn, err := h.GetTurn("turn-running")
 	if err != nil {
