@@ -140,7 +140,9 @@ func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string)
 	}
 	if evidence.Status == RuntimeInterruptionTerminal && inspectErr == nil {
 		meta.Status = "idle"
-		meta.LastError = ""
+		if evidence.TerminalStatus == "completed" {
+			meta.LastError = ""
+		}
 		meta.LastTurn.Status = evidence.TerminalStatus
 		meta.UpdatedAt = now()
 		_ = h.persistAgentsLocked()

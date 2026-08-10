@@ -2029,6 +2029,10 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 		bindings[turnID] = nativeTurnID
 	}
 	view := AgentView{Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID], nativeRuntimeRef: meta.RuntimeBinding.NativeRef, nativeTurnBindings: bindings}
+	if meta.LastTurn != nil {
+		last := *meta.LastTurn
+		view.LastTurn = &last
+	}
 	view.RuntimeBinding.NativeRef = ""
 	view.RuntimeTurnBindings = nil
 	view.TurnRecoveryMarkers = nil

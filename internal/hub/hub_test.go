@@ -573,6 +573,18 @@ func TestTurnSource(t *testing.T) {
 	}
 }
 
+func TestAgentViewDoesNotAliasLastTurn(t *testing.T) {
+	h := &Hub{}
+	meta := &Agent{ID: "agent-1", LastTurn: &TurnSummary{TurnID: "turn-1", Status: "completed"}}
+
+	view := h.viewLocked(meta)
+	meta.LastTurn.Status = "failed"
+
+	if view.LastTurn == nil || view.LastTurn.Status != "completed" {
+		t.Fatalf("AgentView LastTurn changed through Hub state alias: %#v", view.LastTurn)
+	}
+}
+
 func writeTestRollout(t *testing.T, dir, threadID, ts string) {
 	t.Helper()
 	day := filepath.Join(dir, "2026", "07", "08")

@@ -422,7 +422,7 @@ func TestPiAgentSendsSupportedImagesAsNativeRPCContent(t *testing.T) {
 	}
 }
 
-func TestPiProtocolFailureFailsActiveLoomTurn(t *testing.T) {
+func TestPiProtocolFailureReconcilesDurableFailedTurn(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -442,16 +442,22 @@ func TestPiProtocolFailureFailsActiveLoomTurn(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		view, _ := h.GetAgent(agent.ID)
-		if view.LastTurn != nil {
-			if view.LastTurn.TurnID != result.TurnID || view.LastTurn.Status != "failed" || !strings.Contains(view.LastError, "protocol") {
-				t.Fatalf("failed Pi Turn = %#v", view.Agent)
+		if view.Status == "idle" && view.LastTurn != nil {
+			if view.LastTurn.TurnID != result.TurnID {
+				t.Fatalf("failed Pi Turn ID = %q, want %q", view.LastTurn.TurnID, result.TurnID)
+			}
+			if view.LastTurn.Status != "failed" {
+				t.Fatalf("Pi Turn status = %q, want failed", view.LastTurn.Status)
+			}
+			if !strings.Contains(view.LastError, "protocol") {
+				t.Fatalf("Pi protocol failure = %q", view.LastError)
 			}
 			h.Shutdown()
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("Pi protocol failure did not fail the active Loom Turn")
+	t.Fatal("Pi protocol failure did not reconcile the durable failed Turn")
 }
 
 func TestPiCleanProcessLossCreatesOneRecoveryTurnWithoutReplayingOriginalPrompt(t *testing.T) {
