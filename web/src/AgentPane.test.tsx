@@ -183,9 +183,17 @@ describe("AgentPane scroll restoration", () => {
 
   it("restores a Pi Approval card from the Agent snapshot without Codex wording", async () => {
 	virtualizerHarness.instance.getVirtualItems.mockReturnValue([
-	  { index: 0, key: "approval:ap-agent-scroll-a1", start: 0, size: 120, end: 120, lane: 0 },
+	  { index: 0, key: "row-0", start: 0, size: 120, end: 120, lane: 0 },
+	  { index: 1, key: "row-1", start: 120, size: 120, end: 240, lane: 0 },
 	]);
-	virtualizerHarness.instance.getTotalSize.mockReturnValue(120);
+	virtualizerHarness.instance.getTotalSize.mockReturnValue(240);
+	vi.mocked(fetch).mockImplementation(async (input) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  const body = url.includes("/thread/history")
+		? { total: 1, turns: [{ items: [{ type: "user", timestamp: "2026-08-10T00:00:00Z", text: "Current work" }] }] }
+		: { artifacts: [] };
+	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
 	const piAgent: Agent = {
 	  ...testAgent,
 	  runtimeBinding: { kind: "pi" },
@@ -196,7 +204,9 @@ describe("AgentPane scroll restoration", () => {
 	};
 	const view = render(<AgentPane {...props} agent={piAgent} active />);
 
-	expect(await view.findByText("pi Runtime requests approval")).toBeInTheDocument();
+	const approval = await view.findByText("pi Runtime requests approval");
+	const currentWork = await view.findByText("Current work");
+	expect(currentWork.compareDocumentPosition(approval) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 	expect(view.queryByText("codex requests approval")).toBeNull();
 	fireEvent.click(view.getByRole("button", { name: "approve" }));
 	fireEvent.click(view.getByRole("button", { name: "reject" }));

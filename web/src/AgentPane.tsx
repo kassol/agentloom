@@ -159,16 +159,16 @@ export function AgentPane({
   const sendStatusTimerRef = useRef<number | null>(null);
   const attachmentsRef = useRef<PendingArtifact[]>([]);
   const feedRows = useMemo<FeedRow[]>(() => [
+    ...feed.blocks.map((block) => ({
+      key: feedBlockKey(block),
+      kind: "block" as const,
+      block,
+    })),
     ...Object.entries(feed.approvals).map(([id, approval]) => ({
       key: `approval:${id}`,
       kind: "approval" as const,
       id,
       approval,
-    })),
-    ...feed.blocks.map((block) => ({
-      key: feedBlockKey(block),
-      kind: "block" as const,
-      block,
     })),
   ], [feed.approvals, feed.blocks]);
   const feedVirtualizer = useVirtualizer({
