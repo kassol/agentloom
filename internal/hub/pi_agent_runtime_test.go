@@ -581,6 +581,13 @@ func TestPiProcessLossWithUnfinishedToolCreatesOneNeedsYou(t *testing.T) {
 	if marker.Disposition != "needs_you" || marker.State != TurnRecoveryDispatched || marker.HumanRequestID != requests[0].ID || marker.RecoveryTurnID != "" {
 		t.Fatalf("ambiguous crash marker = %#v", marker)
 	}
+	history, err := h.History(agent.ID, 10, 0)
+	if err != nil || len(history.Turns) != 1 {
+		t.Fatalf("ambiguous crash history = %#v, err=%v", history, err)
+	}
+	if history.Turns[0].ID != predecessor.TurnID || history.Turns[0].Status != "interrupted" {
+		t.Fatalf("ambiguous predecessor history = %#v, want interrupted", history.Turns[0])
+	}
 	prompts, err := os.ReadFile(os.Getenv("FAKE_PI_PROMPTS_FILE"))
 	if err != nil || strings.Count(string(prompts), "\n--- prompt ---\n") != 1 {
 		t.Fatalf("ambiguous crash prompts = %q, err=%v", prompts, err)
@@ -606,6 +613,20 @@ func TestPiProcessLossWithUnfinishedToolCreatesOneNeedsYou(t *testing.T) {
 	}
 	if delivered.DeliveryStatus != "delivered" || delivered.ResumedTurnID == "" || delivered.ResumedTurnID == predecessor.TurnID || delivered.AgentID != agent.ID || delivered.ThreadID != agent.ThreadID {
 		t.Fatalf("eventual Needs You continuation = %#v", delivered)
+	}
+	history, err = h.History(agent.ID, 10, 0)
+	if err != nil || len(history.Turns) != 2 {
+		t.Fatalf("continued ambiguous crash history = %#v, err=%v", history, err)
+	}
+	if history.Turns[0].ID != predecessor.TurnID || history.Turns[0].Status != "interrupted" {
+		t.Fatalf("continued ambiguous predecessor history = %#v, want interrupted", history.Turns[0])
+	}
+	if len(history.Turns[0].Items) != 2 || history.Turns[0].Items[1]["status"] != "interrupted" {
+		t.Fatalf("continued ambiguous predecessor tool history = %#v, want interrupted", history.Turns[0].Items)
+	}
+	detail, err := h.GetTurn(predecessor.TurnID)
+	if err != nil || detail.Status != "interrupted" || len(detail.Items) != 2 || detail.Items[1]["status"] != "interrupted" {
+		t.Fatalf("continued ambiguous predecessor Turn = %#v, err=%v", detail, err)
 	}
 }
 

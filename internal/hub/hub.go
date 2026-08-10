@@ -109,6 +109,7 @@ type AgentView struct {
 	LastSeq             int64               `json:"lastSeq"`
 	nativeRuntimeRef    string
 	nativeTurnBindings  map[string]string
+	turnRecoveryMarkers map[string]TurnRecoveryMarker
 }
 
 // RuntimeDiagnostics is the explicit Developer-only projection of native
@@ -2068,7 +2069,14 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 	for turnID, nativeTurnID := range meta.RuntimeTurnBindings {
 		bindings[turnID] = nativeTurnID
 	}
-	view := AgentView{Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID], nativeRuntimeRef: meta.RuntimeBinding.NativeRef, nativeTurnBindings: bindings}
+	markers := make(map[string]TurnRecoveryMarker, len(meta.TurnRecoveryMarkers))
+	for turnID, marker := range meta.TurnRecoveryMarkers {
+		markers[turnID] = marker
+	}
+	view := AgentView{
+		Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID],
+		nativeRuntimeRef: meta.RuntimeBinding.NativeRef, nativeTurnBindings: bindings, turnRecoveryMarkers: markers,
+	}
 	if meta.LastTurn != nil {
 		last := *meta.LastTurn
 		view.LastTurn = &last

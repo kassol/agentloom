@@ -1280,6 +1280,7 @@ func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
 			}
 			continue
 		}
+		applyInterruptedHistoryTurn(&agent, turnID, &turn)
 		items := turn.Items
 		if items == nil {
 			items = []map[string]any{}
@@ -1397,6 +1398,7 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 	all := window.Turns
 	for i := range all {
 		all[i].ID = loomTurnIDFor(&view, all[i].ID)
+		applyInterruptedHistoryTurn(&view, all[i].ID, &all[i])
 	}
 	hist.Total = window.Total
 	if len(all) > 0 && all[len(all)-1].Status == "running" && hist.Status != "running" {
@@ -1420,6 +1422,25 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 		hist.Turns = append(hist.Turns, turn)
 	}
 	return hist, nil
+}
+
+func applyInterruptedHistoryTurn(view *AgentView, turnID string, turn *RuntimeHistoryTurn) {
+	if view == nil || turn == nil {
+		return
+	}
+	marker, ok := view.turnRecoveryMarkers[turnID]
+	if !ok {
+		return
+	}
+	turn.Status = "interrupted"
+	if turn.CompletedAt == "" {
+		turn.CompletedAt = marker.CreatedAt
+	}
+	for _, item := range turn.Items {
+		if item["type"] == "command" && item["status"] == "running" {
+			item["status"] = "interrupted"
+		}
+	}
 }
 
 func nativeTurnIDFor(view *AgentView, turnID string) string {
