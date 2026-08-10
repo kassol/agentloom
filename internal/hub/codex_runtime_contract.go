@@ -147,7 +147,7 @@ func (c *codexRuntimeContract) handleNativeEvent(method string, params json.RawM
 	events := c.native.NormalizeEvent(method, params)
 	for _, event := range events {
 		correlation := c.correlationForEvent(event)
-		canonical := codexContractEvent(event, correlation)
+		canonical := runtimeContractEvent(event, correlation)
 		c.mu.Lock()
 		handler := c.handler
 		c.mu.Unlock()
@@ -383,7 +383,7 @@ func codexContractUsage(usage *RuntimeTokenUsage) *runtimecontract.Usage {
 	}
 }
 
-func codexContractEvent(event RuntimeEvent, correlation runtimeTurnCorrelation) runtimecontract.Event {
+func runtimeContractEvent(event RuntimeEvent, correlation runtimeTurnCorrelation) runtimecontract.Event {
 	canonical := runtimecontract.Event{
 		TurnID: correlation.turnID, PredecessorTurnID: correlation.predecessorTurnID, RuntimeTurnRef: event.NativeTurnID,
 	}
@@ -403,7 +403,7 @@ func codexContractEvent(event RuntimeEvent, correlation runtimeTurnCorrelation) 
 		if event.Kind == RuntimeTurnFailed {
 			message := event.Error
 			if message == "" {
-				message = "Codex Turn failed"
+				message = "Runtime Turn failed"
 			}
 			canonical.Outcome.Failure = &runtimecontract.Failure{Code: "runtime_error", Phase: runtimecontract.FailurePhaseTurnStart, Message: message, Diagnostic: event.Error}
 		}

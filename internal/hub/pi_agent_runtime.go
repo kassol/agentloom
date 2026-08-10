@@ -87,6 +87,7 @@ func (r *piAgentRuntime) Resume(request RuntimeBindingRequest, timeout time.Dura
 		return err
 	}
 	if filepath.Clean(state.SessionFile) != filepath.Clean(request.NativeRef) {
+		r.Close()
 		return fmt.Errorf("Pi resumed session %q, expected %q", state.SessionFile, request.NativeRef)
 	}
 	return nil
@@ -387,7 +388,7 @@ func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 		}
 		select {
 		case <-ctx.Done():
-			return "", errors.New("Pi accepted prompt without a new native user entry")
+			return "", errPiPromptAcceptanceIndeterminate
 		case <-time.After(25 * time.Millisecond):
 		}
 	}

@@ -64,6 +64,7 @@ type RPC struct {
 	writeMu     sync.Mutex
 	failureOnce sync.Once
 	closeOnce   sync.Once
+	done        chan struct{}
 }
 
 func SpawnRPC(options RPCOptions) (*RPC, error) {
@@ -102,7 +103,7 @@ func SpawnRPC(options RPCOptions) (*RPC, error) {
 	command.Stderr = &stderr
 	rpc := &RPC{
 		cmd: command, stdin: stdin, onEvent: options.OnEvent, onFailure: options.OnFailure,
-		pending: map[string]pendingCommand{},
+		pending: map[string]pendingCommand{}, done: make(chan struct{}),
 	}
 	if options.OnEvent != nil {
 		rpc.events = make(chan json.RawMessage, 256)
@@ -121,6 +122,7 @@ func SpawnRPC(options RPCOptions) (*RPC, error) {
 	go rpc.read(stdout)
 	go func() {
 		err := command.Wait()
+		close(rpc.done)
 		rpc.mu.Lock()
 		closing := rpc.closing
 		rpc.mu.Unlock()
@@ -249,6 +251,7 @@ func (r *RPC) Close() {
 		if r.cmd.Process != nil {
 			_ = r.cmd.Process.Kill()
 		}
+		<-r.done
 	})
 }
 

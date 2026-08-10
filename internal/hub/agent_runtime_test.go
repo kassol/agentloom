@@ -24,6 +24,8 @@ type fakeAgentRuntime struct {
 	steeredNativeRef, steeredExpected, steeredInput string
 	capabilities                                    *RuntimeCapabilities
 	lastTurnRequest                                 RuntimeTurnRequest
+	startErr                                        error
+	startCount                                      int
 }
 
 func (f *fakeAgentRuntime) Alive() bool { return !f.closed }
@@ -38,7 +40,11 @@ func (f *fakeAgentRuntime) Resume(RuntimeBindingRequest, time.Duration) error {
 func (f *fakeAgentRuntime) InjectDeveloperContext(string, string, time.Duration) error { return nil }
 func (f *fakeAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	f.started = true
+	f.startCount++
 	f.lastTurnRequest = request
+	if f.startErr != nil {
+		return "", f.startErr
+	}
 	return "native-turn-1", nil
 }
 func (f *fakeAgentRuntime) Steer(nativeRef, expectedNativeTurnID, input string, _ time.Duration) (string, error) {

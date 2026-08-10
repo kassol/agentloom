@@ -16,6 +16,7 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -370,6 +371,7 @@ type Hub struct {
 	remoteEnabledGeneration uint64
 	codexHost               *codexHostRuntime
 	codexHostDriver         *codexRuntimeHostDriver
+	piHostDriver            *piRuntimeHostDriver
 	codexHostGeneration     uint64
 	stop                    chan struct{}
 	stopOnce                sync.Once
@@ -1148,7 +1150,17 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 		handle.SetFailureHandler(func(err error) { h.onCodexHostFailure(rt, err) })
 		h.bindCodexContract(meta, rt, handle.contract)
 	} else if meta.RuntimeBinding.Kind == "pi" {
-		rt = &runtime{agentID: meta.ID, agentRuntime: newPiAgentRuntime(meta.ID, h.st.Dir(), h.runtimeAPIURL), ready: make(chan struct{}), approvals: map[string]*approval{}}
+		handle, err := h.piDriverLocked().Acquire(context.Background(), AgentHostRequest{AgentID: meta.ID})
+		if err != nil {
+			return nil, err
+		}
+		piHandle := handle.(*piAgentHost)
+		rt = &runtime{
+			agentID: meta.ID, agentRuntime: piHandle.facade, agentHost: piHandle, runtimeContract: piHandle.contract,
+			ready: make(chan struct{}), approvals: map[string]*approval{},
+		}
+		piHandle.SetFailureHandler(func(err error) { h.onRuntimeFailure(rt, err) })
+		h.bindPiContract(meta, rt, piHandle.contract)
 	} else {
 		return nil, errf(400, "unsupported Runtime kind %q", meta.RuntimeBinding.Kind)
 	}
@@ -1169,6 +1181,21 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 		return nil, errf(503, "CodexLoom is shutting down")
 	}
 	return rt, nil
+}
+
+func (h *Hub) piDriverLocked() *piRuntimeHostDriver {
+	if h.piHostDriver == nil {
+		h.piHostDriver = newPiRuntimeHostDriver(h)
+	}
+	return h.piHostDriver
+}
+
+func (h *Hub) bindPiContract(meta *Agent, rt *runtime, contract *piRuntimeContract) {
+	if contract == nil {
+		return
+	}
+	contract.seedTurnBindings(meta.RuntimeTurnBindings)
+	contract.SetEventHandler(func(event runtimecontract.Event) { h.onCanonicalRuntimeEvent(rt, event) })
 }
 
 // initRuntime runs without the hub lock (talks to codex).

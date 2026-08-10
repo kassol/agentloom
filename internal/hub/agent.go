@@ -241,6 +241,7 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 	rt, err := h.getRuntimeLocked(meta)
 	if err != nil {
 		delete(h.agents, id)
+		delete(h.seqs, id)
 		h.mu.Unlock()
 		return AgentView{}, err
 	}
@@ -250,26 +251,22 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 		h.mu.Lock()
 		delete(h.agents, id)
 		delete(h.runtimes, id)
+		delete(h.seqs, id)
 		persistErr := h.persistAgentsLocked()
 		h.mu.Unlock()
+		if backend := runtimeBackend(rt); backend != nil {
+			backend.Close()
+		}
 		if persistErr != nil {
 			return AgentView{}, errf(500, "failed to start Runtime binding: %s; remove failed Agent: %s", err, persistErr)
 		}
 		return AgentView{}, errf(500, "failed to start Runtime binding: %s", err)
 	}
 
+	// initRuntime durably commits the newly created native binding together
+	// with the Agent. A second registry write here creates no new state and can
+	// only turn a successful commit into a false failure that later resurrects.
 	h.mu.Lock()
-	if err := h.persistAgentsLocked(); err != nil {
-		threadID := meta.RuntimeBinding.NativeRef
-		delete(h.agents, id)
-		delete(h.runtimes, id)
-		delete(h.seqs, id)
-		h.mu.Unlock()
-		if threadID != "" && rt.client != nil && !rt.client.Closed() {
-			_, _ = rt.client.Request("thread/archive", map[string]any{"threadId": threadID}, 10*time.Second)
-		}
-		return AgentView{}, errf(500, "save agent: %s", err)
-	}
 	h.emitLocked(id, "loom/agent-created", map[string]any{
 		"id": id, "name": meta.Name, "cwd": meta.Cwd, "threadId": meta.ThreadID, "runtimeKind": meta.RuntimeBinding.Kind, "providerId": meta.ProviderID,
 	})
@@ -861,6 +858,13 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		}
 	}
 	if err != nil {
+		if isRuntimeIndeterminate(err) {
+			if backend := runtimeBackend(rt); backend != nil {
+				backend.Close()
+			}
+			h.onRuntimeFailure(rt, err)
+			return SendResult{}, errf(500, "turn/start outcome is indeterminate: %s", err)
+		}
 		h.mu.Lock()
 		if m := h.agents[agentID]; m != nil {
 			h.finishTurnLocked(m, rt, "failed", "turn/start failed: "+err.Error())

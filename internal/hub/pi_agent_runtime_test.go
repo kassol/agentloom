@@ -1169,7 +1169,7 @@ func configureFakePiHubRPC(t *testing.T, scenario string) {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "pi")
-	script := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestFakePiHubRPCProcess -- \"$@\"\n", os.Args[0])
+	script := fmt.Sprintf("#!/bin/sh\n[ \"$1\" = \"--version\" ] && { echo 0.84.1; exit 0; }\nexec %q -test.run=TestFakePiHubRPCProcess -- \"$@\"\n", os.Args[0])
 	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1186,12 +1186,19 @@ func configureFakePiHubRPC(t *testing.T, scenario string) {
 	t.Setenv("FAKE_PI_RUNTIME_ENV_FILE", filepath.Join(dir, "runtime-env"))
 	t.Setenv("FAKE_PI_STEER_FILE", filepath.Join(dir, "steer"))
 	t.Setenv("FAKE_PI_TOOL_EFFECT_FILE", filepath.Join(dir, "tool-effect"))
+	t.Setenv("FAKE_PI_PID_FILE", filepath.Join(dir, "pid"))
+	t.Setenv("FAKE_PI_RESUME_MISMATCH_MARKER", filepath.Join(dir, "resume-mismatch"))
 }
 
 func TestFakePiHubRPCProcess(t *testing.T) {
 	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "" {
 		return
 	}
+	if len(os.Args) > 1 && os.Args[len(os.Args)-1] == "--version" {
+		fmt.Println("0.84.1")
+		return
+	}
+	_ = os.WriteFile(os.Getenv("FAKE_PI_PID_FILE"), []byte(fmt.Sprint(os.Getpid())), 0o600)
 	starts, _ := os.OpenFile(os.Getenv("FAKE_PI_STARTS_FILE"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if starts != nil {
 		_, _ = starts.WriteString("start\n")
@@ -1221,10 +1228,18 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 	var command map[string]any
 	readFakePiCommand(t, reader, &command)
 	id, _ := command["id"].(string)
+	reportedSessionFile := sessionFile
+	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "resume-mismatch-once" && resumedSession != "" {
+		marker := os.Getenv("FAKE_PI_RESUME_MISMATCH_MARKER")
+		if _, err := os.Stat(marker); os.IsNotExist(err) {
+			_ = os.WriteFile(marker, []byte("mismatch returned"), 0o600)
+			reportedSessionFile = filepath.Join(sessionDir, "session-wrong.jsonl")
+		}
+	}
 	if scenario := os.Getenv("FAKE_PI_HUB_SCENARIO"); scenario == "image" || scenario == "image-entry-delayed" {
-		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q,"model":{"id":"vision","input":["text","image"]}}}`+"\n", id, sessionFile, sessionID)
+		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q,"model":{"id":"vision","input":["text","image"]}}}`+"\n", id, reportedSessionFile, sessionID)
 	} else {
-		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q}}`+"\n", id, sessionFile, sessionID)
+		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q}}`+"\n", id, reportedSessionFile, sessionID)
 	}
 	serveOneFakePiEntries(t, reader, sessionFile)
 	readFakePiCommand(t, reader, &command)
@@ -1243,6 +1258,11 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 	}
 	answer, stopReason := "hello from Pi", "stop"
 	scenario := os.Getenv("FAKE_PI_HUB_SCENARIO")
+	if scenario == "accepted-no-entry" {
+		fmt.Printf(`{"id":%q,"type":"response","command":"prompt","success":true}`+"\n", id)
+		serveFakePiHistory(reader, sessionFile)
+		return
+	}
 	switch scenario {
 	case "abort":
 		answer, stopReason = "before abort after abort", "aborted"

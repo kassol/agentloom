@@ -19,7 +19,6 @@ import (
 
 	"github.com/yan5xu/codex-loom/internal/httpapi"
 	"github.com/yan5xu/codex-loom/internal/hub"
-	"github.com/yan5xu/codex-loom/internal/pi"
 	"github.com/yan5xu/codex-loom/internal/store"
 	"github.com/yan5xu/codex-loom/internal/webui"
 )
@@ -41,7 +40,7 @@ func main() {
 	canary := flag.Bool("canary", false, "run a passive, read-only development canary")
 	flag.Parse()
 
-	if err := pi.Check(""); err != nil {
+	if err := hub.PreflightPiRuntime(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 	st, err := store.OpenWithOptions(*dataDir, store.OpenOptions{ReadOnly: *canary})

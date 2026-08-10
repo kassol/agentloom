@@ -80,7 +80,7 @@ func configureFakePiModelRPC(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "pi")
-	script := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestFakePiModelRPCProcess -- \"$@\"\n", os.Args[0])
+	script := fmt.Sprintf("#!/bin/sh\n[ \"$1\" = \"--version\" ] && { echo 0.84.1; exit 0; }\nexec %q -test.run=TestFakePiModelRPCProcess -- \"$@\"\n", os.Args[0])
 	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

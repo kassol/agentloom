@@ -29,6 +29,7 @@ func (h *Hub) Shutdown() {
 		h.mu.Lock()
 		host := h.codexHost
 		driver := h.codexHostDriver
+		piDriver := h.piHostDriver
 		backends := make([]AgentRuntime, 0, len(h.runtimes))
 		for _, rt := range h.runtimes {
 			if backend := runtimeBackend(rt); backend != nil && rt.agentHost == nil {
@@ -51,6 +52,11 @@ func (h *Hub) Shutdown() {
 			}
 		} else if host != nil {
 			host.close()
+		}
+		if piDriver != nil {
+			if err := piDriver.Shutdown(context.Background()); err != nil {
+				log.Printf("[codex-loom] shut down Pi Runtime Host Driver: %v", err)
+			}
 		}
 		for _, backend := range backends {
 			backend.Close()

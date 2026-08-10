@@ -48,7 +48,7 @@ func (h *Hub) GetRuntimeModels(key string) (RuntimeModelState, error) {
 	if err := waitReady(rt); err != nil {
 		return RuntimeModelState{}, errf(500, "Runtime not ready: %s", err)
 	}
-	backend, ok := runtimeBackend(rt).(*piAgentRuntime)
+	backend, ok := piNativeRuntime(rt)
 	if !ok {
 		return RuntimeModelState{}, errf(500, "Pi Runtime model control is unavailable")
 	}
@@ -102,7 +102,7 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 	if busy {
 		return RuntimeModelState{}, errf(409, "agent is running; switch models between Turns")
 	}
-	backend, ok := runtimeBackend(rt).(*piAgentRuntime)
+	backend, ok := piNativeRuntime(rt)
 	if !ok {
 		return RuntimeModelState{}, errf(500, "Pi Runtime model control is unavailable")
 	}
@@ -120,4 +120,15 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 	}
 	h.mu.Unlock()
 	return state, nil
+}
+
+func piNativeRuntime(rt *runtime) (*piAgentRuntime, bool) {
+	switch backend := runtimeBackend(rt).(type) {
+	case *piAgentRuntime:
+		return backend, true
+	case *piRuntimeV1Facade:
+		return backend.native, backend.native != nil
+	default:
+		return nil, false
+	}
 }
