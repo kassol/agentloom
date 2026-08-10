@@ -132,6 +132,7 @@ type Failure struct {
 	Message    string       `json:"message"`
 	Retryable  bool         `json:"retryable"`
 	Diagnostic string       `json:"-"`
+	Cause      error        `json:"-"`
 }
 
 type CapabilityAvailability string
@@ -181,12 +182,13 @@ const (
 )
 
 type ContentBlock struct {
-	ID         string      `json:"id"`
-	Kind       ContentKind `json:"kind"`
-	Text       string      `json:"text,omitempty"`
-	ToolCall   *ToolCall   `json:"toolCall,omitempty"`
-	ToolResult *ToolResult `json:"toolResult,omitempty"`
-	Image      *Image      `json:"image,omitempty"`
+	ID         string          `json:"id"`
+	Kind       ContentKind     `json:"kind"`
+	Text       string          `json:"text,omitempty"`
+	ToolCall   *ToolCall       `json:"toolCall,omitempty"`
+	ToolResult *ToolResult     `json:"toolResult,omitempty"`
+	Image      *Image          `json:"image,omitempty"`
+	Diagnostic json.RawMessage `json:"-"`
 }
 
 func (b ContentBlock) Validate() error {
@@ -254,13 +256,24 @@ const (
 	EventTerminal    EventKind = "terminal"
 )
 
+type ContentPhase string
+
+const (
+	ContentPhaseStarted   ContentPhase = "started"
+	ContentPhaseDelta     ContentPhase = "delta"
+	ContentPhaseUpdated   ContentPhase = "updated"
+	ContentPhaseCompleted ContentPhase = "completed"
+)
+
 type Event struct {
-	Kind           EventKind     `json:"kind"`
-	TurnID         string        `json:"turnId"`
-	RuntimeTurnRef string        `json:"-"`
-	Content        *ContentBlock `json:"content,omitempty"`
-	Usage          *Usage        `json:"usage,omitempty"`
-	Outcome        *Outcome      `json:"outcome,omitempty"`
+	Kind              EventKind     `json:"kind"`
+	TurnID            string        `json:"turnId"`
+	PredecessorTurnID string        `json:"predecessorTurnId,omitempty"`
+	RuntimeTurnRef    string        `json:"-"`
+	ContentPhase      ContentPhase  `json:"contentPhase,omitempty"`
+	Content           *ContentBlock `json:"content,omitempty"`
+	Usage             *Usage        `json:"usage,omitempty"`
+	Outcome           *Outcome      `json:"outcome,omitempty"`
 }
 
 type UsageMetric struct {
@@ -286,13 +299,14 @@ type HistoryRequest struct {
 }
 
 type HistoryTurn struct {
-	TurnID         string         `json:"turnId"`
-	RuntimeTurnRef string         `json:"-"`
-	State          LifecycleState `json:"state"`
-	Content        []ContentBlock `json:"content"`
-	Usage          *Usage         `json:"usage,omitempty"`
-	StartedAt      string         `json:"startedAt,omitempty"`
-	CompletedAt    string         `json:"completedAt,omitempty"`
+	TurnID         string          `json:"turnId"`
+	RuntimeTurnRef string          `json:"-"`
+	State          LifecycleState  `json:"state"`
+	Content        []ContentBlock  `json:"content"`
+	Usage          *Usage          `json:"usage,omitempty"`
+	StartedAt      string          `json:"startedAt,omitempty"`
+	CompletedAt    string          `json:"completedAt,omitempty"`
+	Diagnostic     json.RawMessage `json:"-"`
 }
 
 type History struct {

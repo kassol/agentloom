@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -10,10 +11,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
 	"github.com/yan5xu/codex-loom/internal/modelcatalog"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	loomskills "github.com/yan5xu/codex-loom/skills"
 )
 
@@ -22,18 +25,24 @@ import (
 // processes. Remote clients join the same app-server and therefore share its
 // thread subscriptions with the Hub connection.
 type codexHostRuntime struct {
-	client       *codex.Client
-	agentRuntime AgentRuntime
-	ready        chan struct{}
-	initErr      error
-	generation   uint64
-	bin          string
-	catalogSHA   string
+	client     *codex.Client
+	ready      chan struct{}
+	initErr    error
+	generation uint64
+	bin        string
+	catalogSHA string
 	// A mutating Thread RPC that timed out may still complete later. Do not
 	// reuse that Thread on the same app-server generation because a retry could
 	// duplicate context or work. Replacing the host terminates the old effect
 	// domain and starts with an empty fence map.
 	indeterminateThreads map[string]threadControlFailure
+	closeOnce            sync.Once
+}
+
+func (h *codexHostRuntime) close() {
+	if h != nil && h.client != nil {
+		h.closeOnce.Do(h.client.Close)
+	}
 }
 
 type threadControlFailure struct {
@@ -66,18 +75,38 @@ type SkillInventory struct {
 }
 
 func (h *Hub) ensureCodexHostLocked() (*codexHostRuntime, error) {
+	return h.codexDriverLocked().ensureLocked()
+}
+
+func (h *Hub) codexDriverLocked() *codexRuntimeHostDriver {
+	if h.codexHostDriver == nil {
+		h.codexHostDriver = newCodexRuntimeHostDriver(h)
+	}
+	return h.codexHostDriver
+}
+
+func (d *codexRuntimeHostDriver) ensureLocked() (*codexHostRuntime, error) {
+	h := d.hub
 	if host := h.codexHost; host != nil && !host.client.Closed() {
 		return host, nil
 	}
 	if h.providerSwitching {
 		return nil, errf(409, "CodexHost is restarting for an Agent Provider switch")
 	}
-	return h.startCodexHostLocked()
+	return d.startLocked()
 }
 
 func (h *Hub) startCodexHostLocked() (*codexHostRuntime, error) {
+	return h.codexDriverLocked().startLocked()
+}
+
+func (d *codexRuntimeHostDriver) startLocked() (*codexHostRuntime, error) {
+	h := d.hub
 	if host := h.codexHost; host != nil && !host.client.Closed() {
 		return host, nil
+	}
+	if err := d.Preflight(context.Background()); err != nil {
+		return nil, errf(500, "Codex Runtime preflight: %s", err)
 	}
 	catalog, err := h.materializeModelCatalog()
 	if err != nil {
@@ -94,7 +123,6 @@ func (h *Hub) startCodexHostLocked() (*codexHostRuntime, error) {
 	h.codexHostGeneration++
 	host := &codexHostRuntime{
 		client:               client,
-		agentRuntime:         &codexAgentRuntime{client: client},
 		ready:                make(chan struct{}),
 		generation:           h.codexHostGeneration,
 		bin:                  codexHostBin(),
@@ -109,8 +137,8 @@ func (h *Hub) startCodexHostLocked() (*codexHostRuntime, error) {
 	}
 	client.OnClose = func() { h.onHostClose(host.generation) }
 	h.codexHost = host
-	if !h.startWorkerLocked(func() { h.initCodexHost(host) }) {
-		client.Close()
+	if !h.startWorkerLocked(func() { d.initHost(host) }) {
+		host.close()
 		h.codexHost = nil
 		return nil, errf(503, "CodexLoom is shutting down")
 	}
@@ -222,7 +250,8 @@ func (h *Hub) ensureCodexHost() (*codexHostRuntime, error) {
 	return host, nil
 }
 
-func (h *Hub) initCodexHost(host *codexHostRuntime) {
+func (d *codexRuntimeHostDriver) initHost(host *codexHostRuntime) {
+	h := d.hub
 	defer close(host.ready)
 	// The client name is a persisted Remote enrollment scope. Keep the legacy
 	// wire identity so existing paired devices survive the product rename and
@@ -231,13 +260,13 @@ func (h *Hub) initCodexHost(host *codexHostRuntime) {
 		Name: "codex-hub-remote", Title: "CodexLoom", Version: "0.1.0",
 	})
 	if host.initErr != nil {
-		host.client.Close()
+		host.close()
 		return
 	}
 	if h.st != nil {
 		if err := h.st.ValidateWritableIdentity(); err != nil {
 			host.initErr = fmt.Errorf("validate builtin Skill store: %w", err)
-			host.client.Close()
+			host.close()
 			return
 		}
 		skillRoot := filepath.Join(h.st.Dir(), "builtin-skills")
@@ -247,21 +276,21 @@ func (h *Hub) initCodexHost(host *codexHostRuntime) {
 		} else {
 			if _, err := loomskills.MaterializeSelected(skillRoot, missing); err != nil {
 				host.initErr = fmt.Errorf("materialize CodexLoom skills: %w", err)
-				host.client.Close()
+				host.close()
 				return
 			}
 			if _, err := host.client.Request("skills/extraRoots/set", map[string]any{
 				"extraRoots": []string{skillRoot},
 			}, 20*time.Second); err != nil {
 				host.initErr = fmt.Errorf("register CodexLoom skills: %w", err)
-				host.client.Close()
+				host.close()
 				return
 			}
 		}
 	}
 	if _, err := h.requestSkillInventory(host); err != nil {
 		host.initErr = fmt.Errorf("load CodexLoom skill inventory: %w", err)
-		host.client.Close()
+		host.close()
 		return
 	}
 	h.mu.Lock()
@@ -394,6 +423,22 @@ func notificationThreadID(params json.RawMessage) string {
 	return ""
 }
 
+func notificationTurnID(params json.RawMessage) string {
+	var envelope struct {
+		TurnID string `json:"turnId"`
+		Turn   struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	if json.Unmarshal(params, &envelope) != nil {
+		return ""
+	}
+	if turnID := strings.TrimSpace(envelope.TurnID); turnID != "" {
+		return turnID
+	}
+	return strings.TrimSpace(envelope.Turn.ID)
+}
+
 func (h *Hub) runtimeForThreadLocked(threadID string) *runtime {
 	if threadID == "" {
 		return nil
@@ -408,10 +453,17 @@ func (h *Hub) runtimeForThreadLocked(threadID string) *runtime {
 			}
 			ready := make(chan struct{})
 			close(ready)
+			handle, host, err := h.codexDriverLocked().acquireLocked(AgentHostRequest{AgentID: id})
+			if err != nil {
+				return nil
+			}
 			rt := &runtime{
-				agentID: id, client: h.codexHost.client, hostGeneration: h.codexHost.generation,
+				agentID: id, agentRuntime: handle.facade, agentHost: handle, runtimeContract: handle.contract,
+				client: host.client, hostGeneration: host.generation,
 				ready: ready, approvals: map[string]*approval{},
 			}
+			handle.SetFailureHandler(func(err error) { h.onCodexHostFailure(rt, err) })
+			h.bindCodexContract(meta, rt, handle.contract)
 			h.runtimes[id] = rt
 			return rt
 		}
@@ -507,10 +559,17 @@ func (h *Hub) adoptThreadLocked(threadID, threadName, cwd string) *runtime {
 	}
 	ready := make(chan struct{})
 	close(ready)
+	handle, host, err := h.codexDriverLocked().acquireLocked(AgentHostRequest{AgentID: id})
+	if err != nil {
+		return nil
+	}
 	rt := &runtime{
-		agentID: id, client: h.codexHost.client, hostGeneration: h.codexHost.generation,
+		agentID: id, agentRuntime: handle.facade, agentHost: handle, runtimeContract: handle.contract,
+		client: host.client, hostGeneration: host.generation,
 		ready: ready, approvals: map[string]*approval{},
 	}
+	handle.SetFailureHandler(func(err error) { h.onCodexHostFailure(rt, err) })
+	h.bindCodexContract(meta, rt, handle.contract)
 	h.runtimes[id] = rt
 	h.emitLocked(id, "loom/agent-created", map[string]any{
 		"id": id, "name": name, "cwd": meta.Cwd, "threadId": meta.ThreadID, "runtimeKind": "codex", "source": "remote",
@@ -547,13 +606,70 @@ func (h *Hub) onHostNotification(generation uint64, method string, params json.R
 			hydrateAgentID = rt.agentID
 		}
 	}
+	if rt != nil && method == "turn/started" && (rt.activeTurn == nil || rt.activeTurn.finished) {
+		if nativeTurnID := notificationTurnID(params); nativeTurnID != "" {
+			if meta := h.agents[rt.agentID]; meta != nil {
+				turn := h.adoptRemoteTurnLocked(meta, rt, nativeTurnID)
+				if contract, ok := rt.runtimeContract.(*codexRuntimeContract); ok {
+					contract.bindTurn(turn.turnID, "", nativeTurnID)
+				}
+			}
+		}
+	}
+	driver := h.codexHostDriver
 	h.mu.Unlock()
 	if hydrateAgentID != "" {
 		h.startWorker(func() { h.hydrateAdoptedAgent(generation, hydrateAgentID, threadID) })
 	}
 	if rt != nil {
-		h.onNotification(rt, method, params)
+		canonical := false
+		if driver != nil {
+			canonical = driver.dispatchNativeEvent(rt.agentID, method, params)
+		}
+		h.onCodexCompatibilityNotification(rt, method, params, canonical)
 	}
+}
+
+func (h *Hub) bindCodexContract(meta *Agent, rt *runtime, contract *codexRuntimeContract) {
+	if contract == nil {
+		return
+	}
+	for turnID, nativeTurnID := range meta.RuntimeTurnBindings {
+		contract.bindTurn(turnID, "", nativeTurnID)
+	}
+	contract.SetEventHandler(func(event runtimecontract.Event) { h.onCanonicalRuntimeEvent(rt, event) })
+}
+
+func (h *Hub) onCodexCompatibilityNotification(rt *runtime, method string, params json.RawMessage, canonical bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta := h.agents[rt.agentID]
+	if meta == nil {
+		return
+	}
+	// These native-only notifications remain compatibility side effects until
+	// their dedicated Runtime Capabilities migrate to typed events.
+	if method == "error" && rt.activeTurn != nil && !rt.activeTurn.finished && rt.activeTurn.forcedFailure == "" {
+		if failure, interrupt := customProviderModelRouteFailure(meta.ProviderID, meta.Model, params); failure != "" {
+			rt.activeTurn.forcedFailure = failure
+			if interrupt {
+				h.scheduleModelRouteInterruptLocked(meta.ID, rt.activeTurn, failure)
+			}
+		}
+	}
+	if method == "thread/goal/updated" || method == "thread/goal/cleared" {
+		h.onGoalNotificationLocked(meta.ID, method, params)
+	}
+	turnID := ""
+	if rt.activeTurn != nil {
+		turnID = rt.activeTurn.turnID
+	}
+	if turnID == "" {
+		if contract, ok := rt.runtimeContract.(*codexRuntimeContract); ok {
+			turnID = contract.turnIDForNative(notificationTurnID(params))
+		}
+	}
+	h.emitLocked(meta.ID, method, runtimePublicPayload(params, meta.ThreadID, turnID, canonical))
 }
 
 func (h *Hub) hydrateAdoptedAgent(generation uint64, agentID, threadID string) {
@@ -648,6 +764,13 @@ func (h *Hub) onHostServerRequest(generation uint64, id json.RawMessage, method 
 
 func (h *Hub) onHostClose(generation uint64) {
 	h.mu.Lock()
+	driver := h.codexHostDriver
+	valid := h.codexHost != nil && h.codexHost.generation == generation
+	h.mu.Unlock()
+	if valid && driver != nil {
+		driver.fanoutHostFailure(generation, fmt.Errorf("CodexHost exited"))
+	}
+	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.codexHost == nil || h.codexHost.generation != generation {
 		return
@@ -659,10 +782,6 @@ func (h *Hub) onHostClose(generation uint64) {
 			continue
 		}
 		delete(h.runtimes, id)
-		if meta := h.agents[id]; meta != nil && rt.activeTurn != nil && !rt.activeTurn.finished {
-			h.emitLocked(meta.ID, "loom/host-error", map[string]any{"message": "CodexHost exited mid-turn"})
-			h.finishTurnLocked(meta, rt, "interrupted", "CodexHost exited")
-		}
 	}
 	if h.remoteConfig.Enabled {
 		h.remoteStatus.State = "error"
@@ -671,4 +790,18 @@ func (h *Hub) onHostClose(generation uint64) {
 		h.remoteEnabledGeneration = 0
 		h.emitRemoteLocked()
 	}
+}
+
+func (h *Hub) onCodexHostFailure(rt *runtime, err error) {
+	if rt == nil || err == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta := h.agents[rt.agentID]
+	if meta == nil || rt.activeTurn == nil || rt.activeTurn.finished {
+		return
+	}
+	h.emitLocked(meta.ID, "loom/host-error", map[string]any{"message": "CodexHost exited mid-turn"})
+	h.finishTurnLocked(meta, rt, "interrupted", err.Error())
 }

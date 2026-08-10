@@ -84,6 +84,7 @@ type RuntimeBindingRequest struct {
 }
 
 type RuntimeTurnRequest struct {
+	LoomTurnID     string
 	NativeRef      string
 	Input          []RuntimeInput
 	ApprovalPolicy string
@@ -143,6 +144,7 @@ const (
 
 type RuntimeEvent struct {
 	Kind         RuntimeEventKind
+	LoomTurnID   string
 	NativeRef    string
 	NativeTurnID string
 	ItemID       string

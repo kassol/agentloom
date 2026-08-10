@@ -69,6 +69,10 @@ func installFakeRemoteCodex(t *testing.T) {
 	dir := t.TempDir()
 	binPath := filepath.Join(dir, "codex")
 	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'codex-cli 0.144.1\n'
+  exit 0
+fi
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   [ -z "$id" ] && continue

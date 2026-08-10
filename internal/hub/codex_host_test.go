@@ -166,15 +166,23 @@ func TestInterruptRetriesWithAuthoritativeActiveTurnID(t *testing.T) {
 		stopWatchdog: make(chan struct{}),
 	}
 	h.mu.Lock()
-	h.agents["agent-race"] = &Agent{
+	meta := &Agent{
 		ID: "agent-race", Name: "race", ThreadID: "loom-thr-interrupt-race", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-interrupt-race"}, Status: "running",
 		RuntimeTurnBindings: map[string]string{"turn-loom": "turn-stale"},
 		CurrentTurnID:       "turn-loom", CurrentTask: "Investigate", CreatedAt: now(), UpdatedAt: now(),
 	}
-	h.runtimes["agent-race"] = &runtime{
-		agentID: "agent-race", client: host.client, hostGeneration: host.generation,
+	h.agents["agent-race"] = meta
+	handle, _, err := h.codexDriverLocked().acquireLocked(AgentHostRequest{AgentID: meta.ID})
+	if err != nil {
+		h.mu.Unlock()
+		t.Fatal(err)
+	}
+	rt := &runtime{
+		agentID: "agent-race", agentRuntime: handle.facade, agentHost: handle, runtimeContract: handle.contract, client: host.client, hostGeneration: host.generation,
 		ready: host.ready, approvals: map[string]*approval{}, activeTurn: turn,
 	}
+	h.bindCodexContract(meta, rt, handle.contract)
+	h.runtimes["agent-race"] = rt
 	h.mu.Unlock()
 
 	result, err := h.Interrupt("agent-race", "test interrupt")
@@ -196,11 +204,11 @@ func TestInterruptRetriesWithAuthoritativeActiveTurnID(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	h.mu.Lock()
-	meta := *h.agents["agent-race"]
+	completedMeta := *h.agents["agent-race"]
 	h.mu.Unlock()
-	if meta.Status != "idle" || meta.LastTurn == nil || meta.LastTurn.TurnID != "turn-loom" || meta.LastTurn.Status != "interrupted" ||
-		meta.RuntimeTurnBindings["turn-loom"] != "turn-actual" {
-		t.Fatalf("Agent after reconciled interrupt = %#v", meta)
+	if completedMeta.Status != "idle" || completedMeta.LastTurn == nil || completedMeta.LastTurn.TurnID != "turn-loom" || completedMeta.LastTurn.Status != "interrupted" ||
+		completedMeta.RuntimeTurnBindings["turn-loom"] != "turn-actual" {
+		t.Fatalf("Agent after reconciled interrupt = %#v", completedMeta)
 	}
 	if got := countRequestMethod(t, logPath, "turn/interrupt"); got != 2 {
 		t.Fatalf("turn/interrupt requests = %d, want stale request plus one retry", got)
@@ -250,6 +258,13 @@ func TestTwoAgentsShareOneCodexHost(t *testing.T) {
 	if host == nil || firstRuntime == nil || secondRuntime == nil ||
 		firstRuntime.client != host.client || secondRuntime.client != host.client {
 		t.Fatal("Agents do not share the same CodexHost client")
+	}
+	if firstRuntime.agentHost == nil || secondRuntime.agentHost == nil || firstRuntime.agentHost == secondRuntime.agentHost ||
+		firstRuntime.runtimeContract == nil || secondRuntime.runtimeContract == nil || firstRuntime.runtimeContract == secondRuntime.runtimeContract {
+		t.Fatal("Agents did not receive distinct v2 AgentHost and Runtime Contract handles")
+	}
+	if _, ok := firstRuntime.agentRuntime.(*codexRuntimeV1Facade); !ok {
+		t.Fatalf("Codex v1 backend = %T, want thin v2 facade", firstRuntime.agentRuntime)
 	}
 	if got := countRequestMethod(t, logPath, "initialize"); got != 1 {
 		t.Fatalf("initialize requests = %d, want one", got)
@@ -775,6 +790,10 @@ func installFakeSharedCodexHost(t *testing.T) string {
 	logPath := filepath.Join(dir, "requests.ndjson")
 	resumeMarker := filepath.Join(dir, "resumed")
 	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'codex-cli 0.144.1\n'
+  exit 0
+fi
 printf '%s\n' "$@" > "$CODEX_HOST_ARGS_LOG"
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_HOST_LOG"
@@ -841,6 +860,10 @@ while IFS= read -r line; do
 	  printf '{"id":%s,"result":{"turn":{"id":"turn-corrected-model"}}}\n' "$id"
 	  printf '{"method":"turn/started","params":{"threadId":"thr-stale","turn":{"id":"turn-corrected-model","status":"inProgress"}}}\n'
 	  printf '{"method":"turn/completed","params":{"threadId":"thr-stale","turn":{"id":"turn-corrected-model","status":"completed"}}}\n' ;;
+	*'"method":"turn/start"'*'"early-event"'*)
+	  printf '{"method":"turn/started","params":{"threadId":"thr-stale","turn":{"id":"turn-native-early","status":"inProgress"}}}\n'
+	  printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr-stale","turnId":"turn-native-early","itemId":"answer-early","delta":"early"}}\n'
+	  printf '{"id":%s,"result":{"turn":{"id":"turn-native-early"}}}\n' "$id" ;;
 	*'"method":"turn/interrupt"'*'"threadId":"thr-model-route-fence"'*'"turnId":"turn-successor"'*)
 	  printf '{"id":%s,"result":{}}\n' "$id"
 	  printf '{"method":"turn/completed","params":{"threadId":"thr-model-route-fence","turn":{"id":"turn-successor","status":"interrupted"}}}\n' ;;
@@ -850,6 +873,10 @@ while IFS= read -r line; do
 	  else
 	    printf '{"id":%s,"error":{"code":-32602,"message":"thread not found: thr-stale"}}\n' "$id"
 	  fi ;;
+	*'"method":"turn/steer"'*'"threadId":"thr-stale"'*)
+	  printf '{"id":%s,"result":{"turnId":"turn-stale"}}\n' "$id" ;;
+	*'"method":"turn/interrupt"'*'"threadId":"thr-stale"'*'"turnId":"turn-stale"'*)
+	  printf '{"id":%s,"result":{}}\n' "$id" ;;
 	*'"method":"turn/interrupt"'*'"threadId":"thr-interrupt-race"'*'"turnId":"turn-stale"'*)
 	  printf '{"id":%s,"error":{"code":-32602,"message":"expected active turn id turn-stale but found turn-actual"}}\n' "$id" ;;
 	*'"method":"turn/interrupt"'*'"threadId":"thr-interrupt-race"'*'"turnId":"turn-actual"'*)

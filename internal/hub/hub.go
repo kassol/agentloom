@@ -290,6 +290,8 @@ type turnState struct {
 type runtime struct {
 	agentID           string
 	agentRuntime      AgentRuntime
+	agentHost         AgentHost
+	runtimeContract   runtimecontract.Contract
 	client            *codex.Client
 	hostGeneration    uint64
 	skillConfigHash   string
@@ -367,6 +369,7 @@ type Hub struct {
 	remoteStartMu           sync.Mutex
 	remoteEnabledGeneration uint64
 	codexHost               *codexHostRuntime
+	codexHostDriver         *codexRuntimeHostDriver
 	codexHostGeneration     uint64
 	stop                    chan struct{}
 	stopOnce                sync.Once
@@ -1133,14 +1136,17 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 		}
 		rt = &runtime{agentID: meta.ID, agentRuntime: backend, ready: make(chan struct{}), approvals: map[string]*approval{}}
 	} else if meta.RuntimeBinding.Kind == "codex" {
-		host, err := h.ensureCodexHostLocked()
+		handle, host, err := h.codexDriverLocked().acquireLocked(AgentHostRequest{AgentID: meta.ID})
 		if err != nil {
 			return nil, err
 		}
 		rt = &runtime{
-			agentID: meta.ID, agentRuntime: host.agentRuntime, client: host.client, hostGeneration: host.generation,
+			agentID: meta.ID, agentRuntime: handle.facade, agentHost: handle, runtimeContract: handle.contract,
+			client: host.client, hostGeneration: host.generation,
 			ready: make(chan struct{}), approvals: map[string]*approval{},
 		}
+		handle.SetFailureHandler(func(err error) { h.onCodexHostFailure(rt, err) })
+		h.bindCodexContract(meta, rt, handle.contract)
 	} else if meta.RuntimeBinding.Kind == "pi" {
 		rt = &runtime{agentID: meta.ID, agentRuntime: newPiAgentRuntime(meta.ID, h.st.Dir(), h.runtimeAPIURL), ready: make(chan struct{}), approvals: map[string]*approval{}}
 	} else {
@@ -1524,6 +1530,11 @@ func (h *Hub) recordRuntimeTurnBindingLocked(meta *Agent, turnID, nativeTurnID s
 		meta.RuntimeTurnBindings = map[string]string{}
 	}
 	meta.RuntimeTurnBindings[turnID] = nativeTurnID
+	if rt := h.runtimes[meta.ID]; rt != nil {
+		if contract, ok := rt.runtimeContract.(*codexRuntimeContract); ok {
+			contract.bindTurn(turnID, "", nativeTurnID)
+		}
+	}
 }
 
 func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage) {
@@ -1565,6 +1576,89 @@ func (h *Hub) onRuntimeEvent(rt *runtime, event RuntimeEvent) {
 	if meta != nil {
 		h.onRuntimeEventLocked(meta, rt, event, "", nil)
 	}
+}
+
+func (h *Hub) onCanonicalRuntimeEvent(rt *runtime, event runtimecontract.Event) {
+	h.onRuntimeEvent(rt, compatibilityRuntimeEvent(event))
+}
+
+func compatibilityRuntimeEvent(event runtimecontract.Event) RuntimeEvent {
+	result := RuntimeEvent{LoomTurnID: event.TurnID, NativeTurnID: event.RuntimeTurnRef}
+	switch event.Kind {
+	case runtimecontract.EventTurnStarted:
+		result.Kind = RuntimeTurnStarted
+	case runtimecontract.EventContent:
+		if event.Content == nil {
+			return result
+		}
+		result.ItemID = event.Content.ID
+		result.Text = event.Content.Text
+		if len(event.Content.Diagnostic) > 0 {
+			_ = json.Unmarshal(event.Content.Diagnostic, &result.Item)
+		}
+		switch event.Content.Kind {
+		case runtimecontract.ContentUserText:
+			result.Kind = RuntimeUserInput
+		case runtimecontract.ContentAssistantText:
+			if event.ContentPhase == runtimecontract.ContentPhaseDelta {
+				result.Kind = RuntimeTextDelta
+			} else {
+				result.Kind = RuntimeTextCompleted
+			}
+		case runtimecontract.ContentReasoning:
+			if event.ContentPhase == runtimecontract.ContentPhaseDelta {
+				result.Kind = RuntimeReasoningDelta
+			} else {
+				result.Kind = RuntimeReasoningCompleted
+			}
+		case runtimecontract.ContentToolCall:
+			if event.Content.ToolCall != nil {
+				_ = json.Unmarshal(event.Content.ToolCall.Arguments, &result.Item)
+			}
+			switch event.ContentPhase {
+			case runtimecontract.ContentPhaseUpdated:
+				result.Kind = RuntimeToolUpdated
+			case runtimecontract.ContentPhaseCompleted:
+				result.Kind = RuntimeToolCompleted
+			default:
+				result.Kind = RuntimeToolStarted
+			}
+		case runtimecontract.ContentToolResult:
+			result.Kind = RuntimeToolCompleted
+			if event.Content.ToolResult != nil {
+				if result.Item == nil {
+					result.Item = map[string]any{}
+				}
+				status := "failed"
+				if event.Content.ToolResult.Success {
+					status = "completed"
+				}
+				if _, ok := result.Item["id"]; !ok {
+					result.Item["id"] = event.Content.ToolResult.ToolCallID
+				}
+				if _, ok := result.Item["output"]; !ok {
+					result.Item["output"] = event.Content.ToolResult.Text
+				}
+				if _, ok := result.Item["status"]; !ok {
+					result.Item["status"] = status
+				}
+			}
+		}
+	case runtimecontract.EventTerminal:
+		result.Kind = RuntimeTurnCompleted
+		if event.Outcome != nil {
+			if event.Outcome.Failure != nil {
+				result.Error = event.Outcome.Failure.Message
+			}
+			switch event.Outcome.State {
+			case runtimecontract.LifecycleFailed, runtimecontract.LifecycleRejected, runtimecontract.LifecycleIndeterminate:
+				result.Kind = RuntimeTurnFailed
+			case runtimecontract.LifecycleInterrupted:
+				result.Kind = RuntimeTurnInterrupted
+			}
+		}
+	}
+	return result
 }
 
 func (h *Hub) onRuntimeFailure(rt *runtime, err error) {
@@ -1630,6 +1724,7 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent Runtim
 		}
 	}
 	activeEvent := rt.activeTurn != nil && !rt.activeTurn.finished &&
+		(runtimeEvent.LoomTurnID == "" || rt.activeTurn.turnID == runtimeEvent.LoomTurnID) &&
 		(nativeTurnID == "" || rt.activeTurn.nativeTurnID == nativeTurnID)
 	if text := runtimeEvent.Text; runtimeEvent.Kind == RuntimeUserInput && text != "" && activeEvent {
 		task := displayUserTask(text)
@@ -1735,9 +1830,11 @@ func runtimePublicPayload(params json.RawMessage, threadID, turnID string, compa
 
 func (h *Hub) emitRuntimeEventsLocked(meta *Agent, rt *runtime, events []RuntimeEvent) {
 	for _, event := range events {
-		turnID := ""
+		turnID := event.LoomTurnID
 		if rt.activeTurn != nil {
-			turnID = rt.activeTurn.turnID
+			if turnID == "" {
+				turnID = rt.activeTurn.turnID
+			}
 		}
 		data := map[string]any{
 			"turnId": turnID,

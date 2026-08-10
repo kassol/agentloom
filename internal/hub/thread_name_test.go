@@ -69,6 +69,10 @@ func installFakeCodexNameServer(t *testing.T) string {
 	binPath := filepath.Join(dir, "codex")
 	logPath := filepath.Join(dir, "requests.ndjson")
 	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'codex-cli 0.144.1\n'
+  exit 0
+fi
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_NAME_LOG"
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')

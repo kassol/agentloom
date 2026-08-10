@@ -846,7 +846,7 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 
 	startTurn := func() (string, error) {
 		return backend.StartTurn(RuntimeTurnRequest{
-			NativeRef: threadID, Input: input, ApprovalPolicy: approvalPolicy,
+			LoomTurnID: turn.turnID, NativeRef: threadID, Input: input, ApprovalPolicy: approvalPolicy,
 			Sandbox: sandbox, Model: model, Effort: effort, Timeout: 30 * time.Second,
 		})
 	}
@@ -1179,7 +1179,7 @@ func (h *Hub) ArchiveAgent(key string) (map[string]any, error) {
 	killed.Status = "killed"
 	h.emitStatusLocked(&killed, "killed")
 	h.mu.Unlock()
-	if backend := runtimeBackend(rt); backend != nil && meta.RuntimeBinding.Kind != "codex" {
+	if backend := runtimeBackend(rt); backend != nil {
 		backend.Close()
 	}
 

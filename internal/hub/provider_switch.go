@@ -138,7 +138,7 @@ func closeCodexHost(host *codexHostRuntime) error {
 	if host == nil {
 		return nil
 	}
-	host.client.Close()
+	host.close()
 	if !host.client.WaitClosed(4 * time.Second) {
 		return fmt.Errorf("CodexHost did not exit within 4s")
 	}
