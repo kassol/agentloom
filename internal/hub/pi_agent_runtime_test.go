@@ -66,16 +66,36 @@ func TestPiAgentCompletesLiveLoomTurnOnlyAfterAgentSettled(t *testing.T) {
 		t.Fatal(err)
 	}
 	var answerSeen, completionSeen bool
+	var normalized []string
+	toolIDs := map[string]bool{}
 	for _, event := range events {
 		switch event.Type {
+		case "loom/reasoning-delta", "loom/reasoning-completed", "loom/text-delta", "loom/tool-started", "loom/tool-updated", "loom/tool-completed":
+			normalized = append(normalized, event.Type)
+			if strings.HasPrefix(event.Type, "loom/tool-") {
+				var payload struct {
+					ItemID string `json:"itemId"`
+				}
+				_ = json.Unmarshal(event.Data, &payload)
+				toolIDs[payload.ItemID] = true
+			}
 		case "loom/text-completed":
+			normalized = append(normalized, event.Type)
 			answerSeen = strings.Contains(string(event.Data), "hello from Pi")
 		case "loom/turn-completed":
+			normalized = append(normalized, event.Type)
 			completionSeen = answerSeen && strings.Contains(string(event.Data), result.TurnID)
 		}
 	}
 	if !answerSeen || !completionSeen {
 		t.Fatalf("normalized Pi events = %#v", events)
+	}
+	wantNormalized := []string{
+		"loom/reasoning-delta", "loom/reasoning-completed", "loom/tool-started", "loom/tool-updated",
+		"loom/tool-completed", "loom/text-delta", "loom/text-completed", "loom/turn-completed",
+	}
+	if strings.Join(normalized, ",") != strings.Join(wantNormalized, ",") || len(toolIDs) != 1 || !toolIDs["call-1"] {
+		t.Fatalf("streamed normalized order=%v toolIDs=%v", normalized, toolIDs)
 	}
 	prompt, err := os.ReadFile(os.Getenv("FAKE_PI_PROMPT_FILE"))
 	if err != nil || !strings.Contains(string(prompt), "hello Pi") || !strings.Contains(string(prompt), "loom_agent_profile") {
@@ -120,6 +140,187 @@ func TestPiProtocolFailureFailsActiveLoomTurn(t *testing.T) {
 	t.Fatal("Pi protocol failure did not fail the active Loom Turn")
 }
 
+func TestPiRuntimeNormalizesStreamingTextReasoningAndToolLifecycle(t *testing.T) {
+	runtime := newPiAgentRuntime("agent-1", t.TempDir())
+	rawEvents := []string{
+		`{"type":"message_start","message":{"role":"assistant","content":[]}}`,
+		`{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"checking"}}`,
+		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"hello"}}`,
+		`{"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{"command":"pwd"}}`,
+		`{"type":"tool_execution_update","toolCallId":"call-1","toolName":"bash","args":{"command":"pwd"},"partialResult":{"content":[{"type":"text","text":"/tmp"}]}}`,
+		`{"type":"tool_execution_end","toolCallId":"call-1","toolName":"bash","result":{"content":[{"type":"text","text":"/tmp/project"}]},"isError":false}`,
+		`{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"thinking","thinking":"checking files"},{"type":"text","text":"hello world"}]}}`,
+	}
+	var events []RuntimeEvent
+	for _, raw := range rawEvents {
+		events = append(events, runtime.NormalizeEvent("", json.RawMessage(raw))...)
+	}
+	if len(events) != 7 {
+		t.Fatalf("normalized events = %#v, want 7", events)
+	}
+	wantKinds := []RuntimeEventKind{
+		RuntimeReasoningDelta, RuntimeTextDelta, RuntimeToolStarted, RuntimeToolUpdated,
+		RuntimeToolCompleted, RuntimeReasoningCompleted, RuntimeTextCompleted,
+	}
+	for i, want := range wantKinds {
+		if events[i].Kind != want {
+			t.Fatalf("event %d kind = %q, want %q (all=%#v)", i, events[i].Kind, want, events)
+		}
+	}
+	if events[0].ItemID == "" || events[0].ItemID == events[1].ItemID || events[0].Text != "checking" || events[1].Text != "hello" {
+		t.Fatalf("stream correlation = %#v", events[:2])
+	}
+	for _, index := range []int{2, 3, 4} {
+		if events[index].ItemID != "call-1" {
+			t.Fatalf("tool event %d correlation = %#v", index, events[index])
+		}
+	}
+	if events[3].Item["aggregatedOutput"] != "/tmp" || events[4].Item["aggregatedOutput"] != "/tmp/project" || events[4].Item["status"] != "completed" {
+		t.Fatalf("tool lifecycle = %#v", events[2:5])
+	}
+	if events[5].ItemID != events[0].ItemID || events[5].Text != "checking files" || events[6].ItemID != events[1].ItemID || events[6].Text != "hello world" {
+		t.Fatalf("completed message correlation = %#v", events[5:])
+	}
+}
+
+func TestPiAbortKeepsLoomTurnRunningUntilAbortedAgentSettles(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	configureFakePiHubRPC(t, "abort")
+	h := testHub(st)
+	h.stop = make(chan struct{})
+	defer h.Shutdown()
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-abort", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := h.SendTask(agent.ID, "stream until stopped", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForPiFile(t, os.Getenv("FAKE_PI_ABORT_READY_FILE"))
+
+	type interruptResult struct {
+		result InterruptResult
+		err    error
+	}
+	interruptCh := make(chan interruptResult, 1)
+	go func() {
+		interrupted, err := h.Interrupt(agent.ID, "Owner stopped Pi")
+		interruptCh <- interruptResult{result: interrupted, err: err}
+	}()
+
+	waitForPiFile(t, os.Getenv("FAKE_PI_AGENT_END_FILE"))
+	view, err := h.GetAgent(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != "running" || view.CurrentTurnID != result.TurnID || view.LastTurn != nil {
+		t.Fatalf("Loom settled before Pi agent_settled: %#v", view.Agent)
+	}
+
+	select {
+	case stopped := <-interruptCh:
+		if stopped.err != nil || !stopped.result.Interrupted {
+			t.Fatalf("Interrupt() = (%#v, %v)", stopped.result, stopped.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Interrupt did not return after Pi settled")
+	}
+	view, err = h.GetAgent(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != "idle" || view.LastTurn == nil || view.LastTurn.Status != "interrupted" || view.LastTurn.TurnID != result.TurnID {
+		t.Fatalf("settled aborted Pi Turn = %#v", view.Agent)
+	}
+	events, err := st.ReadEvents(agent.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var text string
+	terminal := ""
+	for _, event := range events {
+		switch event.Type {
+		case "loom/text-delta":
+			var payload struct {
+				Delta string `json:"delta"`
+			}
+			_ = json.Unmarshal(event.Data, &payload)
+			text += payload.Delta
+		case "loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted":
+			terminal = event.Type
+		}
+	}
+	if text != "before abort after abort" || terminal != "loom/turn-interrupted" {
+		t.Fatalf("post-abort event stream text=%q terminal=%q events=%#v", text, terminal, events)
+	}
+}
+
+func TestPiRetryAndCompactionContinuationSettleOnlyFinalAssistantState(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	configureFakePiHubRPC(t, "retry-compaction")
+	h := testHub(st)
+	h.stop = make(chan struct{})
+	defer h.Shutdown()
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-retry", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := h.SendTask(agent.ID, "recover transparently", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForPiFile(t, os.Getenv("FAKE_PI_AGENT_END_FILE"))
+	view, err := h.GetAgent(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != "running" || view.LastTurn != nil {
+		t.Fatalf("Loom settled during retry/compaction continuation: %#v", view.Agent)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		view, _ = h.GetAgent(agent.ID)
+		if view.LastTurn != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if view.LastTurn == nil || view.LastTurn.TurnID != result.TurnID || view.LastTurn.Status != "completed" {
+		t.Fatalf("settled retry Turn = %#v", view.Agent)
+	}
+	events, err := st.ReadEvents(agent.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deltas string
+	terminals := 0
+	for _, event := range events {
+		if event.Type == "loom/text-delta" {
+			var payload struct {
+				Delta string `json:"delta"`
+			}
+			_ = json.Unmarshal(event.Data, &payload)
+			deltas += payload.Delta
+		}
+		if event.Type == "loom/turn-completed" || event.Type == "loom/turn-failed" || event.Type == "loom/turn-interrupted" {
+			terminals++
+		}
+	}
+	if deltas != "first attemptrecovered" || terminals != 1 {
+		t.Fatalf("retry stream deltas=%q terminals=%d events=%#v", deltas, terminals, events)
+	}
+}
+
 func configureFakePiHubRPC(t *testing.T, scenario string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -133,6 +334,7 @@ func configureFakePiHubRPC(t *testing.T, scenario string) {
 	t.Setenv("FAKE_PI_AGENT_END_FILE", filepath.Join(dir, "agent-end"))
 	t.Setenv("FAKE_PI_PROMPT_FILE", filepath.Join(dir, "prompt"))
 	t.Setenv("FAKE_PI_STARTS_FILE", filepath.Join(dir, "starts"))
+	t.Setenv("FAKE_PI_ABORT_READY_FILE", filepath.Join(dir, "abort-ready"))
 }
 
 func TestFakePiHubRPCProcess(t *testing.T) {
@@ -161,11 +363,60 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 	message, _ := command["message"].(string)
 	_ = os.WriteFile(os.Getenv("FAKE_PI_PROMPT_FILE"), []byte(message), 0o600)
 	fmt.Printf(`{"id":%q,"type":"response","command":"prompt","success":true}`+"\n", id)
+	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "abort" {
+		fmt.Print("{\"type\":\"agent_start\"}\n")
+		fmt.Print("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n")
+		fmt.Print("{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"before abort \"}}\n")
+		_ = os.WriteFile(os.Getenv("FAKE_PI_ABORT_READY_FILE"), []byte("ready"), 0o600)
+		readFakePiCommand(t, reader, &command)
+		id, _ = command["id"].(string)
+		if command["type"] != "abort" {
+			os.Exit(32)
+		}
+		fmt.Printf(`{"id":%q,"type":"response","command":"abort","success":true}`+"\n", id)
+		fmt.Print("{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"after abort\"}}\n")
+		fmt.Print("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"aborted\",\"content\":[{\"type\":\"text\",\"text\":\"before abort after abort\"}]}}\n")
+		fmt.Print("{\"type\":\"agent_end\",\"willRetry\":false}\n")
+		_ = os.WriteFile(os.Getenv("FAKE_PI_AGENT_END_FILE"), []byte("done"), 0o600)
+		time.Sleep(250 * time.Millisecond)
+		fmt.Print("{\"type\":\"agent_settled\"}\n")
+		_, _ = reader.ReadString('\n')
+		return
+	}
+	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "retry-compaction" {
+		fmt.Print("{\"type\":\"agent_start\"}\n")
+		fmt.Print("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n")
+		fmt.Print("{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"first attempt\"}}\n")
+		fmt.Print("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"error\",\"errorMessage\":\"transient overload\",\"content\":[]}}\n")
+		fmt.Print("{\"type\":\"agent_end\",\"willRetry\":true}\n")
+		fmt.Print("{\"type\":\"auto_retry_start\",\"attempt\":1,\"maxAttempts\":3}\n")
+		_ = os.WriteFile(os.Getenv("FAKE_PI_AGENT_END_FILE"), []byte("done"), 0o600)
+		time.Sleep(250 * time.Millisecond)
+		fmt.Print("{\"type\":\"auto_retry_end\",\"success\":true,\"attempt\":1}\n")
+		fmt.Print("{\"type\":\"compaction_start\",\"reason\":\"overflow\"}\n")
+		fmt.Print("{\"type\":\"compaction_end\",\"reason\":\"overflow\",\"aborted\":false,\"willRetry\":true}\n")
+		fmt.Print("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n")
+		fmt.Print("{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"recovered\"}}\n")
+		fmt.Print("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"recovered\"}]}}\n")
+		fmt.Print("{\"type\":\"agent_end\",\"willRetry\":false}\n")
+		time.Sleep(100 * time.Millisecond)
+		fmt.Print("{\"type\":\"agent_settled\"}\n")
+		_, _ = reader.ReadString('\n')
+		return
+	}
 	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "malformed-after-prompt" {
 		fmt.Print("not-json\n")
 		return
 	}
 	fmt.Print("{\"type\":\"agent_start\"}\n")
+	fmt.Print("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n")
+	fmt.Print("{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"thinking_delta\",\"contentIndex\":0,\"delta\":\"checking\"}}\n")
+	fmt.Print("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"checking\"}]}}\n")
+	fmt.Print("{\"type\":\"tool_execution_start\",\"toolCallId\":\"call-1\",\"toolName\":\"bash\",\"args\":{\"command\":\"pwd\"}}\n")
+	fmt.Print("{\"type\":\"tool_execution_update\",\"toolCallId\":\"call-1\",\"toolName\":\"bash\",\"args\":{\"command\":\"pwd\"},\"partialResult\":{\"content\":[{\"type\":\"text\",\"text\":\"/tmp\"}]}}\n")
+	fmt.Print("{\"type\":\"tool_execution_end\",\"toolCallId\":\"call-1\",\"toolName\":\"bash\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"/tmp/project\"}]},\"isError\":false}\n")
+	fmt.Print("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n")
+	fmt.Print("{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"hello from Pi\"}}\n")
 	fmt.Print("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"hello from Pi\"}]}}\n")
 	fmt.Print("{\"type\":\"agent_end\"}\n")
 	_ = os.WriteFile(os.Getenv("FAKE_PI_AGENT_END_FILE"), []byte("done"), 0o600)

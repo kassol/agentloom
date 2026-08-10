@@ -23,6 +23,33 @@ describe("Runtime-normalized live events", () => {
       { kind: "agent", id: "answer-1", ts: "2026-08-10T00:00:00Z", text: "hello", streaming: true },
     ]);
   });
+
+  it("correlates streamed reasoning, text, and failed tools and closes partial blocks on abort", () => {
+    const events = [
+      { type: "loom/reasoning-delta", data: { itemId: "thinking-1", delta: "checking" } },
+      { type: "loom/text-delta", data: { itemId: "answer-1", delta: "partial" } },
+      { type: "loom/tool-started", data: { itemId: "call-1", item: { id: "call-1", type: "commandExecution", command: "pwd", status: "running", aggregatedOutput: "" } } },
+      { type: "loom/tool-updated", data: { itemId: "call-1", item: { id: "call-1", type: "commandExecution", command: "pwd", status: "running", aggregatedOutput: "/tmp" } } },
+      { type: "loom/tool-completed", data: { itemId: "call-1", item: { id: "call-1", type: "commandExecution", command: "pwd", status: "failed", aggregatedOutput: "permission denied" } } },
+      { type: "loom/turn-interrupted", data: { error: "Pi Turn aborted" } },
+    ];
+    const state = events.reduce(
+      (current, event, index) => reduceFeed(current, {
+        seq: index + 1,
+        ts: "2026-08-10T00:00:00Z",
+        type: event.type,
+        data: event.data,
+      }),
+      emptyFeed,
+    );
+
+    expect(state.blocks).toEqual([
+      { kind: "think", id: "thinking-1", ts: "2026-08-10T00:00:00Z", text: "checking", done: true },
+      { kind: "agent", id: "answer-1", ts: "2026-08-10T00:00:00Z", text: "partial", streaming: false },
+      { kind: "command", id: "call-1", ts: "2026-08-10T00:00:00Z", command: "pwd", status: "failed", exitCode: null, durationMs: null, output: "permission denied" },
+      { kind: "sys", ts: "2026-08-10T00:00:00Z", cls: "warn", text: "■ interrupted Pi Turn aborted" },
+    ]);
+  });
 });
 
 describe("rollout history projection", () => {

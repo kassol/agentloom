@@ -244,9 +244,11 @@ function sys(state: FeedState, ts: string, cls: "ok" | "warn" | "err" | "dim", t
 }
 
 function finishStreaming(state: FeedState): FeedState {
-  const blocks = state.blocks.map((b) =>
-    b.kind === "agent" && b.streaming ? { ...b, streaming: false } : b,
-  );
+  const blocks = state.blocks.map((b) => {
+    if (b.kind === "agent" && b.streaming) return { ...b, streaming: false };
+    if (b.kind === "think" && !b.done) return { ...b, done: true };
+    return b;
+  });
   return { ...state, blocks };
 }
 

@@ -25,7 +25,10 @@ type piAgentRuntime struct {
 	onFailure        func(error)
 	developerContext string
 	messageSequence  uint64
+	currentMessage   uint64
 	pendingTerminal  RuntimeEvent
+	settled          chan struct{}
+	abortRequested   bool
 }
 
 func newPiAgentRuntime(agentID, dataDir string) *piAgentRuntime {
@@ -142,6 +145,9 @@ func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	}
 	rpc := r.rpc
 	r.pendingTerminal = RuntimeEvent{}
+	r.currentMessage = 0
+	r.settled = make(chan struct{})
+	r.abortRequested = false
 	r.mu.Unlock()
 	for _, input := range request.Input {
 		if input.Kind != RuntimeInputText {
@@ -168,50 +174,67 @@ func (r *piAgentRuntime) Steer(string, string, string, time.Duration) (string, e
 	return "", errors.New("Pi Runtime does not support causal steering")
 }
 
-func (r *piAgentRuntime) Interrupt(string, string, time.Duration) error {
+func (r *piAgentRuntime) Interrupt(_ string, _ string, timeout time.Duration) error {
 	r.mu.Lock()
 	rpc := r.rpc
+	settled := r.settled
+	if rpc != nil && settled != nil {
+		r.abortRequested = true
+	}
 	r.mu.Unlock()
 	if rpc == nil {
 		return errors.New("Pi RPC process is unavailable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if settled == nil {
+		return errors.New("Pi Turn is not active")
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err := rpc.Request(ctx, "abort", nil)
-	return err
+	if _, err := rpc.Request(ctx, "abort", nil); err != nil {
+		return err
+	}
+	select {
+	case <-settled:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("wait for Pi aborted Turn settlement: %w", ctx.Err())
+	}
 }
 
 func (r *piAgentRuntime) NormalizeEvent(_ string, raw json.RawMessage) []RuntimeEvent {
-	events, _ := normalizePiEvent(raw, 0)
+	r.mu.Lock()
+	events, _ := r.normalizeEventLocked(raw)
+	r.mu.Unlock()
 	return events
 }
 
 func (r *piAgentRuntime) handleEvent(raw json.RawMessage) {
 	r.mu.Lock()
-	r.messageSequence++
-	sequence := r.messageSequence
-	r.mu.Unlock()
-	events, terminal := normalizePiEvent(raw, sequence)
+	events, terminal := r.normalizeEventLocked(raw)
 	if terminal.Kind != "" {
-		r.mu.Lock()
 		r.pendingTerminal = terminal
-		r.mu.Unlock()
 	}
 	var typeOnly struct {
 		Type string `json:"type"`
 	}
 	_ = json.Unmarshal(raw, &typeOnly)
+	var settled chan struct{}
 	if typeOnly.Type == "agent_settled" {
-		r.mu.Lock()
-		settled := r.pendingTerminal
+		terminal = r.pendingTerminal
 		r.pendingTerminal = RuntimeEvent{}
-		r.mu.Unlock()
-		if settled.Kind == "" {
-			settled.Kind = RuntimeTurnCompleted
+		if r.abortRequested && terminal.Kind != RuntimeTurnInterrupted {
+			terminal = RuntimeEvent{Kind: RuntimeTurnFailed, Error: "Pi settled an aborted Turn without a final aborted assistant state"}
+		} else if terminal.Kind == "" {
+			terminal.Kind = RuntimeTurnCompleted
 		}
-		events = append(events, settled)
+		events = append(events, terminal)
+		settled = r.settled
+		r.settled = nil
+		r.abortRequested = false
 	}
-	r.mu.Lock()
 	handler := r.onEvent
 	r.mu.Unlock()
 	if handler != nil {
@@ -219,9 +242,12 @@ func (r *piAgentRuntime) handleEvent(raw json.RawMessage) {
 			handler(event)
 		}
 	}
+	if settled != nil {
+		close(settled)
+	}
 }
 
-func normalizePiEvent(raw json.RawMessage, sequence uint64) ([]RuntimeEvent, RuntimeEvent) {
+func (r *piAgentRuntime) normalizeEventLocked(raw json.RawMessage) ([]RuntimeEvent, RuntimeEvent) {
 	var envelope struct {
 		Type    string `json:"type"`
 		Message struct {
@@ -229,10 +255,21 @@ func normalizePiEvent(raw json.RawMessage, sequence uint64) ([]RuntimeEvent, Run
 			StopReason   string `json:"stopReason"`
 			ErrorMessage string `json:"errorMessage"`
 			Content      []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
 			} `json:"content"`
 		} `json:"message"`
+		AssistantMessageEvent struct {
+			Type  string `json:"type"`
+			Delta string `json:"delta"`
+		} `json:"assistantMessageEvent"`
+		ToolCallID    string         `json:"toolCallId"`
+		ToolName      string         `json:"toolName"`
+		Args          map[string]any `json:"args"`
+		PartialResult map[string]any `json:"partialResult"`
+		Result        map[string]any `json:"result"`
+		IsError       bool           `json:"isError"`
 	}
 	if json.Unmarshal(raw, &envelope) != nil {
 		return nil, RuntimeEvent{Kind: RuntimeTurnFailed, Error: "Pi emitted malformed event"}
@@ -240,20 +277,77 @@ func normalizePiEvent(raw json.RawMessage, sequence uint64) ([]RuntimeEvent, Run
 	switch envelope.Type {
 	case "agent_start":
 		return []RuntimeEvent{{Kind: RuntimeTurnStarted}}, RuntimeEvent{}
+	case "message_start":
+		if envelope.Message.Role == "assistant" {
+			r.messageSequence++
+			r.currentMessage = r.messageSequence
+		}
+		return nil, RuntimeEvent{}
+	case "message_update":
+		sequence := r.ensureCurrentMessageLocked()
+		switch envelope.AssistantMessageEvent.Type {
+		case "text_delta":
+			return []RuntimeEvent{{Kind: RuntimeTextDelta, ItemID: piMessageItemID(sequence), Text: envelope.AssistantMessageEvent.Delta}}, RuntimeEvent{}
+		case "thinking_delta":
+			return []RuntimeEvent{{Kind: RuntimeReasoningDelta, ItemID: piReasoningItemID(sequence), Text: envelope.AssistantMessageEvent.Delta}}, RuntimeEvent{}
+		default:
+			return nil, RuntimeEvent{}
+		}
+	case "tool_execution_start", "tool_execution_update", "tool_execution_end":
+		if envelope.ToolCallID == "" || envelope.ToolName == "" {
+			return nil, RuntimeEvent{}
+		}
+		kind, status, result := RuntimeToolStarted, "running", map[string]any(nil)
+		switch envelope.Type {
+		case "tool_execution_update":
+			kind, result = RuntimeToolUpdated, envelope.PartialResult
+		case "tool_execution_end":
+			kind, result = RuntimeToolCompleted, envelope.Result
+			status = "completed"
+			if envelope.IsError {
+				status = "failed"
+			}
+		}
+		output := piResultText(result)
+		item := map[string]any{
+			"id": envelope.ToolCallID, "type": "commandExecution", "command": piToolCommand(envelope.ToolName, envelope.Args),
+			"toolName": envelope.ToolName, "args": envelope.Args, "status": status, "aggregatedOutput": output,
+		}
+		if envelope.IsError {
+			item["error"] = output
+		}
+		return []RuntimeEvent{{Kind: kind, ItemID: envelope.ToolCallID, Item: item, Status: status, Error: func() string {
+			if envelope.IsError {
+				return output
+			}
+			return ""
+		}()}}, RuntimeEvent{}
 	case "message_end":
 		if envelope.Message.Role != "assistant" {
 			return nil, RuntimeEvent{}
 		}
-		var text []string
+		sequence := r.ensureCurrentMessageLocked()
+		r.currentMessage = 0
+		var text, reasoning []string
 		for _, content := range envelope.Message.Content {
-			if content.Type == "text" && content.Text != "" {
+			switch content.Type {
+			case "text":
 				text = append(text, content.Text)
+			case "thinking":
+				reasoning = append(reasoning, content.Thinking)
 			}
 		}
 		answer := strings.Join(text, "")
-		itemID := fmt.Sprintf("pi-message-%d", sequence)
 		events := []RuntimeEvent{}
+		if thought := strings.Join(reasoning, ""); thought != "" {
+			itemID := piReasoningItemID(sequence)
+			events = append(events, RuntimeEvent{
+				Kind: RuntimeReasoningCompleted, ItemID: itemID, Text: thought,
+				Item: map[string]any{"id": itemID, "type": "reasoning", "text": thought},
+			})
+		}
 		if answer != "" {
+			itemID := piMessageItemID(sequence)
 			events = append(events, RuntimeEvent{
 				Kind: RuntimeTextCompleted, ItemID: itemID, Text: answer,
 				Item: map[string]any{"id": itemID, "type": "agentMessage", "text": answer},
@@ -269,11 +363,50 @@ func normalizePiEvent(raw json.RawMessage, sequence uint64) ([]RuntimeEvent, Run
 		case "aborted":
 			return events, RuntimeEvent{Kind: RuntimeTurnInterrupted, Error: "Pi Turn aborted"}
 		default:
-			return events, RuntimeEvent{}
+			return events, RuntimeEvent{Kind: RuntimeTurnCompleted}
 		}
 	default:
 		return nil, RuntimeEvent{}
 	}
+}
+
+func (r *piAgentRuntime) ensureCurrentMessageLocked() uint64 {
+	if r.currentMessage == 0 {
+		r.messageSequence++
+		r.currentMessage = r.messageSequence
+	}
+	return r.currentMessage
+}
+
+func piMessageItemID(sequence uint64) string { return fmt.Sprintf("pi-message-%d", sequence) }
+
+func piReasoningItemID(sequence uint64) string { return fmt.Sprintf("pi-reasoning-%d", sequence) }
+
+func piToolCommand(name string, args map[string]any) string {
+	if name == "bash" {
+		if command, _ := args["command"].(string); command != "" {
+			return command
+		}
+	}
+	raw, _ := json.Marshal(args)
+	if len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
+		return name
+	}
+	return name + " " + string(raw)
+}
+
+func piResultText(result map[string]any) string {
+	content, _ := result["content"].([]any)
+	var parts []string
+	for _, value := range content {
+		item, _ := value.(map[string]any)
+		if item["type"] == "text" {
+			if text, _ := item["text"].(string); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "")
 }
 
 func (r *piAgentRuntime) ReadHistory(string, int, int) (RuntimeHistory, error) {
