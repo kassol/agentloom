@@ -1,0 +1,3 @@
+# Use one Pi extension for Loom tools and approvals
+
+Every Pi Agent explicitly loads one Loom-owned extension that registers the structured Message, Topic, and Needs You tools and intercepts tool calls before execution to implement Loom Approval through Pi's RPC UI protocol. Loom control-plane tools rely on Loom's own identity and governance checks instead of entering Runtime Approval, while `on-request` gates mutating built-ins and unknown custom tools; this replaces the earlier CLI-only bridge because Go cannot safely veto a tool after observing its execution event, and it does not claim to provide a Pi sandbox.
