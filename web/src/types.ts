@@ -46,7 +46,8 @@ export interface Agent {
   updatedAt: string;
   processAlive: boolean;
   pendingApprovals: Approval[];
-  goal?: ThreadGoal;
+	goal?: ThreadGoal;
+	goalRevision?: number;
   lastSeq: number;
 }
 
@@ -136,14 +137,20 @@ export interface ThreadArtifact {
 export type ThreadGoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
 
 export interface ThreadGoal {
-  threadId: string;
+	id: string;
+	version: number;
+	threadId: string;
   objective: string;
   status: ThreadGoalStatus;
   tokenBudget: number | null;
   tokensUsed: number;
   timeUsedSeconds: number;
   createdAt: number;
-  updatedAt: number;
+	updatedAt: number;
+	nativeSyncState?: "pending" | "synced" | "failed" | "notApplicable" | string;
+	nativeSyncedAt?: number;
+	nativeSyncError?: string;
+	nativeMigrationBlocked?: boolean;
 }
 
 export interface RemoteConfig {
@@ -997,7 +1004,7 @@ export async function api(method: string, path: string, body?: unknown) {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data.error || resp.statusText);
+  if (!resp.ok) throw Object.assign(new Error(data.error || resp.statusText), { status: resp.status });
   return data;
 }
 

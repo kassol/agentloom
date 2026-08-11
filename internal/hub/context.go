@@ -119,6 +119,9 @@ type turnContextSource struct {
 	TopicID     string
 	WorkContext string
 	DisplayText string
+	GoalID      string
+	GoalVersion int64
+	GoalActive  bool
 }
 
 type contextHistoryProbeFunc func(threadID string, query RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error)
@@ -132,6 +135,8 @@ type TurnContextPlan struct {
 	DeveloperContext string
 	InputContext     string
 	Attempt          *ContextDeliveryAttempt
+	GoalID           string
+	GoalVersion      int64
 }
 
 type loomAgentPromptTemplateData struct {
@@ -273,12 +278,12 @@ func (h *Hub) ClearLoomAgentPrompt(expectedVersion *int) (LoomAgentPrompt, error
 	return prompt, nil
 }
 
-func (h *Hub) currentContextFragments(agentID string, compiledAt string) ([]contextFragment, string, string, string, error) {
+func (h *Hub) currentContextFragments(agentID string, compiledAt string) ([]contextFragment, string, string, string, string, int64, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	agent := h.agents[agentID]
 	if agent == nil {
-		return nil, "", "", "", errf(404, "agent vanished")
+		return nil, "", "", "", "", 0, errf(404, "agent vanished")
 	}
 	prompt := h.effectiveLoomAgentPromptLocked()
 	profile := AgentProfile{AgentID: agentID}
@@ -286,20 +291,21 @@ func (h *Hub) currentContextFragments(agentID string, compiledAt string) ([]cont
 		profile = *current
 	}
 	relationships := h.directRelationshipSnapshotLocked(agentID)
+	goalRecord := cloneGoalRecord(h.goals[agentID])
 
 	promptRevision := fmt.Sprintf("%s:%d", prompt.Source, prompt.Version)
 	profileRevision := fmt.Sprintf("profile:%d", profile.Version)
 	profileXML := renderLoomAgentProfileData(*agent, profile, profileRevision)
 	developerPayload, err := renderLoomAgentPromptTemplate(prompt.Content, *agent, profile, profileRevision)
 	if err != nil {
-		return nil, "", "", "", errf(500, "render Loom Agent Prompt template: %s", err)
+		return nil, "", "", "", "", 0, errf(500, "render Loom Agent Prompt template: %s", err)
 	}
 	relationshipJSON, _ := json.Marshal(relationships)
 	relationshipHash := sha256Hex(relationshipJSON)
 	relationshipRevision := "relationships:" + relationshipHash[:16]
 	relationshipXML := renderLoomRelationshipsFragment(agentID, relationships, relationshipRevision, relationshipHash, compiledAt)
 
-	return []contextFragment{
+	fragments := []contextFragment{
 		newContextFragment("loom_agent_prompt", promptRevision, "developer", prompt.Content),
 		newContextFragment("loom_agent_profile", profileRevision, "developer", profileXML),
 		{
@@ -309,7 +315,37 @@ func (h *Hub) currentContextFragments(agentID string, compiledAt string) ([]cont
 			},
 			XML: relationshipXML,
 		},
-	}, agent.RuntimeBinding.NativeRef, agent.Name, developerPayload, nil
+	}
+	if goalRecord != nil {
+		fragments = append(fragments, newContextFragment(
+			"loom_agent_goal",
+			fmt.Sprintf("goal:%s:%d", goalRecord.ID, goalRecord.Version),
+			"input",
+			renderLoomGoalFragment(*goalRecord),
+		))
+	}
+	goalID, goalVersion := "", int64(0)
+	if goalRecord != nil {
+		goalID, goalVersion = goalRecord.ID, goalRecord.Version
+	}
+	return fragments, agent.RuntimeBinding.NativeRef, agent.Name, developerPayload, goalID, goalVersion, nil
+}
+
+func renderLoomGoalFragment(goal ThreadGoal) string {
+	var b strings.Builder
+	b.WriteString(`<loom_agent_goal id="` + xmlEscape(goal.ID) + `" revision="` + fmt.Sprint(goal.Version) + `"`)
+	if goal.ClearedAt != 0 {
+		b.WriteString(` cleared="true" cleared_at="` + fmt.Sprint(goal.ClearedAt) + `" />`)
+		return b.String()
+	}
+	b.WriteString(` status="` + xmlEscape(goal.Status) + `"`)
+	if goal.TokenBudget != nil {
+		b.WriteString(` token_budget="` + fmt.Sprint(*goal.TokenBudget) + `"`)
+	}
+	b.WriteString(">\n  <objective><![CDATA[")
+	b.WriteString(strings.ReplaceAll(goal.Objective, "]]>", "]]]]><![CDATA[>"))
+	b.WriteString("]]></objective>\n</loom_agent_goal>")
+	return b.String()
 }
 
 type directRelationshipSnapshot struct {
@@ -380,7 +416,7 @@ func newContextFragment(key, revision, channel, xml string) contextFragment {
 
 func (h *Hub) prepareTurnContext(agentID string, source turnContextSource, artifacts []ThreadArtifact) (TurnContextPlan, error) {
 	compiledAt := now()
-	fragments, threadID, _, developerPayload, err := h.currentContextFragments(agentID, compiledAt)
+	fragments, threadID, _, developerPayload, goalID, goalVersion, err := h.currentContextFragments(agentID, compiledAt)
 	if err != nil {
 		return TurnContextPlan{}, err
 	}
@@ -397,10 +433,12 @@ func (h *Hub) prepareTurnContext(agentID string, source turnContextSource, artif
 		if len(developerContext) > maxDeveloperContextBytes {
 			return TurnContextPlan{}, errf(409, "compiled Loom Developer context is %d bytes; maximum is %d bytes and it will not be truncated", len(developerContext), maxDeveloperContextBytes)
 		}
-		return TurnContextPlan{
+		plan := TurnContextPlan{
 			DeveloperContext: developerContext,
 			InputContext:     renderLoomInputContext(compiledAt, ContextEpoch{}, source, contextFragmentsForChannel(fragments, fragments, "input"), artifacts, nil),
-		}, nil
+		}
+		plan.GoalID, plan.GoalVersion = goalID, goalVersion
+		return plan, nil
 	}
 	h.contextCoverageMu.Lock()
 	defer h.contextCoverageMu.Unlock()
@@ -473,11 +511,13 @@ func (h *Hub) prepareTurnContext(agentID string, source turnContextSource, artif
 			return TurnContextPlan{}, errf(500, "save planned context coverage: %s", err)
 		}
 	}
-	return TurnContextPlan{
+	plan := TurnContextPlan{
 		DeveloperContext: developerContext,
 		InputContext:     inputContext,
 		Attempt:          cloneContextAttempt(attempt),
-	}, nil
+	}
+	plan.GoalID, plan.GoalVersion = goalID, goalVersion
+	return plan, nil
 }
 
 func renderPiDeveloperContext(compiledAt, payload string) string {
@@ -712,7 +752,7 @@ func (h *Hub) ExplainContext(key string) (ContextExplainView, error) {
 	agentID, agentName, threadID := agent.ID, agent.Name, agent.ThreadID
 	h.mu.Unlock()
 	compiledAt := now()
-	fragments, _, _, _, err := h.currentContextFragments(agentID, compiledAt)
+	fragments, _, _, _, _, _, err := h.currentContextFragments(agentID, compiledAt)
 	if err != nil {
 		return ContextExplainView{}, err
 	}

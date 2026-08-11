@@ -3,6 +3,7 @@ package hub
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 )
@@ -537,6 +538,13 @@ func (h *Hub) deliverAnsweredHumanRequest(agentID string) (HumanRequest, bool) {
 	if persistErr := h.appendHumanRequestLocked(updated); persistErr != nil {
 		updated.LastError = fmt.Sprintf("persist delivery state: %v", persistErr)
 		return updated, false
+	}
+	if err == nil && updated.ResumedTurnID != "" {
+		if bindErr := h.bindRecoveryHumanAnswerLocked(updated.AgentID, updated.ID, updated.ResumedTurnID); bindErr != nil {
+			// The delivered Human Request is the durable repair source. Startup
+			// reconciliation will retry this binding without replaying the Turn.
+			log.Printf("[codex-loom] bind recovery Human Request %s to Turn %s: %v", updated.ID, updated.ResumedTurnID, bindErr)
+		}
 	}
 	return cloneHumanRequest(updated), err == nil
 }

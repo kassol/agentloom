@@ -211,17 +211,21 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		writeJSON(w, 200, map[string]any{"workload": workload})
 	})
 	mux.HandleFunc("GET /api/agents/{key}/goal", func(w http.ResponseWriter, r *http.Request) {
-		goal, err := s.hub.GetGoal(r.PathValue("key"))
+		goal, revision, err := s.hub.GetGoalState(r.PathValue("key"))
 		if err != nil {
 			writeErr(w, err)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"goal": goal})
+		writeJSON(w, 200, map[string]any{"goal": goal, "revision": revision})
 	})
 	mux.HandleFunc("PUT /api/agents/{key}/goal", func(w http.ResponseWriter, r *http.Request) {
 		var body hub.GoalUpdateParams
 		if err := readJSON(r, &body); err != nil {
 			writeErr(w, err)
+			return
+		}
+		if body.ExpectedVersion == nil {
+			writeErr(w, &hub.HubError{Status: 400, Message: "expectedVersion is required"})
 			return
 		}
 		goal, err := s.hub.UpdateGoal(r.PathValue("key"), body)
@@ -232,12 +236,26 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		writeJSON(w, 200, map[string]any{"goal": goal})
 	})
 	mux.HandleFunc("DELETE /api/agents/{key}/goal", func(w http.ResponseWriter, r *http.Request) {
-		cleared, err := s.hub.ClearGoal(r.PathValue("key"))
+		var expectedVersion *int64
+		if raw := strings.TrimSpace(r.URL.Query().Get("expectedVersion")); raw != "" {
+			value, parseErr := strconv.ParseInt(raw, 10, 64)
+			if parseErr != nil || value < 0 {
+				writeErr(w, &hub.HubError{Status: 400, Message: "expectedVersion must be a non-negative integer"})
+				return
+			}
+			expectedVersion = &value
+		}
+		if expectedVersion == nil {
+			writeErr(w, &hub.HubError{Status: 400, Message: "expectedVersion is required"})
+			return
+		}
+		cleared, err := s.hub.ClearGoalVersion(r.PathValue("key"), expectedVersion)
 		if err != nil {
 			writeErr(w, err)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"cleared": cleared})
+		_, revision, _ := s.hub.GetGoalState(r.PathValue("key"))
+		writeJSON(w, 200, map[string]any{"cleared": cleared, "revision": revision})
 	})
 	mux.HandleFunc("PUT /api/agents/{key}/profile", func(w http.ResponseWriter, r *http.Request) {
 		var body hub.ProfileParams

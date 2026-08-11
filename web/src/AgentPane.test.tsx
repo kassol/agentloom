@@ -192,14 +192,14 @@ describe("AgentPane scroll restoration", () => {
       ...testAgent,
       runtimeBinding: { kind: "pi" },
 	  processAlive: false,
-      capabilitySnapshot: capabilitySnapshot("approval_policy", "model_configuration", "context_delivery"),
+      capabilitySnapshot: capabilitySnapshot("approval_policy", "model_configuration", "context_delivery", "goal"),
     };
     const view = render(<AgentPane {...props} agent={piAgent} onError={onError} active configRequestNonce={1} />);
 
     expect(view.getByText("Runtime capabilities")).toBeInTheDocument();
     expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Checked on start");
     expect(view.getByText("History").nextElementSibling).toHaveTextContent("Available");
-    expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Unavailable");
+    expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Available");
     expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();
 	expect(view.queryByText("Provider configuration")).toBeNull();
 	const providerSelect = () => view.getByText("Provider").closest("label")?.querySelector("select") as HTMLSelectElement;
@@ -211,8 +211,8 @@ describe("AgentPane scroll restoration", () => {
 	expect(view.getByText(/Approval controls individual tool actions only/)).toBeInTheDocument();
     expect(view.getByRole("button", { name: "Usage" })).toBeDisabled();
     expect(view.queryByText("History is unavailable for the pi Runtime.")).toBeNull();
-    expect(view.getByText("Goal is unavailable for the pi Runtime.")).toBeInTheDocument();
-	expect(view.queryByRole("button", { name: "Set a Goal" })).toBeNull();
+    expect(view.queryByText("Goal is unavailable for the pi Runtime.")).toBeNull();
+	expect(view.getByRole("button", { name: "Set a Goal" })).toBeInTheDocument();
 
 	return waitFor(() => {
 	  expect(providerSelect()).toBeEnabled();
@@ -363,6 +363,33 @@ describe("AgentPane scroll restoration", () => {
 	const view = render(<AgentPane {...props} agent={agent} active configRequestNonce={1} />);
 	expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
 	expect(view.getByText("Approval Policy").closest("label")?.querySelector("select")).toBeEnabled();
+  });
+
+  it("reconciles the current Goal after an optimistic revision conflict", async () => {
+	const onAgentUpdated = vi.fn();
+	const onError = vi.fn();
+	const currentGoal = {
+	  id: "goal-1", version: 1, threadId: testAgent.threadId, objective: "Ship", status: "active" as const,
+	  tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1, nativeSyncState: "synced",
+	};
+	const latestGoal = { ...currentGoal, version: 2, status: "paused" as const, updatedAt: 2 };
+	vi.mocked(fetch).mockImplementation(async (input, init) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  if (url.endsWith("/goal") && init?.method === "PUT") {
+		return new Response(JSON.stringify({ error: "Goal version changed" }), { status: 409, headers: { "Content-Type": "application/json" } });
+	  }
+	  if (url.endsWith("/goal") && init?.method === "GET") {
+		return new Response(JSON.stringify({ goal: latestGoal, revision: 2 }), { status: 200, headers: { "Content-Type": "application/json" } });
+	  }
+	  const body = url.includes("/thread/history") ? { total: 0, turns: [] } : { artifacts: [] };
+	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+	const view = render(<AgentPane {...props} agent={{ ...testAgent, goal: currentGoal, goalRevision: 1 }} onAgentUpdated={onAgentUpdated} onError={onError} active />);
+	fireEvent.click(view.getByRole("button", { name: "Open active" }));
+	expect(view.getByRole("button", { name: "Complete" })).toBeInTheDocument();
+	fireEvent.click(view.getByRole("button", { name: "Pause" }));
+	await waitFor(() => expect(onAgentUpdated).toHaveBeenCalledWith(expect.objectContaining({ goal: latestGoal, goalRevision: 2 })));
+	expect(onError).toHaveBeenCalledWith("Goal version changed");
   });
 
   it("restores a Pi Approval card from the Agent snapshot without Codex wording", async () => {

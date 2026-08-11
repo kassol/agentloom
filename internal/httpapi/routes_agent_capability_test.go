@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -62,9 +63,6 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 		name, method, path, body, capability string
 	}{
 		{name: "usage", method: http.MethodGet, path: "/api/agents/agent-pi/usage?days=7", capability: "usage"},
-		{name: "read Goal", method: http.MethodGet, path: "/api/agents/agent-pi/goal", capability: "Goal"},
-		{name: "update Goal", method: http.MethodPut, path: "/api/agents/agent-pi/goal", body: `{"objective":"ship"}`, capability: "Goal"},
-		{name: "clear Goal", method: http.MethodDelete, path: "/api/agents/agent-pi/goal", capability: "Goal"},
 		{name: "manual compaction", method: http.MethodPost, path: "/api/agents/agent-pi/compact", capability: "compaction"},
 		{name: "sandbox config", method: http.MethodPatch, path: "/api/agents/agent-pi/config", body: `{"sandbox":"read-only"}`, capability: "sandbox"},
 	}
@@ -78,13 +76,29 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 			}
 		})
 	}
+	response := topicRequest(t, server, http.MethodGet, "/api/agents/agent-pi/goal", nil, http.StatusOK)
+	if response["goal"] != nil || response["revision"].(float64) != 0 {
+		t.Fatalf("initial Pi Goal = %#v", response)
+	}
+	topicRequest(t, server, http.MethodPut, "/api/agents/agent-pi/goal", map[string]any{"objective": "missing revision"}, http.StatusBadRequest)
+	topicRequest(t, server, http.MethodDelete, "/api/agents/agent-pi/goal", nil, http.StatusBadRequest)
+	response = topicRequest(t, server, http.MethodPut, "/api/agents/agent-pi/goal", map[string]any{"objective": "ship", "expectedVersion": 0}, http.StatusOK)
+	goal := response["goal"].(map[string]any)
+	if goal["objective"] != "ship" || goal["nativeSyncState"] != "notApplicable" {
+		t.Fatalf("Pi Goal = %#v", goal)
+	}
+	revision := int64(goal["version"].(float64))
+	response = topicRequest(t, server, http.MethodDelete, "/api/agents/agent-pi/goal?expectedVersion="+strconv.FormatInt(revision, 10), nil, http.StatusOK)
+	if response["cleared"] != true || int64(response["revision"].(float64)) != revision+1 {
+		t.Fatalf("cleared Pi Goal = %#v", response)
+	}
 	request := httptest.NewRequest(http.MethodPost, "/api/agents/agent-pi/provider", strings.NewReader(`{"providerId":"xai","model":"grok"}`))
 	recorder := httptest.NewRecorder()
 	server.ServeHTTP(recorder, request)
 	if recorder.Code == http.StatusOK {
 		t.Fatalf("obsolete per-Agent Provider authority is still reachable: %d %s", recorder.Code, recorder.Body.String())
 	}
-	response := topicRequest(t, server, http.MethodPatch, "/api/agents/agent-pi/config", map[string]any{"approvalPolicy": "on-request"}, http.StatusOK)
+	response = topicRequest(t, server, http.MethodPatch, "/api/agents/agent-pi/config", map[string]any{"approvalPolicy": "on-request"}, http.StatusOK)
 	agent := response["agent"].(map[string]any)
 	if agent["approvalPolicy"] != "on-request" {
 		t.Fatalf("Pi Approval policy = %#v", agent["approvalPolicy"])

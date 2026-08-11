@@ -10,7 +10,7 @@ import (
 
 func cmdGoal(a args) {
 	if len(a.positional) < 1 {
-		usage("goal <agent> [show|set|pause|resume|clear]")
+		usage("goal <agent> [show|set|pause|resume|complete|clear]")
 	}
 	agent := a.positional[0]
 	action := "show"
@@ -35,7 +35,7 @@ func cmdGoal(a args) {
 		if objective == "" {
 			usage("goal <agent> set <objective> [--token-budget N|--clear-token-budget]")
 		}
-		body := map[string]any{"objective": objective}
+		body := map[string]any{"objective": objective, "expectedVersion": goalRevision(path)}
 		if value := strings.TrimSpace(a.flags["token-budget"]); value != "" {
 			budget, err := strconv.ParseInt(value, 10, 64)
 			if err != nil || budget <= 0 {
@@ -52,19 +52,21 @@ func cmdGoal(a args) {
 		}
 		goal, _ := response["goal"].(map[string]any)
 		fmt.Print(formatGoal(goal))
-	case "pause", "resume":
+	case "pause", "resume", "complete":
 		status := "paused"
 		if action == "resume" {
 			status = "active"
+		} else if action == "complete" {
+			status = "complete"
 		}
-		response, err := api("PUT", path, map[string]any{"status": status})
+		response, err := api("PUT", path, map[string]any{"status": status, "expectedVersion": goalRevision(path)})
 		if err != nil {
 			fail(err)
 		}
 		goal, _ := response["goal"].(map[string]any)
 		fmt.Print(formatGoal(goal))
 	case "clear":
-		response, err := api("DELETE", path, nil)
+		response, err := api("DELETE", path+"?expectedVersion="+strconv.FormatInt(goalRevision(path), 10), nil)
 		if err != nil {
 			fail(err)
 		}
@@ -74,8 +76,16 @@ func cmdGoal(a args) {
 			fmt.Printf("%s %s\n", dim("no Goal to clear for"), agent)
 		}
 	default:
-		usage("goal <agent> [show|set|pause|resume|clear]")
+		usage("goal <agent> [show|set|pause|resume|complete|clear]")
 	}
+}
+
+func goalRevision(path string) int64 {
+	response, err := api("GET", path, nil)
+	if err != nil {
+		fail(err)
+	}
+	return int64(num(response, "revision"))
 }
 
 func formatGoal(goal map[string]any) string {

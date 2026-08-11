@@ -24,6 +24,7 @@ type TurnRecoveryMarker struct {
 	State             string                `json:"state"`
 	RecoveryTurnID    string                `json:"recoveryTurnId,omitempty"`
 	HumanRequestID    string                `json:"humanRequestId,omitempty"`
+	ResolutionTurnID  string                `json:"resolutionTurnId,omitempty"`
 	TopicID           string                `json:"topicId,omitempty"`
 	EvidenceLeafID    string                `json:"evidenceLeafId,omitempty"`
 	UnfinishedTools   []RuntimeToolEvidence `json:"unfinishedTools,omitempty"`
@@ -34,6 +35,102 @@ type TurnRecoveryMarker struct {
 	Summary           string                `json:"summary,omitempty"`
 	CreatedAt         string                `json:"createdAt"`
 	UpdatedAt         string                `json:"updatedAt"`
+}
+
+func recoveryHumanRequestID(source turnContextSource) string {
+	if source.Origin == "owner" && source.Trust == "authenticated" && source.Authority == "current_intent" && source.Kind == "needs_you_answer" {
+		return source.RefID
+	}
+	return ""
+}
+
+func (h *Hub) bindRecoveryHumanTurnMarkerLocked(meta *Agent, requestID, turnID string) bool {
+	if meta == nil || requestID == "" || turnID == "" {
+		return false
+	}
+	for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
+		if marker.HumanRequestID != requestID || marker.State == TurnRecoveryCompleted {
+			continue
+		}
+		marker.ResolutionTurnID = turnID
+		marker.UpdatedAt = now()
+		meta.TurnRecoveryMarkers[predecessorTurnID] = marker
+		return true
+	}
+	return false
+}
+
+func (h *Hub) bindRecoveryHumanAnswerLocked(agentID, requestID, turnID string) error {
+	meta := h.agents[agentID]
+	if meta == nil || turnID == "" {
+		return nil
+	}
+	previousMarkers := make(map[string]TurnRecoveryMarker, len(meta.TurnRecoveryMarkers))
+	for id, current := range meta.TurnRecoveryMarkers {
+		previousMarkers[id] = current
+	}
+	if !h.bindRecoveryHumanTurnMarkerLocked(meta, requestID, turnID) {
+		return nil
+	}
+	terminalTurnID := ""
+	if meta.LastTurn != nil && meta.LastTurn.TurnID == turnID && meta.LastTurn.Status != "interrupted" {
+		terminalTurnID = turnID
+	}
+	h.completeTurnRecoveryMarkersLocked(meta, terminalTurnID)
+	if err := h.persistAgentsLocked(); err != nil {
+		meta.TurnRecoveryMarkers = previousMarkers
+		return err
+	}
+	if h.goalContinuationReadyLocked(agentID) {
+		h.startWorkerLocked(func() { h.continueGoal(agentID) })
+	}
+	return nil
+}
+
+func (h *Hub) reconcileRecoveryHumanAnswersLocked() {
+	for _, meta := range h.agents {
+		for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
+			request := h.humanRequests[marker.HumanRequestID]
+			if marker.State == TurnRecoveryCompleted || request == nil || request.DeliveryStatus != "delivered" || request.ResumedTurnID == "" {
+				continue
+			}
+			marker.ResolutionTurnID = request.ResumedTurnID
+			marker.UpdatedAt = now()
+			meta.TurnRecoveryMarkers[predecessorTurnID] = marker
+			terminalTurnID := ""
+			if meta.LastTurn != nil && meta.LastTurn.TurnID == request.ResumedTurnID && meta.LastTurn.Status != "interrupted" {
+				terminalTurnID = request.ResumedTurnID
+			}
+			h.completeTurnRecoveryMarkersLocked(meta, terminalTurnID)
+		}
+	}
+}
+
+func (h *Hub) completeTurnRecoveryMarkersLocked(meta *Agent, terminalTurnID string) {
+	if meta == nil {
+		return
+	}
+	completedTurns := map[string]bool{}
+	if terminalTurnID != "" {
+		completedTurns[terminalTurnID] = true
+	}
+	for changed := true; changed; {
+		changed = false
+		for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
+			if marker.State == TurnRecoveryCompleted {
+				completedTurns[predecessorTurnID] = true
+				continue
+			}
+			if !completedTurns[marker.RecoveryTurnID] && !completedTurns[marker.ResolutionTurnID] {
+				continue
+			}
+			marker.State = TurnRecoveryCompleted
+			marker.UpdatedAt = now()
+			meta.TurnRecoveryMarkers[predecessorTurnID] = marker
+			completedTurns[predecessorTurnID] = true
+			changed = true
+		}
+	}
 }
 
 func (h *Hub) recoverPiInterruptedTurn(agentID, predecessorTurnID string) {
@@ -89,6 +186,9 @@ func (h *Hub) recoverInterruptedTurnClaimed(agentID, predecessorTurnID string) {
 	defer func() {
 		h.mu.Lock()
 		delete(h.turnRecoveryInFlight, key)
+		if h.goalContinuationReadyLocked(agentID) {
+			h.startWorkerLocked(func() { h.continueGoal(agentID) })
+		}
 		h.mu.Unlock()
 	}()
 
@@ -185,7 +285,10 @@ func (h *Hub) recoverInterruptedTurnClaimed(agentID, predecessorTurnID string) {
 		previousStatus, previousError, previousUpdatedAt := meta.Status, meta.LastError, meta.UpdatedAt
 		previousTurnStatus := meta.LastTurn.Status
 		previousMarker, hadMarker := meta.TurnRecoveryMarkers[predecessorTurnID]
-		originalMarker := previousMarker
+		previousMarkers := make(map[string]TurnRecoveryMarker, len(meta.TurnRecoveryMarkers))
+		for id, marker := range meta.TurnRecoveryMarkers {
+			previousMarkers[id] = marker
+		}
 		meta.Status = "idle"
 		if evidence.TerminalStatus == "completed" {
 			meta.LastError = ""
@@ -199,12 +302,11 @@ func (h *Hub) recoverInterruptedTurnClaimed(agentID, predecessorTurnID string) {
 			previousMarker.UpdatedAt = now()
 			meta.TurnRecoveryMarkers[predecessorTurnID] = previousMarker
 		}
+		h.completeTurnRecoveryMarkersLocked(meta, predecessorTurnID)
 		if err := h.persistAgentsLocked(); err != nil {
 			meta.Status, meta.LastError, meta.UpdatedAt = previousStatus, previousError, previousUpdatedAt
 			meta.LastTurn.Status = previousTurnStatus
-			if hadMarker {
-				meta.TurnRecoveryMarkers[predecessorTurnID] = originalMarker
-			}
+			meta.TurnRecoveryMarkers = previousMarkers
 			log.Printf("[codex-loom] persist terminal recovery evidence: %v", err)
 			h.mu.Unlock()
 			return

@@ -780,16 +780,32 @@ export function AgentPane({
     }
   };
 
-  const updateGoal = async (body: Record<string, unknown>) => {
-    const data = await api("PUT", `/api/agents/${agent.id}/goal`, body);
-    onAgentUpdated({ ...agent, goal: data.goal as ThreadGoal });
-    return data.goal as ThreadGoal;
-  };
+	const updateGoal = async (body: Record<string, unknown>) => {
+		try {
+			const data = await api("PUT", `/api/agents/${agent.id}/goal`, { expectedVersion: agent.goalRevision || 0, ...body });
+			onAgentUpdated({ ...agent, goal: data.goal as ThreadGoal, goalRevision: (data.goal as ThreadGoal).version });
+			return data.goal as ThreadGoal;
+		} catch (error: any) {
+			if (error.status === 409) {
+				const current = await api("GET", `/api/agents/${agent.id}/goal`);
+				onAgentUpdated({ ...agent, goal: current.goal as ThreadGoal | undefined, goalRevision: Number(current.revision || 0) });
+			}
+			throw error;
+		}
+	};
 
-  const clearGoal = async () => {
-    await api("DELETE", `/api/agents/${agent.id}/goal`);
-    onAgentUpdated({ ...agent, goal: undefined });
-  };
+	const clearGoal = async () => {
+		try {
+			const data = await api("DELETE", `/api/agents/${agent.id}/goal?expectedVersion=${agent.goalRevision || 0}`);
+			onAgentUpdated({ ...agent, goal: undefined, goalRevision: Number(data.revision || 0) });
+		} catch (error: any) {
+			if (error.status === 409) {
+				const current = await api("GET", `/api/agents/${agent.id}/goal`);
+				onAgentUpdated({ ...agent, goal: current.goal as ThreadGoal | undefined, goalRevision: Number(current.revision || 0) });
+			}
+			throw error;
+		}
+	};
 
   const resolveApproval = async (approvalId: string, decision: string) => {
     try {
@@ -1546,7 +1562,7 @@ function GoalBar({
     }
   };
 
-  const setStatus = async (status: "active" | "paused") => {
+  const setStatus = async (status: "active" | "paused" | "complete") => {
     setSaving(true);
     try {
       await onUpdate({ status });
@@ -1559,7 +1575,7 @@ function GoalBar({
   };
 
   const clear = async () => {
-    if (!window.confirm("Clear this Goal? Its Codex Goal state and automatic continuation will be removed.")) return;
+    if (!window.confirm("Clear this Loom Goal? Automatic continuation will stop; native sync is best-effort.")) return;
     setSaving(true);
     try {
       await onClear();
@@ -1596,11 +1612,14 @@ function GoalBar({
         <div className="flex items-center gap-2 border-b border-border pb-2">
           <Target className="size-4 text-primary" />
           <div className="min-w-0 flex-1">
-            <div className="text-[12px] font-semibold">Thread Goal</div>
-            <div className="font-mono text-[9px] text-muted-foreground">{goal ? `${statusLabel} · ${usage}` : "Codex native Goal"}</div>
+            <div className="text-[12px] font-semibold">Agent Goal</div>
+            <div className="font-mono text-[9px] text-muted-foreground">{goal ? `${statusLabel} · ${usage}` : "Loom-owned Goal"}</div>
           </div>
           {goal ? <span className={cn("rounded-sm px-1.5 py-0.5 font-mono text-[8.5px] uppercase", goalStatusClass(goal.status))}>{statusLabel}</span> : null}
         </div>
+		{goal ? <div className={cn("mt-2 text-[9.5px]", goal.nativeMigrationBlocked ? "text-destructive" : "text-muted-foreground")}>
+		  {goal.nativeMigrationBlocked ? `Continuation blocked until the imported native Goal is paused · ${goal.nativeSyncError || "retry on the next Goal update"}` : goal.nativeSyncState === "failed" ? `Native Codex shadow sync failed; Loom continuation remains active · ${goal.nativeSyncError || "retry on the next Goal update"}` : goal.nativeSyncState === "synced" ? "Native Codex shadow synced; Loom owns continuation" : goal.nativeSyncState === "pending" ? "Native Codex shadow sync pending; Loom owns continuation" : "Loom-owned; no native Goal sync required"}
+        </div> : null}
         {goal?.status === "complete" ? (
           <div className="py-3 text-[11px] leading-5 text-muted-foreground">{goal.objective}</div>
         ) : (
@@ -1617,8 +1636,9 @@ function GoalBar({
         )}
         <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2">
           <div className="flex items-center gap-1">
-            {goal?.status === "active" ? <button type="button" onClick={() => setStatus("paused")} disabled={saving} className="flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-[10.5px] hover:bg-muted disabled:opacity-50"><Pause className="size-3" />Pause</button> : null}
-            {goal && !["active", "complete"].includes(goal.status) ? <button type="button" onClick={() => setStatus("active")} disabled={saving} className="flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-[10.5px] hover:bg-muted disabled:opacity-50"><Play className="size-3" />Resume</button> : null}
+			{goal?.status === "active" ? <button type="button" onClick={() => setStatus("paused")} disabled={saving} className="flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-[10.5px] hover:bg-muted disabled:opacity-50"><Pause className="size-3" />Pause</button> : null}
+			{goal && !["active", "complete"].includes(goal.status) ? <button type="button" onClick={() => setStatus("active")} disabled={saving} className="flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-[10.5px] hover:bg-muted disabled:opacity-50"><Play className="size-3" />Resume</button> : null}
+			{goal && goal.status !== "complete" ? <button type="button" onClick={() => setStatus("complete")} disabled={saving} className="flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-[10.5px] hover:bg-muted disabled:opacity-50"><Check className="size-3" />Complete</button> : null}
             {goal ? <button type="button" onClick={clear} disabled={saving} title="Clear Goal" aria-label="Clear Goal" className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"><Trash2 className="size-3.5" /></button> : null}
           </div>
           {goal?.status !== "complete" ? <button type="button" onClick={save} disabled={saving || !objective.trim()} className="flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[10.5px] font-medium text-primary-foreground disabled:opacity-50">{saving ? <Loader2 className="size-3 animate-spin" /> : <Check className="size-3" />}{goal ? "Save Goal" : "Start Goal"}</button> : null}

@@ -355,7 +355,11 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 		"id": p.ID, "name": p.Name, "cwd": p.Cwd, "threadId": p.ThreadID, "runtimeKind": p.RuntimeBinding.Kind, "providerId": p.ProviderID,
 	})
 	h.emitStatusLocked(meta, meta.Status)
-	return h.viewLocked(meta), nil
+	view := h.viewLocked(meta)
+	if h.activeGoalReservesThreadLocked(p.ID) {
+		h.startWorkerLocked(func() { h.resumeGoalAfterOpen(p.ID) })
+	}
+	return view, nil
 }
 
 func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
@@ -766,6 +770,23 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		rt.startMu.Unlock()
 		return SendResult{}, errf(404, "agent vanished")
 	}
+	goalID, goalVersion := "", int64(0)
+	if goal := h.goals[agentID]; goal != nil {
+		goalID, goalVersion = goal.ID, goal.Version
+	}
+	if goalID != contextPlan.GoalID || goalVersion != contextPlan.GoalVersion {
+		h.mu.Unlock()
+		rt.startMu.Unlock()
+		return SendResult{}, errf(409, "Goal changed while Turn context was prepared; retry")
+	}
+	if source.GoalActive {
+		goal := h.goals[agentID]
+		if goal == nil || goal.ID != source.GoalID || goal.Version != source.GoalVersion || !h.goalContinuationReadyLocked(agentID) {
+			h.mu.Unlock()
+			rt.startMu.Unlock()
+			return SendResult{}, errf(409, "Goal changed before its continuation Turn was reserved")
+		}
+	}
 	if rt.activeTurn != nil && !rt.activeTurn.finished {
 		h.mu.Unlock()
 		rt.startMu.Unlock()
@@ -782,6 +803,7 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		inboxItemID:    inboxItemID,
 		attemptID:      attemptID,
 		agentMessageID: agentMessageID,
+		humanRequestID: recoveryHumanRequestID(source),
 		topicID:        topicID,
 		contextAttemptID: func() string {
 			if contextPlan.Attempt == nil {
@@ -1177,7 +1199,6 @@ func (h *Hub) ArchiveAgent(key string) (map[string]any, error) {
 		return nil, errf(500, "save archived agent: %s", err)
 	}
 	delete(h.runtimes, agentID)
-	delete(h.goals, agentID)
 	var activeTurnID, activeNativeTurnID string
 	if rt != nil && rt.activeTurn != nil && !rt.activeTurn.finished {
 		activeTurnID, activeNativeTurnID = rt.activeTurn.turnID, rt.activeTurn.nativeTurnID

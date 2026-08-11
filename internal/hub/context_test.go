@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -51,6 +52,50 @@ func TestContextCoverageSeparatesDeveloperAndInputOncePerEpoch(t *testing.T) {
 	}
 	if second.Attempt != nil || second.DeveloperContext != "" || second.InputContext != "" {
 		t.Fatalf("unchanged second Turn repeated context: %#v", second)
+	}
+}
+
+func TestGoalContextRevisionAndClearTombstoneAreDelivered(t *testing.T) {
+	h, agent := contextTestHub(t)
+	history := newContextHistoryHarness("initial:" + agent.ThreadID)
+	h.contextHistoryProbe = history.probe
+	baseline, err := h.prepareTurnContext(agent.ID, authenticatedOwnerContext("direct_input", "", "", ""), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coverAttempt(t, h, agent, history, baseline.Attempt, "turn-baseline")
+
+	h.mu.Lock()
+	h.goals[agent.ID] = &ThreadGoal{ID: "goal-1", Version: 1, ThreadID: agent.ThreadID, Objective: "Ship both Runtimes", Status: GoalStatusActive}
+	h.mu.Unlock()
+	active, err := h.prepareTurnContext(agent.ID, authenticatedOwnerContext("direct_input", "", "", ""), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.GoalID != "goal-1" || active.GoalVersion != 1 || !strings.Contains(active.InputContext, `<loom_agent_goal id="goal-1" revision="1" status="active">`) || !strings.Contains(active.InputContext, "Ship both Runtimes") {
+		t.Fatalf("active Goal context = %#v\n%s", active, active.InputContext)
+	}
+	h.markContextSubmitted(agent.ThreadID, active.Attempt, "turn-goal-active")
+	history.persist(active.Attempt)
+	h.mu.Lock()
+	h.observeContextModelEventLocked(agent, &turnState{turnID: "turn-goal-active", contextAttemptID: active.Attempt.ID, contextEpochID: active.Attempt.EpochID})
+	h.mu.Unlock()
+
+	h.mu.Lock()
+	h.goals[agent.ID] = &ThreadGoal{ID: "goal-1", Version: 2, ThreadID: agent.ThreadID, ClearedAt: 42}
+	h.mu.Unlock()
+	cleared, err := h.prepareTurnContext(agent.ID, authenticatedOwnerContext("direct_input", "", "", ""), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.GoalVersion != 2 || !strings.Contains(cleared.InputContext, `<loom_agent_goal id="goal-1" revision="2" cleared="true" cleared_at="42" />`) {
+		t.Fatalf("cleared Goal context = %#v\n%s", cleared, cleared.InputContext)
+	}
+
+	h.runtimes[agent.ID] = &runtime{runtimeContract: &controlPlaneContract{contextMode: runtimecontract.ContextDeliveryFullPerTurn}}
+	pi, err := h.prepareTurnContext(agent.ID, authenticatedOwnerContext("direct_input", "", "", ""), nil)
+	if err != nil || !strings.Contains(pi.InputContext, `cleared="true"`) {
+		t.Fatalf("Pi full-per-turn Goal tombstone = %#v, err=%v", pi, err)
 	}
 }
 

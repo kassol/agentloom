@@ -52,7 +52,7 @@ Agent status 的 `capabilitySnapshot` 与 capability-driven model data 实时更
 - `POST /api/agents/{key}/thread/approvals/{approvalId}`
 - `PATCH /api/agents/{key}/config`
 - `PUT /api/agents/{key}/profile`
-- `PUT|DELETE /api/agents/{key}/goal`
+- `PUT|DELETE /api/agents/{key}/goal`（必须携带当前 `expectedVersion`；提供 pause/resume/complete/clear，并显示 Loom state 与 optional native sync evidence）
 - `POST /api/agents/{key}/artifacts`
 - `POST /api/human-requests/{id}/answer`
 - `POST /api/comms/messages/{id}/retry|no-reply`

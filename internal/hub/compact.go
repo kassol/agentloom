@@ -43,7 +43,7 @@ func (h *Hub) CompactAgentThread(key string) (ThreadCompactResult, error) {
 		h.mu.Unlock()
 		return ThreadCompactResult{}, errf(409, "agent %q has a pending approval; resolve it before compacting", agent.Name)
 	}
-	if goal := h.goals[agent.ID]; goal != nil && goal.Status == GoalStatusActive {
+	if goal := h.goals[agent.ID]; goal != nil && goal.ClearedAt == 0 && goal.Status == GoalStatusActive {
 		h.mu.Unlock()
 		return ThreadCompactResult{}, errf(409, "agent %q has an active Goal; pause it before compacting", agent.Name)
 	}

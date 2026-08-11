@@ -9,7 +9,7 @@ function agent(status: string, goalStatus?: Agent["goal"] extends infer G ? any 
     approvalPolicy: "never", status, currentTask: "", currentTurnId: "", lastError: "",
     createdAt: "2026-07-17T00:00:00Z", updatedAt: "2026-07-17T00:00:00Z", processAlive: true,
     pendingApprovals: [], lastSeq: 0,
-    goal: goalStatus ? { threadId: "t1", objective: "Long goal", status: goalStatus, tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 0, updatedAt: 0 } : undefined,
+    goal: goalStatus ? { id: "goal-1", version: 1, threadId: "t1", objective: "Long goal", status: goalStatus, tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 0, updatedAt: 0 } : undefined,
   };
 }
 

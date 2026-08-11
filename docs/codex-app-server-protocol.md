@@ -78,12 +78,11 @@ CodexLoom 用到的核心子集：
 
 错误形状:`{"code":-32600,"message":"Invalid request: missing field `threadId`"}`。
 
-## 原生 Thread Goal
+## 原生 Thread Goal shadow
 
-Goal 是 Codex 拥有的 Thread 级持久状态，不是 Loom Message，也不是一个超长 Turn。一个 Thread
-同时只有一个当前 Goal；Codex 负责状态持久化、Token/时间统计、上下文压缩后的延续，以及 active
-Goal 在 Turn 结束后的自动 continuation。Loom 不把 Goal 写进自己的 store，只维护来自原生 API
-和通知的内存投影。
+Codex app-server 仍暴露 Thread 级 Goal API，但它在 CodexLoom 中只承担 legacy migration 与 optional
+paused shadow。Loom 的 `goals.json` 是 Codex/Pi 共用的权威状态，Loom 负责跨 Turn continuation；不得让
+Codex 原生 active Goal 同时创建第二条 continuation loop。
 
 `ThreadGoal` 的稳定字段为：
 
@@ -107,14 +106,13 @@ Goal 在 Turn 结束后的自动 continuation。Loom 不把 Goal 写进自己的
 
 关键运行语义：
 
-1. `thread/goal/set` 创建 active Goal 后，已加载的 Thread 会由 Codex 自动开始或继续工作。
-2. 共享 Host 启动时，Loom 对已登记 Thread 调 `thread/goal/get`；只对 active Goal执行
-   `thread/resume`，把自动 continuation 交还 Codex。
+1. 这些方法现在只位于 Codex adapter 的 optional shadow/migration 接缝；公共 Goal 权威在 Loom。
+2. Loom 将 active Goal 同步为原生 paused shadow，避免 Codex 与 Loom 各自创建 continuation。首次迁移先
+   持久化 Loom Goal/tombstone，再确认原生 paused/cleared；失败时不启动 Loom continuation。
 3. active Goal 可能正处于两个 Turn 之间。Loom 的 `Agent.status=idle` 只表示当前没有 active Turn，
    不能据此把普通队列工作插进未结束 Goal。
-4. Loom 的 UI、HTTP 与 CLI 直接映射 `thread/goal/*`。发送字符串 `/goal ...` 不是 Goal API。
-5. Agent 可通过 Codex Goal tools 将 Goal 标记为 complete 或 blocked；用户控制创建、编辑、暂停、
-   恢复、预算和清除。
+4. 原生 Goal 通知没有 Loom revision correlation，只作为诊断输入，不能修改或认证 Loom Goal。
+5. complete、blocked、pause、resume 和 clear 都走 Loom API；不要依赖仅 Codex 可见的原生 Goal tool。
 
 ## `thread/inject_items`
 

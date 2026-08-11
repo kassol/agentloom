@@ -444,6 +444,7 @@ func (s *Store) schedulesFile() string { return filepath.Join(s.dir, "schedules.
 func (s *Store) triggersFile() string { return filepath.Join(s.dir, "triggers.json") }
 
 func (s *Store) topicsFile() string { return filepath.Join(s.dir, "topics.json") }
+func (s *Store) goalsFile() string  { return filepath.Join(s.dir, "goals.json") }
 
 func (s *Store) profilesFile() string { return filepath.Join(s.dir, "profiles.json") }
 
@@ -709,6 +710,10 @@ func (s *Store) SaveTriggers(v any) error { return s.saveJSON(s.triggersFile(), 
 func (s *Store) LoadTopics(v any) error { return s.loadJSON(s.topicsFile(), v) }
 
 func (s *Store) SaveTopics(v any) error { return s.saveJSON(s.topicsFile(), v) }
+
+func (s *Store) LoadGoals(v any) error { return s.loadJSON(s.goalsFile(), v) }
+
+func (s *Store) SaveGoals(v any) error { return s.saveJSON(s.goalsFile(), v) }
 
 func (s *Store) LoadProfiles(v any) error { return s.loadJSON(s.profilesFile(), v) }
 

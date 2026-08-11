@@ -203,7 +203,7 @@ func (h *Hub) CreateTrigger(p TriggerParams) (Trigger, error) {
 			trigger.Work.TopicID = rt.activeTurn.topicID
 		}
 	}
-	if goal := h.goals[agent.ID]; goal != nil {
+	if goal := h.goals[agent.ID]; goal != nil && goal.ClearedAt == 0 {
 		trigger.Work.GoalCreatedAt = goal.CreatedAt
 	}
 	id := trigger.ID

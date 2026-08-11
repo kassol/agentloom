@@ -36,8 +36,8 @@ Profile 定义长期职责与协作契约；Skill 保存可复用方法和固化
 - **Agent**：稳定治理实体，拥有 `agentId`、名称、Profile、关系和外部地址。
 - **Thread**：Agent 的主要 Codex 历史和上下文绑定，标识为 `threadId`。
 - **Turn**：Thread 上的一次执行；一个 Thread 同时只有一个 active Turn。
-- **Goal**：Codex 持久化在 Thread 上的当前阶段性成果，可以跨多个 Turn 自动 continuation；一个
-  Thread 同时只有一个当前 Goal。
+- **Goal**：Loom 持久化在 Agent 上的当前阶段性成果，可以跨多个 Turn 自动 continuation；Codex 与
+  Pi 使用同一套 Goal 工作流，一个 Agent 同时只有一个当前 Goal slot。
 - **Item**：Turn 内的输入、输出、推理、命令、文件变更、图片等事件。
 - **CodexHost**：CodexLoom 维护的共享 `codex app-server` 进程。
 - **Profile**：长期协作身份、Domain 和 Scope，不是本轮任务描述。
@@ -171,8 +171,8 @@ Observe 命令分别放在 `commands_*.go`。新增命令必须归入所属领�
 ### `internal/hub`
 
 领域编排层。`Agent` 是规范实体，`Session` 只作为源码兼容别名；`Hub.agents` 保存聚合根。
-`codex_host.go` 持有唯一 Host，并将通知按 Thread 路由；`goal.go` 直接适配 Codex 原生
-`thread/goal/*`，只维护内存投影和队列保留语义；`remote.go` 只管理共享 Host 上的
+`codex_host.go` 持有唯一 Host，并将通知按 Thread 路由；`goal.go` 持有 Codex/Pi 共用的 durable
+Goal 与 Loom continuation，Codex `thread/goal/*` 仅是 optional shadow/migration 接缝；`remote.go` 只管理共享 Host 上的
 `remoteControl/*` 状态，不再维护第二个 app-server。
 
 核心文件按状态所有权划分：`hub.go` 是共享 runtime/event 基础，`agent.go` 管 Agent 与 Turn，
@@ -183,7 +183,7 @@ Observe 命令分别放在 `commands_*.go`。新增命令必须归入所属领�
 必须通过明确的 reconciliation/commit helper，不应在一个巨型文件中直接修改多个 projection。
 
 后续新增领域文件同样按状态所有权拆分：`artifact.go` 管 Thread/Topic Artifact 的受管快照与
-下载；`goal.go` 适配 Codex 原生 Goal；`scheduler.go` 与 `trigger.go` 管时间和外部事实恢复；
+下载；`goal.go` 管 Loom-owned Goal；`scheduler.go` 与 `trigger.go` 管时间和外部事实恢复；
 `human_request.go` 管 Needs You；`remote.go` 管远程控制；`collaboration_group.go` 管 Team
 Group；`context.go` 管 Loom Prompt 与 epoch coverage；`daily_activity.go`、`workload.go` 和
 `usage.go` 管观察/容量口径；`interrupted_turn.go` 管重启后的 Turn 恢复；`provider_operation.go`
@@ -413,12 +413,15 @@ Remote enrollment 以 app-server `clientInfo.name` 为持久 scope。共享 Host
 
 ### Goal 跨 Turn 自动继续
 
-1. Web/CLI 调 `thread/goal/set` 创建 Goal，或 Agent 在 Turn 中使用 Codex 原生 Goal tool。
-2. `thread/goal/updated` 更新 `AgentView.goal`；Goal 本体只由 Codex state DB 和 rollout 持久化。
-3. status=`active` 时，Codex 在 Thread idle 后自动创建 continuation Turn。Loom 不手工循环
-   `turn/start`，也不复制 Goal objective。
-4. Loom 重启后先用 `thread/goal/get` 恢复投影，再对 active Goal `thread/resume`；paused、blocked、
-   limited 和 complete Goal 只恢复显示，不自动启动。
+1. Web/CLI 通过 Loom Goal API 创建或修改 Goal；`goals.json` 中的稳定 ID、单调 revision 和 clear
+   tombstone 是 Codex 与 Pi 共用的唯一真相源。Owner/control API 是 complete、pause 和 clear 入口。
+2. Goal revision 以 Runtime-neutral input context 投递。Codex 使用 epoch incremental fragment，Pi 每 Turn
+   收到完整 snapshot；clear 仍投递同 key tombstone，避免旧 objective 留在上下文中。
+3. status=`active` 时，Loom 复用普通 `turn/start`、per-Agent 串行锁和 recovery 排下一轮；Needs You
+   回答与 Goal 因果回复优先。Codex 原生 Goal 只同步为 paused shadow，不创建第二条 continuation loop。
+4. 首次升级会在没有 Loom slot 时查询一次旧 Codex Goal：先持久化导入或空 tombstone，再确认原生 Goal
+   已 paused/cleared，最后才允许 Loom continuation。迁移 neutralization 失败会持久阻止该 imported Goal
+   续跑；普通 optional shadow 同步失败只更新脱敏 evidence，不回滚或阻止 Loom Goal。
 5. 只有 `active` Goal 在两个自动 continuation Turn 之间保留下一次执行权。普通
    Inbox/Schedule/Agent Message 排队；Goal 中发出的 required 请求之回复和 Needs You 回答
    可以继续进入该 Thread。

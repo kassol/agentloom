@@ -64,9 +64,9 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 | PUT | `/api/agents/{key}/profile` | Update Profile |
 | GET | `/api/agents/{key}/usage` | Agent token usage |
 | GET | `/api/agents/{key}/workload` | Agent workload |
-| GET | `/api/agents/{key}/goal` | Get active Goal |
-| PUT | `/api/agents/{key}/goal` | Set or update Goal |
-| DELETE | `/api/agents/{key}/goal` | Clear Goal |
+| GET | `/api/agents/{key}/goal` | Get Loom Goal and current slot `revision` |
+| PUT | `/api/agents/{key}/goal` | Set/update Loom Goal; body requires current `expectedVersion` |
+| DELETE | `/api/agents/{key}/goal?expectedVersion=N` | Clear Goal and persist the next tombstone revision |
 | POST | `/api/agents/{key}/compact` | Start manual Codex Thread compaction |
 | DELETE | `/api/agents/{key}` | Archive Agent |
 | GET | `/api/turns/{turnId}` | Get one Turn by stable ID |

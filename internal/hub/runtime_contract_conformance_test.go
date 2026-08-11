@@ -409,7 +409,12 @@ func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contrac
 				t.Fatalf("native archive = %#v", outcome)
 			}
 		case runtimecontract.CapabilityGoal:
-			capability := contract.(runtimeGoalCapability)
+			// Goal is a Loom-owned control-plane capability. Runtime hooks are
+			// optional native-shadow adapters; certify them only when present.
+			capability, ok := contract.(runtimeGoalCapability)
+			if !ok {
+				continue
+			}
 			objective := "conformance goal"
 			if current, err := capability.RuntimeGoal(context.Background(), binding); err != nil || current == nil || current.Objective != "initial conformance goal" {
 				t.Fatalf("goal read = %#v, err=%v", current, err)

@@ -51,7 +51,7 @@ func (h *Hub) Team() TeamView {
 	h.mu.Lock()
 	agents := map[string]*TeamAgent{}
 	for _, s := range h.agents {
-		goal := cloneGoal(h.goals[s.ID])
+		goal := cloneGoalForAgent(h.goals[s.ID], s)
 		agents[s.ID] = &TeamAgent{
 			Name: s.Name, ID: s.ID, Cwd: s.Cwd, Status: s.Status, Source: s.Source,
 			Goal: goal, Profile: profileCopy(h.profiles[s.ID], s.ID),
@@ -145,7 +145,7 @@ func (h *Hub) TeamActivity(days int) []TeamObservedLink {
 	h.mu.Lock()
 	agents := map[string]*TeamAgent{}
 	for _, agent := range h.agents {
-		agents[agent.ID] = &TeamAgent{Name: agent.Name, ID: agent.ID, Status: agent.Status, Goal: cloneGoal(h.goals[agent.ID]), Profile: profileCopy(h.profiles[agent.ID], agent.ID)}
+		agents[agent.ID] = &TeamAgent{Name: agent.Name, ID: agent.ID, Status: agent.Status, Goal: cloneGoalForAgent(h.goals[agent.ID], agent), Profile: profileCopy(h.profiles[agent.ID], agent.ID)}
 	}
 	messages := make([]AgentMessage, 0, len(h.commOrder))
 	for _, id := range h.commOrder {

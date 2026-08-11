@@ -734,6 +734,7 @@ export default function App() {
                       sandbox: d.sandbox ?? s.sandbox,
                       approvalPolicy: d.approvalPolicy ?? s.approvalPolicy,
                       goal: Object.prototype.hasOwnProperty.call(d, "goal") ? d.goal || undefined : s.goal,
+                      goalRevision: d.goalRevision ?? s.goalRevision,
                       updatedAt: d.updatedAt ?? s.updatedAt,
                     }
                   : s,

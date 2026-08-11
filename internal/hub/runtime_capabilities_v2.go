@@ -77,7 +77,9 @@ func validateRuntimeCapabilityHooks(contract runtimecontract.Contract, snapshot 
 		case runtimecontract.CapabilityNativeArchive:
 			_, implemented = contract.(runtimecontract.BindingArchiveCapability)
 		case runtimecontract.CapabilityGoal:
-			_, implemented = contract.(runtimeGoalCapability)
+			// Goal is Loom-owned. A Runtime hook is only an optional native
+			// synchronization projection and is not required for product CRUD.
+			implemented = true
 		case runtimecontract.CapabilityUsageReporting:
 			_, implemented = contract.(runtimeUsageCapability)
 		case runtimecontract.CapabilityModelConfiguration:
@@ -320,7 +322,7 @@ func piControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Capabi
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityContextDelivery, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityNativeRename, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityNativeArchive, false),
-		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityGoal, false),
+		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityGoal, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityRemote, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityUsageReporting, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityModelConfiguration, true),

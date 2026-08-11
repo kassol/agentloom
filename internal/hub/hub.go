@@ -112,6 +112,7 @@ type AgentView struct {
 	CapabilitySnapshot  runtimecontract.CapabilitySnapshot `json:"capabilitySnapshot"`
 	PendingApprovals    []ApprovalView                     `json:"pendingApprovals"`
 	Goal                *ThreadGoal                        `json:"goal,omitempty"`
+	GoalRevision        int64                              `json:"goalRevision"`
 	LastSeq             int64                              `json:"lastSeq"`
 	Recovery            *RecoveryView                      `json:"recovery,omitempty"`
 	nativeRuntimeRef    string
@@ -280,6 +281,7 @@ type turnState struct {
 	inboxItemID       string
 	attemptID         string
 	agentMessageID    string
+	humanRequestID    string
 	topicID           string
 	handlingAttemptID string
 	contextAttemptID  string
@@ -635,6 +637,49 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	if h.topics == nil {
 		h.topics = map[string]*Topic{}
 	}
+	if err := h.st.LoadGoals(&h.goals); err != nil {
+		return nil, fmt.Errorf("load Goals: %w", err)
+	}
+	if h.goals == nil {
+		h.goals = map[string]*ThreadGoal{}
+	}
+	goalsNormalized := false
+	for agentID, goal := range h.goals {
+		if goal.ID == "" {
+			goal.ID = newIntegrationID("goal")
+			goalsNormalized = true
+		}
+		if goal.Version == 0 {
+			goal.Version = 1
+			goalsNormalized = true
+		}
+		if agent := h.agents[agentID]; agent != nil && goal.ThreadID != agent.ThreadID {
+			goal.ThreadID = agent.ThreadID
+			goalsNormalized = true
+		}
+		if agent := h.agents[agentID]; agent != nil && agent.RuntimeBinding.Kind == "codex" {
+			bindingRevision := goalBindingRevision(runtimeContractBinding(agent))
+			if goal.NativeMigrationBlocked && goal.NativeMigrationBindingRevision == "" {
+				goal.NativeMigrationBindingRevision = bindingRevision
+				goalsNormalized = true
+			}
+			if goal.NativeSyncState != "" && goal.NativeSyncBindingRevision == "" {
+				goal.NativeSyncState = goalNativeSyncPending
+				goal.NativeSyncedAt = 0
+				goal.NativeSyncError = ""
+				goal.NativeSyncBindingRevision = bindingRevision
+				goalsNormalized = true
+			}
+		}
+	}
+	if goalsNormalized && !options.Passive {
+		if err := h.persistGoalsLocked(); err != nil {
+			return nil, fmt.Errorf("persist normalized Goals: %w", err)
+		}
+	}
+	if !options.Passive {
+		h.reconcileRecoveryHumanAnswersLocked()
+	}
 	if h.normalizeTopicsLocked() && !options.Passive {
 		if err := h.persistTopicsLocked(); err != nil {
 			return nil, fmt.Errorf("persist normalized Topics: %w", err)
@@ -765,6 +810,10 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	go func() { defer h.background.Done(); h.remoteLoop() }()
 	go func() { defer h.background.Done(); h.eventMaintenanceLoop() }()
 	go func() { defer h.background.Done(); h.triggerLoop() }()
+	for _, agentID := range h.goalStartupAgentIDs() {
+		id := agentID
+		h.startWorker(func() { h.resumeGoalAfterOpen(id) })
+	}
 	opened = true
 	return h, nil
 }
@@ -1068,7 +1117,13 @@ func (h *Hub) emitStatusLocked(meta *Agent, status string) {
 	if recovery := recoveryView(meta); recovery != nil {
 		data["recovery"] = recovery
 	}
-	data["goal"] = h.goals[meta.ID]
+	if goal := h.goals[meta.ID]; goal != nil {
+		data["goalRevision"] = goal.Version
+		data["goal"] = cloneGoalForAgent(goal, meta)
+	} else {
+		data["goalRevision"] = int64(0)
+		data["goal"] = nil
+	}
 	h.emitGlobalLocked("loom/agent-status", data)
 }
 
@@ -2307,13 +2362,14 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 		meta.LastError = status
 	}
 	meta.LastTurn = &TurnSummary{TurnID: turn.turnID, Task: turn.task, Status: status, CompletedAt: now()}
-	for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
-		if marker.RecoveryTurnID == turn.turnID {
-			marker.State = TurnRecoveryCompleted
-			marker.UpdatedAt = now()
-			meta.TurnRecoveryMarkers[predecessorTurnID] = marker
-		}
+	if turn.humanRequestID != "" {
+		h.bindRecoveryHumanTurnMarkerLocked(meta, turn.humanRequestID, turn.turnID)
 	}
+	terminalTurnID := turn.turnID
+	if status == "interrupted" {
+		terminalTurnID = ""
+	}
+	h.completeTurnRecoveryMarkersLocked(meta, terminalTurnID)
 	meta.UpdatedAt = now()
 	if err := h.persistAgentsLocked(); err != nil {
 		*meta = previous
@@ -2336,7 +2392,11 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 	}
 	h.emitStatusLocked(meta, "idle")
 	if startPending {
-		h.startPendingWorkersLocked(meta.ID)
+		if status == "completed" && h.goalContinuationReadyLocked(meta.ID) {
+			h.startWorkerLocked(func() { h.continueGoal(meta.ID) })
+		} else {
+			h.startPendingWorkersLocked(meta.ID)
+		}
 	}
 	return true
 }
@@ -2472,8 +2532,8 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 		view.LastError = publicRuntimeFailureMessage(meta, turnID, view.LastError)
 	}
 	if goal := h.goals[meta.ID]; goal != nil {
-		copy := *goal
-		view.Goal = &copy
+		view.GoalRevision = goal.Version
+		view.Goal = cloneGoalForAgent(goal, meta)
 	}
 	view.PendingApprovals = h.pendingApprovalsLocked(meta.ID)
 	if rt, ok := h.runtimes[meta.ID]; ok && rt.agentHost != nil && rt.agentHost.Alive() {

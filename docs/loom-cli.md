@@ -331,7 +331,7 @@ reasoning 和工具轨迹。CodexLoom 支持显式请求 Codex 压缩一个 Agen
 
 ## Goal：跨多个 Turn 的当前成果
 
-Goal 是 Codex Thread 的原生长期工作状态。它与 Agent、Profile、Turn 的关系是：
+Goal 是 Loom Agent 的 Runtime-neutral 长期工作状态。它与 Agent、Profile、Turn 的关系是：
 
 - Agent 是稳定的领域主体。
 - Profile 是 Agent 的长期职责。
@@ -350,11 +350,13 @@ loom goal cici-research
 ```sh
 loom goal cici-research pause
 loom goal cici-research resume
+loom goal cici-research complete
 loom goal cici-research clear
 ```
 
-编辑目标或预算仍使用 `set`；清除已有预算使用 `--clear-token-budget`。这些命令直接调用 Codex
-`thread/goal/get|set|clear`，不会向 Thread 发送一条字面 `/goal` 用户消息。
+编辑目标或预算仍使用 `set`；清除已有预算使用 `--clear-token-budget`。这些命令调用 Loom-owned Goal
+API，对 Codex 与 Pi 完全一致；Codex 原生 Goal 仅为 optional paused shadow。命令不会向 Thread 发送
+一条字面 `/goal` 用户消息。
 
 `active` Goal 在自动 continuation 之间保留 Agent Thread 的下一次执行权：普通 Schedule、外部
 Inbox 和无关 Agent Message 继续排队。Agent 在 Goal 工作中发出的 required 请求，其因果回复可以
