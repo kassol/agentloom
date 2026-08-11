@@ -111,6 +111,9 @@ func (c *piRuntimeContract) CreateBinding(ctx context.Context, request runtimeco
 	if err != nil {
 		return runtimecontract.Binding{}, piFailureOutcome(err, runtimecontract.FailurePhaseBindingCreate)
 	}
+	if err := c.reconcileConfiguredModel(ctx); err != nil {
+		return runtimecontract.Binding{}, piModelReconcileOutcome(err, runtimecontract.FailurePhaseBindingCreate)
+	}
 	return piContractBinding(nativeRef), runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}
 }
 
@@ -128,7 +131,39 @@ func (c *piRuntimeContract) ResumeBinding(ctx context.Context, binding runtimeco
 		}
 		return piFailureOutcome(err, runtimecontract.FailurePhaseBindingResume)
 	}
+	if err := c.reconcileConfiguredModel(ctx); err != nil {
+		return piModelReconcileOutcome(err, runtimecontract.FailurePhaseBindingResume)
+	}
 	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
+}
+
+func (c *piRuntimeContract) reconcileConfiguredModel(ctx context.Context) error {
+	c.mu.Lock()
+	provider, model, effort := c.providerID, c.model, c.effort
+	c.mu.Unlock()
+	if provider == "" || model == "" || c.native == nil {
+		return nil
+	}
+	state, err := c.native.models(contractTimeout(ctx, 15*time.Second))
+	if err != nil {
+		return err
+	}
+	if effort == "" {
+		effort = state.ThinkingLevel
+	}
+	if state.Current.Provider == provider && state.Current.ID == model && state.ThinkingLevel == effort {
+		return nil
+	}
+	_, err = c.native.switchModel(runtimecontract.ModelSelection{Provider: provider, Model: model, ThinkingLevel: effort}, contractTimeout(ctx, 15*time.Second))
+	return err
+}
+
+func piModelReconcileOutcome(err error, phase runtimecontract.FailurePhase) runtimecontract.Outcome {
+	var indeterminate *runtimeIndeterminateError
+	if errors.As(err, &indeterminate) {
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleIndeterminate, Failure: indeterminate.RuntimeFailure()}
+	}
+	return piFailureOutcome(err, phase)
 }
 
 func (c *piRuntimeContract) StartTurn(ctx context.Context, request runtimecontract.TurnRequest) runtimecontract.Outcome {
@@ -309,7 +344,7 @@ func (c *piRuntimeContract) CapabilitySnapshot(context.Context, runtimecontract.
 	return piControlPlaneCapabilitySnapshot(imageInput)
 }
 
-func (c *piRuntimeContract) ValidateRuntimeInput(_ context.Context, _ runtimecontract.Binding, input []runtimecontract.InputBlock) *runtimecontract.Failure {
+func (c *piRuntimeContract) ValidateInput(_ context.Context, _ runtimecontract.Binding, input []runtimecontract.InputBlock) *runtimecontract.Failure {
 	imageInput := false
 	if c.native != nil {
 		c.native.mu.Lock()
@@ -327,24 +362,40 @@ func (c *piRuntimeContract) ValidateRuntimeInput(_ context.Context, _ runtimecon
 	return nil
 }
 
-func (c *piRuntimeContract) RuntimeModels(ctx context.Context, _ runtimecontract.Binding) (RuntimeModelState, error) {
+func (c *piRuntimeContract) InspectModelControl(ctx context.Context, _ runtimecontract.Binding) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
 	if err := ctx.Err(); err != nil {
-		return RuntimeModelState{}, err
+		return runtimecontract.ModelControlState{}, modelControlFailure(err)
 	}
 	if c.native == nil {
-		return RuntimeModelState{}, errors.New("Pi Runtime model catalog is unavailable")
+		return runtimecontract.ModelControlState{}, modelControlFailure(errors.New("Pi Runtime model catalog is unavailable"))
 	}
-	return c.native.models(contractTimeout(ctx, 15*time.Second))
+	state, err := c.native.models(contractTimeout(ctx, 15*time.Second))
+	if err != nil {
+		return runtimecontract.ModelControlState{}, modelControlFailure(err)
+	}
+	return state, nil
 }
 
-func (c *piRuntimeContract) SwitchRuntimeModel(ctx context.Context, _ runtimecontract.Binding, selection RuntimeModelSelection) (RuntimeModelState, error) {
+func (c *piRuntimeContract) SelectModel(ctx context.Context, _ runtimecontract.Binding, selection runtimecontract.ModelSelection) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
 	if err := ctx.Err(); err != nil {
-		return RuntimeModelState{}, err
+		return runtimecontract.ModelControlState{}, modelControlFailure(err)
 	}
 	if c.native == nil {
-		return RuntimeModelState{}, errors.New("Pi Runtime model switching is unavailable")
+		return runtimecontract.ModelControlState{}, modelControlFailure(errors.New("Pi Runtime model switching is unavailable"))
 	}
-	return c.native.switchModel(selection, contractTimeout(ctx, 15*time.Second))
+	state, err := c.native.switchModel(selection, contractTimeout(ctx, 15*time.Second))
+	if err != nil {
+		var indeterminate *runtimeIndeterminateError
+		if errors.As(err, &indeterminate) {
+			return runtimecontract.ModelControlState{}, indeterminate.RuntimeFailure()
+		}
+		return runtimecontract.ModelControlState{}, modelControlFailure(err)
+	}
+	return state, nil
+}
+
+func modelControlFailure(err error) *runtimecontract.Failure {
+	return &runtimecontract.Failure{Code: "model_control_failed", Phase: runtimecontract.FailurePhaseModelControl, Message: err.Error(), Cause: err}
 }
 
 func (c *piRuntimeContract) SetApprovalHandler(handler func(runtimecontract.ApprovalProposal)) {

@@ -74,28 +74,6 @@ func TestCustomProviderModelRouteErrorStopsRetryAndReportsConfigurationFailure(t
 	if turn["model"] != "Example-Model" {
 		t.Fatalf("turn model = %#v, want case-preserved id", turn["model"])
 	}
-	correctedModel := "example-model"
-	view, err = h.UpdateAgentConfig("agent-1", ConfigParams{Model: &correctedModel})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if view.Model != correctedModel {
-		t.Fatalf("corrected model = %q, want %q", view.Model, correctedModel)
-	}
-	if failure := sendAndWaitForTerminalEvent(t, h, "loom/turn-completed"); failure != "" {
-		t.Fatalf("corrected model Turn error = %q", failure)
-	}
-	view, err = h.GetAgent("agent-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if view.LastTurn == nil || view.LastTurn.Status != "completed" || view.LastError != "" || view.Model != correctedModel {
-		t.Fatalf("corrected model recovery = %#v", view.Agent)
-	}
-	turn = lastRequestParams(t, logPath, "turn/start")
-	if turn["model"] != correctedModel {
-		t.Fatalf("corrected turn model = %#v, want %q", turn["model"], correctedModel)
-	}
 }
 
 func TestCustomProviderServiceUnavailableRemainsProviderFailure(t *testing.T) {

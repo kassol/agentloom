@@ -43,7 +43,6 @@ type piAgentRuntime struct {
 	currentModel      RuntimeModel
 	availableModels   []RuntimeModel
 	thinkingLevel     string
-	thinkingLevels    []string
 }
 
 func newPiAgentRuntime(agentID, dataDir, apiURL string) *piAgentRuntime {
@@ -222,7 +221,14 @@ func runtimeModel(model piRuntimeModel) RuntimeModel {
 			levels = append(levels, level)
 		}
 	}
-	return RuntimeModel{Provider: model.Provider, ID: model.ID, ContextWindow: model.ContextWindow, Reasoning: model.Reasoning, ThinkingLevels: levels, ImageInput: imageInput}
+	defaultLevel := levels[0]
+	for _, level := range levels {
+		if level == "medium" {
+			defaultLevel = level
+			break
+		}
+	}
+	return RuntimeModel{Provider: model.Provider, ID: model.ID, ContextWindow: model.ContextWindow, Reasoning: model.Reasoning, ThinkingLevels: levels, DefaultThinkingLevel: defaultLevel, ImageInput: imageInput}
 }
 
 func (r *piAgentRuntime) models(timeout time.Duration) (RuntimeModelState, error) {
@@ -248,61 +254,101 @@ func (r *piAgentRuntime) models(timeout time.Duration) (RuntimeModelState, error
 	for _, model := range data.Models {
 		models = append(models, runtimeModel(model))
 	}
-	levelsResponse, err := rpc.Request(ctx, "get_available_thinking_levels", nil)
-	if err != nil {
-		return RuntimeModelState{}, err
+	currentFound := false
+	for _, model := range models {
+		if model.Provider == current.Provider && model.ID == current.ID {
+			current = model
+			currentFound = true
+			break
+		}
 	}
-	var levelsData struct {
-		Levels []string `json:"levels"`
-	}
-	if err := json.Unmarshal(levelsResponse.Data, &levelsData); err != nil {
-		return RuntimeModelState{}, fmt.Errorf("Pi get_available_thinking_levels returned unsupported data: %w", err)
+	if !currentFound && current.Provider != "" && current.ID != "" {
+		level := thinkingLevel
+		if level == "" {
+			level = current.DefaultThinkingLevel
+		}
+		if level == "" {
+			level = runtimecontract.ThinkingLevelDefault
+		}
+		foundLevel := false
+		for _, candidate := range current.ThinkingLevels {
+			if candidate == level {
+				foundLevel = true
+				break
+			}
+		}
+		if !foundLevel {
+			current.ThinkingLevels = append(current.ThinkingLevels, level)
+		}
+		if current.DefaultThinkingLevel == "" {
+			current.DefaultThinkingLevel = level
+		}
+		models = append(models, current)
 	}
 	r.mu.Lock()
 	r.availableModels = models
-	r.thinkingLevels = levelsData.Levels
+	r.currentModel = current
+	r.imageInput = current.ImageInput
 	r.mu.Unlock()
-	return RuntimeModelState{Current: current, Models: models, ThinkingLevel: thinkingLevel, ThinkingLevels: levelsData.Levels}, nil
+	return RuntimeModelState{Current: current, Models: models, ThinkingLevel: thinkingLevel}, nil
 }
 
 func (r *piAgentRuntime) switchModel(selection RuntimeModelSelection, timeout time.Duration) (RuntimeModelState, error) {
+	preview, err := r.models(timeout)
+	if err != nil {
+		return RuntimeModelState{}, err
+	}
+	if err := preview.ValidateSelection(selection); err != nil {
+		return RuntimeModelState{}, err
+	}
 	r.mu.Lock()
-	rpc, current, imageInput := r.rpc, r.currentModel, r.imageInput
+	rpc, current, currentThinking, imageInput := r.rpc, r.currentModel, r.thinkingLevel, r.imageInput
 	r.mu.Unlock()
 	if rpc == nil {
 		return RuntimeModelState{}, errors.New("Pi Runtime is not running")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	rollback := func(cause error) error {
+		if current.Provider == "" || current.ID == "" {
+			return cause
+		}
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), timeout)
+		defer rollbackCancel()
+		if _, rollbackErr := rpc.Request(rollbackCtx, "set_model", map[string]any{"provider": current.Provider, "modelId": current.ID}); rollbackErr != nil {
+			return piModelSelectionIndeterminate(fmt.Errorf("%v; restoring previous Pi model failed: %w", cause, rollbackErr))
+		}
+		if currentThinking != "" {
+			if _, rollbackErr := rpc.Request(rollbackCtx, "set_thinking_level", map[string]any{"level": currentThinking}); rollbackErr != nil {
+				return piModelSelectionIndeterminate(fmt.Errorf("%v; restoring previous Pi thinking level failed: %w", cause, rollbackErr))
+			}
+		}
+		return cause
+	}
 	model := piRuntimeModel{Provider: current.Provider, ID: current.ID}
 	modelChanged := current.Provider != selection.Provider || current.ID != selection.Model
 	if modelChanged {
 		response, err := rpc.Request(ctx, "set_model", map[string]any{"provider": selection.Provider, "modelId": selection.Model})
 		if err != nil {
-			return RuntimeModelState{}, err
+			return RuntimeModelState{}, piModelSelectionIndeterminate(fmt.Errorf("Pi set_model completion is unknown: %w", err))
 		}
 		if err := json.Unmarshal(response.Data, &model); err != nil || model.Provider == "" || model.ID == "" {
-			return RuntimeModelState{}, fmt.Errorf("Pi set_model returned unsupported model: %s", response.Data)
+			return RuntimeModelState{}, rollback(fmt.Errorf("Pi set_model returned unsupported model: %s", response.Data))
 		}
-	}
-	levelsResponse, err := rpc.Request(ctx, "get_available_thinking_levels", nil)
-	if err != nil {
-		return RuntimeModelState{}, err
-	}
-	var levelsData struct {
-		Levels []string `json:"levels"`
-	}
-	if err := json.Unmarshal(levelsResponse.Data, &levelsData); err != nil {
-		return RuntimeModelState{}, fmt.Errorf("Pi get_available_thinking_levels returned unsupported data: %w", err)
 	}
 	if selection.ThinkingLevel != "" {
 		if _, err := rpc.Request(ctx, "set_thinking_level", map[string]any{"level": selection.ThinkingLevel}); err != nil {
-			return RuntimeModelState{}, err
+			return RuntimeModelState{}, piModelSelectionIndeterminate(fmt.Errorf("Pi set_thinking_level completion is unknown: %w", err))
 		}
 	}
 	nextModel := current
 	if modelChanged {
-		nextModel = runtimeModel(model)
+		for _, candidate := range preview.Models {
+			if candidate.Provider == selection.Provider && candidate.ID == selection.Model {
+				nextModel = candidate
+				break
+			}
+		}
 		imageInput = nextModel.ImageInput
 	}
 	r.mu.Lock()
@@ -311,11 +357,17 @@ func (r *piAgentRuntime) switchModel(selection RuntimeModelSelection, timeout ti
 	if selection.ThinkingLevel != "" {
 		r.thinkingLevel = selection.ThinkingLevel
 	}
-	r.thinkingLevels = levelsData.Levels
 	thinkingLevel := r.thinkingLevel
 	models := append([]RuntimeModel(nil), r.availableModels...)
 	r.mu.Unlock()
-	return RuntimeModelState{Current: nextModel, Models: models, ThinkingLevel: thinkingLevel, ThinkingLevels: levelsData.Levels}, nil
+	return RuntimeModelState{Current: nextModel, Models: models, ThinkingLevel: thinkingLevel}, nil
+}
+
+func piModelSelectionIndeterminate(cause error) error {
+	return &runtimeIndeterminateError{failure: &runtimecontract.Failure{
+		Code: "model_selection_indeterminate", Phase: runtimecontract.FailurePhaseModelControl,
+		Message: "Pi model selection completion is indeterminate", Cause: cause,
+	}}
 }
 
 func (r *piAgentRuntime) InjectDeveloperContext(_ string, content string, _ time.Duration) error {

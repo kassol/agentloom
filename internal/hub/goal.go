@@ -211,6 +211,7 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 		cwd                string
 		provider           string
 		model              string
+		effort             string
 		disabledSkillPaths []string
 	}
 	h.mu.Lock()
@@ -222,7 +223,7 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 		providerID, model := effectiveProviderBinding(agent)
 		targets = append(targets, target{
 			agentID: agent.ID, threadID: agent.RuntimeBinding.NativeRef, sandbox: agent.Sandbox, cwd: agent.Cwd,
-			provider: providerID, model: model,
+			provider: providerID, model: model, effort: agent.Effort,
 			disabledSkillPaths: h.disabledSkillPathsLocked(agent.ID),
 		})
 	}
@@ -231,7 +232,7 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 	active := make([]target, 0)
 	for _, target := range targets {
 		contract := host.agentContract(target.agentID)
-		configureRuntimeBinding(contract, target.sandbox, target.provider, target.model, target.disabledSkillPaths)
+		configureRuntimeBinding(contract, target.sandbox, target.provider, target.model, target.effort, target.disabledSkillPaths)
 		capability, ok := contract.(runtimeGoalCapability)
 		if !ok {
 			log.Printf("[codex-loom] hydrate Goal for %s: Runtime Goal capability is unavailable", target.threadID)
@@ -261,7 +262,7 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 	// blocked, limited, and complete Goals remain visible without starting work.
 	for _, target := range active {
 		contract := host.agentContract(target.agentID)
-		configureRuntimeBinding(contract, target.sandbox, target.provider, target.model, target.disabledSkillPaths)
+		configureRuntimeBinding(contract, target.sandbox, target.provider, target.model, target.effort, target.disabledSkillPaths)
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		outcome := contract.ResumeBinding(ctx, runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: target.threadID})
 		cancel()
@@ -273,10 +274,6 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 
 func (h *Hub) GetGoal(key string) (*ThreadGoal, error) {
 	h.mu.Lock()
-	if h.providerSwitching {
-		h.mu.Unlock()
-		return nil, errf(409, "Codex Goal access is paused during an Agent Provider switch")
-	}
 	agent := h.resolveLocked(key)
 	if agent == nil {
 		h.mu.Unlock()
@@ -346,10 +343,6 @@ func (h *Hub) UpdateGoal(key string, update GoalUpdateParams) (*ThreadGoal, erro
 	}
 
 	h.mu.Lock()
-	if h.providerSwitching {
-		h.mu.Unlock()
-		return nil, errf(409, "Codex Goal changes are paused during an Agent Provider switch")
-	}
 	agent := h.resolveLocked(key)
 	if agent == nil {
 		h.mu.Unlock()
@@ -400,10 +393,6 @@ func (h *Hub) UpdateGoal(key string, update GoalUpdateParams) (*ThreadGoal, erro
 
 func (h *Hub) ClearGoal(key string) (bool, error) {
 	h.mu.Lock()
-	if h.providerSwitching {
-		h.mu.Unlock()
-		return false, errf(409, "Codex Goal changes are paused during an Agent Provider switch")
-	}
 	agent := h.resolveLocked(key)
 	if agent == nil {
 		h.mu.Unlock()
@@ -444,7 +433,7 @@ func (h *Hub) ClearGoal(key string) (bool, error) {
 func (h *Hub) resumeGoalThread(agentID string) {
 	h.mu.Lock()
 	agent := h.agents[agentID]
-	if h.providerSwitching || agent == nil || h.goals[agentID] == nil || h.goals[agentID].Status != GoalStatusActive {
+	if agent == nil || h.goals[agentID] == nil || h.goals[agentID].Status != GoalStatusActive {
 		h.mu.Unlock()
 		return
 	}

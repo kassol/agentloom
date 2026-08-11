@@ -47,9 +47,11 @@ var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 type HubError struct {
 	Status  int
 	Message string
+	Cause   error
 }
 
 func (e *HubError) Error() string { return e.Message }
+func (e *HubError) Unwrap() error { return e.Cause }
 
 func errf(status int, format string, args ...any) *HubError {
 	return &HubError{Status: status, Message: fmt.Sprintf(format, args...)}
@@ -384,7 +386,6 @@ type Hub struct {
 	shutdownOnce                     sync.Once
 	stopping                         bool
 	draining                         bool
-	providerSwitching                bool
 	triggerObservations              map[string]struct{}
 	background                       sync.WaitGroup
 	workers                          sync.WaitGroup
@@ -1324,13 +1325,13 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		rt.initErr = errf(404, "agent vanished")
 		return
 	}
-	threadID, threadName, sandbox, cwd := meta.RuntimeBinding.NativeRef, meta.Name, meta.Sandbox, meta.Cwd
+	threadID, threadName, sandbox, cwd, effort := meta.RuntimeBinding.NativeRef, meta.Name, meta.Sandbox, meta.Cwd, meta.Effort
 	providerID, model := effectiveProviderBinding(meta)
 	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
 	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
 	persistedBinding := runtimeContractBinding(meta)
 	h.mu.Unlock()
-	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, disabledSkillPaths)
+	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, effort, disabledSkillPaths)
 	startBinding := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 		defer cancel()
@@ -1478,7 +1479,7 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 		h.mu.Unlock()
 		return errf(404, "agent vanished")
 	}
-	threadID, sandbox := meta.RuntimeBinding.NativeRef, meta.Sandbox
+	threadID, sandbox, effort := meta.RuntimeBinding.NativeRef, meta.Sandbox, meta.Effort
 	providerID, model := effectiveProviderBinding(meta)
 	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
 	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
@@ -1494,7 +1495,7 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 		return errf(500, "Agent Runtime Contract is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
-	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, disabledSkillPaths)
+	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, effort, disabledSkillPaths)
 	outcome := rt.runtimeContract.ResumeBinding(ctx, rt.binding)
 	cancel()
 	err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false)

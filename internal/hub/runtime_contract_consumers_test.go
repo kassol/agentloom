@@ -344,7 +344,7 @@ func (c *controlPlaneContract) SetRuntimeModel(string)            {}
 func (c *controlPlaneContract) SetRuntimeDisabledSkills([]string) {}
 func (c *controlPlaneContract) SetRuntimeApprovalPolicy(string)   {}
 func (c *controlPlaneContract) SetRuntimeEffort(string)           {}
-func (c *controlPlaneContract) ValidateRuntimeInput(context.Context, runtimecontract.Binding, []runtimecontract.InputBlock) *runtimecontract.Failure {
+func (c *controlPlaneContract) ValidateInput(context.Context, runtimecontract.Binding, []runtimecontract.InputBlock) *runtimecontract.Failure {
 	return nil
 }
 func (c *controlPlaneContract) RuntimeGoal(context.Context, runtimecontract.Binding) (*ThreadGoal, error) {
@@ -359,11 +359,11 @@ func (c *controlPlaneContract) ClearRuntimeGoal(context.Context, runtimecontract
 func (c *controlPlaneContract) RuntimeUsage(context.Context, runtimecontract.Binding) (*RuntimeUsageReport, error) {
 	return &RuntimeUsageReport{}, nil
 }
-func (c *controlPlaneContract) RuntimeModels(context.Context, runtimecontract.Binding) (RuntimeModelState, error) {
-	return RuntimeModelState{}, nil
+func (c *controlPlaneContract) InspectModelControl(context.Context, runtimecontract.Binding) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
+	return runtimecontract.ModelControlState{}, nil
 }
-func (c *controlPlaneContract) SwitchRuntimeModel(context.Context, runtimecontract.Binding, RuntimeModelSelection) (RuntimeModelState, error) {
-	return RuntimeModelState{}, nil
+func (c *controlPlaneContract) SelectModel(context.Context, runtimecontract.Binding, runtimecontract.ModelSelection) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
+	return runtimecontract.ModelControlState{}, nil
 }
 func (c *controlPlaneContract) CompactRuntimeBinding(context.Context, runtimecontract.Binding) error {
 	return nil

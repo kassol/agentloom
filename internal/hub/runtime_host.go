@@ -61,10 +61,6 @@ type runtimeApprovalConfiguration interface{ SetRuntimeApprovalPolicy(string) }
 type runtimeEffortConfiguration interface{ SetRuntimeEffort(string) }
 type runtimeContextTimeoutConfiguration interface{ SetRuntimeDeveloperContextTimeout(time.Duration) }
 
-type runtimeInputCapability interface {
-	ValidateRuntimeInput(context.Context, runtimecontract.Binding, []runtimecontract.InputBlock) *runtimecontract.Failure
-}
-
 type runtimeGoalCapability interface {
 	RuntimeGoal(context.Context, runtimecontract.Binding) (*ThreadGoal, error)
 	UpdateRuntimeGoal(context.Context, runtimecontract.Binding, GoalUpdateParams) (*ThreadGoal, error)
@@ -73,11 +69,6 @@ type runtimeGoalCapability interface {
 
 type runtimeUsageCapability interface {
 	RuntimeUsage(context.Context, runtimecontract.Binding) (*RuntimeUsageReport, error)
-}
-
-type runtimeModelCatalogCapability interface {
-	RuntimeModels(context.Context, runtimecontract.Binding) (RuntimeModelState, error)
-	SwitchRuntimeModel(context.Context, runtimecontract.Binding, RuntimeModelSelection) (RuntimeModelState, error)
 }
 
 type runtimeCompactionCapability interface {
@@ -107,23 +98,15 @@ type runtimeContextEvidenceCapability interface {
 	RuntimeContextEvidence(context.Context, runtimecontract.Binding, RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error)
 }
 
-type RuntimeProviderHistorySanitizeResult struct {
-	Changed      int
-	OriginalPath string
-	BackupPath   string
-}
-
-type runtimeProviderHistoryCapability interface {
-	SanitizeProviderHistory(context.Context, string, string) (RuntimeProviderHistorySanitizeResult, error)
-	RestoreProviderHistory(context.Context, string, string) error
-}
-
-func configureRuntimeBinding(contract runtimecontract.Contract, sandbox, providerID, model string, disabledSkillPaths []string) {
+func configureRuntimeBinding(contract runtimecontract.Contract, sandbox, providerID, model, effort string, disabledSkillPaths []string) {
 	if capability, ok := contract.(runtimeSandboxConfiguration); ok {
 		capability.SetRuntimeSandbox(sandbox)
 	}
 	if capability, ok := contract.(runtimeProviderConfiguration); ok {
 		capability.SetRuntimeProvider(providerID, model)
+	}
+	if capability, ok := contract.(runtimeEffortConfiguration); ok {
+		capability.SetRuntimeEffort(effort)
 	}
 	if capability, ok := contract.(runtimeSkillsConfiguration); ok {
 		capability.SetRuntimeDisabledSkills(disabledSkillPaths)

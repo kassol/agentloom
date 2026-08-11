@@ -373,8 +373,12 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 		h.mu.Unlock()
 		return AgentView{}, errf(409, "Agent Runtime kind is immutable")
 	}
+	if p.ProviderID != nil || p.Model != nil || p.Effort != nil {
+		h.mu.Unlock()
+		return AgentView{}, errf(409, "Runtime model fields are changed through the typed Runtime model operation")
+	}
 	var snapshot runtimecontract.CapabilitySnapshot
-	if p.Sandbox != nil || p.ProviderID != nil || p.Model != nil || p.Effort != nil || p.ApprovalPolicy != nil {
+	if p.Sandbox != nil || p.ApprovalPolicy != nil {
 		capabilityQuery := h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[meta.ID])
 		h.mu.Unlock()
 		var capabilityErr error
@@ -400,12 +404,6 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 			return AgentView{}, err
 		}
 	}
-	if p.ProviderID != nil || p.Model != nil || p.Effort != nil {
-		if err := requireCapability(snapshot, runtimecontract.CapabilityProviderConfiguration, "Provider configuration"); err != nil {
-			h.mu.Unlock()
-			return AgentView{}, err
-		}
-	}
 	if p.ApprovalPolicy != nil {
 		if err := requireCapability(snapshot, runtimecontract.CapabilityApprovalPolicy, "Approval policy configuration"); err != nil {
 			h.mu.Unlock()
@@ -414,11 +412,8 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 	}
 
 	nextName := meta.Name
-	nextModel := meta.Model
-	nextEffort := meta.Effort
 	nextSandbox := meta.Sandbox
 	nextApprovalPolicy := meta.ApprovalPolicy
-	nextProviderID := meta.ProviderID
 
 	if p.Name != nil {
 		name := strings.TrimSpace(*p.Name)
@@ -441,44 +436,6 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 		}
 		nextName = name
 	}
-	if p.Model != nil {
-		nextModel = strings.TrimSpace(*p.Model)
-	}
-	if p.ProviderID != nil {
-		nextProviderID = normalizeProviderID(*p.ProviderID)
-		if nextProviderID != meta.ProviderID && strings.TrimSpace(meta.RuntimeBinding.NativeRef) != "" {
-			h.mu.Unlock()
-			return AgentView{}, errf(409, "agent %q already has a primary Thread; use the Provider switch operation", meta.Name)
-		}
-	}
-	if nextProviderID != "" && !nameRe.MatchString(nextProviderID) {
-		h.mu.Unlock()
-		return AgentView{}, errf(400, "providerId must match [a-zA-Z0-9_-]+")
-	}
-	if nextProviderID == deepSeekProviderID && nextModel == "" {
-		nextModel = deepSeekModel
-	}
-	if nextProviderID != "" && nextModel == "" {
-		h.mu.Unlock()
-		return AgentView{}, errf(400, "model is required for a custom Provider")
-	}
-	if nextProviderID == deepSeekProviderID && nextModel != deepSeekModel {
-		h.mu.Unlock()
-		return AgentView{}, errf(400, "DeepSeek Responses currently supports model %s", deepSeekModel)
-	}
-	if p.Effort != nil {
-		effort := normalizeEffort(strings.TrimSpace(*p.Effort))
-		if effort == "" || validEffort(effort) {
-			nextEffort = effort
-		} else {
-			h.mu.Unlock()
-			return AgentView{}, errf(400, "effort must be one of: minimal, low, medium, high, xhigh, max, ultra")
-		}
-	}
-	if err := validateModelEffort(nextProviderID, nextModel, nextEffort); err != nil {
-		h.mu.Unlock()
-		return AgentView{}, err
-	}
 	if p.Sandbox != nil {
 		nextSandbox = strings.TrimSpace(*p.Sandbox)
 	}
@@ -489,9 +446,6 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 	nameChanged := meta.Name != nextName
 	meta.Source = "" // editing config adopts an edge mirror into CodexLoom's registry
 	meta.Name = nextName
-	meta.ProviderID = nextProviderID
-	meta.Model = nextModel
-	meta.Effort = nextEffort
 	meta.Sandbox = nextSandbox
 	meta.ApprovalPolicy = nextApprovalPolicy
 	meta.UpdatedAt = now()
@@ -707,10 +661,6 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		h.mu.Unlock()
 		return SendResult{}, errf(409, "CodexLoom is draining for restart")
 	}
-	if h.providerSwitching {
-		h.mu.Unlock()
-		return SendResult{}, errf(409, "CodexLoom is switching an Agent Provider")
-	}
 	meta := h.resolveLocked(key)
 	if meta == nil {
 		h.mu.Unlock()
@@ -738,12 +688,8 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		return SendResult{}, err
 	}
 	agentID := meta.ID
-	providerID := meta.ProviderID
 	imageCapabilityErr := unsupportedRuntimeCapability(meta, "image input for the active model")
 	h.mu.Unlock()
-	if providerID == deepSeekProviderID && len(artifactIDs) > 0 {
-		return SendResult{}, errf(400, "DeepSeek %s currently supports text input only; remove image and file attachments", deepSeekModel)
-	}
 	artifacts, err := h.resolveThreadArtifacts(agentID, artifactIDs)
 	if err != nil {
 		return SendResult{}, err
@@ -787,12 +733,12 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		return SendResult{}, err
 	}
 	if hasImageArtifact {
-		capability, ok := rt.runtimeContract.(runtimeInputCapability)
+		capability, ok := rt.runtimeContract.(runtimecontract.InputCapability)
 		if !ok {
 			rt.startMu.Unlock()
 			return SendResult{}, imageCapabilityErr
 		}
-		if failure := capability.ValidateRuntimeInput(context.Background(), rt.binding, []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage}}); failure != nil {
+		if failure := capability.ValidateInput(context.Background(), rt.binding, []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage}}); failure != nil {
 			rt.startMu.Unlock()
 			return SendResult{}, imageCapabilityErr
 		}
@@ -813,11 +759,6 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		h.mu.Unlock()
 		rt.startMu.Unlock()
 		return SendResult{}, errf(409, "CodexLoom is draining for restart")
-	}
-	if h.providerSwitching {
-		h.mu.Unlock()
-		rt.startMu.Unlock()
-		return SendResult{}, errf(409, "CodexLoom is switching an Agent Provider")
 	}
 	meta = h.agents[agentID]
 	if meta == nil {

@@ -65,6 +65,22 @@ narrow typed optional hooks. A `CapabilitySnapshot` may say `available` only
 when the corresponding hook is present and passes its capability-specific
 exercise. Unknown or malformed descriptors fail closed.
 
+`ModelControlCapability` is the single per-Agent model surface. Its typed
+state carries the available catalog, active model, per-model thinking choices,
+and image-input truth; `SelectModel` applies one provider/model/thinking
+selection. The Hub validates the pending selection against a fresh state,
+revalidates the binding and configuration before persistence, and restores the
+previous Runtime selection if persistence loses the race or fails.
+`InputCapability` independently checks the committed active model again at
+Turn start. Inspector previews may therefore show a pending model while the
+composer continues to follow the active Capability Snapshot until Save
+succeeds.
+
+Codex Provider definitions, credentials, verification, and shared Host restart
+remain a Codex Host integration. They are not part of
+`ModelControlCapability`, and Pi does not implement that administration
+surface.
+
 Approval proposals cross the Contract as a Loom-neutral tool/action summary
 with a typed decision. Native RPC IDs, raw request JSON, client handles, and
 wire response vocabulary remain in the adapter's private pending-response

@@ -64,8 +64,6 @@ func validateRuntimeCapabilityHooks(contract runtimecontract.Contract, snapshot 
 		switch descriptor.ID {
 		case runtimecontract.CapabilitySandboxConfiguration:
 			_, implemented = contract.(runtimeSandboxConfiguration)
-		case runtimecontract.CapabilityProviderConfiguration:
-			_, implemented = contract.(runtimeProviderConfiguration)
 		case runtimecontract.CapabilityApprovalPolicy:
 			_, configured := contract.(runtimeApprovalConfiguration)
 			_, governed := contract.(runtimecontract.ApprovalCapability)
@@ -83,11 +81,11 @@ func validateRuntimeCapabilityHooks(contract runtimecontract.Contract, snapshot 
 		case runtimecontract.CapabilityUsageReporting:
 			_, implemented = contract.(runtimeUsageCapability)
 		case runtimecontract.CapabilityModelConfiguration:
-			_, implemented = contract.(runtimeModelCatalogCapability)
+			_, implemented = contract.(runtimecontract.ModelControlCapability)
 		case runtimecontract.CapabilityManualCompaction:
 			_, implemented = contract.(runtimeCompactionCapability)
 		case runtimecontract.CapabilityImageInput:
-			_, implemented = contract.(runtimeInputCapability)
+			_, implemented = contract.(runtimecontract.InputCapability)
 		}
 		if !implemented {
 			return errf(500, "Runtime advertises capability %q without its typed hook", descriptor.ID)
@@ -217,10 +215,6 @@ var controlPlaneCapabilityAlternatives = map[string][2]string{
 		"this Runtime does not provide whole-process sandbox isolation",
 		"use Approval policy to authorize individual tool actions",
 	},
-	runtimecontract.CapabilityProviderConfiguration: {
-		"this Runtime does not apply Loom Provider configuration",
-		"use the Runtime model switch operation or native Runtime settings",
-	},
 	runtimecontract.CapabilityApprovalPolicy: {
 		"this Runtime does not enforce Loom Approval policy",
 		"use the Runtime's native authorization controls",
@@ -285,7 +279,6 @@ func runtimeCapabilityDescriptor(runtimeKind, id string, available bool) runtime
 func controlPlaneCapabilitySnapshot(runtimeKind string) runtimecontract.CapabilitySnapshot {
 	return runtimecontract.CapabilitySnapshot{Revision: "runtime-contract-v2", Capabilities: []runtimecontract.CapabilityDescriptor{
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilitySandboxConfiguration, false),
-		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityProviderConfiguration, false),
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityApprovalPolicy, false),
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilitySkillsPolicy, false),
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityContextDelivery, false),
@@ -304,7 +297,6 @@ func codexControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Cap
 	imageAvailable := len(imageInput) > 0 && imageInput[0]
 	return runtimecontract.CapabilitySnapshot{Revision: "runtime-contract-v2", Capabilities: []runtimecontract.CapabilityDescriptor{
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilitySandboxConfiguration, true),
-		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityProviderConfiguration, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityApprovalPolicy, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilitySkillsPolicy, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityContextDelivery, true),
@@ -313,7 +305,7 @@ func codexControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Cap
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityGoal, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityRemote, false),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityUsageReporting, true),
-		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityModelConfiguration, false),
+		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityModelConfiguration, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityManualCompaction, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityImageInput, imageAvailable),
 	}}
@@ -323,7 +315,6 @@ func piControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Capabi
 	imageAvailable := len(imageInput) > 0 && imageInput[0]
 	return runtimecontract.CapabilitySnapshot{Revision: "runtime-contract-v2", Capabilities: []runtimecontract.CapabilityDescriptor{
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilitySandboxConfiguration, false),
-		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityProviderConfiguration, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityApprovalPolicy, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilitySkillsPolicy, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityContextDelivery, true),
@@ -382,7 +373,7 @@ func (h *Hub) validateRequestedRuntimeConfiguration(runtimeKind, sandbox string,
 		}
 	}
 	if providerRequested {
-		if err := requireCapability(snapshot, runtimecontract.CapabilityProviderConfiguration, "Provider configuration"); err != nil {
+		if err := requireCapability(snapshot, runtimecontract.CapabilityModelConfiguration, "Runtime model configuration"); err != nil {
 			return err
 		}
 	}

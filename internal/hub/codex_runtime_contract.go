@@ -6,12 +6,15 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
+	"github.com/yan5xu/codex-loom/internal/modelcatalog"
 	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
@@ -34,10 +37,18 @@ type codexRuntimeContract struct {
 	handler                 func(runtimecontract.Event)
 	approvalHandler         func(runtimecontract.ApprovalProposal)
 	approvalResponses       map[string]codexNativeApprovalResponse
+	modelCatalog            func() ([]runtimecontract.Model, error)
+	modelCompensation       *codexModelCompensation
 	bindingRef              string
 	release                 func()
 	pendingTurn             runtimeTurnCorrelation
 	turnsByNative           map[string]runtimeTurnCorrelation
+}
+
+type codexModelCompensation struct {
+	previous runtimecontract.ModelSelection
+	backup   string
+	original string
 }
 
 type runtimeTurnCorrelation struct {
@@ -79,7 +90,7 @@ func (c *codexRuntimeContract) SetRuntimeSandbox(value string) {
 
 func (c *codexRuntimeContract) SetRuntimeProvider(providerID, model string) {
 	c.mu.Lock()
-	c.providerID, c.model = providerID, model
+	c.providerID, c.model = normalizePublicProviderID(providerID), model
 	c.mu.Unlock()
 }
 
@@ -103,6 +114,9 @@ func (c *codexRuntimeContract) SetRuntimeApprovalPolicy(value string) {
 
 func (c *codexRuntimeContract) SetRuntimeEffort(value string) {
 	c.mu.Lock()
+	if value == runtimecontract.ThinkingLevelDefault {
+		value = ""
+	}
 	c.effort = value
 	c.mu.Unlock()
 }
@@ -116,7 +130,7 @@ func (c *codexRuntimeContract) SetRuntimeDeveloperContextTimeout(value time.Dura
 func (c *codexRuntimeContract) nativeBindingRequest(name, cwd, nativeRef string) nativeBindingRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return nativeBindingRequest{NativeRef: nativeRef, Name: name, Cwd: cwd, Sandbox: c.sandbox, ProviderID: c.providerID, Model: c.model, DisabledSkillPaths: append([]string(nil), c.disabledSkillPaths...)}
+	return nativeBindingRequest{NativeRef: nativeRef, Name: name, Cwd: cwd, Sandbox: c.sandbox, ProviderID: normalizeProviderID(c.providerID), Model: c.model, DisabledSkillPaths: append([]string(nil), c.disabledSkillPaths...)}
 }
 
 func (c *codexRuntimeContract) nativeTurnRequest(request runtimecontract.TurnRequest) nativeTurnRequest {
@@ -494,17 +508,18 @@ func (c *codexRuntimeContract) InspectInterruptedTurn(ctx context.Context, targe
 	return inspectCodexInterruptedTurn(turn), nil
 }
 
-func (c *codexRuntimeContract) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
-	c.mu.Lock()
-	imageInput := c.providerID != deepSeekProviderID
-	c.mu.Unlock()
+func (c *codexRuntimeContract) CapabilitySnapshot(ctx context.Context, binding runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
+	state, failure := c.InspectModelControl(ctx, binding)
+	imageInput := failure == nil && state.Current.ImageInput
 	return codexControlPlaneCapabilitySnapshot(imageInput)
 }
 
-func (c *codexRuntimeContract) ValidateRuntimeInput(_ context.Context, _ runtimecontract.Binding, input []runtimecontract.InputBlock) *runtimecontract.Failure {
-	c.mu.Lock()
-	imageInput := c.providerID != deepSeekProviderID
-	c.mu.Unlock()
+func (c *codexRuntimeContract) ValidateInput(ctx context.Context, binding runtimecontract.Binding, input []runtimecontract.InputBlock) *runtimecontract.Failure {
+	state, failure := c.InspectModelControl(ctx, binding)
+	if failure != nil {
+		return failure
+	}
+	imageInput := state.Current.ImageInput
 	if imageInput {
 		return nil
 	}
@@ -514,6 +529,166 @@ func (c *codexRuntimeContract) ValidateRuntimeInput(_ context.Context, _ runtime
 		}
 	}
 	return nil
+}
+
+func (c *codexRuntimeContract) InspectModelControl(ctx context.Context, _ runtimecontract.Binding) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
+	return c.inspectModelControl(ctx)
+}
+
+func (c *codexRuntimeContract) inspectModelControl(ctx context.Context) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
+	if err := ctx.Err(); err != nil {
+		return runtimecontract.ModelControlState{}, modelControlFailure(err)
+	}
+	c.mu.Lock()
+	provider, currentID, thinking := normalizePublicProviderID(c.providerID), c.model, c.effort
+	c.mu.Unlock()
+	models, err := c.availableModelCatalog()
+	if err != nil {
+		return runtimecontract.ModelControlState{}, modelControlFailure(err)
+	}
+	if provider == "" {
+		provider = "openai"
+	}
+	currentIndex := -1
+	for i := range models {
+		if models[i].Provider == provider && models[i].ID == currentID {
+			currentIndex = i
+			break
+		}
+	}
+	if currentIndex < 0 {
+		level := thinking
+		if level == "" {
+			level = runtimecontract.ThinkingLevelDefault
+		}
+		models = append(models, runtimecontract.Model{Provider: provider, ID: currentID, DisplayName: currentID, ThinkingLevels: []string{level}, DefaultThinkingLevel: level})
+		currentIndex = len(models) - 1
+	}
+	current := models[currentIndex]
+	if thinking == "" {
+		thinking = current.DefaultThinkingLevel
+	}
+	return runtimecontract.ModelControlState{Current: current, Models: models, ThinkingLevel: thinking}, nil
+}
+
+func (c *codexRuntimeContract) availableModelCatalog() ([]runtimecontract.Model, error) {
+	c.mu.Lock()
+	load := c.modelCatalog
+	c.mu.Unlock()
+	if load != nil {
+		return load()
+	}
+	snapshot, err := modelcatalog.Describe(os.Getenv("CODEX_LOOM_MODEL_CATALOG"))
+	if err != nil {
+		return nil, err
+	}
+	models := []runtimecontract.Model{{
+		Provider: "openai", ID: "", DisplayName: "Default (Codex)", Reasoning: true,
+		ThinkingLevels: []string{runtimecontract.ThinkingLevelDefault, "minimal", "low", "medium", "high", "xhigh"}, DefaultThinkingLevel: runtimecontract.ThinkingLevelDefault, ImageInput: true,
+	}}
+	for _, model := range snapshot.PublicModels() {
+		if model.Visible {
+			models = append(models, runtimeModelFromCatalog(model))
+		}
+	}
+	return models, nil
+}
+
+func runtimeModelFromCatalog(model modelcatalog.PublicModel) runtimecontract.Model {
+	imageInput := false
+	for _, modality := range model.InputModalities {
+		if modality == "image" {
+			imageInput = true
+			break
+		}
+	}
+	levels := append([]string(nil), model.ReasoningEfforts...)
+	defaultLevel := model.DefaultReasoningEffort
+	if len(levels) == 0 {
+		levels = []string{runtimecontract.ThinkingLevelDefault}
+		defaultLevel = runtimecontract.ThinkingLevelDefault
+	} else if defaultLevel == "" {
+		defaultLevel = levels[0]
+	}
+	return runtimecontract.Model{
+		Provider: model.ProviderID, ID: model.ID, DisplayName: model.DisplayName,
+		ContextWindow: int(model.ContextWindow), Reasoning: len(model.ReasoningEfforts) > 0,
+		ThinkingLevels: levels, DefaultThinkingLevel: defaultLevel,
+		ImageInput: imageInput,
+	}
+}
+
+func (c *codexRuntimeContract) SelectModel(ctx context.Context, binding runtimecontract.Binding, selection runtimecontract.ModelSelection) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
+	c.mu.Lock()
+	compensation := c.modelCompensation
+	c.mu.Unlock()
+	isCompensation := compensation != nil && compensation.previous == selection
+	state, failure := c.inspectModelControl(ctx)
+	if failure != nil {
+		return runtimecontract.ModelControlState{}, failure
+	}
+	if err := state.ValidateSelection(selection); err != nil {
+		return runtimecontract.ModelControlState{}, modelControlFailure(err)
+	}
+	previous := runtimecontract.ModelSelection{Provider: state.Current.Provider, Model: state.Current.ID, ThinkingLevel: state.ThinkingLevel}
+	var sanitizedBackup, sanitizedOriginal string
+	if previous.Provider != "openai" && selection.Provider == "openai" && binding.NativeRef != "" {
+		result, err := rollout.SanitizeReasoningContent(binding.NativeRef, filepath.Join(os.TempDir(), "codexloom-model-control-backups"))
+		if err != nil && !errors.Is(err, rollout.ErrRolloutNotFound) {
+			return runtimecontract.ModelControlState{}, modelControlFailure(fmt.Errorf("prepare Codex history for OpenAI model: %w", err))
+		}
+		if err == nil {
+			sanitizedBackup, sanitizedOriginal = result.BackupPath, result.OriginalPath
+		}
+	}
+	c.mu.Lock()
+	effort := selection.ThinkingLevel
+	if effort == runtimecontract.ThinkingLevelDefault {
+		effort = ""
+	}
+	c.providerID, c.model, c.effort = normalizePublicProviderID(selection.Provider), selection.Model, effort
+	c.mu.Unlock()
+	if binding.NativeRef != "" && c.native != nil && c.native.client != nil {
+		request := c.nativeBindingRequest("", "", binding.NativeRef)
+		if err := c.native.Resume(request, contractTimeout(ctx, 60*time.Second)); err != nil {
+			c.mu.Lock()
+			previousEffort := previous.ThinkingLevel
+			if previousEffort == runtimecontract.ThinkingLevelDefault {
+				previousEffort = ""
+			}
+			c.providerID, c.model, c.effort = normalizePublicProviderID(previous.Provider), previous.Model, previousEffort
+			c.mu.Unlock()
+			if sanitizedBackup != "" && sanitizedOriginal != "" {
+				if restoreErr := rollout.RestoreRolloutBackup(sanitizedBackup, sanitizedOriginal); restoreErr != nil {
+					return runtimecontract.ModelControlState{}, modelControlFailure(fmt.Errorf("resume selected Codex model: %v; restore sanitized history: %w", err, restoreErr))
+				}
+			}
+			return runtimecontract.ModelControlState{}, modelControlFailure(fmt.Errorf("resume selected Codex model: %w", err))
+		}
+	}
+	next, failure := c.inspectModelControl(ctx)
+	if failure != nil {
+		return next, failure
+	}
+	if isCompensation {
+		if err := rollout.RestoreRolloutBackup(compensation.backup, compensation.original); err != nil {
+			return runtimecontract.ModelControlState{}, &runtimecontract.Failure{Code: "model_selection_indeterminate", Phase: runtimecontract.FailurePhaseModelControl, Message: "restore sanitized Codex history failed", Cause: err}
+		}
+		c.mu.Lock()
+		c.modelCompensation = nil
+		c.mu.Unlock()
+	} else if sanitizedBackup != "" && sanitizedOriginal != "" {
+		c.mu.Lock()
+		c.modelCompensation = &codexModelCompensation{previous: previous, backup: sanitizedBackup, original: sanitizedOriginal}
+		c.mu.Unlock()
+	}
+	return next, nil
+}
+
+func (c *codexRuntimeContract) CommitModelSelection() {
+	c.mu.Lock()
+	c.modelCompensation = nil
+	c.mu.Unlock()
 }
 
 func (c *codexRuntimeContract) RuntimeGoal(ctx context.Context, binding runtimecontract.Binding) (*ThreadGoal, error) {

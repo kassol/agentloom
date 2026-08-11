@@ -35,6 +35,12 @@ func TestAgentDetailUsesCapabilitySnapshotAsOnlyRuntimeCapabilitySurface(t *test
 	if !ok || snapshot["revision"] == "" || len(snapshot["capabilities"].([]any)) == 0 {
 		t.Fatalf("Agent detail omitted scoped capability snapshot: %#v", agent)
 	}
+	for _, raw := range snapshot["capabilities"].([]any) {
+		capability := raw.(map[string]any)
+		if capability["id"] == "provider_configuration" {
+			t.Fatalf("Agent detail exposed Host Provider administration as a per-Agent Runtime capability: %#v", snapshot)
+		}
+	}
 }
 
 func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
@@ -72,11 +78,11 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 			}
 		})
 	}
-	request := httptest.NewRequest(http.MethodPost, "/api/agents/agent-pi/runtime/model", strings.NewReader(`{"provider":"xai"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/agents/agent-pi/provider", strings.NewReader(`{"providerId":"xai","model":"grok"}`))
 	recorder := httptest.NewRecorder()
 	server.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "provider and model are required") {
-		t.Fatalf("invalid Pi Runtime model switch = %d %s", recorder.Code, recorder.Body.String())
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("obsolete per-Agent Provider authority is still reachable: %d %s", recorder.Code, recorder.Body.String())
 	}
 	response := topicRequest(t, server, http.MethodPatch, "/api/agents/agent-pi/config", map[string]any{"approvalPolicy": "on-request"}, http.StatusOK)
 	agent := response["agent"].(map[string]any)

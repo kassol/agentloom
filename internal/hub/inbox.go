@@ -249,7 +249,7 @@ func (h *Hub) queuedInboxAgents() []string {
 
 func (h *Hub) deliverNextInboxForAgent(agentID string) {
 	h.mu.Lock()
-	if h.isDrainingLocked() || h.providerSwitching {
+	if h.isDrainingLocked() {
 		h.mu.Unlock()
 		return
 	}

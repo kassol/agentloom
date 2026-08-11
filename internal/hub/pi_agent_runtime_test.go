@@ -1356,8 +1356,6 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 			goto entriesReady
 		case "get_available_models":
 			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"fixture","id":"vision","input":["text","image"],"contextWindow":128000,"reasoning":true},{"provider":"fixture","id":"vision-next","input":["text","image"],"contextWindow":128000,"reasoning":true}]}}`+"\n", id)
-		case "get_available_thinking_levels":
-			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","low","high"]}}`+"\n", id)
 		case "set_model":
 			provider, _ := command["provider"].(string)
 			model, _ := command["modelId"].(string)
@@ -1380,9 +1378,6 @@ entriesReady:
 			continue
 		case "get_available_models":
 			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"fixture","id":"vision","input":["text","image"],"contextWindow":128000,"reasoning":true},{"provider":"fixture","id":"vision-next","input":["text","image"],"contextWindow":128000,"reasoning":true}]}}`+"\n", id)
-			continue
-		case "get_available_thinking_levels":
-			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","low","high"]}}`+"\n", id)
 			continue
 		case "set_model":
 			provider, _ := command["provider"].(string)

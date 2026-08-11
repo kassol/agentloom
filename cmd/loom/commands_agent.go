@@ -387,20 +387,36 @@ func cmdAgentProvider(a args) {
 		usage("agent provider <name|id> --provider PROVIDER [--model MODEL]")
 	}
 	providerID := strings.TrimSpace(a.flags["provider"])
-	resp, err := api("POST", "/api/agents/"+url.PathEscape(a.positional[0])+"/provider", map[string]any{
-		"providerId": providerID,
-		"model":      strings.TrimSpace(a.flags["model"]),
+	modelID := strings.TrimSpace(a.flags["model"])
+	path := "/api/agents/" + url.PathEscape(a.positional[0]) + "/runtime/models"
+	catalog, err := api("GET", path, nil)
+	if err != nil {
+		fail(err)
+	}
+	var selected map[string]any
+	models, _ := catalog["models"].([]any)
+	for _, value := range models {
+		model, _ := value.(map[string]any)
+		if str(model, "provider") != providerID || (modelID != "" && str(model, "id") != modelID) {
+			continue
+		}
+		if selected != nil && modelID == "" {
+			fail(fmt.Errorf("provider %s has multiple Runtime models; pass --model", providerID))
+		}
+		selected = model
+	}
+	if selected == nil {
+		fail(fmt.Errorf("Runtime model %s/%s is not available", providerID, modelID))
+	}
+	resp, err := api("POST", "/api/agents/"+url.PathEscape(a.positional[0])+"/runtime/model", map[string]any{
+		"provider": providerID, "model": str(selected, "id"), "thinkingLevel": str(selected, "defaultThinkingLevel"),
 	})
 	if err != nil {
 		fail(err)
 	}
-	agent, _ := resp["agent"].(map[string]any)
-	actualProvider := str(agent, "providerId")
-	if actualProvider == "" {
-		actualProvider = "openai"
-	}
-	fmt.Printf("%s %s (%s)\n  thread:   %s\n  provider: %s\n  model:    %s\n",
-		green("switched"), bold(str(agent, "name")), str(agent, "id"), str(agent, "threadId"), actualProvider, str(agent, "model"))
+	current, _ := resp["current"].(map[string]any)
+	fmt.Printf("%s %s\n  provider: %s\n  model:    %s\n  thinking: %s\n",
+		green("switched"), bold(a.positional[0]), str(current, "provider"), str(current, "id"), str(resp, "thinkingLevel"))
 }
 
 func cmdSend(a args) {

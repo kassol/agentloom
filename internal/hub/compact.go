@@ -22,10 +22,6 @@ type ThreadCompactResult struct {
 // context on the next Turn after Codex writes the compaction marker.
 func (h *Hub) CompactAgentThread(key string) (ThreadCompactResult, error) {
 	h.mu.Lock()
-	if h.providerSwitching {
-		h.mu.Unlock()
-		return ThreadCompactResult{}, errf(409, "Codex compaction is paused during an Agent Provider switch")
-	}
 	if h.stopping {
 		h.mu.Unlock()
 		return ThreadCompactResult{}, errf(503, "CodexLoom is shutting down")

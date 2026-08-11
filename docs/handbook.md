@@ -187,7 +187,7 @@ Observe 命令分别放在 `commands_*.go`。新增命令必须归入所属领�
 `human_request.go` 管 Needs You；`remote.go` 管远程控制；`collaboration_group.go` 管 Team
 Group；`context.go` 管 Loom Prompt 与 epoch coverage；`daily_activity.go`、`workload.go` 和
 `usage.go` 管观察/容量口径；`interrupted_turn.go` 管重启后的 Turn 恢复；`provider_operation.go`
-管异步 Connector 操作账本；`model_provider.go` 与 `provider_switch.go` 管 custom
+管异步 Connector 操作账本；`model_provider.go` 与 `runtime_model.go` 管 custom
 Provider 配置和 Agent primary Thread 切换。静态模型目录由 `internal/modelcatalog/`
 统一描述、校验和物化。
 

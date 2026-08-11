@@ -65,9 +65,11 @@ export interface CapabilitySnapshot {
 export interface RuntimeModel {
   provider: string;
   id: string;
+  displayName?: string;
   contextWindow?: number;
   reasoning: boolean;
   thinkingLevels: string[];
+  defaultThinkingLevel?: string;
   imageInput: boolean;
 }
 

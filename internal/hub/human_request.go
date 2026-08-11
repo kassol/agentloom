@@ -443,7 +443,7 @@ func (h *Hub) drainHumanAnswers() {
 
 func (h *Hub) deliverAnsweredHumanRequest(agentID string) (HumanRequest, bool) {
 	h.mu.Lock()
-	if h.isDrainingLocked() || h.providerSwitching {
+	if h.isDrainingLocked() {
 		h.mu.Unlock()
 		return HumanRequest{}, false
 	}

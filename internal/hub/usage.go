@@ -80,6 +80,12 @@ var agentUsageCache = struct {
 	clock   uint64
 }{entries: map[string]agentUsageCacheEntry{}}
 
+func clearAgentUsageCache() {
+	agentUsageCache.Lock()
+	agentUsageCache.entries = map[string]agentUsageCacheEntry{}
+	agentUsageCache.Unlock()
+}
+
 func cachedAgentUsage(key string, report *RuntimeUsageReport) (AgentUsage, bool) {
 	agentUsageCache.Lock()
 	defer agentUsageCache.Unlock()

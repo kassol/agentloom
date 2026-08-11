@@ -390,8 +390,6 @@ func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contrac
 		switch descriptor.ID {
 		case runtimecontract.CapabilitySandboxConfiguration:
 			contract.(runtimeSandboxConfiguration).SetRuntimeSandbox("danger-full-access")
-		case runtimecontract.CapabilityProviderConfiguration:
-			contract.(runtimeProviderConfiguration).SetRuntimeProvider("fixture-provider", "fixture-model")
 		case runtimecontract.CapabilityApprovalPolicy:
 			contract.(runtimeApprovalConfiguration).SetRuntimeApprovalPolicy("on-request")
 			capability := contract.(runtimecontract.ApprovalCapability)
@@ -427,22 +425,28 @@ func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contrac
 				t.Fatalf("usage report = %#v, err=%v", report, err)
 			}
 		case runtimecontract.CapabilityModelConfiguration:
-			capability := contract.(runtimeModelCatalogCapability)
-			state, err := capability.RuntimeModels(context.Background(), binding)
-			if err != nil || len(state.Models) == 0 {
-				t.Fatalf("model catalog = %#v, err=%v", state, err)
+			capability := contract.(runtimecontract.ModelControlCapability)
+			state, failure := capability.InspectModelControl(context.Background(), binding)
+			if failure != nil || len(state.Models) == 0 {
+				t.Fatalf("model catalog = %#v, failure=%v", state, failure)
 			}
-			model := state.Models[len(state.Models)-1]
+			model := state.Current
+			for _, candidate := range state.Models {
+				if candidate.ImageInput && candidate.ID != "" && (candidate.Provider != state.Current.Provider || candidate.ID != state.Current.ID) {
+					model = candidate
+					break
+				}
+			}
 			selection := RuntimeModelSelection{Provider: model.Provider, Model: model.ID}
-			if _, err := capability.SwitchRuntimeModel(context.Background(), binding, selection); err != nil {
-				t.Fatalf("model switch: %v", err)
+			if _, failure := capability.SelectModel(context.Background(), binding, selection); failure != nil {
+				t.Fatalf("model switch: %v", failure)
 			}
 		case runtimecontract.CapabilityManualCompaction:
 			if err := contract.(runtimeCompactionCapability).CompactRuntimeBinding(context.Background(), binding); err != nil {
 				t.Fatalf("manual compaction: %v", err)
 			}
 		case runtimecontract.CapabilityImageInput:
-			if failure := contract.(runtimeInputCapability).ValidateRuntimeInput(context.Background(), binding, []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage, Ref: "data:image/png;base64,iVBORw0KGgo=", MIMEType: "image/png"}}); failure != nil {
+			if failure := contract.(runtimecontract.InputCapability).ValidateInput(context.Background(), binding, []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage, Ref: "data:image/png;base64,iVBORw0KGgo=", MIMEType: "image/png"}}); failure != nil {
 				t.Fatalf("image input rejected: %#v", failure)
 			}
 		default:
@@ -545,7 +549,7 @@ func newCodexConformanceFixture(t *testing.T) runtimeConformanceFixture {
 				t.Fatal(readErr)
 			}
 			value := string(requests)
-			for _, expected := range []string{`"modelProvider":"fixture-provider"`, `"model":"fixture-model"`, `"sandbox":"danger-full-access"`, `/fixture/disabled-skill`, `"approvalPolicy":"on-request"`, `"sandboxPolicy":{"type":"dangerFullAccess"}`, `runtime-contract-context-sentinel`, `"type":"localImage"`, `conformance.png`} {
+			for _, expected := range []string{`"model":"gpt-5.6-sol"`, `"sandbox":"danger-full-access"`, `/fixture/disabled-skill`, `"approvalPolicy":"on-request"`, `"sandboxPolicy":{"type":"dangerFullAccess"}`, `runtime-contract-context-sentinel`, `"type":"localImage"`, `conformance.png`} {
 				if !strings.Contains(value, expected) {
 					t.Fatalf("configured Codex capability did not reach native request %q: %s", expected, value)
 				}

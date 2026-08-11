@@ -2,7 +2,7 @@ import { ArrowDown, ArrowUpRight, BarChart3, CalendarClock, Check, ChevronRight,
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ConversationMembership, type HumanRequest, type InboxEntry, type ModelProvider, type PlatformConnection, type RuntimeModel, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
+import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ConversationMembership, type HumanRequest, type InboxEntry, type PlatformConnection, type RuntimeModel, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
 import { emptyFeed, reduceFeed } from "./feed";
 import type { Block } from "./feed";
 import type { LoomEvent } from "./types";
@@ -12,8 +12,6 @@ import { Popover, PopoverContent, PopoverTrigger } from "./components/ui/popover
 import { subscribeThreadEvents } from "./thread-events";
 import { oldestWaitingMs } from "./product-state";
 
-const CUSTOM_MODEL_VALUE = "__custom";
-const FALLBACK_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 function capabilityAvailable(agent: Agent, id: string) {
   return agent.capabilitySnapshot.capabilities.some((capability) => capability.id === id && capability.availability === "available");
@@ -72,7 +70,6 @@ function feedBlockKey(block: Block) {
 
 export function AgentPane({
   agent,
-  modelProviders,
   active,
   configRequestNonce,
   pendingWork,
@@ -87,7 +84,6 @@ export function AgentPane({
   onAgentUpdated,
 }: {
   agent: Agent;
-  modelProviders: ModelProvider[];
   active: boolean;
   configRequestNonce: number;
   pendingWork: InboxEntry[];
@@ -101,7 +97,6 @@ export function AgentPane({
   onError: (msg: string) => void;
   onAgentUpdated: (agent: Agent) => void;
 }) {
-  const providerConfigurationAvailable = capabilityAvailable(agent, "provider_configuration");
   const sandboxConfigurationAvailable = capabilityAvailable(agent, "sandbox_configuration");
   const approvalPolicyAvailable = capabilityAvailable(agent, "approval_policy");
   const modelConfigurationAvailable = capabilityAvailable(agent, "model_configuration");
@@ -126,15 +121,15 @@ export function AgentPane({
   const [nameDraft, setNameDraft] = useState(agent.name);
   const [providerDraft, setProviderDraft] = useState(agent.providerId || "openai");
   const [modelDraft, setModelDraft] = useState(agent.model || "");
-  const [modelCustomOpen, setModelCustomOpen] = useState(isCustomModel(agent.model || "", agent.providerId, modelProviders));
 	const [runtimeModels, setRuntimeModels] = useState<RuntimeModel[]>([]);
 	const [runtimeModelCurrent, setRuntimeModelCurrent] = useState<RuntimeModel | null>(null);
 	const [runtimeThinkingLevel, setRuntimeThinkingLevel] = useState("");
-	const [runtimeThinkingLevels, setRuntimeThinkingLevels] = useState<string[]>([]);
   const [effortDraft, setEffortDraft] = useState(agent.effort || "");
   const [sandboxDraft, setSandboxDraft] = useState(agent.sandbox || "danger-full-access");
   const [approvalDraft, setApprovalDraft] = useState(agent.approvalPolicy || "never");
   const [savingConfig, setSavingConfig] = useState(false);
+	const [savingRuntimeModel, setSavingRuntimeModel] = useState(false);
+	const [runtimeModelSaveStatus, setRuntimeModelSaveStatus] = useState<"" | "saved" | "failed">("");
   const [profile, setProfile] = useState<AgentProfile | null>(null);
   const [identityDraft, setIdentityDraft] = useState("");
   const [domainDraft, setDomainDraft] = useState("");
@@ -291,7 +286,6 @@ export function AgentPane({
     setNameDraft(agent.name);
     setProviderDraft(agent.providerId || "openai");
     setModelDraft(agent.model || "");
-    setModelCustomOpen(isCustomModel(agent.model || "", agent.providerId, modelProviders));
     setEffortDraft(agent.effort || "");
     setSandboxDraft(agent.sandbox || "danger-full-access");
     setApprovalDraft(agent.approvalPolicy || "never");
@@ -336,12 +330,10 @@ export function AgentPane({
 		  const current = data.current as RuntimeModel;
 		  setRuntimeModels((data.models || []) as RuntimeModel[]);
 		  setRuntimeModelCurrent(current);
-		  setRuntimeThinkingLevel(data.thinkingLevel || "off");
-		  setRuntimeThinkingLevels(data.thinkingLevels || []);
+		  setRuntimeThinkingLevel(data.thinkingLevel ?? "");
 		  setProviderDraft(current.provider);
 		  setModelDraft(current.id);
-		  setEffortDraft(data.thinkingLevel || "off");
-		  setModelCustomOpen(false);
+		  setEffortDraft(data.thinkingLevel ?? "");
 		})
 		.catch(() => {
 		  if (cancelled) return;
@@ -349,7 +341,7 @@ export function AgentPane({
 		  setRuntimeModelCurrent(null);
 		});
 	  return () => { cancelled = true; };
-	}, [configOpen, configSection, agent.id, modelConfigurationAvailable]);
+	}, [configOpen, configSection, agent.id, modelConfigurationAvailable, agent.capabilitySnapshot.revision]);
 
   const refreshConnections = async () => {
     const [addressData, connectionData, membershipData] = await Promise.all([
@@ -821,38 +813,12 @@ export function AgentPane({
     }
     setSavingConfig(true);
     try {
-      let updated = agent;
-	  const runtimeModelControl = !!runtimeModelCurrent || runtimeModels.length > 0;
-	  if (runtimeModelControl && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel)) {
-		const state = await api("POST", `/api/agents/${agent.id}/runtime/model`, {
-		  provider: providerDraft,
-		  model: modelDraft.trim(),
-		  thinkingLevel: effortDraft,
-		});
-		setRuntimeModelCurrent(state.current as RuntimeModel);
-		setRuntimeModels((state.models || []) as RuntimeModel[]);
-		setRuntimeThinkingLevel(state.thinkingLevel || "off");
-		setRuntimeThinkingLevels(state.thinkingLevels || []);
-	  } else if (!runtimeModelControl && providerDraft !== (agent.providerId || "openai")) {
-        const switched = await api("POST", `/api/agents/${agent.id}/provider`, {
-          providerId: providerDraft,
-          model: modelDraft.trim(),
-        });
-        updated = switched.agent as Agent;
-        onAgentUpdated(updated);
-      }
-	  const data = await api("PATCH", `/api/agents/${agent.id}/config`, runtimeModelControl ? {
+	  const data = await api("PATCH", `/api/agents/${agent.id}/config`, {
 		name: nextName,
 		approvalPolicy: approvalDraft,
-	  } : {
-        name: nextName,
-        model: modelDraft.trim(),
-        effort: effortDraft,
-        sandbox: sandboxDraft,
-        approvalPolicy: approvalDraft,
-      });
-      updated = data.agent as Agent;
-      onAgentUpdated(updated);
+		...(sandboxConfigurationAvailable ? { sandbox: sandboxDraft } : {}),
+	  });
+      onAgentUpdated(data.agent as Agent);
       setConfigOpen(false);
     } catch (err: any) {
       onError(err.message);
@@ -860,6 +826,33 @@ export function AgentPane({
       setSavingConfig(false);
     }
   };
+
+	const saveRuntimeModel = async () => {
+	  if (running || savingRuntimeModel || !runtimeModelCurrent) return;
+	  if (!pendingModelSelectionValid || pendingImageConflict) {
+		onError(pendingImageConflict ? "Remove image attachments before saving a text-only Runtime model" : "Select a model and supported thinking level before saving");
+		return;
+	  }
+	  setSavingRuntimeModel(true);
+	  setRuntimeModelSaveStatus("");
+	  try {
+		const state = await api("POST", `/api/agents/${agent.id}/runtime/model`, {
+		  provider: providerDraft,
+		  model: modelDraft.trim(),
+		  thinkingLevel: effortDraft,
+		});
+		setRuntimeModelCurrent(state.current as RuntimeModel);
+		setRuntimeModels((state.models || []) as RuntimeModel[]);
+		setRuntimeThinkingLevel(state.thinkingLevel ?? "");
+		setEffortDraft(state.thinkingLevel ?? "");
+		setRuntimeModelSaveStatus("saved");
+	  } catch (err: any) {
+		setRuntimeModelSaveStatus("failed");
+		onError(err.message);
+	  } finally {
+		setSavingRuntimeModel(false);
+	  }
+	};
 
   const saveProfile = async () => {
     if (!profile || loadingProfile || savingProfile) return;
@@ -968,31 +961,15 @@ export function AgentPane({
   const running = agent.status === "running";
 	const runtimeModelControl = !!runtimeModelCurrent || runtimeModels.length > 0;
   const heldMessages = pendingWork.filter((entry) => entry.internalMessage?.handlingStatus === "interrupted" || entry.internalMessage?.handlingStatus === "failed");
-  const currentProviderId = agent.providerId || "openai";
-  const selectableProviders = modelProviders.some((provider) => provider.id === currentProviderId)
-    ? modelProviders
-    : [{
-        id: currentProviderId, name: currentProviderId, source: "missing", configured: false,
-        credentialSource: "missing", credentialConfigured: false, models: agent.model ? [agent.model] : [], modelDetails: [], boundAgentCount: 1,
-      } as ModelProvider, ...modelProviders];
-  const selectedProvider = selectableProviders.find((provider) => provider.id === providerDraft);
-  const providerModelPresets = [
-    ...(providerDraft === "openai" ? [{ value: "", label: "Default (Codex)" }] : []),
-    ...(selectedProvider?.modelDetails || []).map((model) => ({ value: model.id, label: model.displayName || model.id })),
-  ];
-  const selectedModelDetail = selectedProvider?.modelDetails?.find((model) => model.id === modelDraft);
-  const reasoningEfforts = selectedModelDetail?.reasoningEfforts?.length ? selectedModelDetail.reasoningEfforts : FALLBACK_REASONING_EFFORTS;
-  const modelPresetValue = modelCustomOpen || isCustomModel(modelDraft, providerDraft, selectableProviders) ? CUSTOM_MODEL_VALUE : modelDraft;
-  const providerChanged = providerDraft !== (agent.providerId || "openai");
-	const piProviders = [...new Set(runtimeModels.map((model) => model.provider))];
-	const piModels = runtimeModels.filter((model) => model.provider === providerDraft);
-	const selectedRuntimeModel = piModels.find((model) => model.id === modelDraft);
-	const runtimeThinkingOptions = selectedRuntimeModel?.thinkingLevels?.length ? selectedRuntimeModel.thinkingLevels : runtimeThinkingLevels;
+	const runtimeProviders = [...new Set(runtimeModels.map((model) => model.provider))];
+	const providerRuntimeModels = runtimeModels.filter((model) => model.provider === providerDraft);
+	const selectedRuntimeModel = providerRuntimeModels.find((model) => model.id === modelDraft);
+	const runtimeThinkingOptions = selectedRuntimeModel?.thinkingLevels || [];
 	const runtimeModelIdentityChanged = runtimeModelControl && !!selectedRuntimeModel && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id);
-	const imageInputAvailable = selectedRuntimeModel?.imageInput ?? selectedModelDetail?.inputModalities?.includes("image") ?? snapshotImageInputAvailable;
-	const runtimeModelChanged = runtimeModelControl
-	  ? providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel
-	  : providerChanged;
+	const imageInputAvailable = selectedRuntimeModel?.imageInput ?? snapshotImageInputAvailable;
+	const pendingModelSelectionValid = !runtimeModelControl || (!!selectedRuntimeModel && (effortDraft === "" || runtimeThinkingOptions.includes(effortDraft)));
+	const pendingImageConflict = runtimeModelControl && !imageInputAvailable && attachments.some((attachment) => attachment.file.type.startsWith("image/"));
+	const runtimeModelChanged = runtimeModelControl && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel);
   const profileDirty = Boolean(
     profile &&
       (identityDraft.trim() !== (profile.identity || "") ||
@@ -1104,7 +1081,6 @@ export function AgentPane({
 						["Goal support", goalAvailable],
 						["Remote", remoteAvailable],
 						["Usage reporting", usageAvailable],
-						["Provider configuration", providerConfigurationAvailable],
 						["Sandbox configuration", sandboxConfigurationAvailable],
 						["Manual compaction", compactionAvailable],
 					  ] as Array<[string, boolean]>).map(([label, available]) => (
@@ -1130,83 +1106,45 @@ export function AgentPane({
 					  onChange={(event) => {
 						const provider = event.target.value;
 						const model = runtimeModels.find((candidate) => candidate.provider === provider);
+						setRuntimeModelSaveStatus("");
 						setProviderDraft(provider);
 						setModelDraft(model?.id || "");
 						const levels = model?.thinkingLevels || [];
-						setEffortDraft(levels.includes(effortDraft) ? effortDraft : levels[0] || "");
+						setEffortDraft(levels.includes(effortDraft) ? effortDraft : model?.defaultThinkingLevel || "");
 					  }}
 					  disabled={running || runtimeModels.length === 0}
 					  className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
 					>
-					  {piProviders.map((provider) => <option key={provider} value={provider}>{provider}</option>)}
-					</select> : <select
-                      value={providerDraft}
-                      onChange={(event) => {
-                        const nextProvider = event.target.value;
-                        const provider = selectableProviders.find((item) => item.id === nextProvider);
-                        const nextModel = nextProvider === "openai" ? "" : provider?.models?.[0] || "";
-                        setProviderDraft(nextProvider);
-                        setModelDraft(nextModel);
-                        setEffortDraft("");
-                        setModelCustomOpen(nextProvider !== "openai" && nextModel === "");
-                      }}
-                      disabled={running || !providerConfigurationAvailable}
-                      className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
-                    >
-                      {selectableProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
-					</select>}
+					  {runtimeProviders.map((provider) => <option key={provider} value={provider}>{provider}</option>)}
+					</select> : <input value={providerDraft} disabled className="h-8 w-full rounded-md bg-muted/50 px-2.5 font-mono text-[12px] opacity-60 outline-none ring-1 ring-border" />}
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Model</span>
 					{runtimeModelControl ? <select
 					  value={modelDraft}
 					  onChange={(event) => {
-						const model = piModels.find((candidate) => candidate.id === event.target.value);
+						const model = providerRuntimeModels.find((candidate) => candidate.id === event.target.value);
+						setRuntimeModelSaveStatus("");
 						setModelDraft(event.target.value);
 						const levels = model?.thinkingLevels || [];
-						setEffortDraft(levels.includes(effortDraft) ? effortDraft : levels[0] || "");
+						setEffortDraft(levels.includes(effortDraft) ? effortDraft : model?.defaultThinkingLevel || "");
 					  }}
-					  disabled={running || piModels.length === 0}
+					  disabled={running || providerRuntimeModels.length === 0}
 					  className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
 					>
-					  {piModels.map((model) => <option key={`${model.provider}/${model.id}`} value={model.id}>{model.id}</option>)}
-					</select> : <><select
-                      value={modelPresetValue}
-                      onChange={(e) => {
-                        if (e.target.value === CUSTOM_MODEL_VALUE) {
-                          setModelCustomOpen(true);
-                          if (providerModelPresets.some((option) => option.value === modelDraft)) setModelDraft("");
-                          return;
-                        }
-                        setModelCustomOpen(false);
-                        setModelDraft(e.target.value);
-                      }}
-                      disabled={running || !providerConfigurationAvailable}
-                      className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition placeholder:text-muted-foreground/60 focus:ring-ring/25 disabled:opacity-60"
-                    >
-                      {providerModelPresets.map((option) => (
-                        <option key={option.label} value={option.value}>{option.label}</option>
-                      ))}
-                      <option value={CUSTOM_MODEL_VALUE}>Custom...</option>
-					</select>
-                    {modelCustomOpen && (
-                      <input
-                        value={modelDraft}
-                        onChange={(e) => setModelDraft(e.target.value)}
-                        disabled={running || !providerConfigurationAvailable}
-                        placeholder="model id"
-                        spellCheck={false}
-                        className="mt-2 h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition placeholder:text-muted-foreground/60 focus:ring-ring/25 disabled:opacity-60"
-                      />
-					)}</>}
+					  {providerRuntimeModels.map((model) => <option key={`${model.provider}/${model.id}`} value={model.id}>{model.displayName || model.id || "Default"}</option>)}
+					</select> : <input value={modelDraft || "Runtime default"} disabled className="h-8 w-full rounded-md bg-muted/50 px-2.5 font-mono text-[12px] opacity-60 outline-none ring-1 ring-border" />}
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Thinking Effort</span>
-					<select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running || (runtimeModelControl ? runtimeThinkingOptions.length === 0 : !providerConfigurationAvailable)} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
-					  {!runtimeModelControl && <option value="">default{selectedModelDetail?.defaultReasoningEffort ? ` (${selectedModelDetail.defaultReasoningEffort})` : ""}</option>}
-					  {(runtimeModelControl ? runtimeThinkingOptions : reasoningEfforts).map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+					<select value={effortDraft} onChange={(e) => { setEffortDraft(e.target.value); setRuntimeModelSaveStatus(""); }} disabled={running || !runtimeModelControl || runtimeThinkingOptions.length === 0} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+					  {runtimeThinkingOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
                     </select>
                   </label>
+				  {runtimeModelControl && <div className="mb-3 flex items-center justify-between gap-2 rounded-md border border-border p-2">
+					<span className={`text-[11px] ${runtimeModelSaveStatus === "failed" ? "text-destructive" : "text-muted-foreground"}`}>{runtimeModelSaveStatus === "saved" ? "Runtime model saved." : runtimeModelSaveStatus === "failed" ? "Runtime model save failed; Agent config was not changed." : "Model selection is saved independently from Agent config."}</span>
+					<button onClick={saveRuntimeModel} disabled={running || savingRuntimeModel || !runtimeModelChanged || !pendingModelSelectionValid || pendingImageConflict} className="shrink-0 rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-60">{savingRuntimeModel ? "Saving Runtime Model" : "Save Runtime Model"}</button>
+				  </div>}
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Sandbox</span>
                     <select value={sandboxDraft} onChange={(e) => setSandboxDraft(e.target.value)} disabled={running || !sandboxConfigurationAvailable} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
@@ -1226,10 +1164,11 @@ export function AgentPane({
                     </select>
                   </label>
                   {running && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] text-warning">Config can be changed after this turn finishes.</div>}
-				  {runtimeModelChanged && !running && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] leading-4 text-warning">{runtimeModelControl ? "The next Turn will use this Runtime model; the existing Agent, Thread, Profile, and history stay unchanged." : "Switching Provider cold-resumes this primary Thread. Every Agent must be idle with no pending approval or active Goal."}</div>}
+				  {runtimeModelChanged && !running && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] leading-4 text-warning">The next Turn will use this Runtime model; the existing Agent, Thread, Profile, and history stay unchanged.</div>}
+				  {pendingImageConflict && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] text-warning">Remove attached images before saving this text-only model.</div>}
                   <div className="flex justify-end gap-2">
                     <button onClick={() => setConfigOpen(false)} className="rounded-md px-2.5 py-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted">Cancel</button>
-                    <button onClick={saveConfig} disabled={running || savingConfig} className="rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-medium text-primary-foreground transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60">{savingConfig ? "Saving" : "Save"}</button>
+					<button onClick={saveConfig} disabled={running || savingConfig} className="rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-medium text-primary-foreground transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60">{savingConfig ? "Saving Agent Config" : "Save Agent Config"}</button>
                   </div>
                 </>
               ) : configSection === "profile" ? (
@@ -2188,10 +2127,4 @@ function MembershipTextarea({ label, value, onChange, rows }: {
       <textarea value={value} onChange={(event) => onChange(event.target.value)} rows={rows} maxLength={16000} className="w-full resize-y rounded-md bg-background p-2.5 text-[11.5px] leading-5 outline-none ring-1 ring-border focus:ring-ring/25" />
     </label>
   );
-}
-
-function isCustomModel(model: string, providerId?: string, providers: ModelProvider[] = []) {
-  if (model === "") return false;
-  const models = providers.find((provider) => provider.id === (providerId || "openai"))?.models || [];
-  return !models.includes(model);
 }

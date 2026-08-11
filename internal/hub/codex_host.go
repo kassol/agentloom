@@ -94,9 +94,6 @@ func (d *codexRuntimeHostDriver) ensureLocked() (*codexHostRuntime, error) {
 	if host := h.codexHost; host != nil && !host.client.Closed() {
 		return host, nil
 	}
-	if h.providerSwitching {
-		return nil, errf(409, "CodexHost is restarting for an Agent Provider switch")
-	}
 	return d.startLocked()
 }
 
@@ -294,12 +291,7 @@ func (d *codexRuntimeHostDriver) initHost(host *codexHostRuntime) {
 		host.close()
 		return
 	}
-	h.mu.Lock()
-	switchingProvider := h.providerSwitching
-	h.mu.Unlock()
-	if !switchingProvider {
-		h.hydrateGoals(host)
-	}
+	h.hydrateGoals(host)
 }
 
 // ReloadSkills forces the shared CodexHost to rebuild its per-Agent skill

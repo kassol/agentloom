@@ -74,7 +74,8 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 | POST | `/api/agents/{key}/turns/current/interrupt` | Interrupt current Turn |
 | POST | `/api/agents/{key}/turns/interrupted/continue` | Continue interrupted Turn |
 | POST | `/api/agents/{key}/turns/interrupted/dismiss` | Dismiss interrupted Turn |
-| POST | `/api/agents/{key}/provider` | Switch Agent model Provider |
+| GET | `/api/agents/{key}/runtime/models` | Read typed active model, catalog, thinking choices, and image support |
+| POST | `/api/agents/{key}/runtime/model` | Validate and select one Runtime model/thinking combination |
 | GET | `/api/agents/{key}/thread/history` | Runtime Contract history with Loom IDs |
 | GET | `/api/agents/{key}/thread/events` | Thread SSE stream |
 | POST | `/api/agents/{key}/thread/approvals/{approvalId}` | Resolve approval |
@@ -98,6 +99,12 @@ Turn 启动返回 `202 Accepted`；重启 pending 时相关写入口返回 `409`
 Provider 写操作和 verify 只允许 loopback 或 `CODEX_LOOM_ADMIN_TOKEN`。模型目录
 `model_catalog_json` 是 startup-only，重启 Host 后才生效；详细语义见
 [model-provider.md](model-provider.md)。
+
+`/api/model-providers` 管理 Codex Host 的 Provider 定义和 credential；它不是
+Agent Runtime capability。Agent Inspector 只消费 `/runtime/models` 的 typed
+model-control state。未 Save 的选择只影响 Inspector 预览；Save 成功后 Hub
+发布新的 scoped Capability Snapshot，composer 才切到新的 active model。图片
+在附件阶段会被阻止，并在 `POST /turns` 时由 active Runtime 再校验一次。
 
 Artifact 下载支持 `?preview=1` 与 `?download=1`。PNG/JPEG/GIF/WebP 允许跨
 Origin 嵌入，其他类型保持 `same-origin`。

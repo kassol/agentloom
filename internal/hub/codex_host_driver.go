@@ -7,7 +7,6 @@ import (
 	"sync"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
-	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
@@ -24,6 +23,33 @@ type codexRuntimeHostDriver struct {
 
 func newCodexRuntimeHostDriver(h *Hub) *codexRuntimeHostDriver {
 	return &codexRuntimeHostDriver{hub: h, handles: map[string]*codexAgentHost{}, failedHosts: map[uint64]bool{}}
+}
+
+func (d *codexRuntimeHostDriver) newContract(agentID string, native *codexAgentRuntime) *codexRuntimeContract {
+	return &codexRuntimeContract{agentID: agentID, native: native, modelCatalog: d.availableModels}
+}
+
+func (d *codexRuntimeHostDriver) availableModels() ([]runtimecontract.Model, error) {
+	providers, err := d.hub.ListModelProviders()
+	if err != nil {
+		return nil, err
+	}
+	models := make([]runtimecontract.Model, 0)
+	for _, provider := range providers {
+		if !provider.Configured || !provider.CredentialConfigured {
+			continue
+		}
+		if provider.ID == "openai" {
+			models = append(models, runtimecontract.Model{
+				Provider: "openai", ID: "", DisplayName: "Default (Codex)", Reasoning: true,
+				ThinkingLevels: []string{runtimecontract.ThinkingLevelDefault, "minimal", "low", "medium", "high", "xhigh"}, DefaultThinkingLevel: runtimecontract.ThinkingLevelDefault, ImageInput: true,
+			})
+		}
+		for _, model := range provider.ModelDetails {
+			models = append(models, runtimeModelFromCatalog(model))
+		}
+	}
+	return models, nil
 }
 
 // agentContract keeps the native client inside the Codex Host adapter while
@@ -52,18 +78,6 @@ func (d *codexRuntimeHostDriver) Preflight(context.Context) error {
 
 func (d *codexRuntimeHostDriver) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
 	return codexControlPlaneCapabilitySnapshot()
-}
-
-func (d *codexRuntimeHostDriver) SanitizeProviderHistory(_ context.Context, nativeRef, backupDir string) (RuntimeProviderHistorySanitizeResult, error) {
-	result, err := rollout.SanitizeReasoningContent(nativeRef, backupDir)
-	if err != nil {
-		return RuntimeProviderHistorySanitizeResult{}, err
-	}
-	return RuntimeProviderHistorySanitizeResult{Changed: result.Changed, OriginalPath: result.OriginalPath, BackupPath: result.BackupPath}, nil
-}
-
-func (d *codexRuntimeHostDriver) RestoreProviderHistory(_ context.Context, backupPath, originalPath string) error {
-	return rollout.RestoreRolloutBackup(backupPath, originalPath)
 }
 
 func (d *codexRuntimeHostDriver) HistoryContract(request AgentHostRequest) runtimecontract.Contract {
@@ -105,7 +119,7 @@ func (d *codexRuntimeHostDriver) acquireLocked(request AgentHostRequest) (*codex
 	if err != nil {
 		return nil, nil, err
 	}
-	contract := &codexRuntimeContract{agentID: request.AgentID, native: &codexAgentRuntime{client: host.client}}
+	contract := d.newContract(request.AgentID, &codexAgentRuntime{client: host.client})
 	handle := &codexAgentHost{host: host, contract: contract}
 	contract.release = handle.Close
 	d.mu.Lock()

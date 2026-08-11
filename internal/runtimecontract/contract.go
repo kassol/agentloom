@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -132,6 +133,108 @@ type ContextDeliveryPolicy interface {
 	ContextDeliveryMode() ContextDeliveryMode
 }
 
+// ModelControlCapability is the optional, Runtime-neutral model-control
+// surface. Provider administration and credentials remain Host concerns; this
+// capability only describes and selects models already available to one
+// Runtime binding.
+type ModelControlCapability interface {
+	InspectModelControl(context.Context, Binding) (ModelControlState, *Failure)
+	SelectModel(context.Context, Binding, ModelSelection) (ModelControlState, *Failure)
+}
+
+// InputCapability revalidates active-model input support at the execution
+// boundary. Inspector previews use ModelControlState while the composer and
+// Hub always use the committed active model.
+type InputCapability interface {
+	ValidateInput(context.Context, Binding, []InputBlock) *Failure
+}
+
+type Model struct {
+	Provider             string   `json:"provider"`
+	ID                   string   `json:"id"`
+	DisplayName          string   `json:"displayName,omitempty"`
+	ContextWindow        int      `json:"contextWindow,omitempty"`
+	Reasoning            bool     `json:"reasoning"`
+	ThinkingLevels       []string `json:"thinkingLevels"`
+	DefaultThinkingLevel string   `json:"defaultThinkingLevel,omitempty"`
+	ImageInput           bool     `json:"imageInput"`
+}
+
+const ThinkingLevelDefault = "default"
+
+type ModelControlState struct {
+	Current       Model   `json:"current"`
+	Models        []Model `json:"models"`
+	ThinkingLevel string  `json:"thinkingLevel"`
+}
+
+type ModelSelection struct {
+	Provider      string `json:"provider"`
+	Model         string `json:"model"`
+	ThinkingLevel string `json:"thinkingLevel"`
+}
+
+func (s ModelControlState) Validate() error {
+	if len(s.Models) == 0 {
+		return fmt.Errorf("Runtime model catalog is empty")
+	}
+	seen := make(map[string]struct{}, len(s.Models))
+	currentFound := false
+	for _, model := range s.Models {
+		if model.Provider == "" {
+			return fmt.Errorf("Runtime model provider is required")
+		}
+		key := model.Provider + "\x00" + model.ID
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("Runtime model catalog contains duplicate %s/%s", model.Provider, model.ID)
+		}
+		seen[key] = struct{}{}
+		if len(model.ThinkingLevels) == 0 {
+			return fmt.Errorf("Runtime model %s/%s has no explicit thinking choices", model.Provider, model.ID)
+		}
+		defaultFound := false
+		for _, level := range model.ThinkingLevels {
+			if level == model.DefaultThinkingLevel {
+				defaultFound = true
+			}
+		}
+		if model.DefaultThinkingLevel == "" || !defaultFound {
+			return fmt.Errorf("Runtime model %s/%s has no valid explicit default thinking level", model.Provider, model.ID)
+		}
+		if model.Provider == s.Current.Provider && model.ID == s.Current.ID {
+			currentFound = true
+			if !reflect.DeepEqual(model, s.Current) {
+				return fmt.Errorf("active Runtime model descriptor disagrees with its catalog entry")
+			}
+		}
+	}
+	if !currentFound {
+		return fmt.Errorf("active Runtime model %s/%s is absent from the catalog", s.Current.Provider, s.Current.ID)
+	}
+	return s.ValidateSelection(ModelSelection{Provider: s.Current.Provider, Model: s.Current.ID, ThinkingLevel: s.ThinkingLevel})
+}
+
+func (s ModelControlState) ValidateSelection(selection ModelSelection) error {
+	if selection.Provider == "" {
+		return fmt.Errorf("Runtime model provider is required")
+	}
+	for _, model := range s.Models {
+		if model.Provider != selection.Provider || model.ID != selection.Model {
+			continue
+		}
+		if selection.ThinkingLevel == "" {
+			return nil
+		}
+		for _, level := range model.ThinkingLevels {
+			if level == selection.ThinkingLevel {
+				return nil
+			}
+		}
+		return fmt.Errorf("thinking level %q is unavailable for Runtime model %s/%s", selection.ThinkingLevel, selection.Provider, selection.Model)
+	}
+	return fmt.Errorf("Runtime model %s/%s is absent from the catalog", selection.Provider, selection.Model)
+}
+
 type TurnRequest struct {
 	Binding Binding      `json:"binding"`
 	TurnID  string       `json:"turnId"`
@@ -211,6 +314,7 @@ const (
 	FailurePhaseBindingName     FailurePhase = "binding_name"
 	FailurePhaseBindingArchive  FailurePhase = "binding_archive"
 	FailurePhaseContextDelivery FailurePhase = "context_delivery"
+	FailurePhaseModelControl    FailurePhase = "model_control"
 )
 
 type Failure struct {
@@ -233,7 +337,7 @@ func (f Failure) Validate() error {
 	case FailurePhaseBindingCreate, FailurePhaseBindingResume, FailurePhaseTurnStart,
 		FailurePhaseTurnContinue, FailurePhaseTurnInterrupt, FailurePhaseHistory,
 		FailurePhaseClose, FailurePhaseBindingName, FailurePhaseBindingArchive,
-		FailurePhaseContextDelivery:
+		FailurePhaseContextDelivery, FailurePhaseModelControl:
 		return nil
 	default:
 		return fmt.Errorf("Runtime failure has unknown phase %q", f.Phase)
@@ -307,19 +411,18 @@ func (s CapabilitySnapshot) Validate() error {
 }
 
 const (
-	CapabilitySandboxConfiguration  = "sandbox_configuration"
-	CapabilityProviderConfiguration = "provider_configuration"
-	CapabilityApprovalPolicy        = "approval_policy"
-	CapabilitySkillsPolicy          = "skills_policy"
-	CapabilityContextDelivery       = "context_delivery"
-	CapabilityNativeRename          = "native_rename"
-	CapabilityNativeArchive         = "native_archive"
-	CapabilityGoal                  = "goal"
-	CapabilityRemote                = "remote"
-	CapabilityUsageReporting        = "usage_reporting"
-	CapabilityModelConfiguration    = "model_configuration"
-	CapabilityManualCompaction      = "manual_compaction"
-	CapabilityImageInput            = "image_input"
+	CapabilitySandboxConfiguration = "sandbox_configuration"
+	CapabilityApprovalPolicy       = "approval_policy"
+	CapabilitySkillsPolicy         = "skills_policy"
+	CapabilityContextDelivery      = "context_delivery"
+	CapabilityNativeRename         = "native_rename"
+	CapabilityNativeArchive        = "native_archive"
+	CapabilityGoal                 = "goal"
+	CapabilityRemote               = "remote"
+	CapabilityUsageReporting       = "usage_reporting"
+	CapabilityModelConfiguration   = "model_configuration"
+	CapabilityManualCompaction     = "manual_compaction"
+	CapabilityImageInput           = "image_input"
 )
 
 type ContentKind string

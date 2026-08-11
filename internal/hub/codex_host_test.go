@@ -414,7 +414,7 @@ func TestSendTaskResumesCachedThreadBeforeTurnStart(t *testing.T) {
 	}
 }
 
-func TestDeepSeekAgentRejectsAttachmentsBeforeTurnStart(t *testing.T) {
+func TestTextOnlyCodexModelAllowsFilesAndRejectsImagesBeforeTurnStart(t *testing.T) {
 	logPath := installFakeSharedCodexHost(t)
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -432,13 +432,26 @@ func TestDeepSeekAgentRejectsAttachmentsBeforeTurnStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	result, err := h.SendTaskWithArtifacts(agent.ID, "review", []string{artifact.ID}, time.Minute)
+	if err != nil {
+		t.Fatalf("text-only Runtime rejected a non-image attachment: %v", err)
+	}
+	waitForPiTurn(t, h, agent.ID, result.TurnID)
+	image, err := h.StageThreadArtifact(agent.ID, "screen.png", "image/png", strings.NewReader("\x89PNG\r\n\x1a\nfixture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelState, err := h.GetRuntimeModels(agent.ID)
+	if err != nil || modelState.Current.Provider != "deepseek" || modelState.Current.ImageInput {
+		t.Fatalf("active text-only Runtime model = %#v, err=%v", modelState, err)
+	}
 	before := countRequestMethod(t, logPath, "turn/start")
-	_, err = h.SendTaskWithArtifacts(agent.ID, "review", []string{artifact.ID}, time.Minute)
-	if err == nil || !strings.Contains(err.Error(), "text input only") {
-		t.Fatalf("DeepSeek attachment error = %v", err)
+	_, err = h.SendTaskWithArtifacts(agent.ID, "review image", []string{image.ID}, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "image input") {
+		t.Fatalf("text-only Runtime image error = %v", err)
 	}
 	if after := countRequestMethod(t, logPath, "turn/start"); after != before {
-		t.Fatalf("turn/start requests changed from %d to %d after rejected attachment", before, after)
+		t.Fatalf("turn/start requests changed from %d to %d after rejected image", before, after)
 	}
 }
 
@@ -854,6 +867,18 @@ while IFS= read -r line; do
 	*'"method":"thread/resume"'*)
 	  : > "$CODEX_HOST_RESUMED"
 	  printf '{"id":%s,"result":{"thread":{"id":"thr-stale"}}}\n' "$id" ;;
+	*'"method":"turn/start"'*'verify restored image input'*)
+	  printf '{"id":%s,"result":{"turn":{"id":"turn-one-image"}}}\n' "$id"
+	  printf '{"method":"turn/started","params":{"threadId":"thr-one","turn":{"id":"turn-one-image","status":"inProgress"}}}\n'
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-one","turn":{"id":"turn-one-image","status":"completed"}}}\n' ;;
+	*'"method":"turn/start"'*'"threadId":"thr-one"'*)
+	  printf '{"id":%s,"result":{"turn":{"id":"turn-one-model"}}}\n' "$id"
+	  printf '{"method":"turn/started","params":{"threadId":"thr-one","turn":{"id":"turn-one-model","status":"inProgress"}}}\n'
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-one","turn":{"id":"turn-one-model","status":"completed"}}}\n' ;;
+	*'"method":"turn/start"'*'"threadId":"thr-two"'*)
+	  printf '{"id":%s,"result":{"turn":{"id":"turn-two"}}}\n' "$id"
+	  printf '{"method":"turn/started","params":{"threadId":"thr-two","turn":{"id":"turn-two","status":"inProgress"}}}\n'
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-two","turn":{"id":"turn-two","status":"completed"}}}\n' ;;
 	*'"method":"turn/start"'*'"model":"Example-Model"'*'"threadId":"thr-stale"'*)
 	  printf '{"id":%s,"result":{"turn":{"id":"turn-model-route"}}}\n' "$id"
 	  printf '{"method":"turn/started","params":{"threadId":"thr-stale","turn":{"id":"turn-model-route","status":"inProgress"}}}\n'

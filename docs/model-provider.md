@@ -4,8 +4,14 @@
 
 本文档描述 CodexLoom 如何管理 Agent 的 model provider 绑定，以及共享 CodexHost
 加载的静态模型目录。代码入口：`internal/hub/model_provider.go`、
-`internal/hub/provider_switch.go`、`internal/modelcatalog/`、
+`internal/hub/runtime_model.go`、`internal/modelcatalog/`、
 `internal/httpapi/routes_model_provider.go`、`cmd/loom/commands_provider.go`。
+
+Provider definition/credential administration is a Codex Host integration.
+The Agent Inspector does not project these admin records as a Runtime
+capability: per-Agent catalog/current/model/thinking/image state comes from the
+typed Runtime `ModelControlCapability`. Pi implements that same model-control
+contract without implementing Codex Provider administration.
 
 ## 产品语义
 
@@ -79,35 +85,29 @@ CLI：
   --model deepseek-v4-flash
 ```
 
-HTTP：
+HTTP 使用 Runtime-neutral model-control endpoint；Provider、model 与 thinking
+作为一个选择一起校验和提交：
 
 ```text
-POST /api/agents/{key}/provider
+GET  /api/agents/{key}/runtime/models
+POST /api/agents/{key}/runtime/model
 ```
 
 请求体：
 
 ```json
-{"providerId": "deepseek", "model": "deepseek-v4-flash"}
+{"provider": "deepseek", "model": "deepseek-v4-flash", "thinkingLevel": "max"}
 ```
 
-切换前必须满足全局空闲门禁：
+切换前 Agent 必须处于 Turn 间隙，且没有 pending approval。Runtime 先预览并
+校验 catalog；native selection 成功后才持久化 active selection。若后续校验或持久化
+失败，Runtime 会恢复原选择；若恢复无法被验证，当前 Runtime effect domain 会被
+fence 并返回 indeterminate，而不会把不确定状态报告成成功。
 
-- 所有 Agent 没有 running Turn；
-- 没有 pending approval；
-- 没有 active Goal（需先 pause）；
-- 没有正在投递的内部 Message、Inbox、Needs You answer；
-- Loom 没有正在 drain/restart，且没有另一个 Provider switch 在进行。
-
-执行时会：
-
-1. 持久化 `PendingProviderSwitch`。
-2. 重启共享 CodexHost，并使用新的 Provider/Model cold-resume 该 Agent 的 primary
-   Thread。
-3. 成功后提交 binding；失败则恢复旧 binding 并重启回原 Host。
-4. 恢复后重新启动 Remote runtime，并 drain 之前排队的 durable work。
-
-因此“切换一个 Agent 的 Provider”会短暂重启整个共享 Host，所有 Agent 都必须空闲。
+Codex adapter 会用新 Provider/Model 重新 resume 同一个 primary Thread；Pi adapter
+则通过 Pi RPC 的 model/thinking 命令更新同一 Session。两者都不创建新 Agent 或
+Loom Thread。Provider definition 与 credential 管理仍是上面的 Codex Host 集成，
+不会作为 per-Agent Runtime capability 出现在 Inspector。
 
 ## 模型目录
 
@@ -172,6 +172,6 @@ Codex 客户端升级后，不能长期沿用旧 union：
 
 - [codex-app-server-protocol.md](codex-app-server-protocol.md)：wire 层
   `modelProvider` / `model` / `model_catalog_json`。
-- [http-api.md](http-api.md)：Provider 与 Agent switch 路由。
+- [http-api.md](http-api.md)：Provider 管理与 Runtime model-control 路由。
 - [loom-cli.md](loom-cli.md)：`provider` 与 `agent provider` 命令。
 - `internal/modelcatalog/README.md`：目录来源和 SHA 记录。

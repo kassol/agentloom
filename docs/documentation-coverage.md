@@ -22,7 +22,7 @@
 | CLI 命令面 | `cmd/loom/*.go` | `docs/loom-cli.md` | 完整 |
 | HTTP / SSE 契约 | `internal/httpapi/routes_*.go`、`internal/httpapi/server.go` | `docs/http-api.md`、`docs/handbook.md` | 完整 |
 | Hub 领域编排 | `internal/hub/*.go` | `docs/handbook.md`、`topics.md`、`triggers.md`、`thread-artifacts.md`、`agent-profile.md`、`integrations.md`、`model-provider.md`、`epoch-context-coverage.md` | 完整 |
-| Model Provider 与模型目录 | `internal/hub/model_provider.go`、`internal/hub/provider_switch.go`、`internal/modelcatalog/`、`cmd/loom/commands_provider.go` | `docs/model-provider.md`、`docs/http-api.md`、`docs/loom-cli.md` | 完整 |
+| Model Provider 与模型目录 | `internal/hub/model_provider.go`、`internal/hub/runtime_model.go`、`internal/modelcatalog/`、`cmd/loom/commands_provider.go` | `docs/model-provider.md`、`docs/http-api.md`、`docs/loom-cli.md` | 完整 |
 | Durable Store 与事件 | `internal/store/*.go`、`internal/backup/*.go`、`internal/rollout/*.go` | `docs/handbook.md`、`docs/technical-debt-audit.md` | 完整 |
 | Codex runtime 适配 | `internal/codex/*.go`、`internal/rollout/*.go` | `docs/codex-app-server-protocol.md`、`docs/epoch-context-coverage.md` | 完整 |
 | Connector 与 Gateway | `gateway/*.mjs`、`cmd/loom-*-gateway/*.go`、`internal/feishu`、`internal/slack`、`internal/parall`、`internal/github` | `docs/integrations.md`、`docs/agent-platform-integration.md` | 完整 |
@@ -57,7 +57,7 @@
 | `integration.go` | `integrations.md`、`http-api.md` |
 | `interrupted_turn.go` | `handbook.md`、`loom-cli.md` |
 | `lifecycle.go` | `handbook.md`、`operations.md` |
-| `model_provider.go` / `provider_switch.go` | `model-provider.md`、`codex-app-server-protocol.md` |
+| `model_provider.go` / `runtime_model.go` | `model-provider.md`、`codex-app-server-protocol.md` |
 | `organization.go` | `agent-profile.md`、`loom-cli.md` |
 | `outbox.go` | `integrations.md`、`http-api.md` |
 | `profile.go` | `agent-profile.md` |

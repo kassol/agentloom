@@ -38,7 +38,7 @@ const testAgent: Agent = {
   cwd: "/workspace/agent-scroll",
   threadId: "thread-scroll",
   runtimeBinding: { kind: "codex" },
-  capabilitySnapshot: capabilitySnapshot("provider_configuration", "sandbox_configuration", "approval_policy", "model_configuration", "goal", "remote", "usage_reporting", "manual_compaction", "image_input"),
+  capabilitySnapshot: capabilitySnapshot("sandbox_configuration", "approval_policy", "model_configuration", "goal", "remote", "usage_reporting", "manual_compaction", "image_input"),
   sandbox: "workspace-write",
   approvalPolicy: "on-request",
   status: "idle",
@@ -55,7 +55,6 @@ const testAgent: Agent = {
 const noOp = () => {};
 const props = {
   agent: testAgent,
-  modelProviders: [],
   configRequestNonce: 0,
   pendingWork: [],
   humanRequests: [],
@@ -182,7 +181,7 @@ describe("AgentPane scroll restoration", () => {
 		thinkingLevels: ["off", "minimal", "low", "medium", "high"],
 		models: [
 		  { provider: "openai-codex", id: "gpt-5.4-mini", reasoning: true, thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"], imageInput: false },
-		  { provider: "xai", id: "grok-4.5", reasoning: true, thinkingLevels: ["low", "medium", "high"], imageInput: true },
+		  { provider: "xai", id: "grok-4.5", reasoning: true, thinkingLevels: ["low", "high"], defaultThinkingLevel: "high", imageInput: true },
 		  { provider: "xai", id: "grok-build-0.1", reasoning: false, thinkingLevels: ["off"], imageInput: false },
 		],
 	  }), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -202,7 +201,7 @@ describe("AgentPane scroll restoration", () => {
     expect(view.getByText("History").nextElementSibling).toHaveTextContent("Available");
     expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Unavailable");
     expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();
-    expect(view.getByText("Provider configuration").nextElementSibling).toHaveTextContent("Unavailable");
+	expect(view.queryByText("Provider configuration")).toBeNull();
 	const providerSelect = () => view.getByText("Provider").closest("label")?.querySelector("select") as HTMLSelectElement;
 	const modelSelect = () => view.getByText("Model").closest("label")?.querySelector("select") as HTMLSelectElement;
 	const thinkingSelect = () => view.getByText("Thinking Effort").closest("label")?.querySelector("select") as HTMLSelectElement;
@@ -225,18 +224,18 @@ describe("AgentPane scroll restoration", () => {
 	  fireEvent.change(providerSelect(), { target: { value: "xai" } });
 	  expect(modelSelect()).toHaveValue("grok-4.5");
 	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Available after Save");
-	  expect(Array.from(thinkingSelect().options).map((option) => option.value)).toEqual(["low", "medium", "high"]);
-	  expect(thinkingSelect()).toHaveValue("medium");
+	  expect(Array.from(thinkingSelect().options).map((option) => option.value)).toEqual(["low", "high"]);
+	  expect(thinkingSelect()).toHaveValue("high");
 	  fireEvent.change(modelSelect(), { target: { value: "grok-build-0.1" } });
 	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Unavailable after Save");
 	  expect(Array.from(thinkingSelect().options).map((option) => option.value)).toEqual(["off"]);
 	  expect(thinkingSelect()).toHaveValue("off");
 	  fireEvent.change(modelSelect(), { target: { value: "grok-4.5" } });
 	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Available after Save");
-	  expect(Array.from(thinkingSelect().options).map((option) => option.value)).toEqual(["low", "medium", "high"]);
-	  expect(thinkingSelect()).toHaveValue("low");
+	  expect(Array.from(thinkingSelect().options).map((option) => option.value)).toEqual(["low", "high"]);
+	  expect(thinkingSelect()).toHaveValue("high");
 	  fireEvent.change(thinkingSelect(), { target: { value: "high" } });
-	  fireEvent.click(view.getByRole("button", { name: "Save" }));
+	  fireEvent.click(view.getByRole("button", { name: "Save Runtime Model" }));
 	  await waitFor(() => expect(vi.mocked(fetch).mock.calls).toContainEqual([
 		"/api/agents/agent-scroll/runtime/model",
 		expect.objectContaining({ method: "POST", body: JSON.stringify({ provider: "xai", model: "grok-4.5", thinkingLevel: "high" }) }),
@@ -285,6 +284,72 @@ describe("AgentPane scroll restoration", () => {
 	}} active configRequestNonce={1} />);
 	expect(view.getByText("snapshot revision-2")).toBeInTheDocument();
 	expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Unavailable");
+  });
+
+  it("refetches typed model control while the Runtime Inspector stays open", async () => {
+	let modelReads = 0;
+	vi.mocked(fetch).mockImplementation(async (input) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  if (url.includes("/runtime/models")) {
+		modelReads++;
+		const id = modelReads === 1 ? "model-a" : "model-b";
+		return new Response(JSON.stringify({
+		  current: { provider: "fixture", id, thinkingLevels: ["off"], imageInput: modelReads > 1 },
+		  models: [
+			{ provider: "fixture", id, thinkingLevels: ["off"], imageInput: modelReads > 1 },
+			...(modelReads > 1 ? [{ provider: "fixture", id: "model-text", thinkingLevels: ["off"], imageInput: false }] : []),
+		  ],
+		  thinkingLevel: "off", thinkingLevels: ["off"],
+		}), { status: 200, headers: { "Content-Type": "application/json" } });
+	  }
+	  const body = url.includes("/thread/history") ? { total: 0, turns: [] } : { artifacts: [] };
+	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+	const snapshot = (revision: string, model: string): Agent["capabilitySnapshot"] => ({ revision, capabilities: [
+	  { id: "model_configuration", availability: "available", revision, scope: { runtimeKind: "pi", bindingRevision: "b", model, configurationRevision: revision } },
+	  { id: "image_input", availability: model === "model-b" ? "available" : "unavailable", reason: "text only", alternative: "choose vision", revision, scope: { runtimeKind: "pi", bindingRevision: "b", model, configurationRevision: revision } },
+	] });
+	const before: Agent = { ...testAgent, runtimeBinding: { kind: "pi" }, model: "model-a", capabilitySnapshot: snapshot("revision-a", "model-a") };
+	const view = render(<AgentPane {...props} agent={before} active configRequestNonce={1} />);
+	await waitFor(() => expect(view.getByText("Model").closest("label")?.querySelector("select")).toHaveValue("model-a"));
+	view.rerender(<AgentPane {...props} agent={{ ...before, model: "model-b", capabilitySnapshot: snapshot("revision-b", "model-b") }} active configRequestNonce={1} />);
+	await waitFor(() => {
+	  expect(modelReads).toBe(2);
+	  expect(view.getByText("Model").closest("label")?.querySelector("select")).toHaveValue("model-b");
+	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Available");
+	});
+	const fileInput = view.container.querySelector('input[type="file"]') as HTMLInputElement;
+	fireEvent.change(fileInput, { target: { files: [new File(["image"], "active.png", { type: "image/png", lastModified: 3 })] } });
+	expect(view.getByText("active.png")).toBeInTheDocument();
+	fireEvent.change(view.getByText("Model").closest("label")?.querySelector("select") as HTMLSelectElement, { target: { value: "model-text" } });
+	expect(view.getByText("Remove attached images before saving this text-only model.")).toBeInTheDocument();
+	expect(view.getByRole("button", { name: "Save Runtime Model" })).toBeDisabled();
+  });
+
+  it("keeps Runtime model and Agent config saves independent on failure", async () => {
+	const onError = vi.fn();
+	vi.mocked(fetch).mockImplementation(async (input, init) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  if (url.includes("/runtime/models")) return new Response(JSON.stringify({
+		current: { provider: "fixture", id: "vision", thinkingLevels: ["low"], defaultThinkingLevel: "low", imageInput: true },
+		models: [
+		  { provider: "fixture", id: "vision", thinkingLevels: ["low"], defaultThinkingLevel: "low", imageInput: true },
+		  { provider: "fixture", id: "text", thinkingLevels: ["off"], defaultThinkingLevel: "off", imageInput: false },
+		], thinkingLevel: "low",
+	  }), { status: 200, headers: { "Content-Type": "application/json" } });
+	  if (url.includes("/runtime/model") && init?.method === "POST") return new Response(JSON.stringify({ error: "native selection failed" }), { status: 409, headers: { "Content-Type": "application/json" } });
+	  const body = url.includes("/thread/history") ? { total: 0, turns: [] } : { artifacts: [] };
+	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+	const agent: Agent = { ...testAgent, providerId: "fixture", model: "vision", effort: "low", capabilitySnapshot: capabilitySnapshot("model_configuration", "image_input") };
+	const view = render(<AgentPane {...props} agent={agent} onError={onError} active configRequestNonce={1} />);
+	await waitFor(() => expect(view.getByText("Model").closest("label")?.querySelector("select")).toHaveValue("vision"));
+	fireEvent.change(view.getByText("Model").closest("label")?.querySelector("select") as HTMLSelectElement, { target: { value: "text" } });
+	fireEvent.click(view.getByRole("button", { name: "Save Runtime Model" }));
+	await waitFor(() => expect(onError).toHaveBeenCalledWith("native selection failed"));
+	expect(view.getByText("Runtime model save failed; Agent config was not changed.")).toBeInTheDocument();
+	const calls = vi.mocked(fetch).mock.calls.map(([input, init]) => ({ url: typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url, method: init?.method }));
+	expect(calls.some((call) => call.url.endsWith("/config") && call.method === "PATCH")).toBe(false);
   });
 
   it("gates Runtime controls from the typed Capability Snapshot instead of flat v1 flags", () => {
