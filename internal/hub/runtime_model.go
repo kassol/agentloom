@@ -119,6 +119,7 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 		}
 	}
 	h.mu.Unlock()
+	h.refreshRuntimeCapabilitySnapshot(agentID, true)
 	return state, nil
 }
 

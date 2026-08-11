@@ -67,21 +67,6 @@ func TestClipPreservesUTF8(t *testing.T) {
 	}
 }
 
-func TestCanonicalWatchEventType(t *testing.T) {
-	tests := map[string]string{
-		"loom/turn-started":       "loom/turn-started",
-		"hub/turn-started":        "loom/turn-started",
-		"hub/session-created":     "loom/agent-created",
-		"hub/session-killed":      "loom/agent-archived",
-		"item/agentMessage/delta": "item/agentMessage/delta",
-	}
-	for input, want := range tests {
-		if got := canonicalWatchEventType(input); got != want {
-			t.Errorf("canonicalWatchEventType(%q) = %q, want %q", input, got, want)
-		}
-	}
-}
-
 func TestMsgResolveDispatchesWithRequiredFromFlag(t *testing.T) {
 	a := args{
 		positional: []string{"resolve", "msg_123"},

@@ -27,6 +27,7 @@ export interface Agent {
   threadId: string;
   runtimeBinding: { kind: string };
   runtimeCapabilities: RuntimeCapabilities;
+  capabilitySnapshot?: CapabilitySnapshot;
   sandbox: string;
   approvalPolicy: string;
   providerId?: string;
@@ -48,6 +49,18 @@ export interface Agent {
   pendingApprovals: Approval[];
   goal?: ThreadGoal;
   lastSeq: number;
+}
+
+export interface CapabilitySnapshot {
+  revision: string;
+  capabilities: Array<{
+    id: string;
+    availability: "available" | "unavailable" | string;
+    reason?: string;
+    alternative?: string;
+    revision: string;
+    scope: { runtimeKind: string; bindingRevision: string; model: string; configurationRevision: string };
+  }>;
 }
 
 export interface RuntimeCapabilities {

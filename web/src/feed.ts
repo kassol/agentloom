@@ -1,6 +1,6 @@
 // feed.ts turns the raw CodexLoom event stream into renderable blocks.
-// Items are keyed by itemId so streamed deltas, item/updated and
-// item/completed all land on the same block.
+// Canonical content is keyed by Loom item ID so typed deltas and terminal
+// content all land on the same block.
 import type { Approval, LoomEvent } from "./types";
 import { splitTrailingLoomContext } from "./pages/agent/LoomContextView";
 
@@ -172,8 +172,7 @@ export type Block =
       reasoningOutputTokens: number;
       totalTokens: number;
       calls: number;
-    }
-  | { kind: "raw"; id: string; ts?: string; type: string; json: string };
+    };
 
 export interface FeedState {
   blocks: Block[];
@@ -243,63 +242,115 @@ function sys(state: FeedState, ts: string, cls: "ok" | "warn" | "err" | "dim", t
   return push(state, { kind: "sys", ts, cls, text });
 }
 
-function finishStreaming(state: FeedState): FeedState {
+function finishStreaming(state: FeedState, toolStatus = "interrupted"): FeedState {
   const blocks = state.blocks.map((b) => {
     if (b.kind === "agent" && b.streaming) return { ...b, streaming: false };
     if (b.kind === "think" && !b.done) return { ...b, done: true };
+    if (b.kind === "command" && (b.status === "running" || (b.status === "interrupted" && toolStatus === "failed"))) {
+      return { ...b, status: toolStatus };
+    }
     return b;
   });
   return { ...state, blocks };
 }
 
-function eventMessage(data: any) {
-  const value = data?.error?.message ?? data?.message ?? data?.error ?? "";
-  return typeof value === "string" ? value : JSON.stringify(value);
+function metricValue(metric: any): number {
+  if (typeof metric === "number") return metric;
+  return metric?.available && typeof metric.value === "number" ? metric.value : 0;
 }
 
-function structuredText(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) {
-    return value.map(structuredText).filter(Boolean).join("\n\n");
+function runtimeToolCommand(toolCall: any): string {
+  const args = toolCall?.arguments || {};
+  if (typeof args.command === "string") return args.command;
+  if (typeof args.path === "string") return `${toolCall?.name || "tool"} ${args.path}`;
+  const encoded = Object.keys(args).length ? JSON.stringify(args) : "";
+  return [toolCall?.name || "tool", encoded].filter(Boolean).join(" ");
+}
+
+function reduceCanonicalRuntimeEvent(state: FeedState, ev: LoomEvent): FeedState {
+  const event = ev.data || {};
+  if (event.kind === "terminal") {
+    const lifecycle = event.outcome?.state || "completed";
+	// Loom's paired control event owns the one visible terminal message. The
+	// typed Runtime terminal only settles streaming/tool presentation.
+    return finishStreaming(state, lifecycle === "completed" ? "interrupted" : lifecycle);
   }
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    for (const key of ["text", "content", "summary"]) {
-      const text = structuredText(record[key]);
-      if (text) return text;
+  if (event.kind === "usage" && event.usage) {
+    return push(state, {
+      kind: "usage", id: event.turnId || `usage-${ev.seq}`, ts: ev.ts,
+      inputTokens: metricValue(event.usage.inputTokens),
+      cachedInputTokens: metricValue(event.usage.cachedInputTokens),
+      outputTokens: metricValue(event.usage.outputTokens),
+      reasoningOutputTokens: metricValue(event.usage.reasoningOutputTokens),
+      totalTokens: metricValue(event.usage.totalTokens), calls: metricValue(event.usage.calls),
+    });
+  }
+  if (event.kind !== "content" || !event.content) return state;
+  const content = event.content;
+  const id = content.id || `content-${ev.seq}`;
+  const phase = event.contentPhase || "completed";
+  switch (content.kind) {
+    case "user_text":
+      return push(state, userBlock(ev.ts, content.text || ""));
+    case "assistant_text": {
+      const key = `a:${id}`;
+      if (state.index[key] === undefined) return push(state, { kind: "agent", id, ts: ev.ts, text: content.text || "", streaming: phase !== "completed" }, key);
+      return update(state, key, (block) => block.kind === "agent" ? {
+        ...block,
+        text: phase === "delta" ? block.text + (content.text || "") : (content.text || block.text),
+        streaming: phase !== "completed",
+      } : block);
+    }
+    case "reasoning": {
+      const key = `t:${id}`;
+      if (state.index[key] === undefined) {
+        if (!(content.text || "").trim()) return state;
+        return push(state, { kind: "think", id, ts: ev.ts, text: content.text || "", done: phase === "completed" }, key);
+      }
+      return update(state, key, (block) => block.kind === "think" ? {
+        ...block,
+        text: phase === "delta" ? block.text + (content.text || "") : (content.text || block.text),
+        done: phase === "completed",
+      } : block);
+    }
+    case "tool_call": {
+      const key = `c:${id}`;
+      const command = runtimeToolCommand(content.toolCall);
+      if (state.index[key] === undefined) {
+		return push(state, { kind: "command", id, ts: ev.ts, command, status: "running", exitCode: null, durationMs: null, output: "" }, key);
+      }
+      return update(state, key, (block) => block.kind === "command" ? { ...block, command: command || block.command } : block);
+    }
+    case "tool_result": {
+      const toolCallId = content.toolResult?.toolCallId || id;
+      const key = `c:${toolCallId}`;
+      const patch = { status: content.toolResult?.success ? "completed" : "failed", output: content.toolResult?.text || "" };
+      if (state.index[key] === undefined) {
+        return push(state, { kind: "command", id: toolCallId, ts: ev.ts, command: "tool", exitCode: null, durationMs: null, ...patch }, key);
+      }
+      return update(state, key, (block) => block.kind === "command" ? { ...block, ...patch } : block);
+    }
+    case "image": {
+      const key = `i:${id}`;
+      const ref = content.image?.ref || "";
+      if (!ref) return state;
+      if (state.index[key] === undefined) return push(state, { kind: "image", id, ts: ev.ts, data: ref }, key);
+      return update(state, key, (block) => block.kind === "image" ? { ...block, data: ref } : block);
+    }
+    case "attachment": {
+      const artifact = normalizeAttachment({
+        id: content.attachment?.id,
+        name: content.attachment?.name,
+        mimeType: content.attachment?.mimeType,
+        size: content.attachment?.size,
+        url: content.attachment?.ref,
+      });
+      if (!artifact.id || !artifact.url) return state;
+      if (state.blocks.some((block) => block.kind === "artifact" && block.id === artifact.id)) return state;
+      return push(state, { kind: "artifact", id: artifact.id, ts: ev.ts, artifact });
     }
   }
-  return "";
-}
-
-function deltaText(delta: unknown): string {
-  return structuredText(delta);
-}
-
-function kindString(k: any): string {
-  if (typeof k === "string") return k;
-  if (k && typeof k.type === "string") return k.type;
-  return "";
-}
-
-function imageData(value: any): string {
-  if (typeof value !== "string" || !value) return "";
-  if (value.startsWith("data:image/")) return value;
-  return `data:image/png;base64,${value}`;
-}
-
-function imagePath(value: any): string {
-  if (typeof value !== "string" || !value) return "";
-  return `/api/images?path=${encodeURIComponent(value)}`;
-}
-
-function imageSrc(item: any): { data: string; path?: string } | null {
-  const data = imageData(item.data || item.result);
-  if (data) return { data };
-  const path = item.path || item.filePath;
-  const src = imagePath(path);
-  if (!src) return null;
-  return { data: src, path };
+  return state;
 }
 
 function secs(ms: any): string {
@@ -757,58 +808,26 @@ function buildHistoryBlocks(turns: any[], keyPrefix: string): Block[] {
   const blocks: Block[] = [];
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i];
-    const items = turn.items || [];
-    for (let j = 0; j < items.length; j++) {
-      const it = items[j];
-      const id = `${keyPrefix}-${i}-${j}`;
-      const timestamp = typeof it.timestamp === "string" ? it.timestamp : "";
-      switch (it.type) {
-        case "user":
-          blocks.push(userBlock(timestamp, structuredText(it.text), Array.isArray(it.attachments) ? it.attachments : []));
-          break;
-        case "answer":
-          blocks.push({ kind: "agent", id, ts: timestamp, text: structuredText(it.text), streaming: false });
-          break;
-        case "thinking": {
-          const text = structuredText(it.text) || structuredText(it.summary) || structuredText(it.content);
-          if (text.trim()) {
-            blocks.push({ kind: "think", id, ts: timestamp, text, done: true });
-          }
-          break;
-        }
-        case "command":
-          blocks.push({
-            kind: "command", id, ts: timestamp,
-            command: it.command || "",
-            status: it.status || "completed",
-            exitCode: it.exitCode ?? null,
-            durationMs: it.durationMs ?? null,
-            output: it.output || "",
-          });
-          break;
-        case "file_change":
-          blocks.push({ kind: "file", id, ts: timestamp, status: "completed", changes: it.changes || [] });
-          break;
-        case "image":
-          {
-            const image = imageSrc(it);
-            if (image) blocks.push({ kind: "image", id, ts: timestamp, ...image });
-          }
-          break;
-      }
+    if (!Array.isArray(turn.content)) continue;
+    let state: FeedState = { blocks: [], index: {}, approvals: {} };
+    for (const content of turn.content) {
+      state = reduceCanonicalRuntimeEvent(state, {
+        seq: 0, ts: turn.startedAt || "", type: "loom/runtime-event",
+        data: { kind: "content", turnId: turn.turnId, contentPhase: "completed", content },
+      });
     }
-    if (turn.usage?.totalTokens) {
+    blocks.push(...finishStreaming(state, turn.state === "completed" ? "interrupted" : turn.state).blocks);
+    if (turn.error && turn.state === "failed") {
+      blocks.push({ kind: "sys", ts: turn.completedAt || turn.startedAt || "", cls: "err", text: `✖ failed: ${turn.error}` });
+    } else if (turn.error && turn.state === "interrupted") {
+      blocks.push({ kind: "sys", ts: turn.completedAt || turn.startedAt || "", cls: "warn", text: `■ interrupted ${turn.error}` });
+    }
+    if (turn.usage && metricValue(turn.usage.totalTokens)) {
       blocks.push({
-        kind: "usage",
-        id: turn.id || `${keyPrefix}-turn-${i}`,
-        ts: turn.completedAt || turn.updatedAt || items.at(-1)?.timestamp || turn.startedAt || "",
-        model: turn.model,
-        inputTokens: turn.usage.inputTokens || 0,
-        cachedInputTokens: turn.usage.cachedInputTokens || 0,
-        outputTokens: turn.usage.outputTokens || 0,
-        reasoningOutputTokens: turn.usage.reasoningOutputTokens || 0,
-        totalTokens: turn.usage.totalTokens || 0,
-        calls: turn.usage.calls || 0,
+        kind: "usage", id: turn.turnId || `${keyPrefix}-turn-${i}`, ts: turn.completedAt || turn.startedAt || "",
+        inputTokens: metricValue(turn.usage.inputTokens), cachedInputTokens: metricValue(turn.usage.cachedInputTokens),
+        outputTokens: metricValue(turn.usage.outputTokens), reasoningOutputTokens: metricValue(turn.usage.reasoningOutputTokens),
+        totalTokens: metricValue(turn.usage.totalTokens), calls: metricValue(turn.usage.calls),
       });
     }
   }
@@ -816,31 +835,10 @@ function buildHistoryBlocks(turns: any[], keyPrefix: string): Block[] {
 }
 
 export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
-	const rawType = ev.type || "";
-	let t = rawType === "hub/session-created"
-		? "loom/agent-created"
-		: rawType === "hub/session-killed"
-			? "loom/agent-archived"
-			: rawType.startsWith("hub/")
-				? `loom/${rawType.slice("hub/".length)}`
-				: rawType;
+	const t = ev.type || "";
   const d = ev.data || {};
 
-  if ((d as any).compatibility === true && (
-    t === "turn/started" || t === "turn/completed" || t === "turn/failed" || t === "turn/aborted" ||
-    t === "item/started" || t === "item/updated" || t === "item/completed" ||
-    t === "item/agentMessage/delta" || t === "item/reasoning/delta"
-  )) return state;
-
-  switch (t) {
-    case "loom/text-delta": t = "item/agentMessage/delta"; break;
-    case "loom/reasoning-delta": t = "item/reasoning/delta"; break;
-    case "loom/text-completed":
-    case "loom/reasoning-completed":
-    case "loom/tool-completed": t = "item/completed"; break;
-    case "loom/tool-started": t = "item/started"; break;
-    case "loom/tool-updated": t = "item/updated"; break;
-  }
+  if (t === "loom/runtime-event") return reduceCanonicalRuntimeEvent(state, ev);
 
   switch (t) {
     case "__approvals_snapshot__": {
@@ -919,10 +917,6 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
     case "loom/error":
     case "loom/host-error":
       return sys(state, ev.ts, "err", `CodexLoom error: ${d.message || ""}`);
-    case "warning":
-      return sys(state, ev.ts, "warn", eventMessage(d) || "Codex warning");
-    case "error":
-      return sys(finishStreaming(state), ev.ts, "err", eventMessage(d) || "Codex turn failed");
     case "loom/agent-archived":
       return sys(state, ev.ts, "warn", "agent archived");
     case "loom/approval-requested": {
@@ -938,115 +932,6 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
         d.decision === "approve" || d.decision === "accept" ? "ok" : "warn",
         `approval ${d.decision}`,
       );
-    }
-  }
-
-  // Streaming deltas.
-  if (t.endsWith("/delta")) {
-    const text = deltaText(d.delta);
-    if (!text) return state;
-    const itemId = d.itemId || "stream";
-    if (t.includes("reasoning")) {
-      const key = `t:${itemId}`;
-      if (state.index[key] === undefined) {
-        if (!text.trim()) return state;
-        return push(state, { kind: "think", id: itemId, ts: ev.ts, text, done: false }, key);
-      }
-      return update(state, key, (b) => (b.kind === "think" ? { ...b, text: b.text + text } : b));
-    }
-    if (t.includes("agentMessage")) {
-      const key = `a:${itemId}`;
-      if (state.index[key] === undefined) {
-        return push(state, { kind: "agent", id: itemId, ts: ev.ts, text, streaming: true }, key);
-      }
-      return update(state, key, (b) => (b.kind === "agent" ? { ...b, text: b.text + text } : b));
-    }
-    return state;
-  }
-
-  // Item lifecycle.
-  if (t === "item/started" || t === "item/updated" || t === "item/completed") {
-    const item = d.item || {};
-    const itemId = item.id || `anon-${state.blocks.length}`;
-    switch (item.type) {
-      case "agentMessage": {
-        const key = `a:${itemId}`;
-        const done = t === "item/completed";
-        const text = structuredText(item.text) || structuredText(item.content);
-        if (state.index[key] === undefined) {
-          if (!done || !text) return state;
-          const isFinal = item.phase === "final_answer" || !item.phase;
-          return isFinal
-            ? push(state, { kind: "agent", id: itemId, ts: ev.ts, text, streaming: false }, key)
-            : push(state, { kind: "think", id: itemId, ts: ev.ts, text, done: true }, `t:${itemId}`);
-        }
-        return update(state, key, (b) =>
-          b.kind === "agent" ? { ...b, text: text || b.text, streaming: !done } : b,
-        );
-      }
-      case "reasoning": {
-        const key = `t:${itemId}`;
-        const text =
-          structuredText(item.text) || structuredText(item.summary) || structuredText(item.content);
-        if (state.index[key] === undefined) {
-          if (!text.trim()) return state;
-          return push(state, { kind: "think", id: itemId, ts: ev.ts, text, done: t === "item/completed" }, key);
-        }
-        return update(state, key, (b) =>
-          b.kind === "think"
-            ? { ...b, text: text || b.text, done: t === "item/completed" }
-            : b,
-        );
-      }
-      case "commandExecution": {
-        const key = `c:${itemId}`;
-        const patch = {
-          command: item.command || "",
-          status: item.status || (t === "item/completed" ? "completed" : "running"),
-          exitCode: item.exitCode ?? null,
-          durationMs: item.durationMs ?? null,
-          output: item.aggregatedOutput || item.output || "",
-        };
-        if (state.index[key] === undefined) {
-          return push(state, { kind: "command", id: itemId, ts: ev.ts, ...patch }, key);
-        }
-        return update(state, key, (b) => (b.kind === "command" ? { ...b, ...patch } : b));
-      }
-      case "fileChange": {
-        const key = `f:${itemId}`;
-        const changes = (item.changes || []).map((c: any) => ({
-          path: c.path || c.filePath || "",
-          kind: kindString(c.kind) || c.action || "",
-          diff: c.diff || "",
-        }));
-        const status = item.status || (t === "item/completed" ? "done" : "editing");
-        if (state.index[key] === undefined) {
-          return push(state, { kind: "file", id: itemId, ts: ev.ts, status, changes }, key);
-        }
-        return update(state, key, (b) => (b.kind === "file" ? { ...b, status, changes } : b));
-      }
-      case "imageGeneration":
-      case "image_generation_call":
-      case "imageView": {
-        const key = `i:${itemId}`;
-        const image = imageSrc(item);
-        if (!image) return state;
-        if (state.index[key] === undefined) {
-          return push(state, { kind: "image", id: itemId, ts: ev.ts, ...image }, key);
-        }
-        return update(state, key, (b) => (b.kind === "image" ? { ...b, ...image } : b));
-      }
-      default: {
-        // userMessage items duplicate the CodexLoom user-message event.
-        if (t !== "item/completed" || !item.type || item.type === "userMessage") return state;
-        const key = `r:${itemId}`;
-        if (state.index[key] !== undefined) return state;
-        return push(
-          state,
-          { kind: "raw", id: itemId, ts: ev.ts, type: item.type, json: JSON.stringify(item, null, 2) },
-          key,
-        );
-      }
     }
   }
 

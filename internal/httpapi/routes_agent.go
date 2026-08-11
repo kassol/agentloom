@@ -11,6 +11,7 @@ import (
 )
 
 func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/agents/events", s.globalEvents)
 	mux.HandleFunc("GET /api/agents", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("view") == "summary" {
 			writeJSON(w, 200, map[string]any{"agents": s.hub.ListAgentSummaries()})
@@ -60,8 +61,22 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, 200, map[string]any{"diagnostics": diagnostics})
 	})
+	mux.HandleFunc("GET /api/agents/{key}/runtime/diagnostics/events", func(w http.ResponseWriter, r *http.Request) {
+		since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
+		tail, _ := strconv.Atoi(r.URL.Query().Get("tail"))
+		if tail <= 0 {
+			tail = 100
+		}
+		events, err := s.hub.ReadRuntimeDiagnosticEvents(r.PathValue("key"), since, tail)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, 200, map[string]any{"events": events})
+	})
 	mux.HandleFunc("GET /api/turns/{turnId}", func(w http.ResponseWriter, r *http.Request) {
-		turn, err := s.hub.GetTurn(r.PathValue("turnId"))
+		turn, err := s.hub.GetCanonicalTurn(r.PathValue("turnId"))
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -371,7 +386,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/agents/{key}/thread/history", func(w http.ResponseWriter, r *http.Request) {
 		count, _ := strconv.Atoi(r.URL.Query().Get("count"))
 		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-		hist, err := s.hub.History(r.PathValue("key"), count, offset)
+		hist, err := s.hub.CanonicalHistory(r.PathValue("key"), count, offset)
 		if err != nil {
 			writeErr(w, err)
 			return

@@ -36,7 +36,7 @@ func TestTurnGetRouteFindsTurnWithoutAgentKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*hub.Agent{
-		"agent-1": {ID: "agent-1", Name: "worker", ThreadID: "loom-thread-1", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle", CreatedAt: nowForTest(), UpdatedAt: nowForTest()},
+		"agent-1": {ID: "agent-1", Name: "worker", ThreadID: "loom-thread-1", RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: threadID}, RuntimeTurnBindings: map[string]string{"turn-loom-api": "turn-api"}, Status: "idle", CreatedAt: nowForTest(), UpdatedAt: nowForTest()},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestTurnGetRouteFindsTurnWithoutAgentKey(t *testing.T) {
 	server := httptest.NewServer(New(h, nil, web).Handler())
 	defer server.Close()
 
-	response, err := http.Get(server.URL + "/api/turns/turn-api")
+	response, err := http.Get(server.URL + "/api/turns/turn-loom-api")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,12 +62,12 @@ func TestTurnGetRouteFindsTurnWithoutAgentKey(t *testing.T) {
 		t.Fatalf("status = %d", response.StatusCode)
 	}
 	var body struct {
-		Turn hub.TurnDetail `json:"turn"`
+		Turn hub.CanonicalTurnDetail `json:"turn"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Turn.ID != "turn-api" || body.Turn.Agent != "worker" || body.Turn.Status != "completed" {
+	if body.Turn.TurnID != "turn-loom-api" || body.Turn.Agent != "worker" || body.Turn.State != "completed" {
 		t.Fatalf("Turn = %#v", body.Turn)
 	}
 

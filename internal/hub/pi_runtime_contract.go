@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
@@ -158,6 +160,11 @@ func (c *piRuntimeContract) handleNativeEvent(event RuntimeEvent) {
 			c.turnsByNative[event.NativeTurnID] = correlation
 		}
 	}
+	if event.Kind == RuntimeTurnCompleted || event.Kind == RuntimeTurnFailed || event.Kind == RuntimeTurnInterrupted {
+		if c.pendingTurn.turnID == correlation.turnID {
+			c.pendingTurn = runtimeTurnCorrelation{}
+		}
+	}
 	handler := c.handler
 	c.mu.Unlock()
 	if handler != nil {
@@ -171,9 +178,6 @@ func (c *piRuntimeContract) bindTurn(turnID, predecessorTurnID, nativeTurnID str
 	}
 	c.mu.Lock()
 	c.turnsByNative[nativeTurnID] = runtimeTurnCorrelation{turnID: turnID, predecessorTurnID: predecessorTurnID}
-	if c.pendingTurn.turnID == turnID {
-		c.pendingTurn = runtimeTurnCorrelation{}
-	}
 	c.mu.Unlock()
 }
 
@@ -199,6 +203,9 @@ func (c *piRuntimeContract) ReadHistory(ctx context.Context, request runtimecont
 	}
 	native, err := c.native.ReadHistory(request.Binding.NativeRef, request.Count, request.Offset)
 	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, rollout.ErrRolloutNotFound) || errors.Is(err, rollout.ErrTurnNotFound) {
+			return runtimecontract.History{}, &runtimecontract.Failure{Code: "history_not_found", Phase: runtimecontract.FailurePhaseHistory, Message: "Runtime history not found"}
+		}
 		outcome := piFailureOutcome(err, runtimecontract.FailurePhaseHistory)
 		return runtimecontract.History{}, outcome.Failure
 	}

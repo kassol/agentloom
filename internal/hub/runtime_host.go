@@ -52,6 +52,13 @@ type runtimeTurnCorrelationSeeder interface {
 	seedTurnBindings(map[string]string)
 }
 
+// runtimeHistoryContractProvider creates a passive Contract reader without
+// acquiring or starting a Runtime Host. History stays behind the registered
+// Driver boundary even when an Agent is cold after restart.
+type runtimeHistoryContractProvider interface {
+	HistoryContract(AgentHostRequest) runtimecontract.Contract
+}
+
 type runtimeTurnCorrelationBinder interface {
 	bindTurn(string, string, string)
 }

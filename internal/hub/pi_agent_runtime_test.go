@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -71,30 +72,38 @@ func TestPiAgentCompletesLiveLoomTurnOnlyAfterAgentSettled(t *testing.T) {
 	var normalized []string
 	toolIDs := map[string]bool{}
 	for _, event := range events {
-		switch event.Type {
-		case "loom/reasoning-delta", "loom/reasoning-completed", "loom/text-delta", "loom/tool-started", "loom/tool-updated", "loom/tool-completed":
-			normalized = append(normalized, event.Type)
-			if strings.HasPrefix(event.Type, "loom/tool-") {
-				var payload struct {
-					ItemID string `json:"itemId"`
-				}
-				_ = json.Unmarshal(event.Data, &payload)
-				toolIDs[payload.ItemID] = true
+		if event.Type != "loom/runtime-event" {
+			continue
+		}
+		var canonical runtimecontract.Event
+		if json.Unmarshal(event.Data, &canonical) != nil {
+			continue
+		}
+		switch canonical.Kind {
+		case runtimecontract.EventTurnStarted:
+			normalized = append(normalized, "turn_started")
+		case runtimecontract.EventContent:
+			if canonical.Content == nil {
+				continue
 			}
-		case "loom/text-completed":
-			normalized = append(normalized, event.Type)
-			answerSeen = strings.Contains(string(event.Data), "hello from Pi")
-		case "loom/turn-completed":
-			normalized = append(normalized, event.Type)
-			completionSeen = answerSeen && strings.Contains(string(event.Data), result.TurnID)
+			normalized = append(normalized, string(canonical.Content.Kind)+":"+string(canonical.ContentPhase))
+			if canonical.Content.Kind == runtimecontract.ContentToolCall || canonical.Content.Kind == runtimecontract.ContentToolResult {
+				toolIDs[canonical.Content.ID] = true
+			}
+			if canonical.Content.Kind == runtimecontract.ContentAssistantText && canonical.ContentPhase == runtimecontract.ContentPhaseCompleted {
+				answerSeen = strings.Contains(canonical.Content.Text, "hello from Pi")
+			}
+		case runtimecontract.EventTerminal:
+			normalized = append(normalized, "terminal")
+			completionSeen = answerSeen && canonical.TurnID == result.TurnID && canonical.Outcome != nil && canonical.Outcome.State == runtimecontract.LifecycleCompleted
 		}
 	}
 	if !answerSeen || !completionSeen {
 		t.Fatalf("normalized Pi events = %#v", events)
 	}
 	wantNormalized := []string{
-		"loom/reasoning-delta", "loom/reasoning-completed", "loom/tool-started", "loom/tool-updated",
-		"loom/tool-completed", "loom/text-delta", "loom/text-completed", "loom/turn-completed",
+		"turn_started", "reasoning:delta", "reasoning:completed", "tool_call:started", "tool_call:updated",
+		"tool_result:completed", "assistant_text:delta", "assistant_text:completed", "terminal",
 	}
 	if strings.Join(normalized, ",") != strings.Join(wantNormalized, ",") || len(toolIDs) != 1 {
 		t.Fatalf("streamed normalized order=%v toolIDs=%v", normalized, toolIDs)
@@ -273,7 +282,13 @@ func TestPiApprovalDenyAndTimeoutFailClosedBeforeToolExecution(t *testing.T) {
 					t.Fatal(readErr)
 				}
 				for _, event := range events {
-					if event.Type == "loom/tool-completed" && strings.Contains(string(event.Data), `"status":"failed"`) {
+					if event.Type != "loom/runtime-event" {
+						continue
+					}
+					var canonical runtimecontract.Event
+					if json.Unmarshal(event.Data, &canonical) == nil && canonical.Kind == runtimecontract.EventContent &&
+						canonical.Content != nil && canonical.Content.Kind == runtimecontract.ContentToolResult &&
+						canonical.Content.ToolResult != nil && !canonical.Content.ToolResult.Success {
 						failedTool = true
 						break
 					}
@@ -745,6 +760,58 @@ func TestPiStoreRestartCreatesOneRecoveryTurnFromCleanDurableSession(t *testing.
 	}
 }
 
+func TestPiCanonicalHistoryAfterStoreRestartKeepsUnmatchedToolInterrupted(t *testing.T) {
+	dataDir := t.TempDir()
+	sessionFile := filepath.Join(dataDir, "session.jsonl")
+	contents := strings.Join([]string{
+		`{"type":"session","version":3,"id":"agent-restart","timestamp":"2026-08-10T01:00:00Z","cwd":"/tmp/work"}`,
+		`{"type":"message","id":"user-before","parentId":null,"timestamp":"2026-08-10T01:00:01Z","message":{"role":"user","content":[{"type":"text","text":"publish after restart"}]}}`,
+		`{"type":"message","id":"assistant-before","parentId":"user-before","timestamp":"2026-08-10T01:00:02Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-before","name":"bash","arguments":{"command":"deploy --prod"}}],"stopReason":"toolUse"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(sessionFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := now()
+	if err := st.SaveAgents(map[string]*Agent{"agent-restart": {
+		ID: "agent-restart", Name: "pi-restart", Cwd: t.TempDir(), ThreadID: "loom-thread-restart",
+		RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "pi", NativeRef: sessionFile}, RuntimeTurnBindings: map[string]string{"turn-before": "user-before"},
+		TurnRecoveryMarkers: map[string]TurnRecoveryMarker{"turn-before": {PredecessorTurnID: "turn-before", State: TurnRecoveryCompleted, CreatedAt: stamp, UpdatedAt: stamp}},
+		Status:              "idle", CreatedAt: stamp, UpdatedAt: stamp,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	h, err := Open(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Shutdown()
+	history, err := h.CanonicalHistory("agent-restart", 10, 0)
+	if err != nil || len(history.Turns) != 1 {
+		t.Fatalf("canonical history=%#v err=%v", history, err)
+	}
+	predecessor := history.Turns[0]
+	if predecessor.TurnID != "turn-before" || predecessor.State != runtimecontract.LifecycleInterrupted || len(predecessor.Content) < 2 || predecessor.Content[1].Kind != runtimecontract.ContentToolCall {
+		t.Fatalf("restarted Pi predecessor = %#v", predecessor)
+	}
+	for _, content := range predecessor.Content {
+		if content.Kind == runtimecontract.ContentToolResult && content.ToolResult != nil && content.ToolResult.Success {
+			t.Fatalf("restart invented successful tool result: %#v", predecessor.Content)
+		}
+	}
+}
+
 func TestPiRuntimeNormalizesStreamingTextReasoningAndToolLifecycle(t *testing.T) {
 	runtime := newPiAgentRuntime("agent-1", t.TempDir(), "")
 	rawEvents := []string{
@@ -785,6 +852,30 @@ func TestPiRuntimeNormalizesStreamingTextReasoningAndToolLifecycle(t *testing.T)
 	}
 	if events[5].ItemID != events[0].ItemID || events[5].Text != "checking files" || events[6].ItemID != events[1].ItemID || events[6].Text != "hello world" {
 		t.Fatalf("completed message correlation = %#v", events[5:])
+	}
+}
+
+func TestPiRuntimeCapturesRedactedNativeDiagnosticBeforeNormalization(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "pi", RuntimeBinding: RuntimeBinding{Kind: "pi"}}
+	runtime := newPiAgentRuntime("agent-1", t.TempDir(), "")
+	runtime.SetRuntimeDiagnosticHandler(func(raw json.RawMessage) {
+		h.mu.Lock()
+		h.appendRuntimeDiagnosticLocked("agent-1", "pi/rpc-event", raw)
+		h.mu.Unlock()
+	})
+	runtime.handleEvent(json.RawMessage(`{"type":"message_update","nativeEntryId":"entry-1","apiKey":"private","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}`))
+	events, err := h.ReadRuntimeDiagnosticEvents("agent-1", 0, 10)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("diagnostic events = %#v, err=%v", events, err)
+	}
+	data := string(events[0].Data)
+	if !strings.Contains(data, "entry-1") || !strings.Contains(data, "[redacted]") || strings.Contains(data, "private") {
+		t.Fatalf("Pi diagnostic projection = %s", data)
 	}
 }
 
@@ -852,13 +943,15 @@ func TestPiAbortKeepsLoomTurnRunningUntilAbortedAgentSettles(t *testing.T) {
 	var text string
 	terminal := ""
 	for _, event := range events {
-		switch event.Type {
-		case "loom/text-delta":
-			var payload struct {
-				Delta string `json:"delta"`
+		if event.Type == "loom/runtime-event" {
+			var canonical runtimecontract.Event
+			if json.Unmarshal(event.Data, &canonical) == nil && canonical.Kind == runtimecontract.EventContent &&
+				canonical.Content != nil && canonical.Content.Kind == runtimecontract.ContentAssistantText &&
+				canonical.ContentPhase == runtimecontract.ContentPhaseDelta {
+				text += canonical.Content.Text
 			}
-			_ = json.Unmarshal(event.Data, &payload)
-			text += payload.Delta
+		}
+		switch event.Type {
 		case "loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted":
 			terminal = event.Type
 		}
@@ -913,14 +1006,17 @@ func TestPiRetryAndCompactionContinuationSettleOnlyFinalAssistantState(t *testin
 	var deltas string
 	terminals := 0
 	for _, event := range events {
-		if event.Type == "loom/text-delta" {
-			var payload struct {
-				Delta string `json:"delta"`
-			}
-			_ = json.Unmarshal(event.Data, &payload)
-			deltas += payload.Delta
+		if event.Type != "loom/runtime-event" {
+			continue
 		}
-		if event.Type == "loom/turn-completed" || event.Type == "loom/turn-failed" || event.Type == "loom/turn-interrupted" {
+		var canonical runtimecontract.Event
+		if json.Unmarshal(event.Data, &canonical) != nil {
+			continue
+		}
+		if canonical.Kind == runtimecontract.EventContent && canonical.Content != nil && canonical.Content.Kind == runtimecontract.ContentAssistantText && canonical.ContentPhase == runtimecontract.ContentPhaseDelta {
+			deltas += canonical.Content.Text
+		}
+		if canonical.Kind == runtimecontract.EventTerminal {
 			terminals++
 		}
 	}

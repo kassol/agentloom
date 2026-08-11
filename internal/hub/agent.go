@@ -26,6 +26,9 @@ func (h *Hub) ListAgents() []AgentView {
 	h.mu.Unlock()
 	for i := range out {
 		applyRolloutStatus(&out[i])
+		if snapshot, ok := h.refreshRuntimeCapabilitySnapshot(out[i].ID, false); ok {
+			out[i].CapabilitySnapshot = snapshot
+		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].CreatedAt != out[j].CreatedAt {
@@ -90,6 +93,9 @@ func (h *Hub) GetAgent(key string) (AgentView, error) {
 	view := h.viewLocked(meta)
 	h.mu.Unlock()
 	applyRolloutStatus(&view)
+	if snapshot, ok := h.refreshRuntimeCapabilitySnapshot(view.ID, false); ok {
+		view.CapabilitySnapshot = snapshot
+	}
 	return view, nil
 }
 
@@ -515,7 +521,6 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 		h.mu.Unlock()
 		return AgentView{}, errf(500, "save agent config: %s", err)
 	}
-	h.emitStatusLocked(meta, meta.Status)
 	view := h.viewLocked(meta)
 	binding := runtimeContractBinding(meta)
 	rt := h.runtimes[meta.ID]
@@ -527,6 +532,9 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 			// later native synchronization may retry this optional convenience.
 			log.Printf("[codex-loom] sync native binding name for Agent %s to %q: %v", meta.ID, nextName, err)
 		}
+	}
+	if snapshot, ok := h.refreshRuntimeCapabilitySnapshot(view.ID, true); ok {
+		view.CapabilitySnapshot = snapshot
 	}
 	return view, nil
 }
@@ -1420,6 +1428,35 @@ type History struct {
 	Turns    []HistoryTurn `json:"turns"`
 }
 
+// CanonicalHistory is the Runtime Contract v2 history projection returned by
+// ordinary Agent APIs. Native Runtime references and diagnostic payloads are
+// intentionally absent.
+type CanonicalHistory struct {
+	ID       string                 `json:"id"`
+	Name     string                 `json:"name"`
+	Cwd      string                 `json:"cwd"`
+	ThreadID string                 `json:"threadId"`
+	Status   string                 `json:"status"`
+	Total    int                    `json:"total"`
+	Turns    []CanonicalHistoryTurn `json:"turns"`
+}
+
+type CanonicalHistoryTurn struct {
+	runtimecontract.HistoryTurn
+	Source *TurnReference `json:"source,omitempty"`
+	Error  string         `json:"error,omitempty"`
+}
+
+type CanonicalTurnDetail struct {
+	runtimecontract.HistoryTurn
+	AgentID  string         `json:"agentId"`
+	Agent    string         `json:"agent"`
+	ThreadID string         `json:"threadId"`
+	Cwd      string         `json:"cwd"`
+	Source   *TurnReference `json:"source,omitempty"`
+	Error    string         `json:"error,omitempty"`
+}
+
 type TurnReference struct {
 	Kind    string `json:"kind"`
 	ID      string `json:"id,omitempty"`
@@ -1624,6 +1661,162 @@ func (h *Hub) History(key string, count, offset int) (History, error) {
 		hist.Turns = append(hist.Turns, turn)
 	}
 	return hist, nil
+}
+
+// CanonicalHistory reads through Runtime Contract v2 and applies the public
+// Loom identity projection. The v1 History method remains for /api/sessions.
+func (h *Hub) CanonicalHistory(key string, count, offset int) (CanonicalHistory, error) {
+	if count <= 0 {
+		count = 10
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	h.mu.Lock()
+	meta := h.resolveLocked(key)
+	if meta == nil {
+		h.mu.Unlock()
+		return CanonicalHistory{}, errf(404, "agent not found: %s", key)
+	}
+	view := h.viewLocked(meta)
+	contract := runtimecontract.Contract(nil)
+	var historyProvider runtimeHistoryContractProvider
+	if rt := h.runtimes[meta.ID]; rt != nil {
+		contract = rt.runtimeContract
+	}
+	if contract == nil {
+		if driver, err := h.runtimeHostDriverLocked(meta.RuntimeBinding.Kind); err == nil {
+			historyProvider, _ = driver.(runtimeHistoryContractProvider)
+		}
+	}
+	h.mu.Unlock()
+	applyRolloutStatus(&view)
+	result := CanonicalHistory{ID: view.ID, Name: view.Name, Cwd: view.Cwd, ThreadID: view.ThreadID, Status: view.Status, Turns: []CanonicalHistoryTurn{}}
+	if view.nativeRuntimeRef == "" {
+		return result, nil
+	}
+	if contract == nil && historyProvider != nil {
+		contract = historyProvider.HistoryContract(AgentHostRequest{AgentID: view.ID})
+		if seeder, ok := contract.(runtimeTurnCorrelationSeeder); ok {
+			seeder.seedTurnBindings(view.nativeTurnBindings)
+		}
+	}
+	if contract == nil {
+		return CanonicalHistory{}, errf(503, "%s Runtime history backend is unavailable", view.RuntimeBinding.Kind)
+	}
+	history, failure := contract.ReadHistory(context.Background(), runtimecontract.HistoryRequest{
+		Binding: runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: view.RuntimeBinding.Kind, NativeRef: view.nativeRuntimeRef},
+		Count:   count, Offset: offset,
+	})
+	if failure != nil {
+		if failure.Code == "history_not_found" {
+			return result, nil
+		}
+		return CanonicalHistory{}, errf(500, "read %s Runtime history: %s", view.RuntimeBinding.Kind, publicRuntimeFailureMessage(&view.Agent, "", failure.Message))
+	}
+	result.Total = history.Total
+	for _, turn := range history.Turns {
+		projected := projectCanonicalHistoryTurn(&view, turn)
+		h.mu.Lock()
+		source, turnError := h.turnReferenceLocked(view.ID, projected.TurnID)
+		h.mu.Unlock()
+		if strings.TrimSpace(turnError) == "" && view.LastTurn != nil && view.LastTurn.TurnID == projected.TurnID {
+			turnError = view.LastError
+		}
+		result.Turns = append(result.Turns, CanonicalHistoryTurn{
+			HistoryTurn: projected,
+			Source:      source,
+			Error:       publicRuntimeFailureMessage(&view.Agent, projected.TurnID, turnError),
+		})
+	}
+	return result, nil
+}
+
+func projectCanonicalHistoryTurn(view *AgentView, turn runtimecontract.HistoryTurn) runtimecontract.HistoryTurn {
+	turnID := strings.TrimSpace(turn.TurnID)
+	if turnID == "" && view != nil {
+		for loomTurnID, nativeTurnID := range view.nativeTurnBindings {
+			if nativeTurnID == turn.RuntimeTurnRef {
+				turnID = loomTurnID
+				break
+			}
+		}
+	}
+	if turnID == "" {
+		seed := turn.RuntimeTurnRef
+		if view != nil {
+			seed = view.ThreadID + "\x00" + seed
+		}
+		digest := sha256Hex([]byte(seed))
+		turnID = "turn_" + digest[:16]
+	}
+	turn.TurnID = turnID
+	turn.RuntimeTurnRef = ""
+	turn.Diagnostic = nil
+	if view != nil {
+		if view.LastTurn != nil && view.LastTurn.TurnID == turnID {
+			switch view.LastTurn.Status {
+			case "completed":
+				turn.State = runtimecontract.LifecycleCompleted
+			case "failed":
+				turn.State = runtimecontract.LifecycleFailed
+			case "interrupted":
+				turn.State = runtimecontract.LifecycleInterrupted
+			}
+			if view.LastTurn.CompletedAt != "" {
+				turn.CompletedAt = view.LastTurn.CompletedAt
+			}
+		}
+		if marker, ok := view.turnRecoveryMarkers[turnID]; ok {
+			turn.State = runtimecontract.LifecycleInterrupted
+			if turn.CompletedAt == "" {
+				turn.CompletedAt = marker.UpdatedAt
+				if turn.CompletedAt == "" {
+					turn.CompletedAt = marker.CreatedAt
+				}
+			}
+		}
+	}
+	projected := make([]runtimecontract.ContentBlock, 0, len(turn.Content))
+	for index := range turn.Content {
+		if content, ok := projectRuntimeContentBlock(view, turnID, turn.Content[index]); ok {
+			projected = append(projected, content)
+		}
+	}
+	turn.Content = projected
+	return turn
+}
+
+func (h *Hub) GetCanonicalTurn(turnID string) (CanonicalTurnDetail, error) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return CanonicalTurnDetail{}, errf(400, "turn id is required")
+	}
+	var firstErr error
+	for _, agent := range h.ListAgents() {
+		history, err := h.CanonicalHistory(agent.ID, 10_000, 0)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, turn := range history.Turns {
+			if turn.TurnID != turnID {
+				continue
+			}
+			detail := CanonicalTurnDetail{HistoryTurn: turn.HistoryTurn, AgentID: agent.ID, Agent: agent.Name, ThreadID: agent.ThreadID, Cwd: agent.Cwd, Source: turn.Source, Error: turn.Error}
+			if strings.TrimSpace(detail.Error) == "" && turn.State == runtimecontract.LifecycleFailed {
+				detail.Error = agent.LastError
+			}
+			detail.Error = publicRuntimeFailureMessage(&agent.Agent, turnID, detail.Error)
+			return detail, nil
+		}
+	}
+	if firstErr != nil {
+		return CanonicalTurnDetail{}, firstErr
+	}
+	return CanonicalTurnDetail{}, errf(404, "turn not found: %s", turnID)
 }
 
 func applyInterruptedHistoryTurn(view *AgentView, turnID string, turn *RuntimeHistoryTurn) {

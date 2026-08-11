@@ -476,18 +476,6 @@ export function BlockView({ block }: { block: Block }) {
         </div>
       );
 
-    // Unrecognised item — raw JSON, collapsed.
-    case "raw":
-      return (
-        <details className="my-2 overflow-hidden rounded-md border border-border bg-card">
-          <summary className="cursor-pointer select-none px-3 py-2 font-mono text-[12.5px] text-muted-foreground">
-            {block.type}
-          </summary>
-          <pre className="max-h-80 overflow-auto whitespace-pre-wrap border-t border-border bg-muted/40 px-3.5 py-2.5 font-mono text-[12px] text-muted-foreground">
-            {block.json}
-          </pre>
-        </details>
-      );
   }
 }
 

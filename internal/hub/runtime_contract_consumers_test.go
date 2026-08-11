@@ -40,6 +40,8 @@ type controlPlaneContract struct {
 	name             string
 	snapshot         runtimecontract.CapabilitySnapshot
 	snapshotHook     func()
+	history          runtimecontract.History
+	historyFailure   *runtimecontract.Failure
 }
 
 type controlPlaneHost struct {
@@ -57,6 +59,7 @@ type controlPlaneDriver struct {
 	shutdownCalls        int
 	closedBeforeShutdown bool
 	snapshot             runtimecontract.CapabilitySnapshot
+	historyContract      runtimecontract.Contract
 }
 
 func (d *controlPlaneDriver) Preflight(context.Context) error { return nil }
@@ -68,6 +71,9 @@ func (d *controlPlaneDriver) acquireWhileHubLocked(ctx context.Context, request 
 }
 func (d *controlPlaneDriver) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
 	return d.snapshot
+}
+func (d *controlPlaneDriver) HistoryContract(AgentHostRequest) runtimecontract.Contract {
+	return d.historyContract
 }
 func (d *controlPlaneDriver) Shutdown(context.Context) error {
 	d.shutdownCalls++
@@ -135,13 +141,103 @@ func (c *controlPlaneContract) InterruptTurn(_ context.Context, request runtimec
 }
 func (c *controlPlaneContract) SetEventHandler(func(runtimecontract.Event)) {}
 func (c *controlPlaneContract) ReadHistory(context.Context, runtimecontract.HistoryRequest) (runtimecontract.History, *runtimecontract.Failure) {
-	return runtimecontract.History{}, nil
+	return c.history, c.historyFailure
 }
 func (c *controlPlaneContract) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
 	if c.snapshotHook != nil {
 		c.snapshotHook()
 	}
 	return c.snapshot
+}
+
+func TestCanonicalHistoryUsesRegisteredDriverWhenAgentIsCold(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	contract := &controlPlaneContract{history: runtimecontract.History{
+		Total: 1,
+		Turns: []runtimecontract.HistoryTurn{{
+			RuntimeTurnRef: "native-turn", State: runtimecontract.LifecycleCompleted,
+			Content: []runtimecontract.ContentBlock{{ID: "native-content", Kind: runtimecontract.ContentAssistantText, Text: "hello"}},
+		}},
+	}}
+	h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{"fake": &controlPlaneDriver{historyContract: contract}}
+	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "cold", ThreadID: "loom-thread", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "fake", NativeRef: "/native/session"}, RuntimeTurnBindings: map[string]string{"turn-loom": "native-turn"}, Status: "idle"}
+
+	history, err := h.CanonicalHistory("agent-1", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Turns) != 1 || history.Turns[0].TurnID != "turn-loom" || history.Turns[0].Content[0].ID == "native-content" {
+		t.Fatalf("cold canonical history = %#v", history)
+	}
+}
+
+func TestCanonicalHistoryUsesTypedNotFoundAndGetTurnPreservesBackendFailure(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	driver := &controlPlaneDriver{historyContract: &controlPlaneContract{historyFailure: &runtimecontract.Failure{Code: "history_not_found", Phase: runtimecontract.FailurePhaseHistory, Message: "localized missing history"}}}
+	h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{"fake": driver}
+	h.agents["missing"] = &Agent{ID: "missing", Name: "missing", ThreadID: "loom-missing", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "fake", NativeRef: "/native/missing"}, Status: "idle"}
+	if history, err := h.CanonicalHistory("missing", 10, 0); err != nil || len(history.Turns) != 0 {
+		t.Fatalf("typed not found history=%#v err=%v", history, err)
+	}
+
+	driver.historyContract = &controlPlaneContract{historyFailure: &runtimecontract.Failure{Code: "transport_failed", Phase: runtimecontract.FailurePhaseHistory, Message: "backend unavailable"}}
+	if _, err := h.GetCanonicalTurn("turn-unknown"); err == nil || !strings.Contains(err.Error(), "backend unavailable") {
+		t.Fatalf("GetCanonicalTurn error = %v", err)
+	}
+}
+
+func TestScopedCapabilitySnapshotRevisionChangesWithModelAndConfiguration(t *testing.T) {
+	base := runtimecontract.CapabilitySnapshot{
+		Revision: "driver-7",
+		Capabilities: []runtimecontract.CapabilityDescriptor{{
+			ID: runtimecontract.CapabilityContextDelivery, Availability: runtimecontract.CapabilityAvailable, Revision: "cap-1",
+		}},
+	}
+	first, err := scopeRuntimeCapabilitySnapshot(base, runtimecontract.CapabilityScope{RuntimeKind: "fake", BindingRevision: "binding-1", Model: "model-a", ConfigurationRevision: "config-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := scopeRuntimeCapabilitySnapshot(base, runtimecontract.CapabilityScope{RuntimeKind: "fake", BindingRevision: "binding-1", Model: "model-b", ConfigurationRevision: "config-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := scopeRuntimeCapabilitySnapshot(base, runtimecontract.CapabilityScope{RuntimeKind: "fake", BindingRevision: "binding-1", Model: "model-a", ConfigurationRevision: "config-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Revision == "" || first.Revision == second.Revision || first.Revision == third.Revision {
+		t.Fatalf("scoped revisions first=%q second=%q third=%q", first.Revision, second.Revision, third.Revision)
+	}
+}
+
+func TestCanonicalTurnFailureFallsBackToPublicAgentError(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	contract := &controlPlaneContract{history: runtimecontract.History{Total: 1, Turns: []runtimecontract.HistoryTurn{{TurnID: "turn-loom", State: runtimecontract.LifecycleFailed, Content: []runtimecontract.ContentBlock{}}}}}
+	h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{"fake": &controlPlaneDriver{historyContract: contract}}
+	nativeRef := "/private/native/session.jsonl"
+	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "failed", ThreadID: "thread-loom", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "fake", NativeRef: nativeRef}, Status: "idle", LastError: "read " + nativeRef + ": token=private"}
+	detail, err := h.GetCanonicalTurn("turn-loom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Error == "" || strings.Contains(detail.Error, nativeRef) || strings.Contains(detail.Error, "token=private") || !strings.Contains(detail.Error, "[redacted]") {
+		t.Fatalf("public Turn failure = %q", detail.Error)
+	}
 }
 
 func TestUnsupportedConfigUsesCapabilityReasonAndAlternativeBeforePersistence(t *testing.T) {

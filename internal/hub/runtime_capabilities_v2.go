@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,32 @@ func (h *Hub) queryRuntimeCapabilities(query runtimeCapabilityQuery) (runtimecon
 		}
 	}
 	return scopeRuntimeCapabilitySnapshot(snapshot, query.scope)
+}
+
+func (h *Hub) refreshRuntimeCapabilitySnapshot(agentID string, emit bool) (runtimecontract.CapabilitySnapshot, bool) {
+	h.mu.Lock()
+	meta := h.agents[agentID]
+	if meta == nil {
+		h.mu.Unlock()
+		return runtimecontract.CapabilitySnapshot{}, false
+	}
+	query := h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[agentID])
+	h.mu.Unlock()
+	snapshot, err := h.queryRuntimeCapabilities(query)
+	if err != nil {
+		return runtimecontract.CapabilitySnapshot{}, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.runtimeCapabilityQueryCurrentLocked(query) {
+		return runtimecontract.CapabilitySnapshot{}, false
+	}
+	meta = h.agents[agentID]
+	meta.capabilitySnapshot = snapshot
+	if emit {
+		h.emitStatusLocked(meta, meta.Status)
+	}
+	return snapshot, true
 }
 
 func (h *Hub) runtimeCapabilityQueryCurrentLocked(query runtimeCapabilityQuery) bool {
@@ -94,6 +121,20 @@ func scopeRuntimeCapabilitySnapshot(snapshot runtimecontract.CapabilitySnapshot,
 			}
 		}
 	}
+	// A snapshot revision describes the fully scoped observation, not merely
+	// the Driver's static capability vocabulary. This makes model/config/binding
+	// changes observable without inventing per-Runtime revision conventions.
+	sourceRevision := snapshot.Revision
+	snapshot.Revision = ""
+	encoded, err := json.Marshal(struct {
+		Source       string                                 `json:"source"`
+		Capabilities []runtimecontract.CapabilityDescriptor `json:"capabilities"`
+	}{Source: sourceRevision, Capabilities: snapshot.Capabilities})
+	if err != nil {
+		return runtimecontract.CapabilitySnapshot{}, err
+	}
+	digest := sha256Hex(encoded)
+	snapshot.Revision = "snapshot:" + digest[:16]
 	return snapshot, nil
 }
 

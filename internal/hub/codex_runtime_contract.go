@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
+	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
@@ -245,6 +247,9 @@ func (c *codexRuntimeContract) ReadHistory(ctx context.Context, request runtimec
 	}
 	native, err := c.native.ReadHistory(request.Binding.NativeRef, request.Count, request.Offset)
 	if err != nil {
+		if errors.Is(err, rollout.ErrRolloutNotFound) || errors.Is(err, rollout.ErrTurnNotFound) {
+			return runtimecontract.History{}, &runtimecontract.Failure{Code: "history_not_found", Phase: runtimecontract.FailurePhaseHistory, Message: "Runtime history not found"}
+		}
 		outcome := codexFailureOutcome(err, runtimecontract.FailurePhaseHistory)
 		return runtimecontract.History{}, outcome.Failure
 	}
@@ -384,19 +389,50 @@ func codexHistoryContent(items []map[string]any) []runtimecontract.ContentBlock 
 		switch strings.ToLower(itemType) {
 		case "usermessage", "user_message", "input_text", "user":
 			block.Kind = runtimecontract.ContentUserText
+			visibleText, attachments := historyManagedAttachments(text, item)
+			block.Text = visibleText
+			content = append(content, block)
+			for attachmentIndex, attachment := range attachments {
+				attachmentID := id + "-attachment-" + fmt.Sprint(attachmentIndex+1)
+				if strings.HasPrefix(strings.ToLower(attachment.MIMEType), "image/") {
+					image := runtimecontract.Image(attachment)
+					content = append(content, runtimecontract.ContentBlock{ID: attachmentID, Kind: runtimecontract.ContentImage, Image: &image})
+				} else {
+					copy := attachment
+					content = append(content, runtimecontract.ContentBlock{ID: attachmentID, Kind: runtimecontract.ContentAttachment, Attachment: &copy})
+				}
+			}
+			continue
 		case "agentmessage", "assistantmessage", "agent_message", "assistant_text", "answer":
 			block.Kind = runtimecontract.ContentAssistantText
 		case "reasoning", "thinking":
 			block.Kind = runtimecontract.ContentReasoning
+		case "image":
+			ref, _ := item["data"].(string)
+			if ref == "" {
+				ref, _ = item["url"].(string)
+			}
+			if ref == "" {
+				ref, _ = item["path"].(string)
+			}
+			if ref == "" {
+				continue
+			}
+			mimeType, _ := item["mimeType"].(string)
+			block.Kind, block.Text = runtimecontract.ContentImage, ""
+			block.Image = &runtimecontract.Image{MIMEType: mimeType, Ref: ref}
 		case "command", "commandexecution":
 			arguments, _ := json.Marshal(map[string]any{"command": item["command"], "cwd": item["cwd"]})
 			block.Kind = runtimecontract.ContentToolCall
 			block.Text = ""
 			block.ToolCall = &runtimecontract.ToolCall{Name: "exec_command", Arguments: arguments}
-			content = append(content, block, runtimecontract.ContentBlock{
-				ID: id + "-result", Kind: runtimecontract.ContentToolResult,
-				ToolResult: codexToolResult(id, item),
-			})
+			content = append(content, block)
+			if runtimeHistoryToolSettled(item) {
+				content = append(content, runtimecontract.ContentBlock{
+					ID: id + "-result", Kind: runtimecontract.ContentToolResult,
+					ToolResult: codexToolResult(id, item),
+				})
+			}
 			continue
 		default:
 			arguments, _ := json.Marshal(item)
@@ -407,6 +443,92 @@ func codexHistoryContent(items []map[string]any) []runtimecontract.ContentBlock 
 		content = append(content, block)
 	}
 	return content
+}
+
+func runtimeHistoryToolSettled(item map[string]any) bool {
+	status, _ := item["status"].(string)
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "failed", "error", "interrupted", "aborted", "cancelled", "canceled":
+		return true
+	}
+	for _, key := range []string{"aggregatedOutput", "output", "exitCode", "error"} {
+		if value, ok := item[key]; ok && value != nil && value != "" {
+			return true
+		}
+	}
+	return false
+}
+
+type historyAttachmentXML struct {
+	ID       string `xml:"id,attr"`
+	Name     string `xml:"name,attr"`
+	MIMEType string `xml:"mime_type,attr"`
+	Size     int64  `xml:"size,attr"`
+	Path     string `xml:"path,attr"`
+	URL      string `xml:"url,attr"`
+}
+
+type historyAttachmentManifest struct {
+	Attachments []historyAttachmentXML `xml:"attachment"`
+}
+
+func historyManagedAttachments(text string, item map[string]any) (string, []runtimecontract.Attachment) {
+	visible := text
+	manifest := ""
+	if index := strings.Index(text, "<loom_attachments"); index >= 0 {
+		visible, manifest = strings.TrimSpace(text[:index]), strings.TrimSpace(text[index:])
+	}
+	attachments := make([]runtimecontract.Attachment, 0)
+	if manifest != "" {
+		var parsed historyAttachmentManifest
+		if xml.Unmarshal([]byte(manifest), &parsed) == nil {
+			for _, source := range parsed.Attachments {
+				ref := source.URL
+				if source.ID != "" {
+					ref = "artifact:" + source.ID
+				}
+				attachments = append(attachments, runtimecontract.Attachment{ID: source.ID, Name: source.Name, Size: source.Size, MIMEType: source.MIMEType, Ref: ref})
+			}
+		}
+	}
+	if raw, ok := item["attachments"].([]map[string]any); ok {
+		for _, source := range raw {
+			id, _ := source["id"].(string)
+			name, _ := source["name"].(string)
+			mimeType, _ := source["mimeType"].(string)
+			ref, _ := source["url"].(string)
+			if id != "" {
+				ref = "artifact:" + id
+			}
+			var size int64
+			switch value := source["size"].(type) {
+			case int64:
+				size = value
+			case int:
+				size = int64(value)
+			case float64:
+				size = int64(value)
+			}
+			attachments = append(attachments, runtimecontract.Attachment{ID: id, Name: name, Size: size, MIMEType: mimeType, Ref: ref})
+		}
+	}
+	seen := map[string]bool{}
+	deduplicated := attachments[:0]
+	for _, attachment := range attachments {
+		if attachment.ID == "" && !strings.HasPrefix(attachment.Ref, "/api/agents/") {
+			continue
+		}
+		key := attachment.ID
+		if key == "" {
+			key = attachment.Ref + "\x00" + attachment.Name
+		}
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		deduplicated = append(deduplicated, attachment)
+	}
+	return visible, deduplicated
 }
 
 func codexToolResult(toolCallID string, item map[string]any) *runtimecontract.ToolResult {

@@ -149,12 +149,16 @@ func TestCodexAgentReopensSameBindingWithoutPublicNativeIdentity(t *testing.T) {
 	}
 	foundMappedDelta := false
 	for _, event := range events {
-		if event.Type != "loom/text-delta" {
+		if event.Type != "loom/runtime-event" {
 			continue
 		}
-		var payload map[string]any
+		var payload struct {
+			Kind    runtimecontract.EventKind     `json:"kind"`
+			TurnID  string                        `json:"turnId"`
+			Content *runtimecontract.ContentBlock `json:"content"`
+		}
 		_ = json.Unmarshal(event.Data, &payload)
-		foundMappedDelta = payload["turnId"] == "turn-loom-before-restart" && payload["delta"] == "still mapped"
+		foundMappedDelta = payload.Kind == runtimecontract.EventContent && payload.TurnID == "turn-loom-before-restart" && payload.Content != nil && payload.Content.Text == "still mapped"
 	}
 	if !foundMappedDelta {
 		t.Fatalf("restart canonical mapping missing from events: %#v", events)

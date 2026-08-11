@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -32,6 +33,10 @@ func (d *piRuntimeHostDriver) Preflight(context.Context) error {
 
 func (d *piRuntimeHostDriver) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
 	return piControlPlaneCapabilitySnapshot()
+}
+
+func (d *piRuntimeHostDriver) HistoryContract(request AgentHostRequest) runtimecontract.Contract {
+	return newPiRuntimeContract(request.AgentID, &piAgentRuntime{})
 }
 
 // PreflightPiRuntime exposes the Driver-owned startup prerequisite without
@@ -66,6 +71,11 @@ func (d *piRuntimeHostDriver) acquireWhileHubLocked(ctx context.Context, request
 	contract.release = handle.Close
 	handle.facade = &piRuntimeV1Facade{host: handle, contract: contract, native: native}
 	native.SetRuntimeEventHandlers(contract.handleNativeEvent, handle.fail)
+	native.SetRuntimeDiagnosticHandler(func(raw json.RawMessage) {
+		d.hub.mu.Lock()
+		d.hub.appendRuntimeDiagnosticLocked(request.AgentID, "pi/rpc-event", raw)
+		d.hub.mu.Unlock()
+	})
 	d.handles[request.AgentID] = handle
 	return handle, nil
 }

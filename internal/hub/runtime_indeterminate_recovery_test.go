@@ -482,7 +482,14 @@ func TestRecoveryTurnCompletionPersistenceFailurePublishesNothing(t *testing.T) 
 	if view.Status != "running" || view.LastTurn == nil || view.LastTurn.TurnID != "turn-before" || view.Recovery == nil || view.Recovery.State != TurnRecoveryDispatched || h.seqs["agent-1"] != 0 {
 		t.Fatalf("failed completion checkpoint public view=%#v seq=%d", view, h.seqs["agent-1"])
 	}
-	h.Shutdown()
+	if rt.activeTurn != turn || turn.finished {
+		t.Fatalf("failed terminal checkpoint consumed retryable Turn: active=%#v finished=%v", rt.activeTurn, turn.finished)
+	}
+	select {
+	case <-turn.stopWatchdog:
+		t.Fatal("failed terminal checkpoint closed the active Turn watchdog")
+	default:
+	}
 	if err := readOnly.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -491,11 +498,30 @@ func TestRecoveryTurnCompletionPersistenceFailurePublishesNothing(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer reopened.Close()
+	h.st = reopened
+	h.onRuntimeEvent(rt, RuntimeEvent{Kind: RuntimeTurnCompleted, LoomTurnID: turn.turnID, NativeTurnID: turn.nativeTurnID})
+	events, err := reopened.ReadEvents("agent-1", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalTerminals, controlTerminals := 0, 0
+	for _, event := range events {
+		if event.Type == "loom/runtime-event" && strings.Contains(string(event.Data), `"kind":"terminal"`) {
+			canonicalTerminals++
+		}
+		if event.Type == "loom/turn-completed" {
+			controlTerminals++
+		}
+	}
+	if canonicalTerminals != 1 || controlTerminals != 1 || rt.activeTurn != nil || !turn.finished {
+		t.Fatalf("retried terminal canonical=%d control=%d active=%#v finished=%v events=%#v", canonicalTerminals, controlTerminals, rt.activeTurn, turn.finished, events)
+	}
+	h.Shutdown()
 	var persisted map[string]*Agent
 	if err := reopened.LoadAgents(&persisted); err != nil {
 		t.Fatal(err)
 	}
-	if got := persisted["agent-1"]; got == nil || got.Status != "running" || got.TurnRecoveryMarkers["turn-before"].State != TurnRecoveryDispatched {
+	if got := persisted["agent-1"]; got == nil || got.Status != "idle" || got.LastTurn == nil || got.LastTurn.TurnID != "turn-recovery" || got.TurnRecoveryMarkers["turn-before"].State != TurnRecoveryCompleted {
 		t.Fatalf("reopened completion truth=%#v", got)
 	}
 }

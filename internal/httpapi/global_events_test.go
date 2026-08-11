@@ -112,8 +112,8 @@ func TestAgentEventsTailDoesNotMasqueradeAsCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := readGlobalSSE(t, h, "/api/agents/agent-1/thread/events?since=1&tail=2", 1)
-	if events[0].Type == "loom/reconcile" || events[0].Seq != 4 {
-		t.Fatalf("first bounded-tail Agent event = %#v, want seq 4 without reconcile", events[0])
+	if events[0].Type == "loom/reconcile" || events[0].Type != "loom/live" || events[0].Seq != 5 {
+		t.Fatalf("first bounded-tail Agent event = %#v, want live cursor 5 without exposing persisted raw rows", events[0])
 	}
 }
 

@@ -151,6 +151,9 @@ func (s *Server) agentThreadEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	gap := reconnecting && currentSeq > since && (len(events) == 0 || tail <= 0 && events[0].Seq > since+1)
 
+	if !canonical {
+		deprecatedRuntimeHeaders(w)
+	}
 	sseHeaders(w)
 	replayMax := since
 	if gap {
@@ -165,10 +168,13 @@ func (s *Server) agentThreadEvents(w http.ResponseWriter, r *http.Request) {
 		writeThreadSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "loom/reconcile", Data: data}, canonical)
 	}
 	for _, ev := range events {
-		writeThreadSSE(w, ev, canonical)
 		if ev.Seq > replayMax {
 			replayMax = ev.Seq
 		}
+		if canonical && isRuntimeCompatibilityEvent(ev) {
+			continue
+		}
+		writeThreadSSE(w, ev, canonical)
 	}
 	agent, _ := s.hub.GetAgent(key)
 	livePayload := map[string]any{"agent": agent}
@@ -195,6 +201,10 @@ func (s *Server) agentThreadEvents(w http.ResponseWriter, r *http.Request) {
 			if ev.Seq <= replayMax {
 				continue // overlap raced during replay
 			}
+			replayMax = ev.Seq
+			if canonical && isRuntimeCompatibilityEvent(ev) {
+				continue
+			}
 			writeThreadSSE(w, ev, canonical)
 			flusher.Flush()
 		}
@@ -202,6 +212,7 @@ func (s *Server) agentThreadEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) globalEvents(w http.ResponseWriter, r *http.Request) {
+	compatibility := r.URL.Path == "/api/events"
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, errors.New("streaming unsupported"))
@@ -231,6 +242,9 @@ func (s *Server) globalEvents(w http.ResponseWriter, r *http.Request) {
 	currentSeq := s.hub.LastGlobalSeq()
 	gap := reconnecting && currentSeq > since && (len(events) == 0 || events[0].Seq > since+1)
 
+	if compatibility {
+		deprecatedRuntimeHeaders(w)
+	}
 	sseHeaders(w)
 	replayMax := since
 	if gap {
@@ -244,7 +258,13 @@ func (s *Server) globalEvents(w http.ResponseWriter, r *http.Request) {
 		writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "loom/reconcile", Data: data})
 	}
 	for _, event := range events {
-		writeCompatibleGlobalSSE(w, event)
+		if !compatibility && isRuntimeCompatibilityEvent(event) {
+			if event.Seq > replayMax {
+				replayMax = event.Seq
+			}
+			continue
+		}
+		writeGlobalSSE(w, event, compatibility)
 		if event.Seq > replayMax {
 			replayMax = event.Seq
 		}
@@ -252,14 +272,16 @@ func (s *Server) globalEvents(w http.ResponseWriter, r *http.Request) {
 	agents := s.hub.ListAgentSummaries()
 	loomSnapshot, _ := json.Marshal(map[string]any{"agents": agents})
 	writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "loom/agents", Data: loomSnapshot})
-	legacySnapshot, _ := json.Marshal(map[string]any{"sessions": agents})
-	writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "hub/sessions", Data: legacySnapshot})
 	restartSnapshot, _ := json.Marshal(map[string]any{"restart": s.restartSnapshot()})
 	writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "loom/restart-status", Data: restartSnapshot})
-	writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "hub/restart-status", Data: restartSnapshot})
 	remoteSnapshot, _ := json.Marshal(map[string]any{"remote": s.hub.RemoteSnapshot()})
 	writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "loom/remote-status", Data: remoteSnapshot})
-	writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "hub/remote-status", Data: remoteSnapshot})
+	if compatibility {
+		legacySnapshot, _ := json.Marshal(map[string]any{"sessions": agents})
+		writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "hub/sessions", Data: legacySnapshot})
+		writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "hub/restart-status", Data: restartSnapshot})
+		writeSSE(w, store.Event{TS: time.Now().UTC().Format(time.RFC3339Nano), Type: "hub/remote-status", Data: remoteSnapshot})
+	}
 	flusher.Flush()
 
 	ping := time.NewTicker(15 * time.Second)
@@ -278,7 +300,11 @@ func (s *Server) globalEvents(w http.ResponseWriter, r *http.Request) {
 			if ev.Seq <= replayMax {
 				continue
 			}
-			writeCompatibleGlobalSSE(w, ev)
+			replayMax = ev.Seq
+			if !compatibility && isRuntimeCompatibilityEvent(ev) {
+				continue
+			}
+			writeGlobalSSE(w, ev, compatibility)
 			flusher.Flush()
 		}
 	}
@@ -713,16 +739,47 @@ func writeThreadSSE(w io.Writer, ev store.Event, canonical bool) {
 	writeSSE(w, ev)
 }
 
-func writeCompatibleGlobalSSE(w io.Writer, ev store.Event) {
+func writeGlobalSSE(w io.Writer, ev store.Event, compatibility bool) {
 	canonical := ev
 	canonical.Type = canonicalEventType(ev.Type)
 	writeSSE(w, canonical)
+	if !compatibility {
+		return
+	}
 	legacyType := legacyEventType(canonical.Type)
 	if legacyType != canonical.Type {
 		legacy := canonical
 		legacy.Type = legacyType
 		writeSSE(w, legacy)
 	}
+}
+
+func deprecatedRuntimeHeaders(w http.ResponseWriter) {
+	w.Header().Set("Deprecation", "true")
+	w.Header().Set("Link", `</docs/http-api.md#runtime-event-compatibility>; rel="deprecation"`)
+}
+
+func isRuntimeCompatibilityEvent(ev store.Event) bool {
+	if strings.HasPrefix(ev.Type, "item/") || strings.HasPrefix(ev.Type, "turn/") || strings.HasPrefix(ev.Type, "thread/") {
+		return true
+	}
+	var data map[string]any
+	if json.Unmarshal(ev.Data, &data) != nil {
+		return false
+	}
+	if compatibility, _ := data["compatibility"].(bool); compatibility {
+		return true
+	}
+	if canonicalEventType(ev.Type) != "loom/thread-event" {
+		return false
+	}
+	nested, ok := data["event"].(map[string]any)
+	if !ok {
+		return false
+	}
+	typ, _ := nested["type"].(string)
+	nestedData, _ := json.Marshal(nested["data"])
+	return isRuntimeCompatibilityEvent(store.Event{Type: typ, Data: nestedData})
 }
 
 func legacyEventType(typ string) string {

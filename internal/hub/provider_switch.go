@@ -373,9 +373,11 @@ func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (Agen
 		"previousProviderId": publicProviderID(previous.ProviderID), "previousModel": previous.Model,
 		"providerId": publicProviderID(providerID), "model": model, "switchedAt": switchedAt,
 	})
-	h.emitStatusLocked(agent, agent.Status)
 	view := h.viewLocked(agent)
 	h.mu.Unlock()
 	h.finishProviderSwitchMaintenance()
+	if snapshot, ok := h.refreshRuntimeCapabilitySnapshot(agentID, true); ok {
+		view.CapabilitySnapshot = snapshot
+	}
 	return view, nil
 }

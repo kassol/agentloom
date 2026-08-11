@@ -112,7 +112,7 @@ describe("AgentPane scroll restoration", () => {
 	vi.mocked(fetch).mockImplementation(async (input) => {
 	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
 	  const body = url.includes("/thread/history")
-		? { total: 1, turns: [{ items: [{ type: "user", text: "Latest work" }] }] }
+		? { total: 1, turns: [{ turnId: "turn-latest", state: "completed", content: [{ id: "content-latest", kind: "user_text", text: "Latest work" }] }] }
 		: { artifacts: [] };
 	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
 	});
@@ -201,10 +201,10 @@ describe("AgentPane scroll restoration", () => {
     expect(view.getByText("History").nextElementSibling).toHaveTextContent("Available");
     expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Unavailable");
     expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();
-    expect(view.getByText("Provider switching").nextElementSibling).toHaveTextContent("Available");
-	const provider = view.getByText("Provider").closest("label")?.querySelector("select") as HTMLSelectElement;
-	const model = view.getByText("Model").closest("label")?.querySelector("select") as HTMLSelectElement;
-	const thinking = view.getByText("Thinking Effort").closest("label")?.querySelector("select") as HTMLSelectElement;
+    expect(view.getByText("Provider configuration").nextElementSibling).toHaveTextContent("Available");
+	const providerSelect = () => view.getByText("Provider").closest("label")?.querySelector("select") as HTMLSelectElement;
+	const modelSelect = () => view.getByText("Model").closest("label")?.querySelector("select") as HTMLSelectElement;
+	const thinkingSelect = () => view.getByText("Thinking Effort").closest("label")?.querySelector("select") as HTMLSelectElement;
     expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
 	expect(view.getByText("Approval Policy").closest("label")?.querySelector("select")).toBeEnabled();
 	expect(view.getByText("Sandbox isolation is unsupported for the pi Runtime.")).toBeInTheDocument();
@@ -215,26 +215,26 @@ describe("AgentPane scroll restoration", () => {
 	expect(view.queryByRole("button", { name: "Set a Goal" })).toBeNull();
 
 	return waitFor(() => {
-	  expect(provider).toBeEnabled();
-	  expect(model).toBeEnabled();
-	  expect(thinking).toBeEnabled();
-	  expect(provider).toHaveValue("openai-codex");
-	  expect(thinking).toHaveValue("medium");
+	  expect(providerSelect()).toBeEnabled();
+	  expect(modelSelect()).toBeEnabled();
+	  expect(thinkingSelect()).toBeEnabled();
+	  expect(providerSelect()).toHaveValue("openai-codex");
+	  expect(thinkingSelect()).toHaveValue("medium");
 	}).then(async () => {
-	  fireEvent.change(provider, { target: { value: "xai" } });
-	  expect(model).toHaveValue("grok-4.5");
+	  fireEvent.change(providerSelect(), { target: { value: "xai" } });
+	  expect(modelSelect()).toHaveValue("grok-4.5");
 	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Available after Save");
-	  expect(Array.from(thinking.options).map((option) => option.value)).toEqual(["low", "medium", "high"]);
-	  expect(thinking).toHaveValue("medium");
-	  fireEvent.change(model, { target: { value: "grok-build-0.1" } });
+	  expect(Array.from(thinkingSelect().options).map((option) => option.value)).toEqual(["low", "medium", "high"]);
+	  expect(thinkingSelect()).toHaveValue("medium");
+	  fireEvent.change(modelSelect(), { target: { value: "grok-build-0.1" } });
 	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Unavailable after Save");
-	  expect(Array.from(thinking.options).map((option) => option.value)).toEqual(["off"]);
-	  expect(thinking).toHaveValue("off");
-	  fireEvent.change(model, { target: { value: "grok-4.5" } });
+	  expect(Array.from(thinkingSelect().options).map((option) => option.value)).toEqual(["off"]);
+	  expect(thinkingSelect()).toHaveValue("off");
+	  fireEvent.change(modelSelect(), { target: { value: "grok-4.5" } });
 	  expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Available after Save");
-	  expect(Array.from(thinking.options).map((option) => option.value)).toEqual(["low", "medium", "high"]);
-	  expect(thinking).toHaveValue("low");
-	  fireEvent.change(thinking, { target: { value: "high" } });
+	  expect(Array.from(thinkingSelect().options).map((option) => option.value)).toEqual(["low", "medium", "high"]);
+	  expect(thinkingSelect()).toHaveValue("low");
+	  fireEvent.change(thinkingSelect(), { target: { value: "high" } });
 	  fireEvent.click(view.getByRole("button", { name: "Save" }));
 	  await waitFor(() => expect(vi.mocked(fetch).mock.calls).toContainEqual([
 		"/api/agents/agent-scroll/runtime/model",
@@ -271,6 +271,36 @@ describe("AgentPane scroll restoration", () => {
 	expect(view.getByText("notes.txt")).toBeInTheDocument();
   });
 
+  it("refreshes an open Inspector from a live Capability Snapshot", async () => {
+	const before: Agent = {
+	  ...testAgent,
+	  capabilitySnapshot: { revision: "revision-1", capabilities: [] },
+	};
+	const view = render(<AgentPane {...props} agent={before} active configRequestNonce={1} />);
+	expect(await view.findByText("snapshot revision-1")).toBeInTheDocument();
+	view.rerender(<AgentPane {...props} agent={{
+	  ...before,
+	  runtimeCapabilities: { ...before.runtimeCapabilities, imageInput: false },
+	  capabilitySnapshot: { revision: "revision-2", capabilities: [] },
+	}} active configRequestNonce={1} />);
+	expect(view.getByText("snapshot revision-2")).toBeInTheDocument();
+	expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Unavailable");
+  });
+
+  it("gates Runtime controls from the typed Capability Snapshot instead of flat v1 flags", () => {
+	const agent: Agent = {
+	  ...testAgent,
+	  runtimeCapabilities: { ...testAgent.runtimeCapabilities, sandbox: true, approval: false },
+	  capabilitySnapshot: { revision: "snapshot-data", capabilities: [
+		{ id: "sandbox_configuration", availability: "unavailable", revision: "1", scope: { runtimeKind: "codex", bindingRevision: "b", model: "m", configurationRevision: "c" } },
+		{ id: "approval_policy", availability: "available", revision: "1", scope: { runtimeKind: "codex", bindingRevision: "b", model: "m", configurationRevision: "c" } },
+	  ] },
+	};
+	const view = render(<AgentPane {...props} agent={agent} active configRequestNonce={1} />);
+	expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
+	expect(view.getByText("Approval Policy").closest("label")?.querySelector("select")).toBeEnabled();
+  });
+
   it("restores a Pi Approval card from the Agent snapshot without Codex wording", async () => {
 	virtualizerHarness.instance.getVirtualItems.mockReturnValue([
 	  { index: 0, key: "row-0", start: 0, size: 120, end: 120, lane: 0 },
@@ -280,7 +310,7 @@ describe("AgentPane scroll restoration", () => {
 	vi.mocked(fetch).mockImplementation(async (input) => {
 	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
 	  const body = url.includes("/thread/history")
-		? { total: 1, turns: [{ items: [{ type: "user", timestamp: "2026-08-10T00:00:00Z", text: "Current work" }] }] }
+		? { total: 1, turns: [{ turnId: "turn-current", state: "completed", startedAt: "2026-08-10T00:00:00Z", content: [{ id: "content-current", kind: "user_text", text: "Current work" }] }] }
 		: { artifacts: [] };
 	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
 	});

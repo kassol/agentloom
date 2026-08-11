@@ -688,12 +688,8 @@ func (h *Hub) onCodexCompatibilityNotification(rt *runtime, method string, param
 	if rt.activeTurn != nil {
 		turnID = rt.activeTurn.turnID
 	}
-	if turnID == "" {
-		if contract, ok := rt.runtimeContract.(*codexRuntimeContract); ok {
-			turnID = contract.turnIDForNative(notificationTurnID(params))
-		}
-	}
-	h.emitLocked(meta.ID, method, runtimePublicPayload(params, meta.ThreadID, turnID, canonical))
+	h.emitLocked(meta.ID, method, runtimePublicPayload(params, meta.ThreadID, turnID, true))
+	h.appendRuntimeDiagnosticLocked(meta.ID, method, params)
 }
 
 func recoveryEventFenced(meta *Agent, rt *runtime) bool {

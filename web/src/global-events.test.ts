@@ -52,7 +52,7 @@ describe("global event stream", () => {
     const unsubscribeSecond = subscribeGlobalEvents(second);
 
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0].url).toBe("/api/events");
+    expect(FakeEventSource.instances[0].url).toBe("/api/agents/events");
     FakeEventSource.instances[0].open();
     FakeEventSource.instances[0].message({ seq: 8, ts: "now", type: "loom/thread-event", data: { agentId: "agent-1" } });
 

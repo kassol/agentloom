@@ -1,36 +1,41 @@
 import { describe, expect, it } from "vitest";
 import { emptyFeed, reduceFeed, summarizeTask } from "./feed";
 
+function typedTurn(items: Array<{ type: string; text?: string; timestamp?: string }>) {
+  return {
+    turnId: `turn-${items[0]?.timestamp || "fixture"}`,
+    state: "completed",
+    startedAt: items[0]?.timestamp || "",
+    content: items.map((item, index) => ({
+      id: `content-${index}`,
+      kind: item.type === "answer" ? "assistant_text" : item.type === "thinking" ? "reasoning" : "user_text",
+      text: item.text || "",
+    })),
+  };
+}
+
 describe("Runtime-normalized live events", () => {
-  it("renders the normalized event and ignores its raw Codex compatibility duplicate", () => {
+  it("renders one typed canonical event without a raw compatibility branch", () => {
     const normalized = reduceFeed(emptyFeed, {
       seq: 1,
       ts: "2026-08-10T00:00:00Z",
-      type: "loom/text-delta",
-      data: { itemId: "answer-1", delta: "hello" },
+      type: "loom/runtime-event",
+      data: { kind: "content", turnId: "turn-1", contentPhase: "delta", content: { id: "answer-1", kind: "assistant_text", text: "hello" } },
     });
     expect(normalized.blocks).toEqual([
       { kind: "agent", id: "answer-1", ts: "2026-08-10T00:00:00Z", text: "hello", streaming: true },
     ]);
-    const state = reduceFeed(normalized, {
-      seq: 2,
-      ts: "2026-08-10T00:00:00Z",
-      type: "item/agentMessage/delta",
-      data: { itemId: "answer-1", delta: "hello", compatibility: true },
-    });
-
-    expect(state.blocks).toEqual([
+    expect(normalized.blocks).toEqual([
       { kind: "agent", id: "answer-1", ts: "2026-08-10T00:00:00Z", text: "hello", streaming: true },
     ]);
   });
 
   it("correlates streamed reasoning, text, and failed tools and closes partial blocks on abort", () => {
     const events = [
-      { type: "loom/reasoning-delta", data: { itemId: "thinking-1", delta: "checking" } },
-      { type: "loom/text-delta", data: { itemId: "answer-1", delta: "partial" } },
-      { type: "loom/tool-started", data: { itemId: "call-1", item: { id: "call-1", type: "commandExecution", command: "pwd", status: "running", aggregatedOutput: "" } } },
-      { type: "loom/tool-updated", data: { itemId: "call-1", item: { id: "call-1", type: "commandExecution", command: "pwd", status: "running", aggregatedOutput: "/tmp" } } },
-      { type: "loom/tool-completed", data: { itemId: "call-1", item: { id: "call-1", type: "commandExecution", command: "pwd", status: "failed", aggregatedOutput: "permission denied" } } },
+      { type: "loom/runtime-event", data: { kind: "content", contentPhase: "delta", content: { id: "thinking-1", kind: "reasoning", text: "checking" } } },
+      { type: "loom/runtime-event", data: { kind: "content", contentPhase: "delta", content: { id: "answer-1", kind: "assistant_text", text: "partial" } } },
+      { type: "loom/runtime-event", data: { kind: "content", contentPhase: "started", content: { id: "call-1", kind: "tool_call", toolCall: { name: "bash", arguments: { command: "pwd" } } } } },
+      { type: "loom/runtime-event", data: { kind: "content", contentPhase: "completed", content: { id: "result-1", kind: "tool_result", toolResult: { toolCallId: "call-1", success: false, text: "permission denied" } } } },
       { type: "loom/turn-interrupted", data: { error: "Pi Turn aborted" } },
     ];
     const state = events.reduce(
@@ -49,6 +54,33 @@ describe("Runtime-normalized live events", () => {
       { kind: "command", id: "call-1", ts: "2026-08-10T00:00:00Z", command: "pwd", status: "failed", exitCode: null, durationMs: null, output: "permission denied" },
       { kind: "sys", ts: "2026-08-10T00:00:00Z", cls: "warn", text: "■ interrupted Pi Turn aborted" },
     ]);
+  });
+
+  it("shows one control error for paired terminal events and never invents tool success", () => {
+    const events = [
+      { type: "loom/runtime-event", data: { kind: "content", turnId: "turn-1", contentPhase: "completed", content: { id: "call-1", kind: "tool_call", toolCall: { name: "bash", arguments: { command: "deploy --prod" } } } } },
+      { type: "loom/turn-failed", data: { turnId: "turn-1", error: "safe failure" } },
+      { type: "loom/runtime-event", data: { kind: "terminal", turnId: "turn-1", outcome: { state: "failed", failure: { message: "safe failure" } } } },
+    ];
+    const state = events.reduce((current, event, index) => reduceFeed(current, {
+      seq: index + 1, ts: `t${index + 1}`, type: event.type, data: event.data,
+    }), emptyFeed);
+    expect(state.blocks.filter((block) => block.kind === "sys" && block.cls === "err")).toHaveLength(1);
+    expect(state.blocks.find((block) => block.kind === "command")).toMatchObject({ status: "failed" });
+
+    const history = reduceFeed(emptyFeed, { seq: 0, ts: "", type: "__history__", data: { turns: [{
+      turnId: "turn-history", state: "completed", content: [{ id: "call-history", kind: "tool_call", toolCall: { name: "bash", arguments: { command: "deploy --prod" } } }],
+    }] } });
+    expect(history.blocks.find((block) => block.kind === "command")).toMatchObject({ status: "interrupted" });
+
+	const failedHistory = reduceFeed(emptyFeed, { seq: 0, ts: "", type: "__history__", data: { turns: [{
+		turnId: "turn-failed", state: "failed", error: "safe durable failure", source: { kind: "internal", id: "msg-1" },
+		content: [{ id: "call-failed", kind: "tool_call", toolCall: { name: "bash", arguments: { command: "deploy --prod" } } }],
+	}] } });
+	expect(failedHistory.blocks.find((block) => block.kind === "command")).toMatchObject({ status: "failed" });
+	expect(failedHistory.blocks.filter((block) => block.kind === "sys" && block.cls === "err")).toEqual([
+		{ kind: "sys", ts: "", cls: "err", text: "✖ failed: safe durable failure" },
+	]);
   });
 });
 
@@ -93,7 +125,7 @@ describe("rollout history projection", () => {
       seq: 0,
       ts: "",
       type: "__history__",
-      data: { turns: [{ items: [{ type: "user", timestamp: "2026-07-15T01:23:45Z", text }] }] },
+      data: { turns: [typedTurn([{ type: "user", timestamp: "2026-07-15T01:23:45Z", text }])] },
     });
     expect(state.blocks).toHaveLength(1);
     expect(state.blocks[0]).toMatchObject({
@@ -120,7 +152,7 @@ describe("rollout history projection", () => {
       seq: 0,
       ts: "",
       type: "__history__",
-      data: { turns: [{ items: [{ type: "user", timestamp: "2026-07-19T01:00:06Z", text }] }] },
+      data: { turns: [typedTurn([{ type: "user", timestamp: "2026-07-19T01:00:06Z", text }])] },
     });
     expect(state.blocks[0]).toMatchObject({
       kind: "externalTrigger",
@@ -157,7 +189,7 @@ describe("rollout history projection", () => {
       seq: 0,
       ts: "",
       type: "__history__",
-      data: { turns: [{ items: [{ type: "user", timestamp: "2026-07-20T01:00:01Z", text }] }] },
+      data: { turns: [typedTurn([{ type: "user", timestamp: "2026-07-20T01:00:01Z", text }])] },
     });
     expect(state.blocks).toHaveLength(1);
     expect(state.blocks[0]).toMatchObject({
@@ -197,7 +229,7 @@ describe("rollout history projection", () => {
       seq: 0,
       ts: "",
       type: "__history__",
-      data: { turns: [{ items: [{ type: "user", timestamp: "2026-07-28T01:00:00Z", text }] }] },
+      data: { turns: [typedTurn([{ type: "user", timestamp: "2026-07-28T01:00:00Z", text }])] },
     });
     expect(state.blocks).toHaveLength(1);
     expect(state.blocks[0]).toMatchObject({
@@ -243,7 +275,7 @@ This trusted context applies only to the immediately following inbox message.
         ts: "2026-07-28T09:32:50Z",
         type,
         data: type === "__history__"
-          ? { turns: [{ items: [{ type: "user", timestamp: "2026-07-28T09:32:50Z", text: historyText }] }] }
+          ? { turns: [typedTurn([{ type: "user", timestamp: "2026-07-28T09:32:50Z", text: historyText }])] }
           : { text: liveText },
       }).blocks[0];
 
@@ -280,7 +312,7 @@ This trusted context applies only to the immediately following inbox message.
       seq: 0,
       ts: "",
       type: "__history__",
-      data: { turns: [{ items: [{ type: "user", text }] }] },
+      data: { turns: [typedTurn([{ type: "user", text }])] },
     });
     expect(state.blocks[0]).toMatchObject({
       kind: "topicContext",
@@ -303,7 +335,7 @@ This trusted context applies only to the immediately following inbox message.
       seq: 0,
       ts: "",
       type: "__history__",
-      data: { turns: [{ items: [{ type: "user", text }] }] },
+      data: { turns: [typedTurn([{ type: "user", text }])] },
     }).blocks[0];
 
     expect(project(ownerInput)).toMatchObject({ kind: "topicContext", payload: { kind: "ownerInput", label: "OWNER INPUT", body: "Keep this **read-only**." } });
@@ -318,7 +350,7 @@ This trusted context applies only to the immediately following inbox message.
       seq: 0,
       ts: "",
       type: "__history__",
-      data: { turns: [{ items: [{ type: "user", text: first }, { type: "user", text: second }] }] },
+      data: { turns: [typedTurn([{ type: "user", text: first }, { type: "user", text: second }])] },
     });
     const ids = state.blocks.filter((block) => block.kind === "topicContext").map((block) => block.id);
     expect(ids).toHaveLength(2);
@@ -329,11 +361,9 @@ This trusted context applies only to the immediately following inbox message.
     const state = reduceFeed(emptyFeed, {
       seq: 9,
       ts: "2026-07-16T04:22:45Z",
-      type: "error",
+      type: "loom/turn-failed",
       data: {
-        error: {
-          message: "The selected model is not supported with this account.",
-        },
+        error: "The selected model is not supported with this account.",
       },
     });
 
@@ -342,7 +372,7 @@ This trusted context applies only to the immediately following inbox message.
         kind: "sys",
         ts: "2026-07-16T04:22:45Z",
         cls: "err",
-        text: "The selected model is not supported with this account.",
+        text: "✖ failed: The selected model is not supported with this account.",
       },
     ]);
   });
@@ -356,7 +386,7 @@ This trusted context applies only to the immediately following inbox message.
       seq: 0,
       ts: "",
       type: "__history__",
-      data: { turns: [{ items: [{ type: "user", timestamp: "2026-07-16T05:00:00Z", text, attachments: [{ path: "/tmp/screen.png", mimeType: "image/png" }] }] }] },
+      data: { turns: [typedTurn([{ type: "user", timestamp: "2026-07-16T05:00:00Z", text }])] },
     });
 
     expect(state.blocks).toHaveLength(1);
@@ -393,17 +423,11 @@ This trusted context applies only to the immediately following inbox message.
   it("restores published artifacts at their chronological position", () => {
     const history = {
       turns: [
-        {
-          id: "turn-1",
-          items: [
-            { type: "user", timestamp: "2026-07-16T05:00:00Z", text: "first request" },
-            { type: "answer", timestamp: "2026-07-16T05:01:00Z", text: "first answer" },
-          ],
-        },
-        {
-          id: "turn-2",
-          items: [{ type: "user", timestamp: "2026-07-16T05:10:00Z", text: "second request" }],
-        },
+        typedTurn([
+          { type: "user", timestamp: "2026-07-16T05:00:00Z", text: "first request" },
+          { type: "answer", timestamp: "2026-07-16T05:01:00Z", text: "first answer" },
+        ]),
+        typedTurn([{ type: "user", timestamp: "2026-07-16T05:10:00Z", text: "second request" }]),
       ],
     };
     const seeded = reduceFeed(emptyFeed, { seq: 0, ts: "", type: "__history__", data: history });
@@ -425,7 +449,7 @@ This trusted context applies only to the immediately following inbox message.
       seq: 0,
       ts: "",
       type: "__history__",
-      data: { turns: [{ items: [{ type: "user", timestamp: "2026-07-16T05:10:00Z", text: "current" }] }] },
+      data: { turns: [typedTurn([{ type: "user", timestamp: "2026-07-16T05:10:00Z", text: "current" }])] },
     });
     const restored = reduceFeed(current, {
       seq: 0,
@@ -437,7 +461,7 @@ This trusted context applies only to the immediately following inbox message.
       seq: 0,
       ts: "",
       type: "__history_prepend__",
-      data: { offset: 25, turns: [{ items: [{ type: "answer", timestamp: "2026-07-16T05:01:00Z", text: "older" }] }] },
+      data: { offset: 25, turns: [typedTurn([{ type: "answer", timestamp: "2026-07-16T05:01:00Z", text: "older" }])] },
     });
 
     expect(prepended.blocks.map((block) => block.kind)).toEqual(["agent", "artifact", "user"]);

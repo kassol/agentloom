@@ -47,6 +47,10 @@ func (d *codexRuntimeHostDriver) CapabilitySnapshot(context.Context, runtimecont
 	return codexControlPlaneCapabilitySnapshot()
 }
 
+func (d *codexRuntimeHostDriver) HistoryContract(request AgentHostRequest) runtimecontract.Contract {
+	return &codexRuntimeContract{agentID: request.AgentID, native: &codexAgentRuntime{}, turnsByNative: map[string]runtimeTurnCorrelation{}}
+}
+
 func (d *codexRuntimeHostDriver) Acquire(ctx context.Context, request AgentHostRequest) (AgentHost, error) {
 	if err := d.Preflight(ctx); err != nil {
 		return nil, err

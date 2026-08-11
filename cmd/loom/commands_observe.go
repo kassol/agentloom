@@ -26,10 +26,11 @@ func cmdHistory(a args) {
 	fmt.Printf("%s %s — %d turn(s)\n\n", bold(str(resp, "name")), dim(str(resp, "threadId")), len(turns))
 	for _, tv := range turns {
 		t, _ := tv.(map[string]any)
-		fmt.Printf("%s %s %s\n", magenta("── turn"), str(t, "id"), dim("["+str(t, "status")+"]"))
-		items, _ := t["items"].([]any)
-		for _, iv := range items {
-			printHistoryItem(iv.(map[string]any))
+		fmt.Printf("%s %s %s\n", magenta("── turn"), str(t, "turnId"), dim("["+str(t, "state")+"]"))
+		content, _ := t["content"].([]any)
+		for _, value := range content {
+			block, _ := value.(map[string]any)
+			printCanonicalContent(block)
 		}
 		fmt.Println()
 	}
@@ -53,7 +54,7 @@ func cmdTurnGet(a args) {
 		return
 	}
 
-	fmt.Printf("%s %s %s\n", magenta("turn"), str(turn, "id"), dim("["+str(turn, "status")+"]"))
+	fmt.Printf("%s %s %s\n", magenta("turn"), str(turn, "turnId"), dim("["+str(turn, "state")+"]"))
 	fmt.Printf("agent: %s %s\n", bold(str(turn, "agent")), dim(str(turn, "agentId")))
 	fmt.Printf("thread: %s\n", dim(str(turn, "threadId")))
 	if startedAt := str(turn, "startedAt"); startedAt != "" {
@@ -84,43 +85,35 @@ func cmdTurnGet(a args) {
 		fmt.Printf("error: %s\n", red(message))
 	}
 	fmt.Println()
-	items, _ := turn["items"].([]any)
-	for _, value := range items {
-		item, _ := value.(map[string]any)
-		printHistoryItem(item)
+	content, _ := turn["content"].([]any)
+	for _, value := range content {
+		block, _ := value.(map[string]any)
+		printCanonicalContent(block)
 	}
 }
 
-func printHistoryItem(item map[string]any) {
-	switch str(item, "type") {
-	case "user":
-		fmt.Printf("  %s %s\n", cyan("user>"), oneline(str(item, "text"), 200))
-	case "answer":
-		fmt.Printf("  %s %s\n", green("codex>"), indent(strings.TrimSpace(str(item, "text"))))
-	case "thinking":
-		fmt.Printf("  %s\n", dim("think: "+oneline(str(item, "text"), 160)))
+func printCanonicalContent(content map[string]any) {
+	switch str(content, "kind") {
+	case "user_text":
+		fmt.Printf("  %s %s\n", cyan("user>"), oneline(str(content, "text"), 200))
+	case "assistant_text":
+		fmt.Printf("  %s %s\n", green("agent>"), indent(strings.TrimSpace(str(content, "text"))))
 	case "reasoning":
-		fmt.Printf("  %s\n", dim("reason: "+oneline(str(item, "text"), 160)))
-	case "command":
-		exitCode := "?"
-		if v, ok := item["exitCode"].(float64); ok {
-			exitCode = fmt.Sprintf("%.0f", v)
+		fmt.Printf("  %s\n", dim("think: "+oneline(str(content, "text"), 160)))
+	case "tool_call":
+		tool, _ := content["toolCall"].(map[string]any)
+		arguments, _ := json.Marshal(tool["arguments"])
+		fmt.Printf("  %s %s %s\n", yellow("$"), str(tool, "name"), dim(clip(string(arguments), 160)))
+	case "tool_result":
+		result, _ := content["toolResult"].(map[string]any)
+		status := red("failed")
+		if result["success"] == true {
+			status = green("completed")
 		}
-		dur := "?"
-		if v, ok := item["durationMs"].(float64); ok {
-			dur = fmt.Sprintf("%.0fms", v)
-		}
-		code := red("exit " + exitCode)
-		if exitCode == "0" {
-			code = green("exit 0")
-		}
-		fmt.Printf("  %s %s %s\n", yellow("$"), oneline(str(item, "command"), 160), dim("[")+code+dim(", "+dur+"]"))
-	case "file_change":
-		changes, _ := item["changes"].([]any)
-		for _, cv := range changes {
-			c, _ := cv.(map[string]any)
-			fmt.Printf("  %s %s %s\n", magenta("edit"), str(c, "kind"), str(c, "path"))
-		}
+		fmt.Printf("  %s %s\n", status, indent(strings.TrimSpace(str(result, "text"))))
+	case "image":
+		image, _ := content["image"].(map[string]any)
+		fmt.Printf("  %s %s\n", magenta("image"), str(image, "ref"))
 	}
 }
 
@@ -183,7 +176,6 @@ func cmdWatch(a args) {
 type watchState struct {
 	streamOpen  bool
 	streamThink bool
-	streamed    map[string]bool // itemIds whose text already streamed via deltas
 }
 
 func (st *watchState) closeStream() {
@@ -204,41 +196,11 @@ func renderEvent(st *watchState, seq int64, ts, typ string, data json.RawMessage
 	var d map[string]any
 	_ = json.Unmarshal(data, &d)
 	t := tsShort(ts)
-	typ = canonicalWatchEventType(typ)
-
-	// Streaming deltas: agent text inline, reasoning dimmed.
-	if strings.HasSuffix(typ, "/delta") && (strings.Contains(typ, "agentMessage") || strings.Contains(typ, "reasoning")) {
-		text := deltaText(d["delta"])
-		if text == "" {
-			return
-		}
-		isThink := strings.Contains(typ, "reasoning")
-		if st.streamed == nil {
-			st.streamed = map[string]bool{}
-		}
-		if id, ok := d["itemId"].(string); ok && !isThink {
-			st.streamed[id] = true
-		}
-		if !st.streamOpen || st.streamThink != isThink {
-			st.closeStream()
-			if isThink {
-				fmt.Print(dim("think "))
-			} else {
-				fmt.Print(green("codex> "))
-			}
-			st.streamOpen = true
-			st.streamThink = isThink
-		}
-		if isThink {
-			fmt.Print(dim(text))
-		} else {
-			fmt.Print(text)
-		}
-		return
-	}
 	st.closeStream()
 
 	switch typ {
+	case "loom/runtime-event":
+		renderCanonicalWatchEvent(st, t, d)
 	case "loom/live":
 		fmt.Println(dim(fmt.Sprintf("─── live (replayed up to seq %d) ───", seq)))
 	case "loom/agent-created":
@@ -271,9 +233,6 @@ func renderEvent(st *watchState, seq int64, ts, typ string, data json.RawMessage
 		fmt.Printf("%s %s %s\n", t, green(fmt.Sprintf("approval %v", d["decision"])), dim(fmt.Sprintf("%v", d["approvalId"])))
 	case "loom/error", "loom/host-error":
 		fmt.Printf("%s %s %v\n", t, red("CodexLoom error:"), d["message"])
-	case "item/started", "item/completed":
-		item, _ := d["item"].(map[string]any)
-		renderItem(st, t, typ, item)
 	default:
 		if os.Getenv("CODEX_LOOM_DEBUG") != "" || os.Getenv("CHUB_DEBUG") != "" {
 			raw, _ := json.Marshal(d)
@@ -282,81 +241,49 @@ func renderEvent(st *watchState, seq int64, ts, typ string, data json.RawMessage
 	}
 }
 
-func canonicalWatchEventType(typ string) string {
-	if typ == "hub/session-created" {
-		return "loom/agent-created"
+func renderCanonicalWatchEvent(st *watchState, timestamp string, event map[string]any) {
+	if str(event, "kind") == "terminal" {
+		st.closeStream()
+		return
 	}
-	if typ == "hub/session-killed" {
-		return "loom/agent-archived"
+	if str(event, "kind") != "content" {
+		return
 	}
-	if strings.HasPrefix(typ, "hub/") {
-		return "loom/" + strings.TrimPrefix(typ, "hub/")
-	}
-	return typ
-}
-
-func renderItem(st *watchState, t, phase string, item map[string]any) {
-	switch str(item, "type") {
-	case "commandExecution":
-		cmd := oneline(str(item, "command"), 160)
-		if phase == "item/started" {
-			fmt.Printf("%s %s %s %s\n", t, yellow("$"), cmd, dim("..."))
-			return
-		}
-		exitCode := "?"
-		if v, ok := item["exitCode"].(float64); ok {
-			exitCode = fmt.Sprintf("%.0f", v)
-		}
-		dur := "?"
-		if v, ok := item["durationMs"].(float64); ok {
-			dur = fmt.Sprintf("%.0fms", v)
-		}
-		code := red("exit " + exitCode)
-		if exitCode == "0" {
-			code = green("exit 0")
-		}
-		fmt.Printf("%s %s %s %s\n", t, yellow("$"), cmd, dim("[")+code+dim(" "+dur+"]"))
-		if out := strings.TrimSpace(str(item, "aggregatedOutput")); out != "" {
-			for _, line := range strings.Split(clip(out, 600), "\n") {
-				fmt.Println(dim("    │ " + line))
+	content, _ := event["content"].(map[string]any)
+	phase := str(event, "contentPhase")
+	text := str(content, "text")
+	switch str(content, "kind") {
+	case "assistant_text", "reasoning":
+		isThink := str(content, "kind") == "reasoning"
+		if phase == "delta" {
+			if !st.streamOpen || st.streamThink != isThink {
+				st.closeStream()
+				if isThink {
+					fmt.Print(dim("think "))
+				} else {
+					fmt.Print(green("agent> "))
+				}
+				st.streamOpen, st.streamThink = true, isThink
 			}
-		}
-	case "agentMessage":
-		if phase == "item/completed" {
-			if st.streamed[str(item, "id")] {
-				return // already streamed via deltas
-			}
-			ph := str(item, "phase")
-			if ph == "final_answer" || ph == "" {
-				fmt.Printf("%s %s %s\n", t, green("codex>"), strings.TrimSpace(str(item, "text")))
-			}
-		}
-	case "fileChange":
-		if phase != "item/completed" {
-			return
-		}
-		changes, _ := item["changes"].([]any)
-		for _, cv := range changes {
-			c, _ := cv.(map[string]any)
-			kind := ""
-			if k, ok := c["kind"].(map[string]any); ok {
-				kind = str(k, "type")
+			if isThink {
+				fmt.Print(dim(text))
 			} else {
-				kind = str(c, "kind")
+				fmt.Print(text)
 			}
-			fmt.Printf("%s %s %s %s\n", t, magenta("edit"), kind, str(c, "path"))
+			return
 		}
+		st.closeStream()
+		if text != "" {
+			label := green("agent>")
+			if isThink {
+				label = dim("think")
+			}
+			fmt.Printf("%s %s %s\n", timestamp, label, strings.TrimSpace(text))
+		}
+	case "tool_call", "tool_result":
+		st.closeStream()
+		printCanonicalContent(content)
 	}
-}
-
-func deltaText(v any) string {
-	switch d := v.(type) {
-	case string:
-		return d
-	case map[string]any:
-		return str(d, "text")
-	}
-	return ""
 }
 
 // ---- text helpers ----

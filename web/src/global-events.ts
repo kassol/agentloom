@@ -32,7 +32,7 @@ function ensureSource() {
   if (source || eventListeners.size === 0 || typeof EventSource === "undefined") return;
 
   setState(openedOnce ? "reconnecting" : "connecting");
-  const next = new EventSource("/api/events");
+  const next = new EventSource("/api/agents/events");
   source = next;
   next.onopen = () => {
     if (source !== next) return;

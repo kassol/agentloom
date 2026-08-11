@@ -25,6 +25,7 @@ type piAgentRuntime struct {
 	rpc              *pi.RPC
 	onEvent          func(RuntimeEvent)
 	onFailure        func(error)
+	onDiagnostic     func(json.RawMessage)
 	onApproval       func(RuntimeApprovalRequest)
 	developerContext string
 	approvalPolicy   string
@@ -51,6 +52,12 @@ func newPiAgentRuntime(agentID, dataDir, apiURL string) *piAgentRuntime {
 func (r *piAgentRuntime) SetRuntimeEventHandlers(onEvent func(RuntimeEvent), onFailure func(error)) {
 	r.mu.Lock()
 	r.onEvent, r.onFailure = onEvent, onFailure
+	r.mu.Unlock()
+}
+
+func (r *piAgentRuntime) SetRuntimeDiagnosticHandler(onDiagnostic func(json.RawMessage)) {
+	r.mu.Lock()
+	r.onDiagnostic = onDiagnostic
 	r.mu.Unlock()
 }
 
@@ -463,6 +470,12 @@ func (r *piAgentRuntime) NormalizeEvent(_ string, raw json.RawMessage) []Runtime
 }
 
 func (r *piAgentRuntime) handleEvent(raw json.RawMessage) {
+	r.mu.Lock()
+	diagnostic := r.onDiagnostic
+	r.mu.Unlock()
+	if diagnostic != nil {
+		diagnostic(append(json.RawMessage(nil), raw...))
+	}
 	if r.handleApprovalEvent(raw) {
 		return
 	}

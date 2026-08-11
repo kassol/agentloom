@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -49,21 +50,83 @@ func TestThreadSSEProjectsCanonicalAndLegacyNamespaces(t *testing.T) {
 	}
 }
 
-func TestGlobalSSEEmitsCanonicalAndCompatibilityAliases(t *testing.T) {
+func TestGlobalSSEIsCanonicalUnlessCompatibilityIsExplicit(t *testing.T) {
 	var output bytes.Buffer
-	writeCompatibleGlobalSSE(&output, store.Event{Type: "hub/comms-message", Data: json.RawMessage(`{}`)})
+	writeGlobalSSE(&output, store.Event{Type: "hub/comms-message", Data: json.RawMessage(`{}`)}, false)
 	got := output.String()
+	if !strings.Contains(got, `"type":"loom/comms-message"`) || strings.Contains(got, `"type":"hub/comms-message"`) {
+		t.Fatalf("ordinary global SSE = %q", got)
+	}
+
+	output.Reset()
+	writeGlobalSSE(&output, store.Event{Type: "hub/comms-message", Data: json.RawMessage(`{}`)}, true)
+	got = output.String()
 	if !strings.Contains(got, `"type":"loom/comms-message"`) || !strings.Contains(got, `"type":"hub/comms-message"`) {
-		t.Fatalf("compatible global SSE = %q", got)
+		t.Fatalf("explicit compatibility global SSE = %q", got)
 	}
 }
 
 func TestGlobalThreadEventHasNoLegacyDuplicate(t *testing.T) {
 	var output bytes.Buffer
-	writeCompatibleGlobalSSE(&output, store.Event{Type: "loom/thread-event", Data: json.RawMessage(`{"agentId":"agent-1"}`)})
+	writeGlobalSSE(&output, store.Event{Type: "loom/thread-event", Data: json.RawMessage(`{"agentId":"agent-1"}`)}, true)
 	got := output.String()
 	if strings.Count(got, `"type":"loom/thread-event"`) != 1 || strings.Contains(got, `"type":"hub/thread-event"`) {
 		t.Fatalf("multiplexed global SSE = %q", got)
+	}
+}
+
+func TestCanonicalRuntimeEventFilterCoversPersistedRawAndNestedGlobalRows(t *testing.T) {
+	cases := []store.Event{
+		{Type: "item/agentMessage/delta", Data: json.RawMessage(`{"delta":"old"}`)},
+		{Type: "loom/runtime-event", Data: json.RawMessage(`{"compatibility":true}`)},
+		{Type: "loom/thread-event", Data: json.RawMessage(`{"event":{"type":"item/agentMessage/delta","data":{"delta":"old"}}}`)},
+	}
+	if isRuntimeCompatibilityEvent(store.Event{Type: "loom/text-delta", Data: json.RawMessage(`{"delta":"canonical-v1"}`)}) {
+		t.Fatal("public normalized event without compatibility marker was filtered")
+	}
+	for _, event := range cases {
+		if !isRuntimeCompatibilityEvent(event) {
+			t.Fatalf("event was not filtered: %#v", event)
+		}
+	}
+	if isRuntimeCompatibilityEvent(store.Event{Type: "loom/runtime-event", Data: json.RawMessage(`{"kind":"content"}`)}) {
+		t.Fatal("typed canonical event was filtered")
+	}
+}
+
+func TestCanonicalGlobalRouteFiltersPersistedCompatibilityAndLegacyRouteIsDeprecated(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := hub.New(st)
+	defer h.Shutdown()
+	h.EmitGlobal("loom/thread-event", map[string]any{
+		"agentId": "agent-1", "event": store.Event{Seq: 1, Type: "loom/runtime-event", Data: json.RawMessage(`{"kind":"content","turnId":"turn-1"}`)},
+	})
+	h.EmitGlobal("loom/thread-event", map[string]any{
+		"agentId": "agent-1", "event": store.Event{Seq: 2, Type: "item/agentMessage/delta", Data: json.RawMessage(`{"compatibility":true,"delta":"duplicate"}`)},
+	})
+	server := New(h, st, fstest.MapFS{"index.html": {Data: []byte("ok")}}).Handler()
+
+	requestStream := func(path string) *httptest.ResponseRecorder {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		return response
+	}
+	canonical := requestStream("/api/agents/events?since=0")
+	if canonical.Code != http.StatusOK || !strings.Contains(canonical.Body.String(), `"type":"loom/runtime-event"`) || strings.Contains(canonical.Body.String(), "duplicate") {
+		t.Fatalf("canonical global stream = %d %s", canonical.Code, canonical.Body.String())
+	}
+	if canonical.Header().Get("Deprecation") != "" {
+		t.Fatalf("canonical stream marked deprecated: %#v", canonical.Header())
+	}
+	legacy := requestStream("/api/events?since=0")
+	if legacy.Code != http.StatusOK || !strings.Contains(legacy.Body.String(), "duplicate") || legacy.Header().Get("Deprecation") != "true" || legacy.Header().Get("Link") == "" {
+		t.Fatalf("legacy global stream = %d headers=%#v body=%s", legacy.Code, legacy.Header(), legacy.Body.String())
 	}
 }
 
@@ -114,11 +177,20 @@ func TestAgentRuntimeKindIsRequiredAndImmutable(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.AppendEvent("__runtime-diagnostic-agent-1", store.Event{Seq: 1, TS: nowForTest(), Type: "turn/native", Data: json.RawMessage(`{"threadId":"codex-thread-1","credential":"native-only"}`)}); err != nil {
+		t.Fatal(err)
+	}
 	diagnosticsRequest := httptest.NewRequest(http.MethodGet, "/api/agents/agent-1/runtime/diagnostics", nil)
 	diagnosticsResponse := httptest.NewRecorder()
 	server.ServeHTTP(diagnosticsResponse, diagnosticsRequest)
 	if diagnosticsResponse.Code != http.StatusOK || !strings.Contains(diagnosticsResponse.Body.String(), `"nativeRef":"codex-thread-1"`) {
 		t.Fatalf("Runtime diagnostics = %d %s", diagnosticsResponse.Code, diagnosticsResponse.Body.String())
+	}
+	diagnosticEventsRequest := httptest.NewRequest(http.MethodGet, "/api/agents/agent-1/runtime/diagnostics/events", nil)
+	diagnosticEventsResponse := httptest.NewRecorder()
+	server.ServeHTTP(diagnosticEventsResponse, diagnosticEventsRequest)
+	if diagnosticEventsResponse.Code != http.StatusOK || !strings.Contains(diagnosticEventsResponse.Body.String(), `"credential":"[redacted]"`) || strings.Contains(diagnosticEventsResponse.Body.String(), "native-only") {
+		t.Fatalf("Runtime diagnostic events = %d %s", diagnosticEventsResponse.Code, diagnosticEventsResponse.Body.String())
 	}
 	ordinaryRequest := httptest.NewRequest(http.MethodGet, "/api/agents/agent-1", nil)
 	ordinaryResponse := httptest.NewRecorder()

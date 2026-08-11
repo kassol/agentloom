@@ -228,6 +228,7 @@ const (
 	ContentToolCall      ContentKind = "tool_call"
 	ContentToolResult    ContentKind = "tool_result"
 	ContentImage         ContentKind = "image"
+	ContentAttachment    ContentKind = "attachment"
 )
 
 type ContentBlock struct {
@@ -237,6 +238,7 @@ type ContentBlock struct {
 	ToolCall   *ToolCall       `json:"toolCall,omitempty"`
 	ToolResult *ToolResult     `json:"toolResult,omitempty"`
 	Image      *Image          `json:"image,omitempty"`
+	Attachment *Attachment     `json:"attachment,omitempty"`
 	Diagnostic json.RawMessage `json:"-"`
 }
 
@@ -257,9 +259,12 @@ func (b ContentBlock) Validate() error {
 	if b.Image != nil {
 		payloads++
 	}
+	if b.Attachment != nil {
+		payloads++
+	}
 	switch b.Kind {
 	case ContentUserText, ContentAssistantText, ContentReasoning:
-		if b.ToolCall != nil || b.ToolResult != nil || b.Image != nil {
+		if b.ToolCall != nil || b.ToolResult != nil || b.Image != nil || b.Attachment != nil {
 			return fmt.Errorf("%s content requires only text", b.Kind)
 		}
 	case ContentToolCall:
@@ -273,6 +278,16 @@ func (b ContentBlock) Validate() error {
 	case ContentImage:
 		if b.Image == nil || payloads != 1 {
 			return fmt.Errorf("image content requires only an image")
+		}
+		if b.Image.Ref == "" {
+			return fmt.Errorf("image content requires a reference")
+		}
+	case ContentAttachment:
+		if b.Attachment == nil || payloads != 1 {
+			return fmt.Errorf("attachment content requires only an attachment")
+		}
+		if b.Attachment.Ref == "" {
+			return fmt.Errorf("attachment content requires a reference")
 		}
 	default:
 		return fmt.Errorf("unknown content kind %q", b.Kind)
@@ -292,7 +307,18 @@ type ToolResult struct {
 }
 
 type Image struct {
+	ID       string `json:"id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Size     int64  `json:"size,omitempty"`
 	MIMEType string `json:"mimeType"`
+	Ref      string `json:"ref"`
+}
+
+type Attachment struct {
+	ID       string `json:"id"`
+	Name     string `json:"name,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	MIMEType string `json:"mimeType,omitempty"`
 	Ref      string `json:"ref"`
 }
 

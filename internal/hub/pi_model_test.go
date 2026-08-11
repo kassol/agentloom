@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -46,6 +48,8 @@ func TestPiAgentSwitchesNativeModelWithoutReplacingSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	global, cancel := h.SubscribeGlobal()
+	defer cancel()
 
 	after, err := h.SwitchRuntimeModel(agent.ID, RuntimeModelSelection{Provider: "xai", Model: "grok-4.5", ThinkingLevel: "high"})
 	if err != nil {
@@ -67,6 +71,28 @@ func TestPiAgentSwitchesNativeModelWithoutReplacingSession(t *testing.T) {
 	}
 	if !view.RuntimeCapabilities.Provider {
 		t.Fatalf("Pi capabilities = %#v", view.RuntimeCapabilities)
+	}
+	if len(view.CapabilitySnapshot.Capabilities) == 0 || view.CapabilitySnapshot.Capabilities[0].Scope.Model != "grok-4.5" {
+		t.Fatalf("fresh capability snapshot = %#v", view.CapabilitySnapshot)
+	}
+	foundLiveSnapshot := false
+	deadline := time.After(time.Second)
+	for !foundLiveSnapshot {
+		select {
+		case event := <-global:
+			if event.Type != "loom/agent-status" {
+				continue
+			}
+			var payload struct {
+				Model              string                             `json:"model"`
+				CapabilitySnapshot runtimecontract.CapabilitySnapshot `json:"capabilitySnapshot"`
+			}
+			if json.Unmarshal(event.Data, &payload) == nil && payload.Model == "grok-4.5" && len(payload.CapabilitySnapshot.Capabilities) > 0 {
+				foundLiveSnapshot = true
+			}
+		case <-deadline:
+			t.Fatal("model switch did not emit a fresh Capability Snapshot")
+		}
 	}
 	h.mu.Lock()
 	h.agents[agent.ID].Status = "running"

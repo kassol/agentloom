@@ -114,6 +114,14 @@ func TestContractV2RejectsContradictoryContentAndLifecycleStates(t *testing.T) {
 	if err := invalid.Validate(); err == nil {
 		t.Fatal("contradictory content validated")
 	}
+	for _, invalid := range []runtimecontract.ContentBlock{
+		{ID: "empty-image", Kind: runtimecontract.ContentImage, Image: &runtimecontract.Image{MIMEType: "image/png"}},
+		{ID: "empty-attachment", Kind: runtimecontract.ContentAttachment, Attachment: &runtimecontract.Attachment{Name: "notes.txt"}},
+	} {
+		if err := invalid.Validate(); err == nil {
+			t.Fatalf("payload without public reference validated: %#v", invalid)
+		}
+	}
 	for _, outcome := range []runtimecontract.Outcome{
 		{State: runtimecontract.LifecycleCompleted, Failure: &runtimecontract.Failure{Code: "unexpected"}},
 		{State: runtimecontract.LifecycleInterrupted, Failure: &runtimecontract.Failure{Code: "unexpected"}},

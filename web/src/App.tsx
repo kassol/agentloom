@@ -232,11 +232,11 @@ function applyThreadStatus(agent: Agent, event: any): Agent {
   const eventType = event?.type;
   const data = event?.data || {};
   const updatedAt = event?.ts || agent.updatedAt;
-  if (eventType === "turn/started") {
+  if (eventType === "loom/turn-started") {
     return {
       ...agent,
       status: "running",
-      currentTurnId: data.turn?.id || data.turnId || agent.currentTurnId,
+      currentTurnId: data.turnId || agent.currentTurnId,
       lastError: "",
       updatedAt,
     };
@@ -247,9 +247,8 @@ function applyThreadStatus(agent: Agent, event: any): Agent {
   if (eventType === "thread/goal/cleared") {
     return { ...agent, goal: undefined, updatedAt };
   }
-  if (["turn/completed", "turn/failed", "turn/aborted", "loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted"].includes(eventType)) {
-    const turnStatus = data.turn?.status;
-    const failed = eventType === "turn/failed" || eventType === "loom/turn-failed" || turnStatus === "failed";
+  if (["loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted"].includes(eventType)) {
+    const failed = eventType === "loom/turn-failed";
     return {
       ...agent,
       status: "idle",
@@ -737,6 +736,7 @@ export default function App() {
                       providerId: d.providerId ?? s.providerId,
 					  processAlive: d.processAlive ?? s.processAlive,
 					  runtimeCapabilities: d.runtimeCapabilities ?? s.runtimeCapabilities,
+					  capabilitySnapshot: d.capabilitySnapshot ?? s.capabilitySnapshot,
                       effort: d.effort ?? s.effort,
                       sandbox: d.sandbox ?? s.sandbox,
                       approvalPolicy: d.approvalPolicy ?? s.approvalPolicy,

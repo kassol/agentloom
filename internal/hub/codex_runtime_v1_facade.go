@@ -93,6 +93,9 @@ func (f *codexRuntimeV1Facade) ReadHistory(nativeRef string, count, offset int) 
 		Binding: contractBinding(nativeRef), Count: count, Offset: offset,
 	})
 	if failure != nil {
+		if failure.Code == "history_not_found" {
+			return RuntimeHistory{Turns: []RuntimeHistoryTurn{}}, nil
+		}
 		return RuntimeHistory{}, compatibilityFailureError(failure)
 	}
 	result := RuntimeHistory{Total: history.Total}

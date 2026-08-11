@@ -54,6 +54,9 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 | POST | `/api/agents` | Create Agent |
 | POST | `/api/agents/restore` | Restore an Agent from an external key |
 | GET | `/api/agents/{key}` | Get one Agent |
+| GET | `/api/agents/events` | Canonical global SSE stream |
+| GET | `/api/agents/{key}/runtime/diagnostics` | Explicit native binding diagnostics |
+| GET | `/api/agents/{key}/runtime/diagnostics/events` | Explicit redacted native event diagnostics |
 | PATCH | `/api/agents/{key}/config` | Update Agent config |
 | GET | `/api/agents/{key}/skills` | Get Skill config and inventory |
 | PATCH | `/api/agents/{key}/skills/config` | Update Skill config |
@@ -72,7 +75,7 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 | POST | `/api/agents/{key}/turns/interrupted/continue` | Continue interrupted Turn |
 | POST | `/api/agents/{key}/turns/interrupted/dismiss` | Dismiss interrupted Turn |
 | POST | `/api/agents/{key}/provider` | Switch Agent model Provider |
-| GET | `/api/agents/{key}/thread/history` | History from Codex rollout |
+| GET | `/api/agents/{key}/thread/history` | Runtime Contract history with Loom IDs |
 | GET | `/api/agents/{key}/thread/events` | Thread SSE stream |
 | POST | `/api/agents/{key}/thread/approvals/{approvalId}` | Resolve approval |
 | POST | `/api/agents/{key}/artifacts` | Stage/publish artifact |
@@ -273,20 +276,37 @@ Operation 状态。
 - `tail=N` 限制重放条数。
 - `replay=0` 只订阅后续 live 事件，不重放历史。
 - 重放窗口被压缩时发送 `loom/reconcile`；客户端应重新拉取权威 history。
-- 规范流使用 `loom/*` 事件名，兼容流保留 `hub/*` 和 Codex `turn/*` / `item/*`。
+- 规范流只发送 Runtime Contract typed `loom/runtime-event` 与 Loom 控制面事件。
+  Turn、content 和 toolCall 只使用稳定 Loom ID；不会发送 native Session/Turn ID、
+  raw protocol payload 或 compatibility duplicate。
 
 ### Global Events
 
-`GET /api/events`
+`GET /api/agents/events`
 
 - 使用持久单调 seq 作为 SSE `id`。
 - `Last-Event-ID` 或 `since` 控制重放。
 - cursor 已压缩时发送 `loom/reconcile`。
+- Web 产品流使用该 canonical 入口；嵌套的 Agent Thread 事件遵守同一 public projection。
+
+### Runtime diagnostics
+
+Native Runtime identity 和 protocol evidence 只在显式 Developer 入口
+`GET /api/agents/{key}/runtime/diagnostics` 与
+`GET /api/agents/{key}/runtime/diagnostics/events` 可读。事件响应使用 `no-store`，并在
+写入与读取时递归移除 Authorization、API key、token、password、cookie、credential
+以及 URL userinfo/sensitive query。普通 Agent、history、Turn、SSE 和 backup 不包含这些
+diagnostic event logs。
 
 ### Compatibility
 
-`/api/sessions/...` 是 `/api/agents/...` 的兼容别名，用于旧客户端迁移；
+`/api/sessions/...` 与 `GET /api/events` 是 raw v1 兼容面，用于旧客户端迁移；
 `/api/images` 是受管 Artifact 服务化之前的图片读取兼容入口。
+
+兼容 history/SSE 响应带 `Deprecation: true` 和指向本节的 `Link`。它们在 #21 完成
+v1 facade removal 前保留，迁移目标分别是 `/api/agents/{key}/thread/history`、
+`/api/agents/{key}/thread/events` 和 `/api/agents/events`。没有承诺虚构的日历下线日期；
+删除将由 #21 的发布说明明确宣布。
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -302,6 +322,7 @@ Operation 状态。
 | POST | `/api/sessions/{key}/approvals/{approvalId}` | Compatibility approval |
 | GET | `/api/sessions/{key}/history` | Compatibility history |
 | GET | `/api/sessions/{key}/events` | Compatibility SSE |
+| GET | `/api/events` | Compatibility global SSE |
 | GET | `/api/images` | Legacy image serving |
 
 ## 维护方式

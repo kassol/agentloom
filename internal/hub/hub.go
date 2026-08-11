@@ -98,7 +98,8 @@ type Agent struct {
 	// registry (they are re-imported each startup and never persisted here);
 	// empty for Agents CodexLoom owns. Starting a Turn promotes an edge mirror
 	// to a native Agent (Source cleared, then persisted).
-	Source string `json:"source,omitempty"`
+	Source             string `json:"source,omitempty"`
+	capabilitySnapshot runtimecontract.CapabilitySnapshot
 }
 
 // Session is the pre-CodexLoom compatibility name.
@@ -108,12 +109,13 @@ type Session = Agent
 // Codex Thread runtime state.
 type AgentView struct {
 	Agent
-	ProcessAlive        bool                `json:"processAlive"`
-	RuntimeCapabilities RuntimeCapabilities `json:"runtimeCapabilities"`
-	PendingApprovals    []ApprovalView      `json:"pendingApprovals"`
-	Goal                *ThreadGoal         `json:"goal,omitempty"`
-	LastSeq             int64               `json:"lastSeq"`
-	Recovery            *RecoveryView       `json:"recovery,omitempty"`
+	ProcessAlive        bool                               `json:"processAlive"`
+	RuntimeCapabilities RuntimeCapabilities                `json:"runtimeCapabilities"`
+	CapabilitySnapshot  runtimecontract.CapabilitySnapshot `json:"capabilitySnapshot"`
+	PendingApprovals    []ApprovalView                     `json:"pendingApprovals"`
+	Goal                *ThreadGoal                        `json:"goal,omitempty"`
+	LastSeq             int64                              `json:"lastSeq"`
+	Recovery            *RecoveryView                      `json:"recovery,omitempty"`
 	nativeRuntimeRef    string
 	nativeTurnBindings  map[string]string
 	turnRecoveryMarkers map[string]TurnRecoveryMarker
@@ -1065,7 +1067,7 @@ func (h *Hub) emitStatusLocked(meta *Agent, status string) {
 		"status":              status,
 		"currentTask":         meta.CurrentTask,
 		"currentTurnId":       meta.CurrentTurnID,
-		"lastError":           meta.LastError,
+		"lastError":           publicRuntimeFailureMessage(meta, meta.CurrentTurnID, meta.LastError),
 		"lastTurn":            meta.LastTurn,
 		"model":               meta.Model,
 		"effort":              meta.Effort,
@@ -1074,6 +1076,7 @@ func (h *Hub) emitStatusLocked(meta *Agent, status string) {
 		"providerId":          meta.ProviderID,
 		"processAlive":        processAlive,
 		"runtimeCapabilities": h.runtimeCapabilitiesLocked(meta),
+		"capabilitySnapshot":  meta.capabilitySnapshot,
 		"updatedAt":           meta.UpdatedAt,
 	}
 	if recovery := recoveryView(meta); recovery != nil {
@@ -1366,12 +1369,19 @@ func (h *Hub) markRuntimeSkillConfigApplied(agentID string, rt *runtime, skillCo
 	available := err == nil && ok && descriptor.Availability == runtimecontract.CapabilityAvailable
 	h.mu.Lock()
 	if h.runtimeCapabilityQueryCurrentLocked(query) {
+		meta = h.agents[agentID]
+		if err == nil {
+			meta.capabilitySnapshot = snapshot
+		}
 		if available {
 			rt.skillConfigHash = skillConfigHash
 			rt.skillConfigLoaded = true
 		} else {
 			rt.skillConfigHash = ""
 			rt.skillConfigLoaded = false
+		}
+		if err == nil && h.seqs[agentID] > 0 {
+			h.emitStatusLocked(meta, meta.Status)
 		}
 	}
 	h.mu.Unlock()
@@ -1773,7 +1783,12 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 	}
 	runtimeEvents := normalizeRuntimeEvents(rt, method, params)
 	for _, runtimeEvent := range runtimeEvents {
-		h.onRuntimeEventLocked(meta, rt, runtimeEvent, method, params)
+		turnID := runtimeEvent.LoomTurnID
+		if turnID == "" && rt.activeTurn != nil {
+			turnID = rt.activeTurn.turnID
+		}
+		canonical := runtimeContractEvent(runtimeEvent, runtimeTurnCorrelation{turnID: turnID})
+		h.onRuntimeEventLocked(meta, rt, runtimeEvent, canonical)
 	}
 	// Codex reports model-route failures as raw `error` notifications. They do
 	// not normalize into a RuntimeEvent, but still need to affect the active
@@ -1793,7 +1808,8 @@ func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage)
 	if rt.activeTurn != nil {
 		turnID = rt.activeTurn.turnID
 	}
-	h.emitLocked(meta.ID, method, runtimePublicPayload(params, meta.ThreadID, turnID, len(runtimeEvents) > 0))
+	h.emitLocked(meta.ID, method, runtimePublicPayload(params, meta.ThreadID, turnID, true))
+	h.appendRuntimeDiagnosticLocked(meta.ID, method, params)
 }
 
 func (h *Hub) onRuntimeEvent(rt *runtime, event RuntimeEvent) {
@@ -1801,12 +1817,22 @@ func (h *Hub) onRuntimeEvent(rt *runtime, event RuntimeEvent) {
 	defer h.mu.Unlock()
 	meta := h.agents[rt.agentID]
 	if meta != nil {
-		h.onRuntimeEventLocked(meta, rt, event, "", nil)
+		turnID := event.LoomTurnID
+		if turnID == "" && rt.activeTurn != nil {
+			turnID = rt.activeTurn.turnID
+		}
+		canonical := runtimeContractEvent(event, runtimeTurnCorrelation{turnID: turnID})
+		h.onRuntimeEventLocked(meta, rt, event, canonical)
 	}
 }
 
 func (h *Hub) onCanonicalRuntimeEvent(rt *runtime, event runtimecontract.Event) {
-	h.onRuntimeEvent(rt, compatibilityRuntimeEvent(event))
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta := h.agents[rt.agentID]
+	if meta != nil {
+		h.onRuntimeEventLocked(meta, rt, compatibilityRuntimeEvent(event), event)
+	}
 }
 
 func compatibilityRuntimeEvent(event runtimecontract.Event) RuntimeEvent {
@@ -1931,10 +1957,10 @@ func (h *Hub) checkpointRuntimeFailure(rt *runtime, err error) (string, string, 
 			h.mu.Unlock()
 			return "", "", false
 		}
-		meta.LastError = err.Error()
+		meta.LastError = publicRuntimeFailureMessage(meta, "", err.Error())
 		meta.UpdatedAt = now()
 		h.persistRuntimeProjectionLocked()
-		h.emitLocked(meta.ID, "loom/runtime-failed", map[string]any{"error": err.Error()})
+		h.emitLocked(meta.ID, "loom/runtime-failed", map[string]any{"error": meta.LastError})
 		h.mu.Unlock()
 		return "", "", false
 	}
@@ -1945,7 +1971,7 @@ func (h *Hub) checkpointRuntimeFailure(rt *runtime, err error) (string, string, 
 	return agentID, predecessorTurnID, checkpointed
 }
 
-func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent RuntimeEvent, method string, params json.RawMessage) {
+func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent RuntimeEvent, canonical runtimecontract.Event) {
 	if recoveryEventFenced(meta, rt) {
 		return
 	}
@@ -2013,8 +2039,6 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent Runtim
 		}
 	}
 
-	h.emitRuntimeEventsLocked(meta, rt, []RuntimeEvent{runtimeEvent})
-
 	switch runtimeEvent.Kind {
 	case RuntimeTurnCompleted, RuntimeTurnFailed, RuntimeTurnInterrupted:
 		if rt.activeTurn == nil || rt.activeTurn.finished {
@@ -2033,13 +2057,30 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent Runtim
 		if rt.activeTurn.forcedFailure == "" {
 			rt.activeTurn.forcedFailure = customProviderModelRouteFailureDetail(meta.ProviderID, meta.Model, errMsg)
 		}
+		if rt.activeTurn.forcedFailure != "" {
+			status = "failed"
+			errMsg = rt.activeTurn.forcedFailure
+			runtimeEvent.Kind = RuntimeTurnFailed
+			canonical.Kind = runtimecontract.EventTerminal
+			canonical.Outcome = &runtimecontract.Outcome{
+				State:   runtimecontract.LifecycleFailed,
+				Failure: &runtimecontract.Failure{Code: "runtime_failed", Phase: runtimecontract.FailurePhaseTurnStart, Message: errMsg},
+			}
+		}
 		switch runtimeEvent.Kind {
 		case RuntimeTurnFailed:
 			status = "failed"
 		case RuntimeTurnInterrupted:
 			status = "interrupted"
 		}
-		h.finishTurnLocked(meta, rt, status, errMsg)
+		if canonical.TurnID == "" {
+			canonical.TurnID = rt.activeTurn.turnID
+		}
+		if h.finishTurnLocked(meta, rt, status, errMsg) {
+			h.emitCanonicalRuntimeEventLocked(meta, rt, canonical)
+		}
+	default:
+		h.emitCanonicalRuntimeEventLocked(meta, rt, canonical)
 	}
 }
 
@@ -2193,42 +2234,162 @@ func runtimePublicActionKey(key string) bool {
 	}
 }
 
-func (h *Hub) emitRuntimeEventsLocked(meta *Agent, rt *runtime, events []RuntimeEvent) {
-	for _, event := range events {
-		turnID := event.LoomTurnID
-		if rt.activeTurn != nil {
-			if turnID == "" {
-				turnID = rt.activeTurn.turnID
+func (h *Hub) emitCanonicalRuntimeEventLocked(meta *Agent, rt *runtime, event runtimecontract.Event) {
+	turnID := event.TurnID
+	if turnID == "" && rt.activeTurn != nil {
+		turnID = rt.activeTurn.turnID
+	}
+	if turnID == "" && event.RuntimeTurnRef != "" {
+		for loomTurnID, nativeTurnID := range meta.RuntimeTurnBindings {
+			if nativeTurnID == event.RuntimeTurnRef {
+				turnID = loomTurnID
+				break
 			}
 		}
-		itemID := publicRuntimeItemID(turnID, event.ItemID)
-		data := map[string]any{
-			"turnId": turnID,
-			"itemId": itemID,
-			"text":   event.Text,
-			"delta":  event.Text,
-			"item":   canonicalRuntimeItem(event.Item, itemID, meta.ThreadID, turnID),
+	}
+	event.TurnID = turnID
+	event.RuntimeTurnRef = ""
+	if event.Content != nil {
+		content, ok := projectRuntimeContentBlock(&AgentView{Agent: *meta}, turnID, *event.Content)
+		if !ok {
+			return
 		}
-		switch event.Kind {
-		case RuntimeUserInput:
-			if rt.activeTurn != nil && rt.activeTurn.source == "remote" {
-				h.emitLocked(meta.ID, "loom/user-message", map[string]any{"text": event.Text})
+		event.Content = &content
+	}
+	if event.Outcome != nil {
+		outcome := *event.Outcome
+		outcome.RuntimeTurnRef = ""
+		if outcome.Failure != nil {
+			failure := *outcome.Failure
+			failure.Diagnostic = ""
+			failure.Cause = nil
+			message := failure.Message
+			if strings.TrimSpace(message) == "" {
+				message = meta.LastError
 			}
-		case RuntimeTextDelta:
-			h.emitLocked(meta.ID, "loom/text-delta", data)
-		case RuntimeTextCompleted:
-			h.emitLocked(meta.ID, "loom/text-completed", data)
-		case RuntimeReasoningDelta:
-			h.emitLocked(meta.ID, "loom/reasoning-delta", data)
-		case RuntimeReasoningCompleted:
-			h.emitLocked(meta.ID, "loom/reasoning-completed", data)
-		case RuntimeToolStarted:
-			h.emitLocked(meta.ID, "loom/tool-started", data)
-		case RuntimeToolUpdated:
-			h.emitLocked(meta.ID, "loom/tool-updated", data)
-		case RuntimeToolCompleted:
-			h.emitLocked(meta.ID, "loom/tool-completed", data)
+			if strings.TrimSpace(message) == "" {
+				message = "Runtime operation failed"
+			}
+			failure.Message = publicRuntimeFailureMessage(meta, turnID, message)
+			outcome.Failure = &failure
 		}
+		event.Outcome = &outcome
+	}
+	h.emitLocked(meta.ID, "loom/runtime-event", event)
+}
+
+func projectRuntimeContentBlock(view *AgentView, turnID string, source runtimecontract.ContentBlock) (runtimecontract.ContentBlock, bool) {
+	content := source
+	content.ID = publicRuntimeItemID(turnID, content.ID)
+	content.Diagnostic = nil
+	if content.ToolCall != nil {
+		toolCall := *content.ToolCall
+		var arguments any
+		if json.Unmarshal(toolCall.Arguments, &arguments) == nil {
+			toolCall.Arguments, _ = json.Marshal(projectRuntimePublicToolArguments(arguments))
+		} else {
+			toolCall.Arguments = nil
+		}
+		content.ToolCall = &toolCall
+	}
+	if content.ToolResult != nil {
+		result := *content.ToolResult
+		result.ToolCallID = publicRuntimeItemID(turnID, result.ToolCallID)
+		if view != nil {
+			result.Text = publicRuntimeFailureMessage(&view.Agent, turnID, result.Text)
+		}
+		content.ToolResult = &result
+	}
+	if content.Image != nil {
+		image := *content.Image
+		image.Ref = publicManagedArtifactRef(view, image.ID, image.Ref)
+		if image.Ref == "" {
+			content.Image = nil
+		} else {
+			content.Image = &image
+		}
+	}
+	if content.Attachment != nil {
+		attachment := *content.Attachment
+		attachment.Ref = publicManagedArtifactRef(view, attachment.ID, attachment.Ref)
+		if attachment.Ref == "" {
+			content.Attachment = nil
+		} else {
+			content.Attachment = &attachment
+		}
+	}
+	if content.Validate() != nil {
+		return runtimecontract.ContentBlock{}, false
+	}
+	return content, true
+}
+
+func publicManagedArtifactRef(view *AgentView, artifactID, ref string) string {
+	if view == nil {
+		return ""
+	}
+	if publicInlineImageRef(ref) {
+		return ref
+	}
+	if strings.HasPrefix(ref, "artifact:") && artifactID == "" {
+		artifactID = strings.TrimPrefix(ref, "artifact:")
+	}
+	if artifactID != "" && safeStoreComponent(artifactID) {
+		return "/api/agents/" + view.ID + "/artifacts/" + artifactID
+	}
+	prefix := "/api/agents/" + view.ID + "/artifacts/"
+	if strings.HasPrefix(ref, prefix) && !strings.ContainsAny(strings.TrimPrefix(ref, prefix), "/\\?#") {
+		return ref
+	}
+	return ""
+}
+
+func publicInlineImageRef(ref string) bool {
+	const maxInlineImageBytes = 8 << 20
+	if len(ref) == 0 || len(ref) > maxInlineImageBytes {
+		return false
+	}
+	header, _, ok := strings.Cut(ref, ",")
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(header) {
+	case "data:image/png;base64", "data:image/jpeg;base64", "data:image/webp;base64", "data:image/gif;base64":
+		return true
+	default:
+		return false
+	}
+}
+
+func projectRuntimePublicToolArguments(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		result := map[string]any{}
+		for key, nested := range typed {
+			normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(key))
+			if runtimeDiagnosticSecretKey(key) || strings.Contains(normalized, "native") || strings.Contains(normalized, "session") ||
+				normalized == "cwd" || strings.Contains(normalized, "filepath") || normalized == "path" {
+				continue
+			}
+			if normalized == "url" || strings.HasSuffix(normalized, "url") {
+				if ref, ok := nested.(string); ok && strings.HasPrefix(ref, "/api/agents/") && strings.Contains(ref, "/artifacts/") && !strings.ContainsAny(ref, "?#") {
+					result[key] = ref
+				}
+				continue
+			}
+			result[key] = projectRuntimePublicToolArguments(nested)
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, nested := range typed {
+			result[index] = projectRuntimePublicToolArguments(nested)
+		}
+		return result
+	case string:
+		return runtimeFailureBearerPattern.ReplaceAllString(typed, "Bearer [redacted]")
+	default:
+		return value
 	}
 }
 
@@ -2387,8 +2548,8 @@ func (h *Hub) ResolveApproval(key, approvalID, decision string) (map[string]any,
 	return map[string]any{"approvalId": approvalID, "decision": decision, "status": status}, nil
 }
 
-func (h *Hub) finishTurnLocked(meta *Agent, rt *runtime, status, errMsg string) {
-	h.finishTurnWithPendingLocked(meta, rt, status, errMsg, true)
+func (h *Hub) finishTurnLocked(meta *Agent, rt *runtime, status, errMsg string) bool {
+	return h.finishTurnWithPendingLocked(meta, rt, status, errMsg, true)
 }
 
 func (h *Hub) finishTurnForRecoveryLocked(meta *Agent, rt *runtime, runtimeErr error) bool {
@@ -2469,14 +2630,17 @@ func runtimeRecoveryDescriptor(err error) (cause, phase, code, summary string) {
 	return cause, phase, code, summary
 }
 
-func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errMsg string, startPending bool) {
+func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errMsg string, startPending bool) bool {
 	turn := rt.activeTurn
 	if turn == nil || turn.finished {
-		return
+		return false
 	}
 	if turn.forcedFailure != "" {
 		status = "failed"
 		errMsg = turn.forcedFailure
+	}
+	if status != "completed" {
+		errMsg = publicRuntimeFailureMessage(meta, turn.turnID, errMsg)
 	}
 	previous := *meta
 	if meta.LastTurn != nil {
@@ -2487,10 +2651,6 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 	for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
 		previous.TurnRecoveryMarkers[predecessorTurnID] = marker
 	}
-	turn.finished = true
-	close(turn.stopWatchdog)
-	rt.activeTurn = nil
-
 	evType := "loom/turn-completed"
 	if status == "failed" {
 		evType = "loom/turn-failed"
@@ -2529,8 +2689,11 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 	if err := h.persistAgentsLocked(); err != nil {
 		*meta = previous
 		log.Printf("[codex-loom] persist terminal Turn before publish: %v", err)
-		return
+		return false
 	}
+	turn.finished = true
+	close(turn.stopWatchdog)
+	rt.activeTurn = nil
 	h.abortTurnApprovalsLocked(meta.ID, turn.turnID, rt, "the Runtime Turn ended before the Approval was resolved")
 	rt.approvals = map[string]*approval{}
 	h.finishInboxAttemptLocked(turn, status, errMsg)
@@ -2546,6 +2709,7 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 	if startPending {
 		h.startPendingWorkersLocked(meta.ID)
 	}
+	return true
 }
 
 // finishAgentMessageTurnLocked completes the handling attempt associated with
@@ -2671,6 +2835,14 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 	view.RuntimeTurnBindings = nil
 	view.TurnRecoveryMarkers = nil
 	view.RuntimeCapabilities = h.runtimeCapabilitiesLocked(meta)
+	view.CapabilitySnapshot = meta.capabilitySnapshot
+	if view.LastError != "" {
+		turnID := view.CurrentTurnID
+		if turnID == "" && view.LastTurn != nil {
+			turnID = view.LastTurn.TurnID
+		}
+		view.LastError = publicRuntimeFailureMessage(meta, turnID, view.LastError)
+	}
 	if goal := h.goals[meta.ID]; goal != nil {
 		copy := *goal
 		view.Goal = &copy
@@ -2752,11 +2924,14 @@ func applyRolloutStatus(view *AgentView) {
 		return
 	}
 	latest.ID = loomTurnIDFor(view, latest.ID)
-	// A restart-interrupted Turn remains visible until explicitly continued or
-	// dismissed. Its rollout has no terminal event by definition, so do not
-	// mistake a recently-written orphan for a live external Turn.
-	if view.LastTurn != nil && view.LastTurn.TurnID == latest.ID && view.LastTurn.Status == "interrupted" {
-		return
+	// A Loom-owned durable terminal result wins over a stale or less precise
+	// native history marker for the same Turn (for example, forced failure or
+	// restart interruption).
+	if view.LastTurn != nil && view.LastTurn.TurnID == latest.ID {
+		switch view.LastTurn.Status {
+		case "completed", "failed", "interrupted":
+			return
+		}
 	}
 	switch latest.Status {
 	case "running":

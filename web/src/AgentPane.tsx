@@ -15,6 +15,11 @@ import { oldestWaitingMs } from "./product-state";
 const CUSTOM_MODEL_VALUE = "__custom";
 const FALLBACK_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
+function capabilityAvailable(agent: Agent, id: string, v1Fallback: boolean) {
+  const descriptor = agent.capabilitySnapshot?.capabilities.find((capability) => capability.id === id);
+  return descriptor ? descriptor.availability === "available" : v1Fallback;
+}
+
 function readableRuntimeError(value: string) {
   const trimmed = value.trim();
   if (!trimmed.startsWith("{")) return trimmed;
@@ -97,6 +102,9 @@ export function AgentPane({
   onError: (msg: string) => void;
   onAgentUpdated: (agent: Agent) => void;
 }) {
+  const providerConfigurationAvailable = capabilityAvailable(agent, "provider_configuration", agent.runtimeCapabilities.provider);
+  const sandboxConfigurationAvailable = capabilityAvailable(agent, "sandbox_configuration", agent.runtimeCapabilities.sandbox);
+  const approvalPolicyAvailable = capabilityAvailable(agent, "approval_policy", agent.runtimeCapabilities.approval);
   const [feed, dispatch] = useReducer(reduceFeed, emptyFeed);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<PendingArtifact[]>([]);
@@ -315,7 +323,7 @@ export function AgentPane({
   }, [configOpen, agent.id]);
 
 	useEffect(() => {
-	  if (!configOpen || configSection !== "runtime" || agent.runtimeBinding.kind !== "pi") return;
+	  if (!configOpen || configSection !== "runtime" || !agent.runtimeCapabilities.provider) return;
 	  let cancelled = false;
 	  api("GET", `/api/agents/${agent.id}/runtime/models`)
 		.then((data) => {
@@ -330,9 +338,13 @@ export function AgentPane({
 		  setEffortDraft(data.thinkingLevel || "off");
 		  setModelCustomOpen(false);
 		})
-		.catch((err: Error) => { if (!cancelled) onError(err.message); });
+		.catch(() => {
+		  if (cancelled) return;
+		  setRuntimeModels([]);
+		  setRuntimeModelCurrent(null);
+		});
 	  return () => { cancelled = true; };
-	}, [configOpen, configSection, agent.id, agent.runtimeBinding.kind]);
+	}, [configOpen, configSection, agent.id, agent.runtimeCapabilities.provider]);
 
   const refreshConnections = async () => {
     const [addressData, connectionData, membershipData] = await Promise.all([
@@ -481,7 +493,7 @@ export function AgentPane({
         return;
       }
       dispatch(event);
-      if (["turn/completed", "turn/failed", "turn/aborted", "loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted"].includes(event.type)) {
+      if (["loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted"].includes(event.type)) {
         if (!agent.runtimeCapabilities.history) return;
         window.setTimeout(() => {
           const count = Math.max(PAGE, loadedRef.current);
@@ -818,8 +830,8 @@ export function AgentPane({
     setSavingConfig(true);
     try {
       let updated = agent;
-	  const piRuntime = agent.runtimeBinding.kind === "pi";
-	  if (piRuntime && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel)) {
+	  const runtimeModelControl = !!runtimeModelCurrent || runtimeModels.length > 0;
+	  if (runtimeModelControl && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel)) {
 		const state = await api("POST", `/api/agents/${agent.id}/runtime/model`, {
 		  provider: providerDraft,
 		  model: modelDraft.trim(),
@@ -829,7 +841,7 @@ export function AgentPane({
 		setRuntimeModels((state.models || []) as RuntimeModel[]);
 		setRuntimeThinkingLevel(state.thinkingLevel || "off");
 		setRuntimeThinkingLevels(state.thinkingLevels || []);
-	  } else if (!piRuntime && providerDraft !== (agent.providerId || "openai")) {
+	  } else if (!runtimeModelControl && providerDraft !== (agent.providerId || "openai")) {
         const switched = await api("POST", `/api/agents/${agent.id}/provider`, {
           providerId: providerDraft,
           model: modelDraft.trim(),
@@ -837,7 +849,7 @@ export function AgentPane({
         updated = switched.agent as Agent;
         onAgentUpdated(updated);
       }
-	  const data = await api("PATCH", `/api/agents/${agent.id}/config`, piRuntime ? {
+	  const data = await api("PATCH", `/api/agents/${agent.id}/config`, runtimeModelControl ? {
 		name: nextName,
 		approvalPolicy: approvalDraft,
 	  } : {
@@ -962,7 +974,7 @@ export function AgentPane({
   };
 
   const running = agent.status === "running";
-	const piRuntime = agent.runtimeBinding.kind === "pi";
+	const runtimeModelControl = !!runtimeModelCurrent || runtimeModels.length > 0;
   const heldMessages = pendingWork.filter((entry) => entry.internalMessage?.handlingStatus === "interrupted" || entry.internalMessage?.handlingStatus === "failed");
   const currentProviderId = agent.providerId || "openai";
   const selectableProviders = modelProviders.some((provider) => provider.id === currentProviderId)
@@ -984,9 +996,9 @@ export function AgentPane({
 	const piModels = runtimeModels.filter((model) => model.provider === providerDraft);
 	const selectedRuntimeModel = piModels.find((model) => model.id === modelDraft);
 	const runtimeThinkingOptions = selectedRuntimeModel?.thinkingLevels?.length ? selectedRuntimeModel.thinkingLevels : runtimeThinkingLevels;
-	const runtimeModelIdentityChanged = piRuntime && !!selectedRuntimeModel && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id);
+	const runtimeModelIdentityChanged = runtimeModelControl && !!selectedRuntimeModel && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id);
 	const imageInputAvailable = selectedRuntimeModel?.imageInput ?? agent.runtimeCapabilities.imageInput;
-	const runtimeModelChanged = piRuntime
+	const runtimeModelChanged = runtimeModelControl
 	  ? providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel
 	  : providerChanged;
   const profileDirty = Boolean(
@@ -1092,6 +1104,7 @@ export function AgentPane({
 				  </div>
 				  <div className="mb-3 rounded-md border border-border bg-muted/20 p-2">
 					<div className="mb-1.5 text-[10px] font-semibold uppercase text-muted-foreground">Runtime capabilities</div>
+					{agent.capabilitySnapshot?.revision ? <div className="mb-1.5 font-mono text-[9px] text-muted-foreground">snapshot {agent.capabilitySnapshot.revision}</div> : null}
 					<div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10.5px]">
 					  {([
 						["Image input", imageInputAvailable],
@@ -1099,11 +1112,11 @@ export function AgentPane({
 						["Goal support", agent.runtimeCapabilities.goal],
 						["Remote", agent.runtimeCapabilities.remote],
 						["Usage reporting", agent.runtimeCapabilities.usage],
-						["Provider switching", agent.runtimeCapabilities.provider],
-						["Sandbox configuration", agent.runtimeCapabilities.sandbox],
+						["Provider configuration", providerConfigurationAvailable],
+						["Sandbox configuration", sandboxConfigurationAvailable],
 						["Manual compaction", agent.runtimeCapabilities.compaction],
 					  ] as Array<[string, boolean]>).map(([label, available]) => (
-						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{label === "Image input" && runtimeModelIdentityChanged ? `${available ? "Available" : "Unavailable"} after Save` : available ? "Available" : label === "Image input" && agent.runtimeBinding.kind === "pi" && !agent.processAlive ? "Checked on start" : "Unavailable"}</span></div>
+						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{label === "Image input" && runtimeModelIdentityChanged ? `${available ? "Available" : "Unavailable"} after Save` : available ? "Available" : label === "Image input" && !agent.processAlive ? "Checked on start" : "Unavailable"}</span></div>
 					  ))}
 					</div>
 				  </div>
@@ -1120,7 +1133,7 @@ export function AgentPane({
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Provider</span>
-					{piRuntime ? <select
+					{runtimeModelControl ? <select
 					  value={providerDraft}
 					  onChange={(event) => {
 						const provider = event.target.value;
@@ -1145,7 +1158,7 @@ export function AgentPane({
                         setEffortDraft("");
                         setModelCustomOpen(nextProvider !== "openai" && nextModel === "");
                       }}
-                      disabled={running || !agent.runtimeCapabilities.provider}
+                      disabled={running || !providerConfigurationAvailable}
                       className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60"
                     >
                       {selectableProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
@@ -1153,7 +1166,7 @@ export function AgentPane({
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Model</span>
-					{piRuntime ? <select
+					{runtimeModelControl ? <select
 					  value={modelDraft}
 					  onChange={(event) => {
 						const model = piModels.find((candidate) => candidate.id === event.target.value);
@@ -1176,7 +1189,7 @@ export function AgentPane({
                         setModelCustomOpen(false);
                         setModelDraft(e.target.value);
                       }}
-                      disabled={running || !agent.runtimeCapabilities.provider}
+                      disabled={running || !providerConfigurationAvailable}
                       className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition placeholder:text-muted-foreground/60 focus:ring-ring/25 disabled:opacity-60"
                     >
                       {providerModelPresets.map((option) => (
@@ -1188,7 +1201,7 @@ export function AgentPane({
                       <input
                         value={modelDraft}
                         onChange={(e) => setModelDraft(e.target.value)}
-                        disabled={running || !agent.runtimeCapabilities.provider}
+                        disabled={running || !providerConfigurationAvailable}
                         placeholder="model id"
                         spellCheck={false}
                         className="mt-2 h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition placeholder:text-muted-foreground/60 focus:ring-ring/25 disabled:opacity-60"
@@ -1197,17 +1210,17 @@ export function AgentPane({
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Thinking Effort</span>
-					<select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running || (piRuntime ? runtimeThinkingOptions.length === 0 : !agent.runtimeCapabilities.provider)} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
-					  {!piRuntime && <option value="">default{selectedModelDetail?.defaultReasoningEffort ? ` (${selectedModelDetail.defaultReasoningEffort})` : ""}</option>}
-					  {(piRuntime ? runtimeThinkingOptions : reasoningEfforts).map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+					<select value={effortDraft} onChange={(e) => setEffortDraft(e.target.value)} disabled={running || (runtimeModelControl ? runtimeThinkingOptions.length === 0 : !providerConfigurationAvailable)} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+					  {!runtimeModelControl && <option value="">default{selectedModelDetail?.defaultReasoningEffort ? ` (${selectedModelDetail.defaultReasoningEffort})` : ""}</option>}
+					  {(runtimeModelControl ? runtimeThinkingOptions : reasoningEfforts).map((effort) => <option key={effort} value={effort}>{effort}</option>)}
                     </select>
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Sandbox</span>
-                    <select value={sandboxDraft} onChange={(e) => setSandboxDraft(e.target.value)} disabled={running || !agent.runtimeCapabilities.sandbox} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+                    <select value={sandboxDraft} onChange={(e) => setSandboxDraft(e.target.value)} disabled={running || !sandboxConfigurationAvailable} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
                       <option value="danger-full-access">danger-full-access</option><option value="workspace-write">workspace-write</option><option value="read-only">read-only</option>
                     </select>
-					{!agent.runtimeCapabilities.sandbox ? (
+					{!sandboxConfigurationAvailable ? (
 					  <span className="mt-2 block rounded-md bg-warning/10 px-2 py-1.5 text-[11px] leading-4 text-warning">
 						<span>Sandbox isolation is unsupported for the {agent.runtimeBinding.kind} Runtime.</span>{" "}
 						<span>Approval controls individual tool actions only; it does not isolate filesystem, processes, network, credentials, or Extensions.</span>
@@ -1216,12 +1229,12 @@ export function AgentPane({
                   </label>
                   <label className="mb-3 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Approval Policy</span>
-                    <select value={approvalDraft} onChange={(e) => setApprovalDraft(e.target.value)} disabled={running || !agent.runtimeCapabilities.approval} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
+                    <select value={approvalDraft} onChange={(e) => setApprovalDraft(e.target.value)} disabled={running || !approvalPolicyAvailable} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
                       <option value="never">never</option><option value="on-request">on-request</option>
                     </select>
                   </label>
                   {running && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] text-warning">Config can be changed after this turn finishes.</div>}
-				  {runtimeModelChanged && !running && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] leading-4 text-warning">{piRuntime ? "The next Turn will use this Pi model; the existing Agent, Session, Profile, and history stay unchanged." : "Switching Provider cold-resumes this primary Thread and briefly restarts the shared Codex runtime. Every Agent must be idle with no pending approval or active Goal."}</div>}
+				  {runtimeModelChanged && !running && <div className="mb-2 rounded-md bg-warning/10 px-2 py-1.5 text-[11px] leading-4 text-warning">{runtimeModelControl ? "The next Turn will use this Runtime model; the existing Agent, Thread, Profile, and history stay unchanged." : "Switching Provider cold-resumes this primary Thread. Every Agent must be idle with no pending approval or active Goal."}</div>}
                   <div className="flex justify-end gap-2">
                     <button onClick={() => setConfigOpen(false)} className="rounded-md px-2.5 py-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted">Cancel</button>
                     <button onClick={saveConfig} disabled={running || savingConfig} className="rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-medium text-primary-foreground transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60">{savingConfig ? "Saving" : "Save"}</button>

@@ -23,6 +23,7 @@ func (s *Server) registerCompatibilityRoutes(mux *http.ServeMux) {
 			writeErr(w, err)
 			return
 		}
+		deprecatedRuntimeHeaders(w)
 		writeJSON(w, 200, hist)
 	})
 

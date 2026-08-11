@@ -2,9 +2,11 @@ package httpapi
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -148,15 +150,49 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	}
 	waitForStoryAgentTurn(t, restartHandler, piAgentID, resumedTurnID)
 
-	var history hub.RuntimeHistory
+	var history struct {
+		Total int `json:"total"`
+		Turns []struct {
+			TurnID  string `json:"turnId"`
+			State   string `json:"state"`
+			Content []struct {
+				ID   string `json:"id"`
+				Kind string `json:"kind"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"turns"`
+	}
 	historyResponse := storyJSONRequest(t, restartHandler, http.MethodGet, "/api/agents/"+piAgentID+"/thread/history?count=10", nil, http.StatusOK)
 	if err := json.Unmarshal(historyResponse, &history); err != nil {
 		t.Fatal(err)
 	}
-	if history.Total != 2 || len(history.Turns) != 2 || history.Turns[0].ID != firstTurnID || history.Turns[1].ID != resumedTurnID {
+	if history.Total != 2 || len(history.Turns) != 2 || history.Turns[0].TurnID != firstTurnID || history.Turns[1].TurnID != resumedTurnID {
 		t.Fatalf("restarted Pi history = %#v", history)
 	}
+	for _, turn := range history.Turns {
+		if turn.State != "completed" || len(turn.Content) < 2 || turn.Content[0].Kind != "user_text" || turn.Content[1].Kind != "assistant_text" {
+			t.Fatalf("canonical Pi history Turn = %#v", turn)
+		}
+		for _, content := range turn.Content {
+			if !strings.HasPrefix(content.ID, "item_") {
+				t.Fatalf("canonical content ID = %q", content.ID)
+			}
+		}
+	}
 	assertRuntimeNeutralJSON(t, json.RawMessage(historyResponse), nativePiPathFragment, "native-codex-thread-secret", "native-user-", "native-assistant-")
+
+	for _, eventPath := range []string{"/api/agents/" + piAgentID + "/thread/events?tail=200", "/api/agents/events?since=0"} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		request := httptest.NewRequest(http.MethodGet, eventPath, nil).WithContext(ctx)
+		response := httptest.NewRecorder()
+		restartHandler.ServeHTTP(response, request)
+		body := response.Body.String()
+		if response.Code != http.StatusOK || !strings.Contains(body, `"type":"loom/runtime-event"`) {
+			t.Fatalf("canonical SSE %s = %d %s", eventPath, response.Code, body)
+		}
+		assertRuntimeNeutralJSON(t, body, nativePiPathFragment, "native-codex-thread-secret", "native-user-", "native-assistant-", `"compatibility":true`, `"type":"item/`)
+	}
 
 	resumePath, err := os.ReadFile(paths.resumeSession)
 	if err != nil {
@@ -210,6 +246,220 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	}
 	assertStoryTopicAudit(t, finalTopic, requestMessageID, replyMessageID, humanRequestID)
 	assertRuntimeNeutralJSON(t, []any{humanRequest, deliveredRequest, finalTopic}, nativePiPathFragment, "native-codex-thread-secret", "native-user-", "native-assistant-")
+}
+
+func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *testing.T) {
+	paths := configureMixedRuntimeStoryPi(t)
+	codexBin, sessionsDir := configureMixedRuntimeStoryCodex(t)
+	t.Setenv("CODEX_LOOM_CODEX_BIN", codexBin)
+	t.Setenv("CODEX_SESSIONS_DIR", sessionsDir)
+	t.Setenv("PINIX_EDGE_NAMES", t.TempDir()+"/missing-edge-names.json")
+	dataDir, workDir := t.TempDir(), t.TempDir()
+	web := fstest.MapFS{"index.html": {Data: []byte("ok")}}
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := hub.Open(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := New(h, st, web).Handler()
+	codexAgent := topicRequest(t, handler, http.MethodPost, "/api/agents", map[string]any{"name": "codex-live", "cwd": workDir, "runtimeKind": "codex"}, http.StatusCreated)["agent"].(map[string]any)
+	piAgent := topicRequest(t, handler, http.MethodPost, "/api/agents", map[string]any{"name": "pi-live", "cwd": workDir, "runtimeKind": "pi"}, http.StatusCreated)["agent"].(map[string]any)
+	codexID, piID := codexAgent["id"].(string), piAgent["id"].(string)
+	codexStart := topicRequest(t, handler, http.MethodPost, "/api/agents/"+codexID+"/turns", map[string]any{"text": "run the Codex check", "timeoutSec": 2}, http.StatusAccepted)
+	codexTurnID := codexStart["turnId"].(string)
+	waitForMixedRuntimeTerminal(t, handler, codexID, codexTurnID, "interrupted")
+
+	piStart := topicRequest(t, handler, http.MethodPost, "/api/agents/"+piID+"/turns", map[string]any{"text": "run the Pi check", "timeoutSec": 2}, http.StatusAccepted)
+	piTurnID := piStart["turnId"].(string)
+	waitForStoryFile(t, paths.firstActive)
+	message := topicRequest(t, handler, http.MethodPost, "/api/comms/messages", map[string]any{
+		"from": piID, "to": codexID, "subject": "Canonical evidence", "body": "Pi adapter is integrating the Codex terminal evidence.", "response": "required",
+	}, http.StatusAccepted)["message"].(map[string]any)
+	deliveredCodexTurnID, _ := message["deliveredTurnId"].(string)
+	if message["deliveryMode"] != "turn_start" || message["sourceTurnId"] != piTurnID || deliveredCodexTurnID == "" {
+		t.Fatalf("mixed Runtime message causality = %#v", message)
+	}
+	waitForMixedRuntimeTerminal(t, handler, codexID, deliveredCodexTurnID, "failed")
+	writeMixedRuntimeCodexRollout(t, sessionsDir)
+	steerMessage := topicRequest(t, handler, http.MethodPost, "/api/comms/messages", map[string]any{
+		"from": codexID, "replyTo": message["id"], "body": "Codex adapter terminal evidence is ready for integration.",
+	}, http.StatusAccepted)["message"].(map[string]any)
+	steerMessage = waitForStoryMessage(t, handler, steerMessage["id"].(string))
+	if steerMessage["deliveryMode"] != "turn_steer" || steerMessage["deliveredTurnId"] != piTurnID {
+		t.Fatalf("Codex to Pi live delivery = %#v", steerMessage)
+	}
+	if err := os.WriteFile(paths.firstRelease, []byte("release"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForStoryAgentTurn(t, handler, piID, piTurnID)
+	h.Shutdown()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restarted, err := hub.Open(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Shutdown()
+	restartHandler := New(restarted, reopened, web).Handler()
+	restartedCodex := topicRequest(t, restartHandler, http.MethodGet, "/api/agents/"+codexID, nil, http.StatusOK)["agent"].(map[string]any)
+	if restartedCodex["lastError"] == "" {
+		t.Fatalf("restarted Codex Agent lost safe failure: %#v", restartedCodex)
+	}
+	assertRuntimeNeutralJSON(t, restartedCodex, "native-codex-mixed", "native-codex-turn", "/private/native/session.jsonl", "sk-mixed-private")
+	for _, runtime := range []struct {
+		id, turnID, wantState string
+		wantKinds             []string
+	}{{codexID, codexTurnID, "interrupted", []string{"user_text", "tool_call", "tool_result", "assistant_text"}}, {piID, piTurnID, "completed", []string{"user_text", "assistant_text"}}} {
+		body := storyJSONRequest(t, restartHandler, http.MethodGet, "/api/agents/"+runtime.id+"/thread/history?count=10", nil, http.StatusOK)
+		var history struct {
+			Turns []struct {
+				TurnID  string `json:"turnId"`
+				State   string `json:"state"`
+				Content []struct {
+					Kind string `json:"kind"`
+				} `json:"content"`
+			} `json:"turns"`
+		}
+		if json.Unmarshal(body, &history) != nil || len(history.Turns) == 0 {
+			t.Fatalf("%s canonical history = %s", runtime.id, body)
+		}
+		turn := history.Turns[0]
+		for _, candidate := range history.Turns {
+			if candidate.TurnID == runtime.turnID {
+				turn = candidate
+				break
+			}
+		}
+		if turn.TurnID != runtime.turnID || turn.State != runtime.wantState {
+			t.Fatalf("%s canonical Turn = %#v", runtime.id, turn)
+		}
+		encoded := string(body)
+		for _, kind := range runtime.wantKinds {
+			if !strings.Contains(encoded, `"kind":"`+kind+`"`) {
+				t.Fatalf("%s history missing %s: %s", runtime.id, kind, body)
+			}
+		}
+		assertRuntimeNeutralJSON(t, json.RawMessage(body), "native-codex-mixed", "native-codex-turn", "/pi/"+piID+"/", "native-user-", "native-assistant-", "Bearer private")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		request := httptest.NewRequest(http.MethodGet, "/api/agents/"+runtime.id+"/thread/events?tail=200", nil).WithContext(ctx)
+		response := httptest.NewRecorder()
+		restartHandler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"type":"loom/runtime-event"`) {
+			t.Fatalf("%s canonical SSE = %d %s", runtime.id, response.Code, response.Body.String())
+		}
+		assertRuntimeNeutralJSON(t, response.Body.String(), "native-codex-mixed", "native-codex-turn", "/pi/"+piID+"/", `"type":"item/`, `"compatibility":true`)
+	}
+	storedMessage := topicRequest(t, restartHandler, http.MethodGet, "/api/comms/messages/"+message["id"].(string), nil, http.StatusOK)["message"].(map[string]any)
+	if storedMessage["sourceTurnId"] != piTurnID || storedMessage["deliveredTurnId"] != deliveredCodexTurnID {
+		t.Fatalf("restarted mixed Runtime causality = %#v", storedMessage)
+	}
+	storedSteer := topicRequest(t, restartHandler, http.MethodGet, "/api/comms/messages/"+steerMessage["id"].(string), nil, http.StatusOK)["message"].(map[string]any)
+	if storedSteer["deliveredTurnId"] != piTurnID || storedSteer["deliveryMode"] != "turn_steer" {
+		t.Fatalf("restarted Codex to Pi causality = %#v", storedSteer)
+	}
+	codexHistory := topicRequest(t, restartHandler, http.MethodGet, "/api/agents/"+codexID+"/thread/history?count=10", nil, http.StatusOK)
+	var failedHistoryTurn map[string]any
+	for _, raw := range codexHistory["turns"].([]any) {
+		turn := raw.(map[string]any)
+		if turn["turnId"] == deliveredCodexTurnID {
+			failedHistoryTurn = turn
+			break
+		}
+	}
+	if failedHistoryTurn == nil || failedHistoryTurn["state"] != "failed" || failedHistoryTurn["error"] == "" || failedHistoryTurn["source"].(map[string]any)["id"] != message["id"] {
+		t.Fatalf("restarted failed canonical history Turn = %#v", failedHistoryTurn)
+	}
+	turnDetail := topicRequest(t, restartHandler, http.MethodGet, "/api/turns/"+deliveredCodexTurnID, nil, http.StatusOK)["turn"].(map[string]any)
+	if turnDetail["state"] != "failed" || turnDetail["error"] == "" || turnDetail["source"].(map[string]any)["id"] != message["id"] {
+		t.Fatalf("restarted failed canonical Turn detail = %#v", turnDetail)
+	}
+	assertRuntimeNeutralJSON(t, []any{failedHistoryTurn, turnDetail}, "native-codex-mixed", "native-codex-turn", "/private/native/session.jsonl", "sk-mixed-private")
+}
+
+func waitForMixedRuntimeTerminal(t *testing.T, handler http.Handler, agentID, turnID, status string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		agent := topicRequest(t, handler, http.MethodGet, "/api/agents/"+agentID, nil, http.StatusOK)["agent"].(map[string]any)
+		last, _ := agent["lastTurn"].(map[string]any)
+		if last != nil && last["turnId"] == turnID && last["status"] == status {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s Turn %s status %s", agentID, turnID, status)
+}
+
+func configureMixedRuntimeStoryCodex(t *testing.T) (string, string) {
+	t.Helper()
+	dir, sessions := t.TempDir(), t.TempDir()
+	bin := filepath.Join(dir, "codex")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'codex-cli 0.144.1\n'; exit 0; fi
+turn_count=0
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"mixed-fake"}}\n' "$id" ;;
+    *'"method":"skills/list"'*) printf '{"id":%s,"result":{"data":[]}}\n' "$id" ;;
+    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"native-codex-mixed"}}}\n' "$id" ;;
+    *'"method":"thread/resume"'*) printf '{"id":%s,"result":{"thread":{"id":"native-codex-mixed"}}}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      turn_count=$((turn_count + 1)); turn_id="native-codex-turn-$turn_count"
+      printf '{"id":%s,"result":{"turn":{"id":"%s"}}}\n' "$id" "$turn_id"
+      printf '{"method":"turn/started","params":{"threadId":"native-codex-mixed","turn":{"id":"%s","status":"inProgress"}}}\n' "$turn_id"
+      printf '{"method":"item/started","params":{"threadId":"native-codex-mixed","turnId":"%s","item":{"id":"native-tool-%s","type":"commandExecution","command":"printf mixed","cwd":"/private/native"}}}\n' "$turn_id" "$turn_count"
+      printf '{"method":"item/completed","params":{"threadId":"native-codex-mixed","turnId":"%s","item":{"id":"native-tool-%s","type":"commandExecution","command":"printf mixed","status":"completed","output":"mixed","exitCode":0}}}\n' "$turn_id" "$turn_count"
+      printf '{"method":"item/agentMessage/delta","params":{"threadId":"native-codex-mixed","turnId":"%s","itemId":"native-answer-%s","delta":"Codex checked"}}\n' "$turn_id" "$turn_count"
+	  if [ "$turn_count" -eq 2 ]; then
+	    printf '{"method":"turn/completed","params":{"threadId":"native-codex-mixed","turn":{"id":"%s","status":"failed","error":{"message":"read /private/native/session.jsonl for %s Authorization=Bearer sk-mixed-private"}}}}\n' "$turn_id" "$turn_id"
+	  else
+	    printf '{"method":"turn/completed","params":{"threadId":"native-codex-mixed","turn":{"id":"%s","status":"interrupted"}}}\n' "$turn_id"
+	  fi ;;
+    *) printf '{"id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, sessions
+}
+
+func writeMixedRuntimeCodexRollout(t *testing.T, sessions string) {
+	t.Helper()
+	day := filepath.Join(sessions, "2026", "08", "10")
+	if err := os.MkdirAll(day, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(day, "rollout-2026-08-10T01-00-00-native-codex-mixed.jsonl")
+	data := strings.Join([]string{
+		`{"timestamp":"2026-08-10T01:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"native-codex-turn-1"}}`,
+		`{"timestamp":"2026-08-10T01:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"run the Codex check"}}`,
+		`{"timestamp":"2026-08-10T01:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"native-tool-1","arguments":"{\"cmd\":\"printf mixed\",\"workdir\":\"/private/native\"}"}}`,
+		`{"timestamp":"2026-08-10T01:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"native-tool-1","output":"mixed\\nProcess exited with code 0\\n"}}`,
+		`{"timestamp":"2026-08-10T01:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"Codex checked","phase":"final_answer"}}`,
+		`{"timestamp":"2026-08-10T01:00:05Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"native-codex-turn-1"}}`,
+		`{"timestamp":"2026-08-10T01:01:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"native-codex-turn-2"}}`,
+		`{"timestamp":"2026-08-10T01:01:01Z","type":"event_msg","payload":{"type":"user_message","message":"Pi adapter is integrating the Codex terminal evidence."}}`,
+		`{"timestamp":"2026-08-10T01:01:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Codex received Pi evidence","phase":"final_answer"}}`,
+		`{"timestamp":"2026-08-10T01:01:03Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"native-codex-turn-2"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 type mixedRuntimeStoryPaths struct {
@@ -510,6 +760,23 @@ func waitForStoryHumanRequest(t *testing.T, handler http.Handler, requestID stri
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for Needs You %s delivery", requestID)
+	return nil
+}
+
+func waitForStoryMessage(t *testing.T, handler http.Handler, messageID string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		message := topicRequest(t, handler, http.MethodGet, "/api/comms/messages/"+messageID, nil, http.StatusOK)["message"].(map[string]any)
+		if message["deliveryStatus"] == "delivered" {
+			return message
+		}
+		if message["deliveryStatus"] == "failed" {
+			t.Fatalf("Agent Message delivery failed: %#v", message)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for Agent Message %s delivery", messageID)
 	return nil
 }
 

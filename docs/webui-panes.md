@@ -10,7 +10,7 @@
 
 `App.tsx` 维护以下工作台级状态：
 
-- Agent 列表来自 `GET /api/agents`，并用 `GET /api/events` 全局 SSE 做增量更新。
+- Agent 列表来自 `GET /api/agents`，并用 `GET /api/agents/events` canonical 全局 SSE 做增量更新。
 - 当前/打开 Agent 使用 `sessionStorage`，Sidebar 折叠状态使用 `localStorage`。
 - 打开多个 Agent Tab 时，每个 Tab 通过 `web/src/thread-events.ts` 订阅 Agent 级
   `GET /api/agents/{key}/thread/events`。
@@ -37,6 +37,11 @@
 - `GET /api/agents/{key}/thread/history?count=25&offset=N`
 - `GET /api/agents/{key}/artifacts`
 - `GET /api/agents/{key}/thread/events`（SSE）
+
+History 和 live feed 都直接消费 Runtime Contract `content` / `loom/runtime-event`；Web
+不再解释 Runtime-native `item/*`，也不依赖 raw duplicate suppression。Inspector 从
+Agent status 的 `capabilitySnapshot` 与 capability-driven model data 实时更新，不要求
+刷新页面或重新打开 Inspector。
 
 写操作：
 
@@ -112,7 +117,7 @@
 - `GET /api/outbox`
 - `GET /api/integrations/addresses`
 - `GET /api/integrations/conversations`
-- `GET /api/events`（SSE）
+- `GET /api/agents/events`（SSE）
 
 写操作：
 
@@ -133,7 +138,7 @@
 数据源：
 
 - `GET /api/comms`
-- `GET /api/events`（SSE）
+- `GET /api/agents/events`（SSE）
 
 写操作：
 
@@ -154,7 +159,7 @@
 - `GET /api/integrations/conversations`
 - `GET /api/integrations/conversation-candidates`
 - `GET /api/inbox`
-- `GET /api/events`（SSE）
+- `GET /api/agents/events`（SSE）
 - 各 Provider discovery endpoint
 
 写操作：
@@ -179,7 +184,7 @@ Ingress 管理；Gateway 状态与 Provider Operation 结果通过独立路由�
 数据源：
 
 - `GET /api/schedules`
-- `GET /api/events`（SSE）
+- `GET /api/agents/events`（SSE）
 
 写操作：
 
