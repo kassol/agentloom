@@ -1,7 +1,10 @@
 package hub
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,22 +12,208 @@ import (
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
+func TestRecoveryCrashWindowsConvergeAcrossTwoStoreReopens(t *testing.T) {
+	tests := []struct {
+		name        string
+		disposition string
+		state       string
+		target      bool
+		completed   bool
+		wantStarts  int
+	}{
+		{name: "recovery planned before target", disposition: "recovery_turn", state: TurnRecoveryPlanned, wantStarts: 1},
+		{name: "recovery target durable before dispatched", disposition: "recovery_turn", state: TurnRecoveryPlanned, target: true},
+		{name: "recovery dispatched", disposition: "recovery_turn", state: TurnRecoveryDispatched, target: true},
+		{name: "recovery completed", disposition: "recovery_turn", state: TurnRecoveryCompleted, target: true, completed: true},
+		{name: "needs you planned before target", disposition: "needs_you", state: TurnRecoveryPlanned},
+		{name: "needs you target durable before dispatched", disposition: "needs_you", state: TurnRecoveryPlanned, target: true},
+		{name: "needs you dispatched", disposition: "needs_you", state: TurnRecoveryDispatched, target: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			st, err := store.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stamp := now()
+			marker := TurnRecoveryMarker{
+				PredecessorTurnID: "turn-before", NativeTurnID: "native-before-secret",
+				Disposition: test.disposition, State: test.state, RuntimeKind: "pi", Cause: "process_exit",
+				Summary: "Runtime process exited before the Turn outcome was confirmed", CreatedAt: stamp, UpdatedAt: stamp,
+			}
+			if test.disposition == "recovery_turn" {
+				marker.RecoveryTurnID = "turn-recovery-reserved"
+			} else {
+				marker.HumanRequestID = "hrq-recovery-reserved"
+			}
+			agent := &Agent{
+				ID: "agent-1", Name: "worker", Cwd: t.TempDir(), ThreadID: "thr-loom",
+				RuntimeBinding:      RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "pi", NativeRef: "native-session-secret"},
+				RuntimeTurnBindings: map[string]string{"turn-before": "native-before-secret"},
+				TurnRecoveryMarkers: map[string]TurnRecoveryMarker{"turn-before": marker},
+				Status:              "interrupted", LastTurn: &TurnSummary{TurnID: "turn-before", Task: "perform original side effect", Status: "interrupted", CompletedAt: stamp},
+				CreatedAt: stamp, UpdatedAt: stamp,
+			}
+			if test.disposition == "recovery_turn" && test.target {
+				agent.RuntimeTurnBindings[marker.RecoveryTurnID] = "native-recovery-secret"
+				if test.completed {
+					agent.Status = "idle"
+					agent.LastTurn = &TurnSummary{TurnID: marker.RecoveryTurnID, Task: "Continue interrupted work", Status: "completed", CompletedAt: stamp}
+				} else {
+					agent.Status = "running"
+					agent.CurrentTurnID = marker.RecoveryTurnID
+					agent.CurrentTask = "Continue interrupted work"
+				}
+			}
+			if err := st.SaveAgents(map[string]*Agent{"agent-1": agent}); err != nil {
+				t.Fatal(err)
+			}
+			if test.disposition == "needs_you" && test.target {
+				if err := st.AppendHumanRequest(HumanRequest{
+					ID: marker.HumanRequestID, AgentID: agent.ID, AgentName: agent.Name, ThreadID: agent.ThreadID,
+					SourceTurnID: marker.PredecessorTurnID, SourceTask: agent.LastTurn.Task, Question: "Confirm outcome",
+					Expectation: HumanRequestRequired, State: "open", DeliveryStatus: "waiting", CreatedAt: stamp, UpdatedAt: stamp,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			totalStarts := 0
+			previousEventCount := -1
+			for reopen := 1; reopen <= 2; reopen++ {
+				reopened, err := store.Open(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h := testHub(reopened)
+				if err := reopened.LoadAgents(&h.agents); err != nil {
+					t.Fatal(err)
+				}
+				if err := h.loadHumanRequests(); err != nil {
+					t.Fatal(err)
+				}
+				for agentID := range h.agents {
+					h.seqs[agentID] = reopened.LastSeq(agentID)
+				}
+				fake := &fakeRecoveryRuntime{
+					fakeAgentRuntime: fakeAgentRuntime{binding: "native-session-secret"},
+					evidence:         RuntimeInterruptionEvidence{Status: RuntimeInterruptionClean, LeafEntryID: "leaf-secret"},
+				}
+				ready := make(chan struct{})
+				close(ready)
+				h.runtimes[agent.ID] = &runtime{agentID: agent.ID, agentRuntime: fake, ready: ready, approvals: map[string]*approval{}}
+				h.contextHistoryProbe = func(threadID string, _ rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
+					return rollout.ContextHistoryState{EpochID: "initial:" + threadID}, nil
+				}
+
+				h.recoverInterruptedTurn(agent.ID, marker.PredecessorTurnID)
+				totalStarts += fake.starts
+				requests, err := h.ListHumanRequests(agent.ID, "all")
+				if err != nil {
+					t.Fatal(err)
+				}
+				h.mu.Lock()
+				currentMarker := h.agents[agent.ID].TurnRecoveryMarkers[marker.PredecessorTurnID]
+				h.mu.Unlock()
+				if test.disposition == "needs_you" {
+					if len(requests) != 1 || requests[0].ID != marker.HumanRequestID || currentMarker.HumanRequestID != marker.HumanRequestID {
+						t.Fatalf("reopen %d Needs You cardinality requests=%#v marker=%#v", reopen, requests, currentMarker)
+					}
+				} else if len(requests) != 0 || currentMarker.RecoveryTurnID != marker.RecoveryTurnID {
+					t.Fatalf("reopen %d Recovery Turn identity requests=%#v marker=%#v", reopen, requests, currentMarker)
+				}
+				if test.completed {
+					if currentMarker.State != TurnRecoveryCompleted {
+						t.Fatalf("reopen %d completed marker=%#v", reopen, currentMarker)
+					}
+				} else if currentMarker.State != TurnRecoveryDispatched {
+					t.Fatalf("reopen %d marker state=%#v", reopen, currentMarker)
+				}
+				events, err := h.ReadEvents(agent.ID, 0, 100)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if previousEventCount >= 0 && len(events) != previousEventCount {
+					t.Fatalf("second reopen duplicated public events: before=%d after=%d events=%#v", previousEventCount, len(events), events)
+				}
+				previousEventCount = len(events)
+				view, err := h.GetAgent(agent.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				public, _ := json.Marshal(struct {
+					View     AgentView
+					Events   []store.Event
+					Requests []HumanRequest
+				}{view, events, requests})
+				for _, secret := range []string{"native-session-secret", "native-before-secret", "native-recovery-secret", "leaf-secret"} {
+					if strings.Contains(string(public), secret) {
+						t.Fatalf("reopen %d public projection leaked %q: %s", reopen, secret, public)
+					}
+				}
+				if fake.starts > 0 {
+					var prompt strings.Builder
+					for _, input := range fake.lastTurnRequest.Input {
+						if input.Kind == RuntimeInputText {
+							prompt.WriteString(input.Text)
+						}
+					}
+					if !strings.Contains(prompt.String(), "<loom_turn_recovery") {
+						t.Fatalf("reopen %d replayed original prompt instead of recovery control: %s", reopen, prompt.String())
+					}
+				}
+				h.mu.Lock()
+				h.stopping = true
+				for _, runtime := range h.runtimes {
+					if runtime.activeTurn != nil && !runtime.activeTurn.finished {
+						runtime.activeTurn.finished = true
+						close(runtime.activeTurn.stopWatchdog)
+						runtime.activeTurn = nil
+					}
+				}
+				h.mu.Unlock()
+				h.workers.Wait()
+				if err := reopened.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if totalStarts != test.wantStarts {
+				t.Fatalf("reserved target starts=%d want=%d", totalStarts, test.wantStarts)
+			}
+		})
+	}
+}
+
 type fakeRecoveryRuntime struct {
 	fakeAgentRuntime
-	evidence       RuntimeInterruptionEvidence
-	inspectStarted chan struct{}
-	inspectRelease chan struct{}
-	starts         int
+	evidence            RuntimeInterruptionEvidence
+	inspectStarted      chan struct{}
+	inspectRelease      chan struct{}
+	starts              int
+	inspectCount        atomic.Int32
+	aliveAtInspect      atomic.Bool
+	hostClosed          func() bool
+	hostClosedAtInspect atomic.Bool
+	inspectErr          error
 }
 
 func (f *fakeRecoveryRuntime) InspectInterruptedTurn(_, _ string) (RuntimeInterruptionEvidence, error) {
+	f.inspectCount.Add(1)
+	f.aliveAtInspect.Store(f.Alive())
+	if f.hostClosed != nil {
+		f.hostClosedAtInspect.Store(f.hostClosed())
+	}
 	if f.inspectStarted != nil {
 		close(f.inspectStarted)
 	}
 	if f.inspectRelease != nil {
 		<-f.inspectRelease
 	}
-	return f.evidence, nil
+	return f.evidence, f.inspectErr
 }
 
 func (f *fakeRecoveryRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
@@ -98,6 +287,7 @@ func TestAmbiguousPiCrashCreatesOneReservedNeedsYouAndNoRecoveryTurn(t *testing.
 	h := testHub(st)
 	fake := &fakeRecoveryRuntime{
 		fakeAgentRuntime: fakeAgentRuntime{binding: "native-session"},
+		inspectErr:       fmt.Errorf("read /private/native/session-secret.jsonl: native-ref-secret"),
 		evidence: RuntimeInterruptionEvidence{
 			Status: RuntimeInterruptionAmbiguous, LeafEntryID: "assistant-tool",
 			UnfinishedTools: []RuntimeToolEvidence{{ID: "call-deploy", Name: "bash", Command: "deploy --prod", StartedAt: "2026-08-10T01:00:02Z"}},
@@ -122,9 +312,14 @@ func TestAmbiguousPiCrashCreatesOneReservedNeedsYouAndNoRecoveryTurn(t *testing.
 	if fake.starts != 0 || h.agents["agent-1"].Status != "idle" || request.AgentID != "agent-1" || request.ThreadID != "loom-thread-1" || request.SourceTurnID != "turn-before" {
 		t.Fatalf("ambiguous recovery starts=%d Agent=%#v request=%#v", fake.starts, h.agents["agent-1"], request)
 	}
-	for _, want := range []string{"deploy --prod", "may have partially completed", "assistant-tool"} {
+	for _, want := range []string{"deploy --prod", "may have partially completed", "bash"} {
 		if !strings.Contains(request.Context, want) {
 			t.Fatalf("Needs You context missing %q: %s", want, request.Context)
+		}
+	}
+	for _, secret := range []string{"assistant-tool", "call-deploy", "/private/native/session-secret.jsonl", "native-ref-secret"} {
+		if strings.Contains(request.Context, secret) {
+			t.Fatalf("Needs You context leaked native evidence %q: %s", secret, request.Context)
 		}
 	}
 
@@ -324,7 +519,7 @@ func TestUnknownPiCrashEvidenceCreatesNeedsYouInsteadOfRecoveryTurn(t *testing.T
 	h.recoverPiInterruptedTurn("agent-1", "turn-before")
 	marker := h.agents["agent-1"].TurnRecoveryMarkers["turn-before"]
 	request := h.humanRequests[marker.HumanRequestID]
-	if marker.Disposition != "needs_you" || marker.RecoveryTurnID != "" || request == nil || !strings.Contains(request.Context, "no native Turn binding") {
+	if marker.Disposition != "needs_you" || marker.RecoveryTurnID != "" || request == nil || !strings.Contains(request.Context, "could not safely confirm the durable Runtime outcome") || strings.Contains(request.Context, "no native Turn binding") {
 		t.Fatalf("unknown recovery marker=%#v request=%#v", marker, request)
 	}
 }

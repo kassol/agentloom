@@ -8,6 +8,7 @@ import (
 )
 
 const (
+	TurnRecoveryObserved   = "observed"
 	TurnRecoveryPlanned    = "planned"
 	TurnRecoveryDispatched = "dispatched"
 	TurnRecoveryCompleted  = "completed"
@@ -23,25 +24,34 @@ type TurnRecoveryMarker struct {
 	TopicID           string                `json:"topicId,omitempty"`
 	EvidenceLeafID    string                `json:"evidenceLeafId,omitempty"`
 	UnfinishedTools   []RuntimeToolEvidence `json:"unfinishedTools,omitempty"`
+	RuntimeKind       string                `json:"runtimeKind,omitempty"`
+	Cause             string                `json:"cause,omitempty"`
+	FailurePhase      string                `json:"failurePhase,omitempty"`
+	FailureCode       string                `json:"failureCode,omitempty"`
+	Summary           string                `json:"summary,omitempty"`
 	CreatedAt         string                `json:"createdAt"`
 	UpdatedAt         string                `json:"updatedAt"`
 }
 
 func (h *Hub) recoverPiInterruptedTurn(agentID, predecessorTurnID string) {
+	h.recoverInterruptedTurn(agentID, predecessorTurnID)
+}
+
+func (h *Hub) recoverInterruptedTurn(agentID, predecessorTurnID string) {
 	h.mu.Lock()
-	if !h.claimPiRecoveryLocked(agentID, predecessorTurnID) {
+	if !h.claimTurnRecoveryLocked(agentID, predecessorTurnID) {
 		h.mu.Unlock()
 		return
 	}
 	h.mu.Unlock()
-	h.recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID)
+	h.recoverInterruptedTurnClaimed(agentID, predecessorTurnID)
 }
 
 func recoveryKey(agentID, predecessorTurnID string) string {
 	return agentID + "\x00" + predecessorTurnID
 }
 
-func (h *Hub) claimPiRecoveryLocked(agentID, predecessorTurnID string) bool {
+func (h *Hub) claimTurnRecoveryLocked(agentID, predecessorTurnID string) bool {
 	if h.turnRecoveryInFlight == nil {
 		h.turnRecoveryInFlight = map[string]bool{}
 	}
@@ -57,17 +67,21 @@ func (h *Hub) claimPiRecoveryLocked(agentID, predecessorTurnID string) bool {
 // so a manual Continue or Dismiss cannot slip in before the durable marker is
 // written by the recovery worker.
 func (h *Hub) schedulePiRecoveryLocked(agentID, predecessorTurnID string) bool {
-	if !h.claimPiRecoveryLocked(agentID, predecessorTurnID) {
+	return h.scheduleTurnRecoveryLocked(agentID, predecessorTurnID)
+}
+
+func (h *Hub) scheduleTurnRecoveryLocked(agentID, predecessorTurnID string) bool {
+	if !h.claimTurnRecoveryLocked(agentID, predecessorTurnID) {
 		return false
 	}
-	if h.startWorkerLocked(func() { h.recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID) }) {
+	if h.startWorkerLocked(func() { h.recoverInterruptedTurnClaimed(agentID, predecessorTurnID) }) {
 		return true
 	}
 	delete(h.turnRecoveryInFlight, recoveryKey(agentID, predecessorTurnID))
 	return false
 }
 
-func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string) {
+func (h *Hub) recoverInterruptedTurnClaimed(agentID, predecessorTurnID string) {
 	key := recoveryKey(agentID, predecessorTurnID)
 	defer func() {
 		h.mu.Lock()
@@ -77,7 +91,7 @@ func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string)
 
 	h.mu.Lock()
 	meta := h.agents[agentID]
-	if meta == nil || meta.RuntimeBinding.Kind != "pi" {
+	if meta == nil || meta.Source == "edge" {
 		h.mu.Unlock()
 		return
 	}
@@ -108,7 +122,7 @@ func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string)
 	predecessor := *meta.LastTurn
 	nativeTurnID := meta.RuntimeTurnBindings[predecessorTurnID]
 	nativeRef := meta.RuntimeBinding.NativeRef
-	backend := runtimeForKind("pi")
+	backend := runtimeForKind(meta.RuntimeBinding.Kind)
 	if rt := h.runtimes[agentID]; rt != nil && runtimeBackend(rt) != nil {
 		backend = runtimeBackend(rt)
 	}
@@ -132,9 +146,12 @@ func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string)
 	if nativeTurnID == "" {
 		inspectErr = fmt.Errorf("no native Turn binding is available for interrupted Loom Turn %s", predecessorTurnID)
 	} else if !canInspect {
-		inspectErr = fmt.Errorf("Pi Runtime does not expose durable interruption evidence")
+		inspectErr = fmt.Errorf("%s Runtime does not expose durable interruption evidence", meta.RuntimeBinding.Kind)
 	} else {
 		evidence, inspectErr = inspector.InspectInterruptedTurn(nativeRef, nativeTurnID)
+	}
+	if inspectErr != nil {
+		log.Printf("[codex-loom] inspect interrupted Runtime Turn for Agent %s predecessor %s: %v", agentID, predecessorTurnID, inspectErr)
 	}
 
 	h.mu.Lock()
@@ -146,15 +163,27 @@ func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string)
 	if evidence.Status == RuntimeInterruptionTerminal && inspectErr == nil {
 		previousStatus, previousError, previousUpdatedAt := meta.Status, meta.LastError, meta.UpdatedAt
 		previousTurnStatus := meta.LastTurn.Status
+		previousMarker, hadMarker := meta.TurnRecoveryMarkers[predecessorTurnID]
+		originalMarker := previousMarker
 		meta.Status = "idle"
 		if evidence.TerminalStatus == "completed" {
 			meta.LastError = ""
 		}
 		meta.LastTurn.Status = evidence.TerminalStatus
 		meta.UpdatedAt = now()
+		if hadMarker {
+			previousMarker.State = TurnRecoveryCompleted
+			previousMarker.Disposition = "terminal_evidence"
+			previousMarker.EvidenceLeafID = evidence.LeafEntryID
+			previousMarker.UpdatedAt = now()
+			meta.TurnRecoveryMarkers[predecessorTurnID] = previousMarker
+		}
 		if err := h.persistAgentsLocked(); err != nil {
 			meta.Status, meta.LastError, meta.UpdatedAt = previousStatus, previousError, previousUpdatedAt
 			meta.LastTurn.Status = previousTurnStatus
+			if hadMarker {
+				meta.TurnRecoveryMarkers[predecessorTurnID] = originalMarker
+			}
 			log.Printf("[codex-loom] persist terminal recovery evidence: %v", err)
 			h.mu.Unlock()
 			return
@@ -167,17 +196,23 @@ func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string)
 		meta.TurnRecoveryMarkers = map[string]TurnRecoveryMarker{}
 	}
 	marker, exists := meta.TurnRecoveryMarkers[predecessorTurnID]
-	if !exists {
+	if !exists || marker.State == TurnRecoveryObserved {
+		previousMarker := marker
 		disposition := "recovery_turn"
 		if inspectErr != nil || evidence.Status != RuntimeInterruptionClean {
 			disposition = "needs_you"
 		}
 		stamp := now()
-		marker = TurnRecoveryMarker{
-			PredecessorTurnID: predecessorTurnID, NativeTurnID: nativeTurnID, Disposition: disposition,
-			State: TurnRecoveryPlanned, EvidenceLeafID: evidence.LeafEntryID,
-			UnfinishedTools: append([]RuntimeToolEvidence(nil), evidence.UnfinishedTools...), CreatedAt: stamp, UpdatedAt: stamp,
+		marker.PredecessorTurnID = predecessorTurnID
+		marker.NativeTurnID = nativeTurnID
+		marker.Disposition = disposition
+		marker.State = TurnRecoveryPlanned
+		marker.EvidenceLeafID = evidence.LeafEntryID
+		marker.UnfinishedTools = append([]RuntimeToolEvidence(nil), evidence.UnfinishedTools...)
+		if marker.CreatedAt == "" {
+			marker.CreatedAt = stamp
 		}
+		marker.UpdatedAt = stamp
 		if source, _ := h.turnReferenceLocked(agentID, predecessorTurnID); source != nil {
 			marker.TopicID = source.TopicID
 		}
@@ -193,7 +228,11 @@ func (h *Hub) recoverPiInterruptedTurnClaimed(agentID, predecessorTurnID string)
 		}
 		meta.TurnRecoveryMarkers[predecessorTurnID] = marker
 		if err := h.persistAgentsLocked(); err != nil {
-			delete(meta.TurnRecoveryMarkers, predecessorTurnID)
+			if exists {
+				meta.TurnRecoveryMarkers[predecessorTurnID] = previousMarker
+			} else {
+				delete(meta.TurnRecoveryMarkers, predecessorTurnID)
+			}
 			h.mu.Unlock()
 			return
 		}
@@ -298,14 +337,21 @@ func (h *Hub) recoverySource(agentID, predecessorTurnID, topicID string) *TurnRe
 func ambiguousRecoveryContext(predecessor TurnSummary, evidence RuntimeInterruptionEvidence, inspectErr error) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Interrupted Turn: %s\n", predecessor.TurnID)
-	if evidence.LeafEntryID != "" {
-		fmt.Fprintf(&b, "Durable Pi evidence leaf: %s\n", evidence.LeafEntryID)
-	}
 	if inspectErr != nil {
-		fmt.Fprintf(&b, "Loom could not safely inspect the durable Pi history: %v\n", inspectErr)
+		b.WriteString("Loom could not safely confirm the durable Runtime outcome.\n")
 	}
 	for _, tool := range evidence.UnfinishedTools {
-		fmt.Fprintf(&b, "Tool %s (%s) started at %s without matching completion evidence. Command: %s\n", tool.Name, tool.ID, tool.StartedAt, tool.Command)
+		fmt.Fprintf(&b, "Tool %s has no matching completion evidence", tool.Name)
+		if tool.StartedAt != "" {
+			fmt.Fprintf(&b, " (started at %s)", tool.StartedAt)
+		}
+		if tool.Command != "" {
+			fmt.Fprintf(&b, ". Command: %s", tool.Command)
+		}
+		if len(tool.Arguments) > 0 {
+			fmt.Fprintf(&b, ". Arguments: %v", tool.Arguments)
+		}
+		b.WriteString(".\n")
 	}
 	b.WriteString("The operation may have partially completed. Check its current effect before deciding how the Agent should continue; do not repeat the original action blindly.")
 	return b.String()

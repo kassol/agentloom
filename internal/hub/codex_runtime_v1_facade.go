@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
@@ -18,6 +19,8 @@ type codexRuntimeV1Facade struct {
 	native   *codexAgentRuntime
 }
 
+var _ RuntimeInterruptedTurnInspector = (*codexRuntimeV1Facade)(nil)
+
 func (f *codexRuntimeV1Facade) Alive() bool { return f != nil && f.host != nil && f.host.Alive() }
 
 func (f *codexRuntimeV1Facade) Create(request RuntimeBindingRequest) (string, error) {
@@ -25,14 +28,14 @@ func (f *codexRuntimeV1Facade) Create(request RuntimeBindingRequest) (string, er
 	binding, outcome := f.contract.CreateBinding(context.Background(), runtimecontract.BindingRequest{
 		AgentID: f.contract.agentID, Name: request.Name, Cwd: request.Cwd,
 	})
-	return binding.NativeRef, compatibilityOutcomeError(outcome)
+	return binding.NativeRef, compatibilityLifecycleOutcomeError(outcome)
 }
 
 func (f *codexRuntimeV1Facade) Resume(request RuntimeBindingRequest, timeout time.Duration) error {
 	f.contract.setCompatibilityBinding(request)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return compatibilityOutcomeError(f.contract.ResumeBinding(ctx, contractBinding(request.NativeRef)))
+	return compatibilityLifecycleOutcomeError(f.contract.ResumeBinding(ctx, contractBinding(request.NativeRef)))
 }
 
 func (f *codexRuntimeV1Facade) InjectDeveloperContext(nativeRef, content string, timeout time.Duration) error {
@@ -46,7 +49,7 @@ func (f *codexRuntimeV1Facade) StartTurn(request RuntimeTurnRequest) (string, er
 	outcome := f.contract.StartTurn(ctx, runtimecontract.TurnRequest{
 		Binding: contractBinding(request.NativeRef), TurnID: request.LoomTurnID, Input: v1InputToContract(request.Input),
 	})
-	return outcome.RuntimeTurnRef, compatibilityOutcomeError(outcome)
+	return outcome.RuntimeTurnRef, compatibilityLifecycleOutcomeError(outcome)
 }
 
 func (f *codexRuntimeV1Facade) Steer(nativeRef, expectedNativeTurnID, input string, timeout time.Duration) (string, error) {
@@ -56,7 +59,7 @@ func (f *codexRuntimeV1Facade) Steer(nativeRef, expectedNativeTurnID, input stri
 		Binding: contractBinding(nativeRef), TurnID: f.contract.turnIDForNative(expectedNativeTurnID), RuntimeTurnRef: expectedNativeTurnID,
 		Input: []runtimecontract.InputBlock{{Kind: runtimecontract.InputText, Text: input}},
 	})
-	return outcome.RuntimeTurnRef, compatibilityOutcomeError(outcome)
+	return outcome.RuntimeTurnRef, compatibilityLifecycleOutcomeError(outcome)
 }
 
 func (c *codexRuntimeContract) turnIDForNative(nativeTurnID string) string {
@@ -68,7 +71,7 @@ func (c *codexRuntimeContract) turnIDForNative(nativeTurnID string) string {
 func (f *codexRuntimeV1Facade) Interrupt(nativeRef, nativeTurnID string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return compatibilityOutcomeError(f.contract.InterruptTurn(ctx, runtimecontract.TurnTarget{
+	return compatibilityLifecycleOutcomeError(f.contract.InterruptTurn(ctx, runtimecontract.TurnTarget{
 		Binding: contractBinding(nativeRef), TurnID: f.contract.turnIDForNative(nativeTurnID), RuntimeTurnRef: nativeTurnID,
 	}))
 }
@@ -106,6 +109,74 @@ func (f *codexRuntimeV1Facade) LatestTurn(nativeRef string) (*RuntimeHistoryTurn
 }
 
 func (f *codexRuntimeV1Facade) Capabilities() RuntimeCapabilities { return f.native.Capabilities() }
+
+func (f *codexRuntimeV1Facade) InspectInterruptedTurn(nativeRef, nativeTurnID string) (RuntimeInterruptionEvidence, error) {
+	turn, err := f.native.ReadTurn(nativeRef, nativeTurnID)
+	if err != nil {
+		return RuntimeInterruptionEvidence{}, err
+	}
+	return inspectCodexInterruptedTurn(turn), nil
+}
+
+func inspectCodexInterruptedTurn(turn RuntimeHistoryTurn) RuntimeInterruptionEvidence {
+	evidence := RuntimeInterruptionEvidence{Status: RuntimeInterruptionClean, UnfinishedTools: []RuntimeToolEvidence{}}
+	switch strings.ToLower(strings.TrimSpace(turn.Status)) {
+	case "completed", "failed", "interrupted", "aborted", "cancelled", "canceled":
+		evidence.Status = RuntimeInterruptionTerminal
+		evidence.TerminalStatus = strings.ToLower(strings.TrimSpace(turn.Status))
+		return evidence
+	}
+	pendingCalls := map[string]RuntimeToolEvidence{}
+	callOrder := []string{}
+	for _, item := range turn.Items {
+		id, _ := item["id"].(string)
+		if id != "" {
+			evidence.LeafEntryID = id
+		}
+		kind, _ := item["type"].(string)
+		lowerKind := strings.ToLower(kind)
+		if strings.Contains(lowerKind, "function_call_output") {
+			callID, _ := item["call_id"].(string)
+			if callID == "" {
+				callID, _ = item["callId"].(string)
+			}
+			delete(pendingCalls, callID)
+			continue
+		}
+		if strings.Contains(lowerKind, "function_call") {
+			callID, _ := item["call_id"].(string)
+			if callID == "" {
+				callID, _ = item["callId"].(string)
+			}
+			if callID == "" {
+				callID = id
+			}
+			name, _ := item["name"].(string)
+			if _, exists := pendingCalls[callID]; !exists {
+				callOrder = append(callOrder, callID)
+			}
+			pendingCalls[callID] = RuntimeToolEvidence{ID: callID, Name: name}
+			continue
+		}
+		if !strings.Contains(lowerKind, "tool") && !strings.Contains(lowerKind, "command") && !strings.Contains(lowerKind, "function_call") {
+			continue
+		}
+		name, _ := item["name"].(string)
+		command, _ := item["command"].(string)
+		// Projected command/tool items do not prove the raw call/result pairing.
+		// A non-terminal Turn that performed any such effect is conservative.
+		evidence.UnfinishedTools = append(evidence.UnfinishedTools, RuntimeToolEvidence{ID: id, Name: name, Command: command})
+	}
+	for _, callID := range callOrder {
+		if call, exists := pendingCalls[callID]; exists {
+			evidence.UnfinishedTools = append(evidence.UnfinishedTools, call)
+		}
+	}
+	if len(evidence.UnfinishedTools) > 0 {
+		evidence.Status = RuntimeInterruptionAmbiguous
+	}
+	return evidence
+}
 
 func (f *codexRuntimeV1Facade) Close() {
 	f.contract.CloseBinding(context.Background(), runtimecontract.Binding{})

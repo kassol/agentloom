@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,7 +17,7 @@ import (
 
 type fakeAgentRuntime struct {
 	created, resumed, started, steered, interrupted bool
-	closed                                          bool
+	closed                                          atomic.Bool
 	binding                                         string
 	history                                         RuntimeHistory
 	historyErr                                      error
@@ -25,10 +26,11 @@ type fakeAgentRuntime struct {
 	capabilities                                    *RuntimeCapabilities
 	lastTurnRequest                                 RuntimeTurnRequest
 	startErr                                        error
+	steerErr, interruptErr                          error
 	startCount                                      int
 }
 
-func (f *fakeAgentRuntime) Alive() bool { return !f.closed }
+func (f *fakeAgentRuntime) Alive() bool { return !f.closed.Load() }
 func (f *fakeAgentRuntime) Create(RuntimeBindingRequest) (string, error) {
 	f.created = true
 	return f.binding, nil
@@ -50,12 +52,12 @@ func (f *fakeAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error)
 func (f *fakeAgentRuntime) Steer(nativeRef, expectedNativeTurnID, input string, _ time.Duration) (string, error) {
 	f.steered = true
 	f.steeredNativeRef, f.steeredExpected, f.steeredInput = nativeRef, expectedNativeTurnID, input
-	return expectedNativeTurnID, nil
+	return expectedNativeTurnID, f.steerErr
 }
 func (f *fakeAgentRuntime) Interrupt(_ string, nativeTurnID string, _ time.Duration) error {
 	f.interrupted = true
 	f.interruptedNative = nativeTurnID
-	return nil
+	return f.interruptErr
 }
 func (f *fakeAgentRuntime) NormalizeEvent(string, json.RawMessage) []RuntimeEvent { return nil }
 func (f *fakeAgentRuntime) ReadHistory(string, int, int) (RuntimeHistory, error) {
@@ -71,7 +73,7 @@ func (f *fakeAgentRuntime) Capabilities() RuntimeCapabilities {
 	}
 	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true}
 }
-func (f *fakeAgentRuntime) Close() { f.closed = true }
+func (f *fakeAgentRuntime) Close() { f.closed.Store(true) }
 
 func TestHistorySurfacesRuntimeReadFailure(t *testing.T) {
 	st, err := store.Open(t.TempDir())
@@ -139,7 +141,7 @@ func TestHubRoutesCoreExecutionThroughAgentRuntime(t *testing.T) {
 		t.Fatalf("Interrupt native Turn = %q", fake.interruptedNative)
 	}
 	h.Shutdown()
-	if !fake.closed {
+	if !fake.closed.Load() {
 		t.Fatal("Shutdown did not close Agent Runtime")
 	}
 }

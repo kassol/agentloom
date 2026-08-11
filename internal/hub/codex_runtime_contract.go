@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -246,8 +247,13 @@ func contextFailure(ctx context.Context, phase runtimecontract.FailurePhase) *ru
 
 func codexFailureOutcome(err error, phase runtimecontract.FailurePhase) runtimecontract.Outcome {
 	state, code := runtimecontract.LifecycleFailed, "runtime_error"
-	if codex.IsRequestTimeout(err) {
-		state, code = runtimecontract.LifecycleIndeterminate, "transport_timeout"
+	if phase == runtimecontract.FailurePhaseTurnStart || phase == runtimecontract.FailurePhaseTurnContinue || phase == runtimecontract.FailurePhaseTurnInterrupt {
+		switch {
+		case codex.IsRequestTimeout(err):
+			state, code = runtimecontract.LifecycleIndeterminate, "transport_timeout"
+		case errors.Is(err, codex.ErrClosed):
+			state, code = runtimecontract.LifecycleIndeterminate, "transport_closed"
+		}
 	}
 	return runtimecontract.Outcome{State: state, Failure: &runtimecontract.Failure{
 		Code: code, Phase: phase, Message: err.Error(), Diagnostic: err.Error(), Cause: err,

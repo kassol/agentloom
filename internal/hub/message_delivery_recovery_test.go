@@ -291,6 +291,8 @@ while IFS= read -r line; do
       else
         printf '{"id":%s,"result":{"thread":{"id":"thread-target"}}}\n' "$id"
       fi ;;
+    *'"method":"thread/start"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"thread-target"}}}\n' "$id" ;;
     *'"method":"thread/inject_items"'*)
 	  if [ "$CODEX_RECOVERY_HANG_METHOD" = "thread/inject_items" ] && [ -f "$CODEX_RECOVERY_HANG_ONCE" ]; then
         rm -f "$CODEX_RECOVERY_HANG_ONCE"
@@ -303,6 +305,9 @@ while IFS= read -r line; do
         printf '{"id":%s,"result":{}}\n' "$id"
       fi ;;
     *'"method":"turn/start"'*)
+      if [ "$CODEX_RECOVERY_HANG_METHOD" = "turn/start-exit" ]; then
+        exit 0
+      fi
       printf '{"id":%s,"result":{"turn":{"id":"turn-recovered"}}}\n' "$id" ;;
     *)
       printf '{"id":%s,"result":{}}\n' "$id" ;;

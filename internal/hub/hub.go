@@ -113,9 +113,20 @@ type AgentView struct {
 	PendingApprovals    []ApprovalView      `json:"pendingApprovals"`
 	Goal                *ThreadGoal         `json:"goal,omitempty"`
 	LastSeq             int64               `json:"lastSeq"`
+	Recovery            *RecoveryView       `json:"recovery,omitempty"`
 	nativeRuntimeRef    string
 	nativeTurnBindings  map[string]string
 	turnRecoveryMarkers map[string]TurnRecoveryMarker
+}
+
+type RecoveryView struct {
+	PredecessorTurnID string `json:"predecessorTurnId"`
+	RuntimeKind       string `json:"runtimeKind"`
+	State             string `json:"state"`
+	Cause             string `json:"cause"`
+	FailurePhase      string `json:"failurePhase,omitempty"`
+	FailureCode       string `json:"failureCode,omitempty"`
+	Summary           string `json:"summary"`
 }
 
 // RuntimeDiagnostics is the explicit Developer-only projection of native
@@ -303,6 +314,9 @@ type runtime struct {
 
 	activeTurn *turnState           // guarded by Hub.mu
 	approvals  map[string]*approval // guarded by Hub.mu
+	// effectDomainInvalidated fences late events from a transport generation
+	// whose mutating command has an indeterminate outcome.
+	effectDomainInvalidated bool // guarded by Hub.mu
 }
 
 type subscriber struct {
@@ -660,6 +674,8 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	// interrupted projection visible until the Owner continues or dismisses it;
 	// otherwise a restart silently turns unfinished work into an idle Agent.
 	recoveryJobs := [][2]string{}
+	restartInterrupted := []*Agent{}
+	restartMessageTurns := []*turnState{}
 	h.mu.Lock()
 	for _, meta := range h.agents {
 		if meta.Source == "edge" {
@@ -692,24 +708,29 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 					if msg == nil || msg.ToAgentID != meta.ID || msg.DeliveryMode != "turn_start" || msg.DeliveredTurnID != interruptedTurnID {
 						continue
 					}
-					h.finishAgentMessageTurnLocked(&turnState{turnID: interruptedTurnID, agentMessageID: msg.ID}, "interrupted", "CodexLoom restarted while delivery Turn was running")
+					restartMessageTurns = append(restartMessageTurns, &turnState{turnID: interruptedTurnID, agentMessageID: msg.ID})
 				}
 			}
-			h.emitLocked(meta.ID, "loom/turn-interrupted", map[string]any{
-				"reason": "loom-restart",
-				"task":   interrupted.Task,
-				"turnId": interrupted.TurnID,
-			})
 			meta.Status = "interrupted"
 			meta.LastError = "interrupted: CodexLoom restarted while task was running"
 			meta.LastTurn = interrupted
 			meta.CurrentTask = ""
 			meta.CurrentTurnID = ""
 			meta.UpdatedAt = now()
+			if meta.TurnRecoveryMarkers == nil {
+				meta.TurnRecoveryMarkers = map[string]TurnRecoveryMarker{}
+			}
+			stamp := now()
+			meta.TurnRecoveryMarkers[interrupted.TurnID] = TurnRecoveryMarker{
+				PredecessorTurnID: interrupted.TurnID, NativeTurnID: meta.RuntimeTurnBindings[interrupted.TurnID],
+				RuntimeKind: meta.RuntimeBinding.Kind, Cause: "hub_restart", State: TurnRecoveryObserved,
+				Summary: "CodexLoom restarted while the Turn outcome was not confirmed", CreatedAt: stamp, UpdatedAt: stamp,
+			}
+			restartInterrupted = append(restartInterrupted, meta)
 		}
 	}
 	for _, meta := range h.agents {
-		if meta == nil || meta.Source == "edge" || meta.RuntimeBinding.Kind != "pi" {
+		if meta == nil || meta.Source == "edge" {
 			continue
 		}
 		planned := map[string]bool{}
@@ -722,7 +743,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		if meta.LastTurn == nil || meta.LastTurn.Status != "interrupted" || planned[meta.LastTurn.TurnID] {
 			continue
 		}
-		if marker, exists := meta.TurnRecoveryMarkers[meta.LastTurn.TurnID]; !exists || marker.State == "" {
+		if marker, exists := meta.TurnRecoveryMarkers[meta.LastTurn.TurnID]; !exists || marker.State == "" || marker.State == TurnRecoveryObserved {
 			recoveryJobs = append(recoveryJobs, [2]string{meta.ID, meta.LastTurn.TurnID})
 		}
 	}
@@ -730,9 +751,19 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("persist startup recovery: %w", err)
 	}
+	for _, meta := range restartInterrupted {
+		h.emitLocked(meta.ID, "loom/turn-interrupted", map[string]any{
+			"reason": "loom-restart", "task": meta.LastTurn.Task, "turnId": meta.LastTurn.TurnID,
+			"recovery": recoveryView(meta),
+		})
+		h.emitStatusLocked(meta, "interrupted")
+	}
+	for _, turn := range restartMessageTurns {
+		h.finishAgentMessageTurnLocked(turn, "interrupted", "CodexLoom restarted while delivery Turn was running")
+	}
 	for _, job := range recoveryJobs {
 		agentID, predecessorTurnID := job[0], job[1]
-		h.schedulePiRecoveryLocked(agentID, predecessorTurnID)
+		h.scheduleTurnRecoveryLocked(agentID, predecessorTurnID)
 	}
 	h.mu.Unlock()
 	h.background.Add(6)
@@ -1041,6 +1072,9 @@ func (h *Hub) emitStatusLocked(meta *Agent, status string) {
 		"processAlive":        processAlive,
 		"runtimeCapabilities": h.runtimeCapabilitiesLocked(meta),
 		"updatedAt":           meta.UpdatedAt,
+	}
+	if recovery := recoveryView(meta); recovery != nil {
+		data["recovery"] = recovery
 	}
 	data["goal"] = h.goals[meta.ID]
 	h.emitGlobalLocked("loom/agent-status", data)
@@ -1689,45 +1723,81 @@ func compatibilityRuntimeEvent(event runtimecontract.Event) RuntimeEvent {
 }
 
 func (h *Hub) onRuntimeFailure(rt *runtime, err error) {
-	if err == nil {
+	agentID, predecessorTurnID, checkpointed := h.checkpointRuntimeFailure(rt, err)
+	if !checkpointed {
 		return
+	}
+	h.mu.Lock()
+	h.scheduleTurnRecoveryLocked(agentID, predecessorTurnID)
+	h.mu.Unlock()
+}
+
+func (h *Hub) onRuntimeIndeterminate(rt *runtime, err error) {
+	agentID, predecessorTurnID, checkpointed := h.checkpointRuntimeFailure(rt, err)
+	// The observed truth is durable before the old effect domain is closed;
+	// even a failed checkpoint must fence the old effect domain so its late
+	// effects cannot pollute the restored in-memory Turn snapshot.
+	h.invalidateRuntimeEffectDomain(rt, err)
+	if !checkpointed {
+		return
+	}
+	h.mu.Lock()
+	h.scheduleTurnRecoveryLocked(agentID, predecessorTurnID)
+	h.mu.Unlock()
+}
+
+func (h *Hub) checkpointRuntimeFailure(rt *runtime, err error) (string, string, bool) {
+	if err == nil {
+		return "", "", false
 	}
 	h.mu.Lock()
 	if h.stopping {
 		h.mu.Unlock()
-		return
+		return "", "", false
 	}
 	meta := h.agents[rt.agentID]
 	if meta == nil {
 		h.mu.Unlock()
-		return
+		return "", "", false
 	}
 	if rt.activeTurn == nil || rt.activeTurn.finished {
+		if isRuntimeIndeterminate(err) || recoveryView(meta) != nil {
+			h.mu.Unlock()
+			return "", "", false
+		}
 		meta.LastError = err.Error()
 		meta.UpdatedAt = now()
 		h.persistRuntimeProjectionLocked()
 		h.emitLocked(meta.ID, "loom/runtime-failed", map[string]any{"error": err.Error()})
 		h.mu.Unlock()
-		return
+		return "", "", false
 	}
-	if meta.RuntimeBinding.Kind == "pi" {
-		predecessorTurnID := rt.activeTurn.turnID
-		h.finishTurnForRecoveryLocked(meta, rt, "interrupted", err.Error())
-		meta.Status = "interrupted"
-		meta.LastError = "interrupted: Pi Runtime process failed: " + err.Error()
-		meta.UpdatedAt = now()
-		h.persistRuntimeProjectionLocked()
-		h.emitStatusLocked(meta, "interrupted")
-		h.schedulePiRecoveryLocked(meta.ID, predecessorTurnID)
-		h.mu.Unlock()
-		return
-	}
-	h.onRuntimeEventLocked(meta, rt, RuntimeEvent{Kind: RuntimeTurnFailed, Error: err.Error()}, "", nil)
+	predecessorTurnID := rt.activeTurn.turnID
+	checkpointed := h.finishTurnForRecoveryLocked(meta, rt, err)
+	agentID := meta.ID
 	h.mu.Unlock()
+	return agentID, predecessorTurnID, checkpointed
 }
 
 func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent RuntimeEvent, method string, params json.RawMessage) {
+	if recoveryEventFenced(meta, rt) {
+		return
+	}
 	nativeTurnID := runtimeEvent.NativeTurnID
+	eventTurnID := runtimeEvent.LoomTurnID
+	if eventTurnID == "" && nativeTurnID != "" {
+		for loomTurnID, boundNativeTurnID := range meta.RuntimeTurnBindings {
+			if boundNativeTurnID == nativeTurnID {
+				eventTurnID = loomTurnID
+				break
+			}
+		}
+	}
+	// Correlate before any adoption or product event. A late response from an
+	// uncertain predecessor must never render on or supersede its successor.
+	if rt.activeTurn != nil && !rt.activeTurn.finished && eventTurnID != "" && eventTurnID != rt.activeTurn.turnID {
+		return
+	}
 
 	if runtimeEvent.Kind == RuntimeTurnStarted {
 		switch turn := rt.activeTurn; {
@@ -2052,8 +2122,82 @@ func (h *Hub) finishTurnLocked(meta *Agent, rt *runtime, status, errMsg string) 
 	h.finishTurnWithPendingLocked(meta, rt, status, errMsg, true)
 }
 
-func (h *Hub) finishTurnForRecoveryLocked(meta *Agent, rt *runtime, status, errMsg string) {
-	h.finishTurnWithPendingLocked(meta, rt, status, errMsg, false)
+func (h *Hub) finishTurnForRecoveryLocked(meta *Agent, rt *runtime, runtimeErr error) bool {
+	turn := rt.activeTurn
+	if turn == nil || turn.finished {
+		return false
+	}
+	previous := *meta
+	if meta.LastTurn != nil {
+		last := *meta.LastTurn
+		previous.LastTurn = &last
+	}
+	previous.TurnRecoveryMarkers = make(map[string]TurnRecoveryMarker, len(meta.TurnRecoveryMarkers))
+	for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
+		previous.TurnRecoveryMarkers[predecessorTurnID] = marker
+	}
+	cause, phase, code, summary := runtimeRecoveryDescriptor(runtimeErr)
+	meta.Status = "interrupted"
+	meta.CurrentTask = ""
+	meta.CurrentTurnID = ""
+	meta.LastError = "interrupted: " + summary
+	meta.LastTurn = &TurnSummary{TurnID: turn.turnID, Task: turn.task, Status: "interrupted", CompletedAt: now()}
+	meta.UpdatedAt = now()
+	if meta.TurnRecoveryMarkers == nil {
+		meta.TurnRecoveryMarkers = map[string]TurnRecoveryMarker{}
+	}
+	stamp := now()
+	meta.TurnRecoveryMarkers[turn.turnID] = TurnRecoveryMarker{
+		PredecessorTurnID: turn.turnID, NativeTurnID: turn.nativeTurnID,
+		RuntimeKind: meta.RuntimeBinding.Kind, Cause: cause, FailurePhase: phase,
+		FailureCode: code, Summary: summary, State: TurnRecoveryObserved,
+		TopicID: turn.topicID, CreatedAt: stamp, UpdatedAt: stamp,
+	}
+	if err := h.persistAgentsLocked(); err != nil {
+		*meta = previous
+		log.Printf("[codex-loom] persist interrupted Turn before recovery: %v", err)
+		return false
+	}
+	turn.finished = true
+	close(turn.stopWatchdog)
+	rt.activeTurn = nil
+	h.abortTurnApprovalsLocked(meta.ID, turn.turnID, rt, "the Runtime Turn ended before the Approval was resolved")
+	rt.approvals = map[string]*approval{}
+	errMsg := ""
+	if runtimeErr != nil {
+		errMsg = runtimeErr.Error()
+	}
+	h.finishInboxAttemptLocked(turn, "interrupted", errMsg)
+	h.finishAgentMessageTurnLocked(turn, "interrupted", errMsg)
+	payload := map[string]any{
+		"turnId": turn.turnID, "task": turn.task, "source": turn.source,
+		"durationMs": time.Since(turn.startedAt).Milliseconds(), "topicId": turn.topicID,
+	}
+	if errMsg != "" {
+		payload["error"] = summary
+	}
+	payload["recovery"] = recoveryView(meta)
+	h.emitLocked(meta.ID, "loom/turn-interrupted", payload)
+	if turn.topicID != "" {
+		h.recordTopicWorkEventLocked(turn.topicID, TopicEvent{
+			Type: "turn_interrupted", Actor: meta.Name, AgentID: meta.ID, Agent: meta.Name,
+			Summary: "interrupted: " + summarizeTopicText(turn.task), Ref: &TopicRef{Type: "turn", ID: turn.turnID, Label: meta.Name}, CreatedAt: now(),
+		})
+	}
+	h.emitStatusLocked(meta, "interrupted")
+	return true
+}
+
+func runtimeRecoveryDescriptor(err error) (cause, phase, code, summary string) {
+	if failure := runtimeFailureFromError(err); failure != nil {
+		return "command_indeterminate", string(failure.Phase), failure.Code, "Runtime command outcome is indeterminate"
+	}
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "protocol") {
+		return "protocol_failure", "", "", "Runtime protocol failed before the Turn outcome was confirmed"
+	}
+	cause = "process_exit"
+	summary = "Runtime process exited before the Turn outcome was confirmed"
+	return cause, phase, code, summary
 }
 
 func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errMsg string, startPending bool) {
@@ -2065,11 +2209,18 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 		status = "failed"
 		errMsg = turn.forcedFailure
 	}
+	previous := *meta
+	if meta.LastTurn != nil {
+		last := *meta.LastTurn
+		previous.LastTurn = &last
+	}
+	previous.TurnRecoveryMarkers = make(map[string]TurnRecoveryMarker, len(meta.TurnRecoveryMarkers))
+	for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
+		previous.TurnRecoveryMarkers[predecessorTurnID] = marker
+	}
 	turn.finished = true
 	close(turn.stopWatchdog)
 	rt.activeTurn = nil
-	h.abortTurnApprovalsLocked(meta.ID, turn.turnID, rt, "the Runtime Turn ended before the Approval was resolved")
-	rt.approvals = map[string]*approval{}
 
 	evType := "loom/turn-completed"
 	if status == "failed" {
@@ -2087,14 +2238,6 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 	if errMsg != "" {
 		payload["error"] = errMsg
 	}
-	h.emitLocked(meta.ID, evType, payload)
-	if turn.topicID != "" {
-		h.recordTopicWorkEventLocked(turn.topicID, TopicEvent{
-			Type: "turn_" + status, Actor: meta.Name, AgentID: meta.ID, Agent: meta.Name,
-			Summary: status + ": " + summarizeTopicText(turn.task), Ref: &TopicRef{Type: "turn", ID: turn.turnID, Label: meta.Name}, CreatedAt: now(),
-		})
-	}
-
 	meta.Status = "idle"
 	meta.CurrentTask = ""
 	meta.CurrentTurnID = ""
@@ -2114,9 +2257,22 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 		}
 	}
 	meta.UpdatedAt = now()
+	if err := h.persistAgentsLocked(); err != nil {
+		*meta = previous
+		log.Printf("[codex-loom] persist terminal Turn before publish: %v", err)
+		return
+	}
+	h.abortTurnApprovalsLocked(meta.ID, turn.turnID, rt, "the Runtime Turn ended before the Approval was resolved")
+	rt.approvals = map[string]*approval{}
 	h.finishInboxAttemptLocked(turn, status, errMsg)
 	h.finishAgentMessageTurnLocked(turn, status, errMsg)
-	h.persistRuntimeProjectionLocked()
+	h.emitLocked(meta.ID, evType, payload)
+	if turn.topicID != "" {
+		h.recordTopicWorkEventLocked(turn.topicID, TopicEvent{
+			Type: "turn_" + status, Actor: meta.Name, AgentID: meta.ID, Agent: meta.Name,
+			Summary: status + ": " + summarizeTopicText(turn.task), Ref: &TopicRef{Type: "turn", ID: turn.turnID, Label: meta.Name}, CreatedAt: now(),
+		})
+	}
 	h.emitStatusLocked(meta, "idle")
 	if startPending {
 		h.startPendingWorkersLocked(meta.ID)
@@ -2236,6 +2392,7 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 		Agent: *meta, PendingApprovals: []ApprovalView{}, LastSeq: h.seqs[meta.ID],
 		nativeRuntimeRef: meta.RuntimeBinding.NativeRef, nativeTurnBindings: bindings, turnRecoveryMarkers: markers,
 	}
+	view.Recovery = recoveryView(meta)
 	if meta.LastTurn != nil {
 		last := *meta.LastTurn
 		view.LastTurn = &last
@@ -2254,6 +2411,21 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 		view.ProcessAlive = true
 	}
 	return view
+}
+
+func recoveryView(meta *Agent) *RecoveryView {
+	if meta == nil || meta.LastTurn == nil {
+		return nil
+	}
+	marker, ok := meta.TurnRecoveryMarkers[meta.LastTurn.TurnID]
+	if !ok || marker.State == TurnRecoveryCompleted {
+		return nil
+	}
+	return &RecoveryView{
+		PredecessorTurnID: marker.PredecessorTurnID, RuntimeKind: marker.RuntimeKind,
+		State: marker.State, Cause: marker.Cause, FailurePhase: marker.FailurePhase,
+		FailureCode: marker.FailureCode, Summary: marker.Summary,
+	}
 }
 
 func (h *Hub) runtimeCapabilitiesLocked(meta *Agent) RuntimeCapabilities {

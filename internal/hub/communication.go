@@ -828,6 +828,12 @@ func (h *Hub) requestTurnSteer(rt *runtime, threadID, expectedTurnID, input stri
 	}
 	acceptedNativeTurnID, err := backend.Steer(threadID, expectedNativeTurnID, input, timeout)
 	if err != nil {
+		if isRuntimeIndeterminate(err) {
+			if rt.client != nil {
+				h.markThreadControlIndeterminate(rt, threadID, "turn/steer")
+			}
+			h.onRuntimeIndeterminate(rt, err)
+		}
 		return "", err
 	}
 	if acceptedNativeTurnID != expectedNativeTurnID {

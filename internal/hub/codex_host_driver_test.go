@@ -640,3 +640,30 @@ func TestCodexRuntimeContractHistoryIsLazyAndCanonical(t *testing.T) {
 		t.Fatalf("v1 facade history = %#v, err = %v", legacy, err)
 	}
 }
+
+func TestCodexInspectorTreatsRealRolloutUnpairedFunctionCallAsAmbiguous(t *testing.T) {
+	sessions := t.TempDir()
+	threadID := "native-thread-interrupted"
+	day := filepath.Join(sessions, "2026", "08", "10")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(day, "rollout-2026-08-10T00-00-00-"+threadID+".jsonl")
+	data := `{"timestamp":"2026-08-10T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"native-turn"}}
+{"timestamp":"2026-08-10T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"deploy"}}
+{"timestamp":"2026-08-10T00:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-unfinished","arguments":"{\"cmd\":\"deploy\"}"}}
+`
+	if err := os.WriteFile(rolloutPath, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_SESSIONS_DIR", sessions)
+	facade := &codexRuntimeV1Facade{native: &codexAgentRuntime{}}
+
+	evidence, err := facade.InspectInterruptedTurn(threadID, "native-turn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence.Status != RuntimeInterruptionAmbiguous || len(evidence.UnfinishedTools) != 1 {
+		t.Fatalf("real rollout interruption evidence=%#v", evidence)
+	}
+}

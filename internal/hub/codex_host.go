@@ -594,6 +594,12 @@ func (h *Hub) onHostNotification(generation uint64, method string, params json.R
 		return
 	}
 	rt := h.runtimeForThreadLocked(threadID)
+	if rt != nil {
+		if meta := h.agents[rt.agentID]; recoveryEventFenced(meta, rt) {
+			h.mu.Unlock()
+			return
+		}
+	}
 	hydrateAgentID := ""
 	if rt == nil && method == "thread/started" {
 		rt = h.bindOrAdoptStartedThreadLocked(params)
@@ -647,6 +653,14 @@ func (h *Hub) onCodexCompatibilityNotification(rt *runtime, method string, param
 	if meta == nil {
 		return
 	}
+	nativeTurnID := notificationTurnID(params)
+	if rt.activeTurn != nil && !rt.activeTurn.finished && nativeTurnID != "" {
+		if contract, ok := rt.runtimeContract.(*codexRuntimeContract); ok {
+			if loomTurnID := contract.turnIDForNative(nativeTurnID); loomTurnID != "" && loomTurnID != rt.activeTurn.turnID {
+				return
+			}
+		}
+	}
 	// These native-only notifications remain compatibility side effects until
 	// their dedicated Runtime Capabilities migrate to typed events.
 	if method == "error" && rt.activeTurn != nil && !rt.activeTurn.finished && rt.activeTurn.forcedFailure == "" {
@@ -670,6 +684,20 @@ func (h *Hub) onCodexCompatibilityNotification(rt *runtime, method string, param
 		}
 	}
 	h.emitLocked(meta.ID, method, runtimePublicPayload(params, meta.ThreadID, turnID, canonical))
+}
+
+func recoveryEventFenced(meta *Agent, rt *runtime) bool {
+	if rt != nil && rt.effectDomainInvalidated {
+		return true
+	}
+	if meta == nil || meta.LastTurn == nil {
+		return false
+	}
+	marker, ok := meta.TurnRecoveryMarkers[meta.LastTurn.TurnID]
+	if !ok || marker.State == TurnRecoveryCompleted {
+		return false
+	}
+	return rt == nil || rt.activeTurn == nil || rt.activeTurn.finished || rt.activeTurn.turnID == marker.PredecessorTurnID
 }
 
 func (h *Hub) hydrateAdoptedAgent(generation uint64, agentID, threadID string) {
@@ -797,11 +825,86 @@ func (h *Hub) onCodexHostFailure(rt *runtime, err error) {
 		return
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	meta := h.agents[rt.agentID]
 	if meta == nil || rt.activeTurn == nil || rt.activeTurn.finished {
+		h.mu.Unlock()
 		return
 	}
-	h.emitLocked(meta.ID, "loom/host-error", map[string]any{"message": "CodexHost exited mid-turn"})
-	h.finishTurnLocked(meta, rt, "interrupted", err.Error())
+	h.mu.Unlock()
+	h.onRuntimeFailure(rt, err)
+}
+
+// invalidateRuntimeEffectDomain terminates the transport generation that may
+// still deliver a late mutating result. Pi owns one process per Agent; Codex
+// fans the shared generation failure out once before closing the host.
+func (h *Hub) invalidateRuntimeEffectDomain(rt *runtime, cause error) {
+	if rt == nil {
+		return
+	}
+	if rt.client == nil {
+		h.mu.Lock()
+		rt.effectDomainInvalidated = true
+		h.mu.Unlock()
+		if backend := runtimeBackend(rt); backend != nil {
+			backend.Close()
+		}
+		return
+	}
+	type recoveryJob struct {
+		agentID, predecessorTurnID string
+	}
+	h.mu.Lock()
+	rt.effectDomainInvalidated = true
+	host := h.codexHost
+	driver := h.codexHostDriver
+	valid := host != nil && host.generation == rt.hostGeneration && host.client == rt.client
+	var affected []*runtime
+	if valid {
+		for _, candidate := range h.runtimes {
+			if candidate == nil || candidate.hostGeneration != host.generation || candidate.client != host.client {
+				continue
+			}
+			candidate.effectDomainInvalidated = true
+			if candidate != rt && candidate.activeTurn != nil && !candidate.activeTurn.finished {
+				affected = append(affected, candidate)
+			}
+		}
+		// Fence the generation before Close can deliver its asynchronous exit
+		// callback. Keep per-Agent projections long enough for the recovery
+		// inspectors; lazy runtime acquisition replaces their closed backend.
+		h.codexHost = nil
+		h.remoteRuntime = nil
+		h.remoteEnabledGeneration = 0
+	}
+	h.mu.Unlock()
+	if !valid {
+		return
+	}
+	sharedCause := fmt.Errorf("CodexHost effect domain invalidated after indeterminate command: %w", cause)
+	jobs := make([]recoveryJob, 0, len(affected))
+	for _, candidate := range affected {
+		agentID, predecessorTurnID, checkpointed := h.checkpointRuntimeFailure(candidate, sharedCause)
+		if checkpointed {
+			jobs = append(jobs, recoveryJob{agentID: agentID, predecessorTurnID: predecessorTurnID})
+		}
+	}
+	if driver != nil {
+		driver.suppressHostFailureFanout(host.generation)
+	}
+	if err := closeCodexHost(host); err != nil {
+		log.Printf("[codex-loom] close invalidated CodexHost generation %d: %v", host.generation, err)
+	}
+	h.mu.Lock()
+	if h.remoteConfig.Enabled {
+		h.remoteStatus.State = "error"
+		h.remoteStatus.LastError = "CodexHost effect domain was invalidated"
+		h.remoteStatus.UpdatedAt = now()
+		h.emitRemoteLocked()
+	}
+	h.mu.Unlock()
+	for _, job := range jobs {
+		h.mu.Lock()
+		h.scheduleTurnRecoveryLocked(job.agentID, job.predecessorTurnID)
+		h.mu.Unlock()
+	}
 }

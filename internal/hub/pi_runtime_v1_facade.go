@@ -3,7 +3,6 @@ package hub
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
@@ -19,31 +18,6 @@ var _ AgentRuntime = (*piRuntimeV1Facade)(nil)
 var _ RuntimeApprovalSource = (*piRuntimeV1Facade)(nil)
 var _ RuntimeInterruptedTurnInspector = (*piRuntimeV1Facade)(nil)
 
-type runtimeIndeterminateError struct {
-	failure *runtimecontract.Failure
-}
-
-func (e *runtimeIndeterminateError) Error() string {
-	if e == nil || e.failure == nil {
-		return "Runtime outcome is indeterminate"
-	}
-	return e.failure.Message
-}
-
-func (e *runtimeIndeterminateError) Unwrap() error {
-	if e == nil || e.failure == nil {
-		return nil
-	}
-	return e.failure.Cause
-}
-
-func piCompatibilityOutcomeError(outcome runtimecontract.Outcome) error {
-	if outcome.State == runtimecontract.LifecycleIndeterminate && outcome.Failure != nil {
-		return &runtimeIndeterminateError{failure: outcome.Failure}
-	}
-	return compatibilityOutcomeError(outcome)
-}
-
 func (f *piRuntimeV1Facade) Alive() bool { return f != nil && f.host != nil && f.host.Alive() }
 
 func (f *piRuntimeV1Facade) Create(request RuntimeBindingRequest) (string, error) {
@@ -51,14 +25,14 @@ func (f *piRuntimeV1Facade) Create(request RuntimeBindingRequest) (string, error
 	binding, outcome := f.contract.CreateBinding(context.Background(), runtimecontract.BindingRequest{
 		AgentID: f.contract.agentID, Name: request.Name, Cwd: request.Cwd,
 	})
-	return binding.NativeRef, piCompatibilityOutcomeError(outcome)
+	return binding.NativeRef, compatibilityLifecycleOutcomeError(outcome)
 }
 
 func (f *piRuntimeV1Facade) Resume(request RuntimeBindingRequest, timeout time.Duration) error {
 	f.contract.setCompatibilityBinding(request)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return piCompatibilityOutcomeError(f.contract.ResumeBinding(ctx, piContractBinding(request.NativeRef)))
+	return compatibilityLifecycleOutcomeError(f.contract.ResumeBinding(ctx, piContractBinding(request.NativeRef)))
 }
 
 func (f *piRuntimeV1Facade) InjectDeveloperContext(nativeRef, content string, timeout time.Duration) error {
@@ -72,7 +46,7 @@ func (f *piRuntimeV1Facade) StartTurn(request RuntimeTurnRequest) (string, error
 	outcome := f.contract.StartTurn(ctx, runtimecontract.TurnRequest{
 		Binding: piContractBinding(request.NativeRef), TurnID: request.LoomTurnID, Input: v1InputToContract(request.Input),
 	})
-	return outcome.RuntimeTurnRef, piCompatibilityOutcomeError(outcome)
+	return outcome.RuntimeTurnRef, compatibilityLifecycleOutcomeError(outcome)
 }
 
 func (f *piRuntimeV1Facade) Steer(nativeRef, expectedNativeTurnID, input string, timeout time.Duration) (string, error) {
@@ -82,23 +56,15 @@ func (f *piRuntimeV1Facade) Steer(nativeRef, expectedNativeTurnID, input string,
 		Binding: piContractBinding(nativeRef), TurnID: f.contract.turnIDForNative(expectedNativeTurnID), RuntimeTurnRef: expectedNativeTurnID,
 		Input: []runtimecontract.InputBlock{{Kind: runtimecontract.InputText, Text: input}},
 	})
-	return outcome.RuntimeTurnRef, piCompatibilityOutcomeError(outcome)
+	return outcome.RuntimeTurnRef, compatibilityLifecycleOutcomeError(outcome)
 }
 
 func (f *piRuntimeV1Facade) Interrupt(nativeRef, nativeTurnID string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return piCompatibilityOutcomeError(f.contract.InterruptTurn(ctx, runtimecontract.TurnTarget{
+	return compatibilityLifecycleOutcomeError(f.contract.InterruptTurn(ctx, runtimecontract.TurnTarget{
 		Binding: piContractBinding(nativeRef), TurnID: f.contract.turnIDForNative(nativeTurnID), RuntimeTurnRef: nativeTurnID,
 	}))
-}
-
-var _ error = (*runtimeIndeterminateError)(nil)
-var _ interface{ Unwrap() error } = (*runtimeIndeterminateError)(nil)
-
-func isRuntimeIndeterminate(err error) bool {
-	var target *runtimeIndeterminateError
-	return errors.As(err, &target)
 }
 
 func (f *piRuntimeV1Facade) NormalizeEvent(_ string, _ json.RawMessage) []RuntimeEvent { return nil }

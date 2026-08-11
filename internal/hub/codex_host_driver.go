@@ -149,6 +149,15 @@ func (d *codexRuntimeHostDriver) fanoutHostFailure(generation uint64, err error)
 	}
 }
 
+// suppressHostFailureFanout records that an explicitly invalidated generation
+// has already been checkpointed. Its later process-exit callback must not
+// checkpoint or schedule the same Agents a second time.
+func (d *codexRuntimeHostDriver) suppressHostFailureFanout(generation uint64) {
+	d.mu.Lock()
+	d.failedHosts[generation] = true
+	d.mu.Unlock()
+}
+
 type codexAgentHost struct {
 	mu       sync.Mutex
 	host     *codexHostRuntime

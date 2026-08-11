@@ -859,10 +859,10 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 	}
 	if err != nil {
 		if isRuntimeIndeterminate(err) {
-			if backend := runtimeBackend(rt); backend != nil {
-				backend.Close()
+			if rt.client != nil {
+				h.markThreadControlIndeterminate(rt, threadID, "turn/start")
 			}
-			h.onRuntimeFailure(rt, err)
+			h.onRuntimeIndeterminate(rt, err)
 			return SendResult{}, errf(500, "turn/start outcome is indeterminate: %s", err)
 		}
 		h.mu.Lock()
@@ -1107,6 +1107,13 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 		}
 	}
 	if err != nil {
+		if isRuntimeIndeterminate(err) {
+			if rt.client != nil {
+				h.markThreadControlIndeterminate(rt, threadID, "turn/interrupt")
+			}
+			h.onRuntimeIndeterminate(rt, err)
+			return InterruptResult{}, errf(500, "turn/interrupt outcome is indeterminate: %s", err)
+		}
 		return InterruptResult{}, errf(500, "turn/interrupt failed: %s", err)
 	}
 	// codex should follow up with turn/completed(status=interrupted); force

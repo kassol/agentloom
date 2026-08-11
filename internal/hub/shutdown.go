@@ -9,12 +9,62 @@ func (h *Hub) Shutdown() {
 	h.shutdownOnce.Do(func() {
 		h.mu.Lock()
 		h.stopping = true
+		snapshots := map[string]Agent{}
+		shutdownTurns := map[string]*turnState{}
 		for agentID, rt := range h.runtimes {
 			if rt.activeTurn != nil && !rt.activeTurn.finished {
-				h.abortTurnApprovalsLocked(agentID, rt.activeTurn.turnID, rt, "CodexLoom shut down before the Approval was resolved")
-				rt.activeTurn.finished = true
-				if rt.activeTurn.stopWatchdog != nil {
-					close(rt.activeTurn.stopWatchdog)
+				turn := rt.activeTurn
+				turn.finished = true
+				if turn.stopWatchdog != nil {
+					close(turn.stopWatchdog)
+				}
+				rt.activeTurn = nil
+				if meta := h.agents[agentID]; meta != nil {
+					previous := *meta
+					if meta.LastTurn != nil {
+						last := *meta.LastTurn
+						previous.LastTurn = &last
+					}
+					previous.TurnRecoveryMarkers = make(map[string]TurnRecoveryMarker, len(meta.TurnRecoveryMarkers))
+					for predecessorTurnID, marker := range meta.TurnRecoveryMarkers {
+						previous.TurnRecoveryMarkers[predecessorTurnID] = marker
+					}
+					snapshots[agentID] = previous
+					shutdownTurns[agentID] = turn
+					meta.Status = "interrupted"
+					meta.CurrentTask = ""
+					meta.CurrentTurnID = ""
+					meta.LastError = "interrupted: CodexLoom shut down before the Turn outcome was confirmed"
+					meta.LastTurn = &TurnSummary{TurnID: turn.turnID, Task: turn.task, Status: "interrupted", CompletedAt: now()}
+					if meta.TurnRecoveryMarkers == nil {
+						meta.TurnRecoveryMarkers = map[string]TurnRecoveryMarker{}
+					}
+					stamp := now()
+					meta.TurnRecoveryMarkers[turn.turnID] = TurnRecoveryMarker{
+						PredecessorTurnID: turn.turnID, NativeTurnID: turn.nativeTurnID,
+						RuntimeKind: meta.RuntimeBinding.Kind, Cause: "hub_shutdown", State: TurnRecoveryObserved,
+						Summary: "CodexLoom shut down before the Turn outcome was confirmed", CreatedAt: stamp, UpdatedAt: stamp,
+					}
+					meta.UpdatedAt = stamp
+				}
+			}
+		}
+		checkpointed := true
+		if !h.passive && len(shutdownTurns) > 0 {
+			if err := h.persistAgentsLocked(); err != nil {
+				checkpointed = false
+				for agentID, previous := range snapshots {
+					if meta := h.agents[agentID]; meta != nil {
+						*meta = previous
+					}
+				}
+				log.Printf("[codex-loom] persist shutdown recovery checkpoint: %v", err)
+			}
+		}
+		if checkpointed {
+			for agentID, turn := range shutdownTurns {
+				if rt := h.runtimes[agentID]; rt != nil {
+					h.abortTurnApprovalsLocked(agentID, turn.turnID, rt, "CodexLoom shut down before the Approval was resolved")
 				}
 			}
 		}
