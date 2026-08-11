@@ -41,6 +41,9 @@ func TestContextHistoryResetsCoverageAtCompaction(t *testing.T) {
 	if old.EpochID != "window:window-2" || old.DeliveriesPersisted {
 		t.Fatalf("old epoch state = %#v", old)
 	}
+	if !old.TurnObserved || len(old.TurnDeliveries) != 1 || old.TurnDeliveries[0].Content != oldPayload {
+		t.Fatalf("old Turn-scoped evidence = %#v", old)
+	}
 	current, err := ContextHistory(threadID, ContextHistoryQuery{
 		TurnID: "turn-new",
 		Deliveries: []ContextDeliveryProbe{{
@@ -52,6 +55,39 @@ func TestContextHistoryResetsCoverageAtCompaction(t *testing.T) {
 	}
 	if current.EpochID != "window:window-2" || current.WindowNumber != 2 || !current.DeliveriesPersisted {
 		t.Fatalf("current epoch state = %#v", current)
+	}
+}
+
+func TestContextHistoryAssociatesExactDeveloperDeliveryWithNativeTurn(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_SESSIONS_DIR", root)
+	threadID := "thread-exact-turn"
+	path := filepath.Join(root, "2026", "08", "12", "rollout-2026-08-12T00-00-00-"+threadID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	developer := `<loom_developer_context version="1" epoch_id="initial" delivery_id="attempt:developer" prompt_revision="owner:3" prompt_hash="prompt-sha" profile_revision="profile:7" profile_hash="profile-sha"></loom_developer_context>`
+	input := `<loom_context version="1" epoch_id="initial" delivery_id="attempt:input"><loom_turn_context kind="agent_message" ref_id="message-1"></loom_turn_context></loom_context>`
+	content := `{"timestamp":"2026-08-12T00:00:00Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":` + mustJSON(t, developer) + `}]}}` + "\n" +
+		`{"timestamp":"2026-08-12T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"task"},{"type":"input_text","text":` + mustJSON(t, input) + `}],"internal_chat_message_metadata_passthrough":{"turn_id":"native-turn-1"}}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPathCache = syncMapForTest()
+
+	state, err := ContextHistory(threadID, ContextHistoryQuery{TurnID: "native-turn-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.TurnObserved || len(state.TurnDeliveries) != 2 || state.TurnDeliveries[0].Role != "developer" || state.TurnDeliveries[0].Content != developer || state.TurnDeliveries[1].Content != input {
+		t.Fatalf("exact Turn evidence = %#v", state)
+	}
+	missing, err := ContextHistory(threadID, ContextHistoryQuery{TurnID: "native-turn-missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.TurnObserved || len(missing.TurnDeliveries) != 0 {
+		t.Fatalf("wrong native Turn inherited evidence = %#v", missing)
 	}
 }
 

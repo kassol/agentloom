@@ -171,6 +171,26 @@ describe("AgentPane scroll restoration", () => {
 	expect(view.queryByDisplayValue("codex")).toBeNull();
   });
 
+  it("shows Runtime-neutral context evidence for the relevant Loom Turn", async () => {
+	vi.mocked(fetch).mockImplementation(async (input) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname + input.search : input.url;
+	  const body = url.includes("/context/explain") ? { context: {
+		agentId: testAgent.id, agentName: testAgent.name, threadId: testAgent.threadId, turnId: "turn-last",
+		state: "proven", mode: "full_per_turn", policy: "Full delivery", reason: "", limitation: "No epoch evidence.",
+		sources: [{ key: "loom_agent_profile", revision: "profile:2", channel: "developer", state: "delivered", covered: true }],
+		deliveries: [], unsupportedDimensions: ["epoch", "replay"],
+	  }} : url.includes("/thread/history") ? { total: 0, turns: [] } : { artifacts: [] };
+	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+	const agent = { ...testAgent, lastTurn: { turnId: "turn-last", task: "done", status: "completed", completedAt: "2026-08-12T00:00:00Z" } };
+	const view = render(<AgentPane {...props} agent={agent} active configRequestNonce={1} />);
+	fireEvent.click(view.getByRole("button", { name: "Context" }));
+	await view.findByText("loom_agent_profile");
+	expect(view.getByText("proven")).toBeInTheDocument();
+	expect(view.getByText(/full_per_turn · Turn turn-last/)).toBeInTheDocument();
+	expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/context/explain?turnId=turn-last"), expect.anything());
+  });
+
   it("shows Pi capability limits and disables unsupported Runtime controls", () => {
 	const onError = vi.fn();
 	vi.mocked(fetch).mockImplementation(async (input) => {

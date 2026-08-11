@@ -34,6 +34,7 @@ type piRuntimeContract struct {
 }
 
 var _ runtimecontract.Contract = (*piRuntimeContract)(nil)
+var _ runtimecontract.ContextEvidenceCapability = (*piRuntimeContract)(nil)
 
 func newPiRuntimeContract(agentID string, native *piAgentRuntime) *piRuntimeContract {
 	return &piRuntimeContract{agentID: agentID, native: native, turnsByNative: map[string]runtimeTurnCorrelation{}}

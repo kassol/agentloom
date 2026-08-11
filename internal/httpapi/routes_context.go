@@ -43,7 +43,7 @@ func (s *Server) registerContextRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, map[string]any{"prompt": prompt})
 	})
 	mux.HandleFunc("GET /api/agents/{key}/context/explain", func(w http.ResponseWriter, r *http.Request) {
-		view, err := s.hub.ExplainContext(r.PathValue("key"))
+		view, err := s.hub.ExplainTurnContext(r.PathValue("key"), r.URL.Query().Get("turnId"))
 		if err != nil {
 			writeErr(w, err)
 			return

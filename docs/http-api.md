@@ -116,11 +116,16 @@ Origin 嵌入，其他类型保持 `same-origin`。
 | GET | `/api/context/agent-prompt` | Read Loom agent prompt |
 | PUT | `/api/context/agent-prompt` | Update Loom agent prompt |
 | DELETE | `/api/context/agent-prompt` | Clear Loom agent prompt |
-| GET | `/api/agents/{key}/context/explain` | Explain compiled context |
+| GET | `/api/agents/{key}/context/explain?turnId={loomTurnId}` | Explain Runtime context-delivery evidence for a Loom Turn |
 | GET | `/api/agents/{key}/context/coverage` | Read epoch coverage ledger |
 
 `DELETE` 支持 `expectedVersion` 做并发保护。完整语义见
 [epoch-context-coverage.md](epoch-context-coverage.md)。
+
+`context/explain` 是 Runtime-neutral：Codex 返回 epoch/coverage/replay 证据，Pi
+返回从 durable Session user entry 被动证明的 full-per-Turn exact Loom blocks。
+缺失 Turn correlation 返回 `unknown`，不可读或畸形证据返回 `unavailable`；响应不包含
+Runtime-native Turn ID 或 Session/rollout path。
 
 ## Organization, Communication, and Team
 

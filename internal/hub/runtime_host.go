@@ -79,28 +79,8 @@ type runtimeCompactionCapability interface {
 	CompactRuntimeBinding(context.Context, runtimecontract.Binding) error
 }
 
-type RuntimeContextDeliveryProbe struct {
-	Role   string
-	Marker string
-	Hash   string
-}
-
-type RuntimeContextEvidenceQuery struct {
-	TurnID     string
-	Deliveries []RuntimeContextDeliveryProbe
-}
-
-type RuntimeContextEvidence struct {
-	EpochID               string
-	WindowNumber          int
-	CompactedAt           string
-	DeliveriesPersisted   bool
-	PersistedDeliveryKeys map[string]bool
-}
-
-type runtimeContextEvidenceCapability interface {
-	RuntimeContextEvidence(context.Context, runtimecontract.Binding, RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error)
-}
+type RuntimeContextEvidenceQuery = runtimecontract.ContextEvidenceQuery
+type RuntimeContextEvidence = runtimecontract.ContextEvidence
 
 func configureRuntimeBinding(contract runtimecontract.Contract, sandbox, providerID, model, effort string, disabledSkillPaths []string) {
 	if capability, ok := contract.(runtimeSandboxConfiguration); ok {

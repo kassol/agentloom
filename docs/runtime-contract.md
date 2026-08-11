@@ -87,6 +87,16 @@ records without that total fall back to input + output + cache read + cache
 write. Every user entry starts Activity, and only a terminal native stop reason
 ends it, so tool-use and interrupted append tails remain open across restart.
 
+`ContextEvidenceCapability` is the single passive context-inspection surface.
+The Hub captures one Agent binding and its Loom-to-Runtime Turn correlation,
+performs adapter I/O without its global mutex, then revalidates both before
+publishing evidence. Codex keeps epoch, coverage, replay, and resend evidence.
+Pi reads the exact historical user entry by its private Runtime Turn reference,
+including entries outside the active branch, and reports only the exact Loom
+blocks and source revisions it can prove. Missing evidence is `unknown`; an
+unreadable or malformed native record is `unavailable`. Native references and
+paths never cross the capability result.
+
 Codex Provider definitions, credentials, verification, and shared Host restart
 remain a Codex Host integration. They are not part of
 `ModelControlCapability`, and Pi does not implement that administration

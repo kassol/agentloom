@@ -40,6 +40,10 @@ func TestContextHTTPPromptAndCoverageRoundTrip(t *testing.T) {
 	if len(explain["sources"].([]any)) != 3 {
 		t.Fatalf("context explain = %#v", explain)
 	}
+	missing := topicRequest(t, server, http.MethodGet, "/api/agents/one/context/explain?turnId=turn-missing", nil, http.StatusOK)["context"].(map[string]any)
+	if missing["state"] != "unknown" || missing["turnId"] != "turn-missing" {
+		t.Fatalf("missing Turn context evidence = %#v", missing)
+	}
 	coverage := topicRequest(t, server, http.MethodGet, "/api/agents/one/context/coverage", nil, http.StatusOK)["coverage"].(map[string]any)
 	if coverage["threadId"] != "loom-thread-one" || coverage["epoch"].(map[string]any)["id"] != "initial:thread-one" {
 		t.Fatalf("coverage = %#v", coverage)

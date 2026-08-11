@@ -104,6 +104,22 @@ export interface RuntimeResourceSnapshot {
   };
 }
 
+export interface ContextEvidenceView {
+  agentId: string;
+  agentName: string;
+  threadId: string;
+  turnId?: string;
+  state: "proven" | "unknown" | "unavailable" | string;
+  mode?: "epoch_incremental" | "full_per_turn" | string;
+  reason?: string;
+  sources: Array<{ key: string; revision?: string; hash?: string; channel: string; state: string; covered: boolean }>;
+  deliveries: Array<{ channel: string; role: string; hash: string; content: string }>;
+  unsupportedDimensions: string[];
+  epoch?: { id?: string; windowNumber?: number; compactedAt?: string };
+  policy: string;
+  limitation?: string;
+}
+
 export interface ModelProvider {
   id: string;
   name: string;

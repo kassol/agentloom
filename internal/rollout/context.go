@@ -24,11 +24,21 @@ type ContextHistoryQuery struct {
 // ContextHistoryState identifies the latest replayable context window and
 // whether every requested Loom context delivery is present in that window.
 type ContextHistoryState struct {
-	EpochID               string          `json:"epochId"`
-	WindowNumber          int             `json:"windowNumber,omitempty"`
-	CompactedAt           string          `json:"compactedAt,omitempty"`
-	DeliveriesPersisted   bool            `json:"deliveriesPersisted"`
-	PersistedDeliveryKeys map[string]bool `json:"persistedDeliveryKeys,omitempty"`
+	EpochID               string                `json:"epochId"`
+	WindowNumber          int                   `json:"windowNumber,omitempty"`
+	CompactedAt           string                `json:"compactedAt,omitempty"`
+	TurnObserved          bool                  `json:"turnObserved,omitempty"`
+	TurnEpochID           string                `json:"turnEpochId,omitempty"`
+	TurnWindowNumber      int                   `json:"turnWindowNumber,omitempty"`
+	TurnCompactedAt       string                `json:"turnCompactedAt,omitempty"`
+	TurnDeliveries        []ContextTurnDelivery `json:"turnDeliveries,omitempty"`
+	DeliveriesPersisted   bool                  `json:"deliveriesPersisted"`
+	PersistedDeliveryKeys map[string]bool       `json:"persistedDeliveryKeys,omitempty"`
+}
+
+type ContextTurnDelivery struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 // ContextHistory scans only canonical rollout records. A compaction marker
@@ -36,6 +46,7 @@ type ContextHistoryState struct {
 func ContextHistory(threadID string, query ContextHistoryQuery) (ContextHistoryState, error) {
 	state := ContextHistoryState{EpochID: "initial:" + strings.TrimSpace(threadID)}
 	state.PersistedDeliveryKeys = make(map[string]bool, len(query.Deliveries))
+	pendingDeveloper := []ContextTurnDelivery{}
 	path, err := FindRollout(threadID)
 	if err != nil {
 		if errors.Is(err, ErrRolloutNotFound) {
@@ -71,8 +82,36 @@ func ContextHistory(threadID string, query ContextHistoryQuery) (ContextHistoryS
 				state.WindowNumber = payload.WindowNumber
 				state.CompactedAt = record.Timestamp
 				clear(state.PersistedDeliveryKeys)
+				pendingDeveloper = pendingDeveloper[:0]
 			}
 		case "response_item":
+			message, validMessage := contextResponseMessage(record.Payload)
+			if validMessage {
+				switch message.Role {
+				case "developer":
+					for _, content := range message.Content {
+						if containsLoomRoot(content, "loom_developer_context") {
+							pendingDeveloper = append(pendingDeveloper, ContextTurnDelivery{Role: "developer", Content: content})
+						}
+					}
+				case "user":
+					if strings.TrimSpace(query.TurnID) != "" && message.TurnID == strings.TrimSpace(query.TurnID) {
+						if !state.TurnObserved {
+							state.TurnObserved = true
+							state.TurnEpochID = state.EpochID
+							state.TurnWindowNumber = state.WindowNumber
+							state.TurnCompactedAt = state.CompactedAt
+						}
+						state.TurnDeliveries = append(state.TurnDeliveries, pendingDeveloper...)
+						for _, content := range message.Content {
+							if containsLoomRoot(content, "loom_context") {
+								state.TurnDeliveries = append(state.TurnDeliveries, ContextTurnDelivery{Role: "user", Content: content})
+							}
+						}
+					}
+					pendingDeveloper = pendingDeveloper[:0]
+				}
+			}
 			for _, delivery := range query.Deliveries {
 				key := contextDeliveryProbeKey(delivery)
 				if !state.PersistedDeliveryKeys[key] &&
@@ -95,7 +134,13 @@ func ContextHistory(threadID string, query ContextHistoryQuery) (ContextHistoryS
 	return state, nil
 }
 
-func responseItemContainsContext(payload json.RawMessage, turnID string, delivery ContextDeliveryProbe) bool {
+type contextMessage struct {
+	Role    string
+	TurnID  string
+	Content []string
+}
+
+func contextResponseMessage(payload json.RawMessage) (contextMessage, bool) {
 	var message struct {
 		Type    string `json:"type"`
 		Role    string `json:"role"`
@@ -107,18 +152,34 @@ func responseItemContainsContext(payload json.RawMessage, turnID string, deliver
 			TurnID string `json:"turn_id"`
 		} `json:"internal_chat_message_metadata_passthrough"`
 	}
-	if json.Unmarshal(payload, &message) != nil || message.Type != "message" ||
-		message.Role != strings.TrimSpace(delivery.Role) {
+	if json.Unmarshal(payload, &message) != nil || message.Type != "message" {
+		return contextMessage{}, false
+	}
+	result := contextMessage{Role: strings.TrimSpace(message.Role), TurnID: strings.TrimSpace(message.Metadata.TurnID)}
+	for _, content := range message.Content {
+		if content.Type == "input_text" || content.Type == "text" {
+			result.Content = append(result.Content, content.Text)
+		}
+	}
+	return result, true
+}
+
+func containsLoomRoot(content, root string) bool {
+	content = strings.TrimSpace(content)
+	return strings.HasPrefix(content, "<"+root) && (strings.HasSuffix(content, "</"+root+">") || strings.HasSuffix(content, "/>"))
+}
+
+func responseItemContainsContext(payload json.RawMessage, turnID string, delivery ContextDeliveryProbe) bool {
+	message, ok := contextResponseMessage(payload)
+	if !ok || message.Role != strings.TrimSpace(delivery.Role) {
 		return false
 	}
 	if message.Role == "user" && strings.TrimSpace(turnID) != "" &&
-		message.Metadata.TurnID != strings.TrimSpace(turnID) {
+		message.TurnID != strings.TrimSpace(turnID) {
 		return false
 	}
 	for _, content := range message.Content {
-		if (content.Type == "input_text" || content.Type == "text") &&
-			strings.Contains(content.Text, delivery.Marker) &&
-			sha256Hex(content.Text) == delivery.Hash {
+		if strings.Contains(content, delivery.Marker) && sha256Hex(content) == delivery.Hash {
 			return true
 		}
 	}

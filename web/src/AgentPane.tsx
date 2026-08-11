@@ -2,7 +2,7 @@ import { ArrowDown, ArrowUpRight, BarChart3, CalendarClock, Check, ChevronRight,
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ConversationMembership, type HumanRequest, type InboxEntry, type PlatformConnection, type RuntimeModel, type RuntimeResourceSnapshot, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
+import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ContextEvidenceView, type ConversationMembership, type HumanRequest, type InboxEntry, type PlatformConnection, type RuntimeModel, type RuntimeResourceSnapshot, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
 import { emptyFeed, reduceFeed } from "./feed";
 import type { Block } from "./feed";
 import type { LoomEvent } from "./types";
@@ -119,7 +119,7 @@ export function AgentPane({
   const [sendStatus, setSendStatus] = useState<"idle" | "sending" | "sent" | "failed">("idle");
   const [sendKind, setSendKind] = useState<"task" | "answer" | "compact">("task");
   const [configOpen, setConfigOpen] = useState(false);
-  const [configSection, setConfigSection] = useState<"profile" | "team" | "external" | "triggers" | "runtime" | "resources" | "usage">("profile");
+  const [configSection, setConfigSection] = useState<"profile" | "team" | "external" | "triggers" | "runtime" | "context" | "resources" | "usage">("profile");
   const [nameDraft, setNameDraft] = useState(agent.name);
   const [providerDraft, setProviderDraft] = useState(agent.providerId || "openai");
   const [modelDraft, setModelDraft] = useState(agent.model || "");
@@ -136,6 +136,8 @@ export function AgentPane({
   const [loadingRuntimeResources, setLoadingRuntimeResources] = useState(false);
   const [savingResourceID, setSavingResourceID] = useState("");
   const [resourceRefresh, setResourceRefresh] = useState(0);
+  const [contextEvidence, setContextEvidence] = useState<ContextEvidenceView | null>(null);
+  const [loadingContextEvidence, setLoadingContextEvidence] = useState(false);
   const [profile, setProfile] = useState<AgentProfile | null>(null);
   const [identityDraft, setIdentityDraft] = useState("");
   const [domainDraft, setDomainDraft] = useState("");
@@ -364,7 +366,20 @@ export function AgentPane({
         if (!cancelled) setLoadingRuntimeResources(false);
       });
     return () => { cancelled = true; };
-  }, [configOpen, configSection, agent.id, resourceInventoryAvailable, agent.capabilitySnapshot.revision, resourceRefresh]);
+	}, [configOpen, configSection, agent.id, resourceInventoryAvailable, agent.capabilitySnapshot.revision, resourceRefresh]);
+
+  useEffect(() => {
+    if (!configOpen || configSection !== "context") return;
+    let cancelled = false;
+    const turnId = agent.currentTurnId || agent.lastTurn?.turnId || "";
+	setContextEvidence(null);
+    setLoadingContextEvidence(true);
+    api("GET", `/api/agents/${agent.id}/context/explain${turnId ? `?turnId=${encodeURIComponent(turnId)}` : ""}`)
+      .then((data) => { if (!cancelled) setContextEvidence(data.context as ContextEvidenceView); })
+      .catch((err: Error) => { if (!cancelled) { setContextEvidence(null); onError(err.message); } })
+      .finally(() => { if (!cancelled) setLoadingContextEvidence(false); });
+    return () => { cancelled = true; };
+  }, [configOpen, configSection, agent.id, agent.currentTurnId, agent.lastTurn?.turnId]);
 
   const setResourceEnabled = async (resource: RuntimeResourceSnapshot["resources"][number], enabled: boolean) => {
     if (!runtimeResources || savingResourceID) return;
@@ -1120,6 +1135,7 @@ export function AgentPane({
                 <button onClick={() => setConfigSection("external")} className={`h-7 rounded px-3 ${configSection === "external" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>External</button>
                 <button onClick={() => setConfigSection("triggers")} className={`h-7 rounded px-3 ${configSection === "triggers" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Triggers</button>
                 <button onClick={() => setConfigSection("runtime")} className={`h-7 rounded px-3 ${configSection === "runtime" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Runtime</button>
+                <button onClick={() => setConfigSection("context")} className={`h-7 rounded px-3 ${configSection === "context" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Context</button>
                 <button onClick={() => setConfigSection("resources")} disabled={!resourceInventoryAvailable} title={!resourceInventoryAvailable ? `Resources are unavailable for the ${agent.runtimeBinding.kind} Runtime` : undefined} className={`h-7 rounded px-3 disabled:cursor-not-allowed disabled:opacity-40 ${configSection === "resources" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Resources</button>
                 <button onClick={() => setConfigSection("usage")} disabled={!usageAvailable} title={!usageAvailable ? `Usage is unavailable for the ${agent.runtimeBinding.kind} Runtime` : undefined} className={`h-7 rounded px-3 disabled:cursor-not-allowed disabled:opacity-40 ${configSection === "usage" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Usage</button>
               </div>
@@ -1230,6 +1246,29 @@ export function AgentPane({
 					<button onClick={saveConfig} disabled={running || savingConfig} className="rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-medium text-primary-foreground transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60">{savingConfig ? "Saving Agent Config" : "Save Agent Config"}</button>
                   </div>
                 </>
+              ) : configSection === "context" ? (
+                loadingContextEvidence ? (
+                  <div className="py-8 text-center text-[12px] text-muted-foreground">Loading context evidence...</div>
+                ) : contextEvidence ? (
+                  <div className="space-y-3 text-[11px]">
+                    <div className="rounded-md border border-border bg-muted/20 p-2.5">
+                      <div className="flex items-center justify-between gap-2"><span className="font-medium">Delivery evidence</span><span className={`font-mono text-[10px] ${contextEvidence.state === "proven" ? "text-success" : "text-warning"}`}>{contextEvidence.state}</span></div>
+                      <div className="mt-1 font-mono text-[9px] text-muted-foreground">{contextEvidence.mode || "policy unavailable"}{contextEvidence.turnId ? ` · Turn ${contextEvidence.turnId}` : ""}</div>
+                      <p className="mt-2 leading-4 text-muted-foreground">{contextEvidence.reason || contextEvidence.policy}</p>
+                    </div>
+                    <div className="divide-y divide-border border-y border-border">
+                      {contextEvidence.sources.map((source) => <div key={`${source.key}:${source.revision || ""}`} className="flex min-w-0 items-center gap-2 py-2">
+                        <span className={`size-2 shrink-0 rounded-full ${source.covered || source.state === "delivered" ? "bg-success" : "bg-warning"}`} />
+                        <span className="min-w-0 flex-1 truncate font-medium">{source.key}</span>
+                        <span className="truncate font-mono text-[9px] text-muted-foreground">{source.revision || source.state}</span>
+                        <span className="font-mono text-[9px] text-muted-foreground">{source.channel}</span>
+                      </div>)}
+                      {contextEvidence.sources.length === 0 ? <div className="py-5 text-center text-muted-foreground">No attributable context sources.</div> : null}
+                    </div>
+                    {contextEvidence.unsupportedDimensions.length > 0 ? <p className="rounded-md bg-warning/10 px-2.5 py-2 leading-4 text-warning">Unsupported evidence dimensions: {contextEvidence.unsupportedDimensions.join(", ")}.</p> : null}
+                    {contextEvidence.limitation ? <p className="leading-4 text-muted-foreground">{contextEvidence.limitation}</p> : null}
+                  </div>
+                ) : <div className="py-8 text-center text-[12px] text-muted-foreground">Context evidence unavailable.</div>
               ) : configSection === "resources" ? (
 				loadingRuntimeResources ? (
 				  <div className="py-8 text-center text-[12px] text-muted-foreground">Loading Runtime resources...</div>

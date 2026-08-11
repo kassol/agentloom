@@ -287,11 +287,15 @@ loom context coverage AGENT --json
 GET    /api/context/agent-prompt
 PUT    /api/context/agent-prompt
 DELETE /api/context/agent-prompt
-GET    /api/agents/{agent}/context/explain
+GET    /api/agents/{agent}/context/explain?turnId={loomTurnId}
 GET    /api/agents/{agent}/context/coverage
 ```
 
 `explain` 和 `coverage` 是只读观察，不会因为读取而把 missing source 标成 covered。
+`explain` 对 Codex 与 Pi 使用同一个响应模型。Codex 保留 epoch、coverage、replay 和
+resend 维度；Pi 只报告 full-per-Turn policy 及 durable Session 中能逐字证明的
+`loom_developer_context` / `loom_context` blocks，并明确列出不支持的 Codex-specific
+维度。两者都只接受 Loom Turn ID，native correlation 和文件路径不进入公共响应。
 
 ### 常见判断
 

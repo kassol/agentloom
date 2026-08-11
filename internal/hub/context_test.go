@@ -94,7 +94,11 @@ func TestGoalContextRevisionAndClearTombstoneAreDelivered(t *testing.T) {
 
 	h.runtimes[agent.ID] = &runtime{runtimeContract: &controlPlaneContract{contextMode: runtimecontract.ContextDeliveryFullPerTurn}}
 	pi, err := h.prepareTurnContext(agent.ID, authenticatedOwnerContext("direct_input", "", "", ""), nil)
-	if err != nil || !strings.Contains(pi.InputContext, `cleared="true"`) {
+	if err != nil || !strings.Contains(pi.InputContext, `cleared="true"`) ||
+		!strings.Contains(pi.DeveloperContext, `prompt_revision="builtin:2"`) ||
+		!strings.Contains(pi.DeveloperContext, `prompt_hash="`) ||
+		!strings.Contains(pi.DeveloperContext, `profile_revision="profile:0"`) ||
+		!strings.Contains(pi.DeveloperContext, `profile_hash="`) {
 		t.Fatalf("Pi full-per-turn Goal tombstone = %#v, err=%v", pi, err)
 	}
 }

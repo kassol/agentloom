@@ -163,6 +163,209 @@ func (c *piRuntimeContract) InspectUsage(ctx context.Context, binding runtimecon
 	return projectPiUsage(entries), nil
 }
 
+func (c *piRuntimeContract) InspectContextEvidence(ctx context.Context, binding runtimecontract.Binding, query runtimecontract.ContextEvidenceQuery) (runtimecontract.ContextEvidence, *runtimecontract.Failure) {
+	report := runtimecontract.ContextEvidence{
+		State: runtimecontract.ContextEvidenceUnknown, TurnID: query.TurnID,
+		Mode: runtimecontract.ContextDeliveryFullPerTurn, Sources: []runtimecontract.ContextEvidenceSource{},
+		Deliveries:            []runtimecontract.ContextEvidenceDelivery{},
+		UnsupportedDimensions: []string{"coverage", "epoch", "replay", "resend"},
+	}
+	if err := ctx.Err(); err != nil {
+		report.State, report.Reason = runtimecontract.ContextEvidenceUnavailable, "Runtime evidence inspection was cancelled"
+		return report, nil
+	}
+	entries, _, err := readPiSessionEntries(binding.NativeRef)
+	if err != nil {
+		report.State, report.Reason = runtimecontract.ContextEvidenceUnavailable, "Pi Session evidence is unreadable"
+		return report, nil
+	}
+	matched := false
+	developerComplete, inputComplete := false, false
+	for _, entry := range entries {
+		if entry.ID != query.RuntimeTurnRef {
+			continue
+		}
+		if matched {
+			report.State, report.Reason = runtimecontract.ContextEvidenceUnavailable, "Pi Turn evidence is ambiguous"
+			return report, nil
+		}
+		matched = true
+		var message piSessionMessage
+		if entry.Type != "message" || json.Unmarshal(entry.Message, &message) != nil || message.Role != "user" {
+			report.State, report.Reason = runtimecontract.ContextEvidenceUnavailable, "Pi Turn evidence is malformed"
+			return report, nil
+		}
+		text := piContentText(piMessageContent(message.Content))
+		for _, delivery := range []struct {
+			root, channel string
+		}{{"loom_developer_context", "developer"}, {"loom_context", "input"}} {
+			content := piLoomDelivery(text, delivery.root)
+			if content == "" {
+				continue
+			}
+			report.Deliveries = append(report.Deliveries, runtimecontract.ContextEvidenceDelivery{
+				Channel: delivery.channel, Role: "user",
+				Hash: sha256Hex([]byte(content)), Content: content,
+			})
+			sources, valid := piContextEvidenceSources(content, delivery.channel)
+			if !valid {
+				report.State, report.Reason = runtimecontract.ContextEvidenceUnavailable, "Pi Turn contains malformed Loom context evidence"
+				return report, nil
+			}
+			if delivery.channel == "developer" {
+				developerComplete = contextEvidenceHasSources(sources, "loom_agent_prompt", "loom_agent_profile")
+			} else {
+				inputComplete = contextEvidenceHasSources(sources, "loom_agent_relationships")
+			}
+			report.Sources = append(report.Sources, sources...)
+		}
+		if len(report.Deliveries) == 0 {
+			report.Reason = "Pi Turn contains no provable Loom context"
+			return report, nil
+		}
+		if !developerComplete || !inputComplete {
+			report.Reason = "Pi Turn contains incomplete full-per-Turn Loom context evidence"
+			return report, nil
+		}
+		report.State = runtimecontract.ContextEvidenceProven
+	}
+	if matched {
+		return report, nil
+	}
+	report.Reason = "No durable Runtime correlation exists for this Loom Turn"
+	return report, nil
+}
+
+func contextEvidenceHasSources(sources []runtimecontract.ContextEvidenceSource, keys ...string) bool {
+	found := make(map[string]bool, len(sources))
+	for _, source := range sources {
+		found[source.Key] = true
+	}
+	for _, key := range keys {
+		if !found[key] {
+			return false
+		}
+	}
+	return true
+}
+
+func piLoomDelivery(text, root string) string {
+	start := strings.Index(text, "<"+root)
+	if root == "loom_context" {
+		start = strings.LastIndex(text, "<"+root)
+	}
+	if start < 0 {
+		return ""
+	}
+	endTag := "</" + root + ">"
+	end := strings.Index(text[start:], endTag)
+	if end < 0 {
+		return ""
+	}
+	return text[start : start+end+len(endTag)]
+}
+
+func piContextEvidenceSources(content, channel string) ([]runtimecontract.ContextEvidenceSource, bool) {
+	decoder := xml.NewDecoder(strings.NewReader(content))
+	sources := []runtimecontract.ContextEvidenceSource{}
+	seen := map[string]bool{}
+	root := ""
+	depth := 0
+	valid := true
+	add := func(key, revision, hash string) {
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		sources = append(sources, runtimecontract.ContextEvidenceSource{Key: key, Revision: revision, Hash: hash, Channel: channel, State: "delivered"})
+	}
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, false
+		}
+		start, ok := token.(xml.StartElement)
+		if end, ok := token.(xml.EndElement); ok {
+			if depth == 1 && end.Name.Local != root {
+				return nil, false
+			}
+			depth--
+			continue
+		}
+		if chars, ok := token.(xml.CharData); ok {
+			if depth == 0 && strings.TrimSpace(string(chars)) != "" {
+				return nil, false
+			}
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if depth == 0 {
+			if root != "" {
+				return nil, false
+			}
+			root = start.Name.Local
+			if root != "loom_developer_context" && root != "loom_context" {
+				return nil, false
+			}
+			if channel == "developer" && root != "loom_developer_context" || channel == "input" && root != "loom_context" {
+				return nil, false
+			}
+		}
+		depth++
+		attrs := map[string]string{}
+		for _, attr := range start.Attr {
+			attrs[attr.Name.Local] = attr.Value
+		}
+		switch start.Name.Local {
+		case "loom_developer_context":
+			promptRevision, promptHash := attrs["prompt_revision"], attrs["prompt_hash"]
+			profileRevision, profileHash := attrs["profile_revision"], attrs["profile_hash"]
+			if (promptRevision == "") != (promptHash == "") || (profileRevision == "") != (profileHash == "") || promptRevision == "" && profileRevision == "" {
+				valid = false
+				continue
+			}
+			add("loom_agent_prompt", promptRevision, promptHash)
+			add("loom_agent_profile", profileRevision, profileHash)
+		case "loom_agent_relationships":
+			if attrs["revision"] == "" || attrs["hash"] == "" {
+				valid = false
+				continue
+			}
+			add("loom_agent_relationships", attrs["revision"], attrs["hash"])
+		case "loom_agent_goal":
+			if attrs["id"] == "" || attrs["revision"] == "" {
+				valid = false
+				continue
+			}
+			add("loom_agent_goal", "goal:"+attrs["id"]+":"+attrs["revision"], "")
+		case "loom_turn_context":
+			kind := attrs["kind"]
+			if kind == "" || ((kind == "agent_message" || kind == "inbox_message" || kind == "needs_you_answer") && attrs["ref_id"] == "") || kind == "topic_input" && attrs["topic_id"] == "" {
+				valid = false
+				continue
+			}
+			add("turn_source", kind+":"+attrs["ref_id"], "")
+			switch kind {
+			case "agent_message", "inbox_message":
+				add("message", attrs["ref_id"], "")
+			case "topic_input":
+				add("topic", attrs["topic_id"], "")
+			case "needs_you_answer":
+				add("needs_you", attrs["ref_id"], "")
+			}
+			if attrs["topic_id"] != "" {
+				add("topic", attrs["topic_id"], "")
+			}
+		}
+	}
+	return sources, valid && root != "" && depth == 0
+}
+
 func piUsageFailure(err error) *runtimecontract.Failure {
 	return &runtimecontract.Failure{Code: "usage_inspection_failed", Phase: runtimecontract.FailurePhaseUsageInspection, Message: "Pi usage could not be inspected", Diagnostic: err.Error(), Cause: err}
 }

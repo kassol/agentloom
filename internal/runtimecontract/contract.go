@@ -133,6 +133,64 @@ type ContextDeliveryPolicy interface {
 	ContextDeliveryMode() ContextDeliveryMode
 }
 
+// ContextEvidenceCapability passively explains what Loom context a Runtime
+// can prove for one canonical Turn. Runtime-native identifiers stay inside the
+// adapter call and must never be copied into the returned evidence.
+type ContextEvidenceCapability interface {
+	ContextDeliveryPolicy
+	InspectContextEvidence(context.Context, Binding, ContextEvidenceQuery) (ContextEvidence, *Failure)
+}
+
+type ContextEvidenceState string
+
+const (
+	ContextEvidenceProven      ContextEvidenceState = "proven"
+	ContextEvidenceUnknown     ContextEvidenceState = "unknown"
+	ContextEvidenceUnavailable ContextEvidenceState = "unavailable"
+)
+
+type ContextEvidenceQuery struct {
+	TurnID         string                 `json:"turnId"`
+	RuntimeTurnRef string                 `json:"-"`
+	Deliveries     []ContextDeliveryProbe `json:"deliveries,omitempty"`
+}
+
+type ContextDeliveryProbe struct {
+	Role   string `json:"role"`
+	Marker string `json:"marker"`
+	Hash   string `json:"hash"`
+}
+
+type ContextEvidenceDelivery struct {
+	Channel string `json:"channel"`
+	Role    string `json:"role"`
+	Hash    string `json:"hash"`
+	Content string `json:"content"`
+}
+
+type ContextEvidenceSource struct {
+	Key      string `json:"key"`
+	Revision string `json:"revision,omitempty"`
+	Hash     string `json:"hash,omitempty"`
+	Channel  string `json:"channel"`
+	State    string `json:"state"`
+}
+
+type ContextEvidence struct {
+	State                 ContextEvidenceState      `json:"state"`
+	TurnID                string                    `json:"turnId"`
+	Mode                  ContextDeliveryMode       `json:"mode"`
+	Reason                string                    `json:"reason,omitempty"`
+	Sources               []ContextEvidenceSource   `json:"sources"`
+	Deliveries            []ContextEvidenceDelivery `json:"deliveries"`
+	UnsupportedDimensions []string                  `json:"unsupportedDimensions"`
+	EpochID               string                    `json:"epochId,omitempty"`
+	WindowNumber          int                       `json:"windowNumber,omitempty"`
+	CompactedAt           string                    `json:"compactedAt,omitempty"`
+	DeliveriesPersisted   bool                      `json:"deliveriesPersisted,omitempty"`
+	PersistedDeliveryKeys map[string]bool           `json:"persistedDeliveryKeys,omitempty"`
+}
+
 // ModelControlCapability is the optional, Runtime-neutral model-control
 // surface. Provider administration and credentials remain Host concerns; this
 // capability only describes and selects models already available to one

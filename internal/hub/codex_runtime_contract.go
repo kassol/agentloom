@@ -63,25 +63,67 @@ type codexNativeApprovalResponse struct {
 	id     json.RawMessage
 }
 
+var _ runtimecontract.ContextEvidenceCapability = (*codexRuntimeContract)(nil)
+
 func (c *codexRuntimeContract) ContractVersion() int { return runtimecontract.Version }
 
 func (c *codexRuntimeContract) ContextDeliveryMode() runtimecontract.ContextDeliveryMode {
 	return runtimecontract.ContextDeliveryEpochIncremental
 }
 
-func (c *codexRuntimeContract) RuntimeContextEvidence(_ context.Context, binding runtimecontract.Binding, query RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error) {
+func (c *codexRuntimeContract) InspectContextEvidence(_ context.Context, binding runtimecontract.Binding, query runtimecontract.ContextEvidenceQuery) (runtimecontract.ContextEvidence, *runtimecontract.Failure) {
 	nativeQuery := rollout.ContextHistoryQuery{TurnID: query.TurnID, Deliveries: make([]rollout.ContextDeliveryProbe, 0, len(query.Deliveries))}
+	if query.RuntimeTurnRef != "" {
+		nativeQuery.TurnID = query.RuntimeTurnRef
+	}
 	for _, delivery := range query.Deliveries {
 		nativeQuery.Deliveries = append(nativeQuery.Deliveries, rollout.ContextDeliveryProbe{Role: delivery.Role, Marker: delivery.Marker, Hash: delivery.Hash})
 	}
 	state, err := rollout.ContextHistory(binding.NativeRef, nativeQuery)
 	if err != nil {
-		return RuntimeContextEvidence{}, err
+		return runtimecontract.ContextEvidence{}, &runtimecontract.Failure{Code: "context_evidence_failed", Phase: runtimecontract.FailurePhaseContextDelivery, Message: "Codex context evidence could not be inspected", Diagnostic: err.Error(), Cause: err}
 	}
-	return RuntimeContextEvidence{
+	evidenceState := runtimecontract.ContextEvidenceUnknown
+	if len(query.Deliveries) > 0 && state.DeliveriesPersisted {
+		evidenceState = runtimecontract.ContextEvidenceProven
+	}
+	report := runtimecontract.ContextEvidence{
+		State: evidenceState, TurnID: query.TurnID, Mode: runtimecontract.ContextDeliveryEpochIncremental,
+		Sources: []runtimecontract.ContextEvidenceSource{}, Deliveries: []runtimecontract.ContextEvidenceDelivery{}, UnsupportedDimensions: []string{},
 		EpochID: state.EpochID, WindowNumber: state.WindowNumber, CompactedAt: state.CompactedAt,
 		DeliveriesPersisted: state.DeliveriesPersisted, PersistedDeliveryKeys: state.PersistedDeliveryKeys,
-	}, nil
+	}
+	if query.RuntimeTurnRef == "" {
+		return report, nil
+	}
+	if !state.TurnObserved {
+		report.Reason = "Codex Turn is not present in durable rollout evidence"
+		return report, nil
+	}
+	report.EpochID, report.WindowNumber, report.CompactedAt = state.TurnEpochID, state.TurnWindowNumber, state.TurnCompactedAt
+	for _, delivery := range state.TurnDeliveries {
+		channel := "input"
+		if delivery.Role == "developer" {
+			channel = "developer"
+		}
+		sources, valid := piContextEvidenceSources(delivery.Content, channel)
+		if !valid {
+			report.State, report.Reason = runtimecontract.ContextEvidenceUnavailable, "Codex Turn contains malformed Loom context evidence"
+			report.Sources = []runtimecontract.ContextEvidenceSource{}
+			report.Deliveries = []runtimecontract.ContextEvidenceDelivery{}
+			return report, nil
+		}
+		report.Sources = append(report.Sources, sources...)
+		report.Deliveries = append(report.Deliveries, runtimecontract.ContextEvidenceDelivery{
+			Channel: channel, Role: delivery.Role, Hash: sha256Hex([]byte(delivery.Content)), Content: delivery.Content,
+		})
+	}
+	if len(report.Deliveries) == 0 {
+		report.Reason = "Codex Turn is durable but contains no Turn-scoped Loom context delivery"
+		return report, nil
+	}
+	report.State, report.Reason = runtimecontract.ContextEvidenceProven, ""
+	return report, nil
 }
 
 func (c *codexRuntimeContract) SetRuntimeSandbox(value string) {

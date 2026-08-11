@@ -96,18 +96,25 @@ type ContextSourceView struct {
 	Revision string `json:"revision"`
 	Hash     string `json:"hash"`
 	Channel  string `json:"channel"`
+	State    string `json:"state"`
 	Covered  bool   `json:"covered"`
 }
 
 type ContextExplainView struct {
-	AgentID    string                  `json:"agentId"`
-	AgentName  string                  `json:"agentName"`
-	ThreadID   string                  `json:"threadId"`
-	Epoch      ContextEpoch            `json:"epoch"`
-	Sources    []ContextSourceView     `json:"sources"`
-	Pending    *ContextDeliveryAttempt `json:"pending,omitempty"`
-	Policy     string                  `json:"policy"`
-	Limitation string                  `json:"limitation"`
+	AgentID               string                                    `json:"agentId"`
+	AgentName             string                                    `json:"agentName"`
+	ThreadID              string                                    `json:"threadId"`
+	TurnID                string                                    `json:"turnId,omitempty"`
+	State                 runtimecontract.ContextEvidenceState      `json:"state"`
+	Mode                  runtimecontract.ContextDeliveryMode       `json:"mode"`
+	Reason                string                                    `json:"reason,omitempty"`
+	Epoch                 *ContextEpoch                             `json:"epoch,omitempty"`
+	Sources               []ContextSourceView                       `json:"sources"`
+	Deliveries            []runtimecontract.ContextEvidenceDelivery `json:"deliveries"`
+	UnsupportedDimensions []string                                  `json:"unsupportedDimensions"`
+	Pending               *ContextDeliveryAttempt                   `json:"pending,omitempty"`
+	Policy                string                                    `json:"policy"`
+	Limitation            string                                    `json:"limitation"`
 }
 
 type turnContextSource struct {
@@ -429,7 +436,7 @@ func (h *Hub) prepareTurnContext(agentID string, source turnContextSource, artif
 	}
 	h.mu.Unlock()
 	if mode == runtimecontract.ContextDeliveryFullPerTurn {
-		developerContext := renderPiDeveloperContext(compiledAt, developerPayload)
+		developerContext := renderPiDeveloperContext(compiledAt, developerPayload, fragments)
 		if len(developerContext) > maxDeveloperContextBytes {
 			return TurnContextPlan{}, errf(409, "compiled Loom Developer context is %d bytes; maximum is %d bytes and it will not be truncated", len(developerContext), maxDeveloperContextBytes)
 		}
@@ -520,11 +527,26 @@ func (h *Hub) prepareTurnContext(agentID string, source turnContextSource, artif
 	return plan, nil
 }
 
-func renderPiDeveloperContext(compiledAt, payload string) string {
+func renderPiDeveloperContext(compiledAt, payload string, fragments []contextFragment) string {
 	if strings.TrimSpace(payload) == "" {
 		return ""
 	}
-	return `<loom_developer_context version="1" compiled_at="` + xmlEscape(compiledAt) + `" complete="true" atomic="true">` + "\n" + payload + "\n</loom_developer_context>"
+	var b strings.Builder
+	b.WriteString(`<loom_developer_context version="1" compiled_at="` + xmlEscape(compiledAt) + `" complete="true" atomic="true"`)
+	for _, fragment := range fragments {
+		switch fragment.Key {
+		case "loom_agent_prompt":
+			writeXMLAttribute(&b, "prompt_revision", fragment.Revision)
+			writeXMLAttribute(&b, "prompt_hash", fragment.Hash)
+		case "loom_agent_profile":
+			writeXMLAttribute(&b, "profile_revision", fragment.Revision)
+			writeXMLAttribute(&b, "profile_hash", fragment.Hash)
+		}
+	}
+	b.WriteString(">\n")
+	b.WriteString(payload)
+	b.WriteString("\n</loom_developer_context>")
+	return b.String()
 }
 
 func contextFragmentsForChannel(all, selected []contextFragment, channel string) []contextFragment {
@@ -598,10 +620,6 @@ func (h *Hub) reconcilePendingContext(ledger *ContextCoverageLedger) error {
 	return h.reconcilePendingContextUsing(ledger, h.contextHistory)
 }
 
-func (h *Hub) reconcilePendingContextLocked(ledger *ContextCoverageLedger) error {
-	return h.reconcilePendingContextUsing(ledger, h.contextHistoryLocked)
-}
-
 func (h *Hub) reconcilePendingContextUsing(ledger *ContextCoverageLedger, read func(string, RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error)) error {
 	if ledger == nil || ledger.Pending == nil || ledger.Pending.EpochID != ledger.Epoch.ID {
 		return nil
@@ -612,10 +630,10 @@ func (h *Hub) reconcilePendingContextUsing(ledger *ContextCoverageLedger, read f
 	}
 	query := RuntimeContextEvidenceQuery{
 		TurnID:     pending.TurnID,
-		Deliveries: make([]RuntimeContextDeliveryProbe, 0, len(pending.Deliveries)),
+		Deliveries: make([]runtimecontract.ContextDeliveryProbe, 0, len(pending.Deliveries)),
 	}
 	for _, delivery := range pending.Deliveries {
-		query.Deliveries = append(query.Deliveries, RuntimeContextDeliveryProbe{
+		query.Deliveries = append(query.Deliveries, runtimecontract.ContextDeliveryProbe{
 			Role: delivery.Role, Marker: delivery.Marker, Hash: delivery.Hash,
 		})
 	}
@@ -701,7 +719,6 @@ func (h *Hub) observeContextModelEventLocked(meta *Agent, turn *turnState) {
 	if ledger.Pending.TurnID == "" {
 		ledger.Pending.TurnID = turn.turnID
 	}
-	observedNow := false
 	if ledger.Pending.ModelEventObservedAt == "" {
 		ledger.Pending.ModelEventObservedAt = now()
 		ledger.Pending.State = "model_observed"
@@ -709,11 +726,8 @@ func (h *Hub) observeContextModelEventLocked(meta *Agent, turn *turnState) {
 		if err := h.st.SaveContextCoverage(meta.RuntimeBinding.NativeRef, ledger); err != nil {
 			return
 		}
-		observedNow = true
 	}
-	if observedNow {
-		_ = h.reconcilePendingContextLocked(&ledger)
-	}
+	// Adapter evidence is reconciled by the next read or Turn preparation.
 }
 
 func isModelProducedNotification(method string) bool {
@@ -738,11 +752,14 @@ func (h *Hub) ContextCoverage(key string) (ContextCoverageLedger, error) {
 		return ContextCoverageLedger{}, err
 	}
 	ledger, err := h.loadContextCoverage(agentID, runtimeRef, history, false)
+	if err == nil {
+		err = h.reconcilePendingContext(&ledger)
+	}
 	ledger.ThreadID = threadID
 	return ledger, err
 }
 
-func (h *Hub) ExplainContext(key string) (ContextExplainView, error) {
+func (h *Hub) ExplainTurnContext(key, turnID string) (ContextExplainView, error) {
 	h.mu.Lock()
 	agent := h.resolveLocked(strings.TrimSpace(key))
 	if agent == nil {
@@ -750,30 +767,126 @@ func (h *Hub) ExplainContext(key string) (ContextExplainView, error) {
 		return ContextExplainView{}, errf(404, "agent not found: %s", key)
 	}
 	agentID, agentName, threadID := agent.ID, agent.Name, agent.ThreadID
+	binding := runtimeContractBinding(agent)
+	turnID = strings.TrimSpace(turnID)
+	runtimeTurnRef := agent.RuntimeTurnBindings[turnID]
+	capability, capabilityErr := h.contextEvidenceCapabilityForAgentLocked(agent)
+	mode := runtimecontract.ContextDeliveryMode("")
+	if capabilityErr == nil {
+		mode = capability.ContextDeliveryMode()
+	}
 	h.mu.Unlock()
+	view := ContextExplainView{
+		AgentID: agentID, AgentName: agentName, ThreadID: threadID, TurnID: turnID,
+		State: runtimecontract.ContextEvidenceUnknown, Mode: mode, Sources: []ContextSourceView{},
+		Deliveries: []runtimecontract.ContextEvidenceDelivery{}, UnsupportedDimensions: contextEvidenceUnsupportedDimensions(mode),
+		Policy: "Loom context is delivered according to the Runtime's declared policy and only marked proven from passive durable evidence.",
+	}
+	view.Limitation = contextEvidenceLimitation(mode)
+	if turnID != "" && runtimeTurnRef == "" {
+		view.Reason = "No durable Runtime correlation exists for this Loom Turn"
+		return view, nil
+	}
+	if capabilityErr != nil {
+		view.State, view.Reason = runtimecontract.ContextEvidenceUnavailable, "This Runtime does not expose passive context evidence"
+		return view, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	evidence, failure := capability.InspectContextEvidence(ctx, binding, runtimecontract.ContextEvidenceQuery{TurnID: turnID, RuntimeTurnRef: runtimeTurnRef})
+	cancel()
+	h.mu.Lock()
+	current := h.agents[agentID]
+	stable := current != nil && runtimeContractBinding(current) == binding && current.RuntimeTurnBindings[turnID] == runtimeTurnRef
+	h.mu.Unlock()
+	if !stable {
+		view.Reason = "Agent binding or Turn correlation changed during evidence inspection"
+		return view, nil
+	}
+	if failure != nil {
+		view.State, view.Reason = runtimecontract.ContextEvidenceUnavailable, failure.Message
+		return view, nil
+	}
+	view.State, view.Reason = evidence.State, evidence.Reason
+	view.Deliveries = append(view.Deliveries, evidence.Deliveries...)
+	if len(evidence.UnsupportedDimensions) > 0 {
+		view.UnsupportedDimensions = append([]string(nil), evidence.UnsupportedDimensions...)
+	}
+	if evidence.EpochID != "" {
+		view.Epoch = &ContextEpoch{ID: publicContextEpochID(evidence.EpochID), WindowNumber: evidence.WindowNumber, CompactedAt: evidence.CompactedAt}
+	}
+	for _, source := range evidence.Sources {
+		view.Sources = append(view.Sources, ContextSourceView{Key: source.Key, Revision: source.Revision, Hash: source.Hash, Channel: source.Channel, State: source.State, Covered: source.State == "covered"})
+	}
+	if mode == runtimecontract.ContextDeliveryFullPerTurn {
+		return view, nil
+	}
+	if turnID != "" {
+		return view, nil
+	}
 	compiledAt := now()
 	fragments, _, _, _, _, _, err := h.currentContextFragments(agentID, compiledAt)
 	if err != nil {
 		return ContextExplainView{}, err
 	}
-	ledger, err := h.ContextCoverage(agentID)
+	h.contextCoverageMu.Lock()
+	ledger, err := h.loadContextCoverage(agentID, binding.NativeRef, evidence, false)
+	h.contextCoverageMu.Unlock()
 	if err != nil {
 		return ContextExplainView{}, err
 	}
-	view := ContextExplainView{
-		AgentID: agentID, AgentName: agentName, ThreadID: threadID, Epoch: ledger.Epoch,
-		Pending:    ledger.Pending,
-		Policy:     "The Loom Agent Prompt template and complete Agent Profile snapshot are rendered as one atomic Developer message while retaining separate logical coverage. Other durable and bounded context is delivered through Turn input.",
-		Limitation: "A compaction during an active Turn is recovered at the next Turn start; this version does not restore context inside the same Turn.",
+	ledger.ThreadID = threadID
+	publicEpoch := ledger.Epoch
+	publicEpoch.ID = publicContextEpochID(publicEpoch.ID)
+	view.Epoch = &publicEpoch
+	view.Pending = cloneContextAttempt(ledger.Pending)
+	if view.Pending != nil {
+		view.Pending.EpochID = publicContextEpochID(view.Pending.EpochID)
 	}
+	view.Limitation = contextEvidenceLimitation(mode)
+	allCovered := len(fragments) > 0
 	for _, fragment := range fragments {
 		covered := ledger.Covered[fragment.Key]
+		isCovered := covered.Revision == fragment.Revision && covered.Hash == fragment.Hash
+		allCovered = allCovered && isCovered
+		state := "missing"
+		if isCovered {
+			state = "covered"
+		}
 		view.Sources = append(view.Sources, ContextSourceView{
 			Key: fragment.Key, Revision: fragment.Revision, Hash: fragment.Hash, Channel: fragment.Channel,
-			Covered: covered.Revision == fragment.Revision && covered.Hash == fragment.Hash,
+			State: state, Covered: isCovered,
 		})
 	}
+	if allCovered {
+		view.State, view.Reason = runtimecontract.ContextEvidenceProven, ""
+	} else if view.Reason == "" {
+		view.Reason = "Current context coverage is incomplete in this Runtime epoch"
+	}
 	return view, nil
+}
+
+func contextEvidenceUnsupportedDimensions(mode runtimecontract.ContextDeliveryMode) []string {
+	if mode == runtimecontract.ContextDeliveryFullPerTurn {
+		return []string{"coverage", "epoch", "replay", "resend"}
+	}
+	return []string{}
+}
+
+func contextEvidenceLimitation(mode runtimecontract.ContextDeliveryMode) string {
+	if mode == runtimecontract.ContextDeliveryFullPerTurn {
+		return "This Runtime proves full delivery per Turn and does not expose Codex-specific epochs, coverage percentages, replay, or resend attempts."
+	}
+	if mode == runtimecontract.ContextDeliveryEpochIncremental {
+		return "A compaction during an active Turn is recovered at the next Turn start; this version does not restore context inside the same Turn."
+	}
+	return ""
+}
+
+func publicContextEpochID(epochID string) string {
+	if strings.TrimSpace(epochID) == "" {
+		return ""
+	}
+	return "epoch:" + sha256Hex([]byte(epochID))[:16]
 }
 
 func (h *Hub) contextHistory(threadID string, query RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error) {
@@ -781,33 +894,31 @@ func (h *Hub) contextHistory(threadID string, query RuntimeContextEvidenceQuery)
 		return h.contextHistoryProbe(threadID, query)
 	}
 	h.mu.Lock()
-	capability, binding, err := h.contextEvidenceCapabilityLocked(threadID)
+	capability, binding, agentID, runtimeTurnRef, err := h.contextEvidenceCapabilityLocked(threadID, query.TurnID)
 	h.mu.Unlock()
 	if err != nil {
 		return RuntimeContextEvidence{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	return capability.RuntimeContextEvidence(ctx, binding, query)
-}
-
-// contextHistoryLocked is used only from the canonical event reducer, which
-// already owns h.mu. It preserves the reducer's atomic coverage transition
-// without recursively acquiring the Hub mutex.
-func (h *Hub) contextHistoryLocked(threadID string, query RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error) {
-	if h.contextHistoryProbe != nil {
-		return h.contextHistoryProbe(threadID, query)
-	}
-	capability, binding, err := h.contextEvidenceCapabilityLocked(threadID)
-	if err != nil {
-		return RuntimeContextEvidence{}, err
+	if query.TurnID != "" {
+		query.RuntimeTurnRef = runtimeTurnRef
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return capability.RuntimeContextEvidence(ctx, binding, query)
+	evidence, failure := capability.InspectContextEvidence(ctx, binding, query)
+	h.mu.Lock()
+	current := h.agents[agentID]
+	stable := current != nil && runtimeContractBinding(current) == binding && current.RuntimeTurnBindings[query.TurnID] == runtimeTurnRef
+	h.mu.Unlock()
+	if !stable {
+		return RuntimeContextEvidence{}, fmt.Errorf("Agent binding or Turn correlation changed during context evidence inspection")
+	}
+	if failure != nil {
+		return RuntimeContextEvidence{}, fmt.Errorf("%s", failure.Message)
+	}
+	return evidence, nil
 }
 
-func (h *Hub) contextEvidenceCapabilityLocked(threadID string) (runtimeContextEvidenceCapability, runtimecontract.Binding, error) {
+func (h *Hub) contextEvidenceCapabilityLocked(threadID, turnID string) (runtimecontract.ContextEvidenceCapability, runtimecontract.Binding, string, string, error) {
 	var meta *Agent
 	for _, candidate := range h.agents {
 		if candidate.RuntimeBinding.NativeRef == threadID {
@@ -816,23 +927,28 @@ func (h *Hub) contextEvidenceCapabilityLocked(threadID string) (runtimeContextEv
 		}
 	}
 	if meta == nil {
-		return nil, runtimecontract.Binding{}, fmt.Errorf("Runtime binding for context evidence was not found")
+		return nil, runtimecontract.Binding{}, "", "", fmt.Errorf("Runtime binding for context evidence was not found")
 	}
-	driver, err := h.runtimeHostDriverLocked(meta.RuntimeBinding.Kind)
 	binding := runtimeContractBinding(meta)
+	capability, err := h.contextEvidenceCapabilityForAgentLocked(meta)
+	return capability, binding, meta.ID, meta.RuntimeTurnBindings[turnID], err
+}
+
+func (h *Hub) contextEvidenceCapabilityForAgentLocked(meta *Agent) (runtimecontract.ContextEvidenceCapability, error) {
+	driver, err := h.runtimeHostDriverLocked(meta.RuntimeBinding.Kind)
 	if err != nil {
-		return nil, runtimecontract.Binding{}, err
+		return nil, err
 	}
 	provider, ok := driver.(runtimeHistoryContractProvider)
 	if !ok {
-		return nil, runtimecontract.Binding{}, unsupportedRuntimeCapability(meta, "context evidence")
+		return nil, unsupportedRuntimeCapability(meta, "context evidence")
 	}
 	contract := provider.HistoryContract(AgentHostRequest{AgentID: meta.ID})
-	capability, ok := contract.(runtimeContextEvidenceCapability)
+	capability, ok := contract.(runtimecontract.ContextEvidenceCapability)
 	if !ok {
-		return nil, runtimecontract.Binding{}, unsupportedRuntimeCapability(meta, "context evidence")
+		return nil, unsupportedRuntimeCapability(meta, "context evidence")
 	}
-	return capability, binding, nil
+	return capability, nil
 }
 
 func renderLoomAgentProfileData(agent Agent, profile AgentProfile, revision string) string {
@@ -951,8 +1067,10 @@ func renderLoomDeveloperContext(compiledAt string, epoch ContextEpoch, payload s
 		switch fragment.Key {
 		case "loom_agent_prompt":
 			writeXMLAttribute(&b, "prompt_revision", fragment.Revision)
+			writeXMLAttribute(&b, "prompt_hash", fragment.Hash)
 		case "loom_agent_profile":
 			writeXMLAttribute(&b, "profile_revision", fragment.Revision)
+			writeXMLAttribute(&b, "profile_hash", fragment.Hash)
 		}
 	}
 	b.WriteString(">\n")
