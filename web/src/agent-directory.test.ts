@@ -9,11 +9,7 @@ function agent(id: string, name: string, cwd = `/workspace/${name}`): Agent {
     cwd,
 	threadId: `thread-${id}`,
 	runtimeBinding: { kind: "codex" },
-    runtimeCapabilities: {
-      history: true, causalSteer: true, interrupt: true, goal: true, remote: true,
-      usage: true, provider: true, compaction: true, approval: true, skills: true,
-      naming: true, archive: true, sandbox: true, imageInput: true,
-    },
+    capabilitySnapshot: { revision: "test", capabilities: [] },
     sandbox: "workspace-write",
     approvalPolicy: "on-request",
     status: "idle",

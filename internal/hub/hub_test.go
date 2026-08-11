@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -57,7 +58,7 @@ func TestAgentEventIsMultiplexedToGlobalSubscribers(t *testing.T) {
 	}
 }
 
-func TestAgentStatusIncludesLiveRuntimeCapabilities(t *testing.T) {
+func TestAgentStatusIncludesOnlyScopedCapabilitySnapshot(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -66,24 +67,25 @@ func TestAgentStatusIncludesLiveRuntimeCapabilities(t *testing.T) {
 	defer h.Shutdown()
 	global, cancel := h.SubscribeGlobal()
 	defer cancel()
-	capabilities := RuntimeCapabilities{History: true, ImageInput: true}
-	meta := &Agent{ID: "agent-1", Name: "worker", RuntimeBinding: RuntimeBinding{Kind: "pi"}}
+	snapshot := piControlPlaneCapabilitySnapshot(true)
+	meta := &Agent{ID: "agent-1", Name: "worker", RuntimeBinding: RuntimeBinding{Kind: "pi"}, capabilitySnapshot: snapshot}
 	h.mu.Lock()
-	h.runtimes[meta.ID] = &runtime{agentID: meta.ID, agentRuntime: &fakeAgentRuntime{capabilities: &capabilities}}
+	h.runtimes[meta.ID] = &runtime{agentID: meta.ID}
 	h.emitStatusLocked(meta, "idle")
 	h.mu.Unlock()
 
 	select {
 	case event := <-global:
-		var payload struct {
-			ProcessAlive        bool                `json:"processAlive"`
-			RuntimeCapabilities RuntimeCapabilities `json:"runtimeCapabilities"`
-		}
+		var payload map[string]json.RawMessage
 		if err := json.Unmarshal(event.Data, &payload); err != nil {
 			t.Fatal(err)
 		}
-		if !payload.ProcessAlive || !payload.RuntimeCapabilities.History || !payload.RuntimeCapabilities.ImageInput {
-			t.Fatalf("runtime status payload = %#v", payload)
+		if _, exists := payload["runtimeCapabilities"]; exists {
+			t.Fatalf("Runtime status retained obsolete flat capabilities: %s", event.Data)
+		}
+		var actual runtimecontract.CapabilitySnapshot
+		if err := json.Unmarshal(payload["capabilitySnapshot"], &actual); err != nil || actual.Revision != snapshot.Revision {
+			t.Fatalf("Runtime status capability snapshot = %#v, err=%v", actual, err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("global subscriber did not receive Agent status")
@@ -100,7 +102,7 @@ func TestRuntimeFailureDuringShutdownIsIgnored(t *testing.T) {
 		ID: "agent-1", Name: "worker", Status: "idle", RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: "/tmp/pi.jsonl"},
 		LastTurn: &TurnSummary{TurnID: "turn-1", Status: "completed"},
 	}
-	rt := &runtime{agentID: meta.ID, agentRuntime: &fakeAgentRuntime{}}
+	rt := &runtime{agentID: meta.ID}
 	h.agents[meta.ID] = meta
 	h.runtimes[meta.ID] = rt
 	h.stopping = true
@@ -161,7 +163,7 @@ func TestCompletedNotificationWithFailedTurnStatusProjectsFailure(t *testing.T) 
 			turnID: "turn-loom-1", nativeTurnID: "turn-1", task: "Do work", startedAt: time.Now(), stopWatchdog: make(chan struct{}),
 		},
 	}
-	h.onNotification(rt, "turn/completed", json.RawMessage(`{
+	deliverTestNativeNotification(h, rt, "turn/completed", json.RawMessage(`{
 		"threadId":"thread-1",
 		"turn":{"id":"turn-1","status":"failed","error":{"message":"model is unavailable"}}
 	}`))
@@ -219,7 +221,7 @@ func TestTurnStartedNotificationBindsNativeIDWithoutRewritingLoomCausality(t *te
 	rt := &runtime{agentID: "agent-1", approvals: map[string]*approval{}, activeTurn: turn}
 	h.runtimes["agent-1"] = rt
 
-	h.onNotification(rt, "turn/started", json.RawMessage(`{
+	deliverTestNativeNotification(h, rt, "turn/started", json.RawMessage(`{
 		"threadId":"thread-1","turn":{"id":"turn-actual","status":"inProgress"}
 	}`))
 
@@ -263,7 +265,7 @@ func TestStaleTerminalNotificationDoesNotFinishCurrentTurn(t *testing.T) {
 	rt := &runtime{agentID: "agent-1", approvals: map[string]*approval{}, activeTurn: turn}
 	h.runtimes["agent-1"] = rt
 
-	h.onNotification(rt, "turn/completed", json.RawMessage(`{
+	deliverTestNativeNotification(h, rt, "turn/completed", json.RawMessage(`{
 		"threadId":"thread-1","turn":{"id":"turn-previous","status":"completed"}
 	}`))
 
@@ -500,7 +502,7 @@ func TestOpenMigratesRuntimeBindingSchemaV1AndPreservesControlPlaneIDs(t *testin
 	}
 
 	var firstRegistry []byte
-	for open := 0; open < 2; open++ {
+	for open := 0; open < 3; open++ {
 		h, err := Open(st)
 		if err != nil {
 			t.Fatal(err)
@@ -519,7 +521,7 @@ func TestOpenMigratesRuntimeBindingSchemaV1AndPreservesControlPlaneIDs(t *testin
 		if err := st.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if open == 0 {
+		if open < 2 {
 			st, err = store.Open(dataDir)
 			if err != nil {
 				t.Fatal(err)
@@ -722,129 +724,8 @@ func TestImportEdgeSkipsAliasForOwnedThread(t *testing.T) {
 	}
 }
 
-func TestApplyRolloutStatusShowsRecentExternalRunningTurn(t *testing.T) {
-	const threadID = "test-thread-recent-running"
-	dir := t.TempDir()
-	writeTestRollout(t, dir, threadID, time.Now().UTC().Format(time.RFC3339Nano))
-	t.Setenv("CODEX_SESSIONS_DIR", dir)
-
-	view := AgentView{Agent: Agent{ThreadID: "loom-" + threadID, Status: "idle"}, nativeRuntimeRef: threadID}
-	applyRolloutStatus(&view)
-
-	if view.Status != "running" {
-		t.Fatalf("status = %q, want running", view.Status)
-	}
-	if view.CurrentTurnID != "turn-running" || view.CurrentTask != "keep working" {
-		t.Fatalf("view = %#v, want current running turn", view)
-	}
-}
-
-func TestApplyRolloutStatusSummarizesCompletedTopicControlEnvelope(t *testing.T) {
-	const threadID = "test-thread-topic-display"
-	dir := t.TempDir()
-	day := filepath.Join(dir, "2026", "07", "20")
-	if err := os.MkdirAll(day, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	prompt := `<loom_topic_context version="1"><brief><summary>Internal state</summary></brief></loom_topic_context>
-<owner_topic_input version="1"><message><![CDATA[Verify the visible Topic task.]]></message></owner_topic_input>`
-	records := []map[string]any{
-		{"timestamp": "2026-07-20T01:00:00Z", "type": "event_msg", "payload": map[string]any{"type": "task_started", "turn_id": "turn-topic"}},
-		{"timestamp": "2026-07-20T01:00:01Z", "type": "event_msg", "payload": map[string]any{"type": "user_message", "message": prompt}},
-		{"timestamp": "2026-07-20T01:00:02Z", "type": "event_msg", "payload": map[string]any{"type": "task_complete", "turn_id": "turn-topic"}},
-	}
-	var data []byte
-	for _, record := range records {
-		line, err := json.Marshal(record)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data = append(data, line...)
-		data = append(data, '\n')
-	}
-	path := filepath.Join(day, "rollout-2026-07-20T01-00-00-"+threadID+".jsonl")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("CODEX_SESSIONS_DIR", dir)
-
-	view := AgentView{Agent: Agent{ThreadID: "loom-" + threadID, Status: "idle"}, nativeRuntimeRef: threadID}
-	applyRolloutStatus(&view)
-	if view.LastTurn == nil || view.LastTurn.Task != "Verify the visible Topic task." {
-		t.Fatalf("last Turn = %#v", view.LastTurn)
-	}
-}
-
-func TestApplyRolloutStatusMarksStaleExternalRunningTurnInterrupted(t *testing.T) {
-	const threadID = "test-thread-stale-running"
-	dir := t.TempDir()
-	writeTestRollout(t, dir, threadID, "2000-01-01T00:00:00Z")
-	t.Setenv("CODEX_SESSIONS_DIR", dir)
-
-	view := AgentView{Agent: Agent{ThreadID: "loom-" + threadID, Status: "idle"}, nativeRuntimeRef: threadID}
-	applyRolloutStatus(&view)
-
-	if view.Status != "interrupted" {
-		t.Fatalf("status = %q, want interrupted", view.Status)
-	}
-	if view.CurrentTurnID != "" {
-		t.Fatalf("current turn = %q, want empty", view.CurrentTurnID)
-	}
-	if view.LastTurn == nil || view.LastTurn.Status != "interrupted" || view.LastTurn.TurnID != "turn-running" {
-		t.Fatalf("last turn = %#v, want stale running turn summarized as interrupted", view.LastTurn)
-	}
-}
-
-func TestApplyRolloutStatusMarksPersistedStaleRunningTurnInterrupted(t *testing.T) {
-	const threadID = "test-thread-persisted-stale-running"
-	dir := t.TempDir()
-	writeTestRollout(t, dir, threadID, "2000-01-01T00:00:00Z")
-	t.Setenv("CODEX_SESSIONS_DIR", dir)
-
-	view := AgentView{
-		Agent: Agent{
-			ThreadID:      "loom-" + threadID,
-			Status:        "running",
-			CurrentTask:   "old task",
-			CurrentTurnID: "turn-running",
-		},
-		ProcessAlive: false, nativeRuntimeRef: threadID,
-	}
-	applyRolloutStatus(&view)
-
-	if view.Status != "interrupted" {
-		t.Fatalf("status = %q, want interrupted", view.Status)
-	}
-	if view.CurrentTask != "" || view.CurrentTurnID != "" {
-		t.Fatalf("current task/turn = %q/%q, want empty", view.CurrentTask, view.CurrentTurnID)
-	}
-	if view.LastTurn == nil || view.LastTurn.Status != "interrupted" || view.LastTurn.TurnID != "turn-running" {
-		t.Fatalf("last turn = %#v, want stale persisted running turn summarized as interrupted", view.LastTurn)
-	}
-}
-
-func TestApplyRolloutStatusKeepsDismissedInterruptedTurnIdle(t *testing.T) {
-	const threadID = "test-thread-dismissed-interruption"
-	dir := t.TempDir()
-	writeTestRollout(t, dir, threadID, time.Now().UTC().Format(time.RFC3339Nano))
-	t.Setenv("CODEX_SESSIONS_DIR", dir)
-
-	view := AgentView{Agent: Agent{
-		ThreadID: threadID, Status: "idle",
-		LastTurn: &TurnSummary{TurnID: "turn-running", Task: "keep working", Status: "interrupted", CompletedAt: now()},
-	}}
-	applyRolloutStatus(&view)
-
-	if view.Status != "idle" || view.CurrentTurnID != "" {
-		t.Fatalf("dismissed view = %#v, want idle", view)
-	}
-}
-
 func TestGetTurnLocatesAgentAndDurableSource(t *testing.T) {
 	const threadID = "test-thread-turn-get"
-	dir := t.TempDir()
-	writeTestRollout(t, dir, threadID, "2026-07-21T01:00:00Z")
-	t.Setenv("CODEX_SESSIONS_DIR", dir)
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -852,6 +733,10 @@ func TestGetTurnLocatesAgentAndDurableSource(t *testing.T) {
 	h := testHub(st)
 	h.agents["agent-0"] = &Agent{ID: "agent-0", Name: "no-rollout", ThreadID: "loom-thread-without-rollout", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-without-rollout"}, Status: "idle"}
 	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Cwd: "/repo", Status: "idle"}
+	h.runtimes["agent-1"] = testRuntime("agent-1", "codex", &fakeAgentRuntime{history: runtimecontract.History{Total: 1, Turns: []runtimecontract.HistoryTurn{{
+		TurnID: "turn-running", State: runtimecontract.LifecycleInterrupted,
+		Content: []runtimecontract.ContentBlock{{ID: "item-user", Kind: runtimecontract.ContentUserText, Text: "keep working"}},
+	}}}}, nil)
 	h.comms["msg-1"] = &AgentMessage{
 		ID: "msg-1", ToAgentID: "agent-1", DeliveryMode: "turn_start", DeliveredTurnID: "turn-running",
 		DeliveryStatus: "delivered", HandlingStatus: "interrupted", LastHandlingError: "CodexLoom restarted",
@@ -859,42 +744,58 @@ func TestGetTurnLocatesAgentAndDurableSource(t *testing.T) {
 	}
 	h.commOrder = []string{"msg-1"}
 
-	turn, err := h.GetTurn("turn-running")
+	turn, err := h.GetCanonicalTurn("turn-running")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if turn.AgentID != "agent-1" || turn.Agent != "worker" || turn.ThreadID != "loom-"+threadID || turn.Status != "interrupted" {
+	if turn.AgentID != "agent-1" || turn.Agent != "worker" || turn.ThreadID != "loom-"+threadID || turn.State != runtimecontract.LifecycleInterrupted {
 		t.Fatalf("Turn identity/status = %#v", turn)
 	}
 	if turn.Source == nil || turn.Source.Kind != "internal" || turn.Source.ID != "msg-1" || turn.Source.TopicID != "tpc-1" {
 		t.Fatalf("Turn source = %#v", turn.Source)
 	}
-	if turn.Error != "CodexLoom restarted" || len(turn.Items) != 1 || turn.Items[0]["text"] != "keep working" {
+	if turn.Error != "CodexLoom restarted" || len(turn.Content) != 1 || turn.Content[0].Text != "keep working" {
 		t.Fatalf("Turn detail = %#v", turn)
 	}
-	if _, err := h.GetTurn("turn-missing"); err == nil {
+	if _, err := h.GetCanonicalTurn("turn-missing"); err == nil {
 		t.Fatal("missing Turn did not return an error")
 	}
 }
 
 func TestGetTurnPreservesRecentExternalRunningStatus(t *testing.T) {
 	const threadID = "test-thread-turn-get-live"
-	dir := t.TempDir()
-	writeTestRollout(t, dir, threadID, time.Now().UTC().Format(time.RFC3339Nano))
-	t.Setenv("CODEX_SESSIONS_DIR", dir)
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := testHub(st)
 	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "worker", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle"}
+	h.runtimes["agent-1"] = testRuntime("agent-1", "codex", &fakeAgentRuntime{history: runtimecontract.History{Total: 1, Turns: []runtimecontract.HistoryTurn{{
+		TurnID: "turn-running", State: runtimecontract.LifecycleAccepted,
+		Content: []runtimecontract.ContentBlock{{ID: "item-user", Kind: runtimecontract.ContentUserText, Text: "keep working"}},
+	}}}}, nil)
 
-	turn, err := h.GetTurn("turn-running")
+	turn, err := h.GetCanonicalTurn("turn-running")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if turn.Status != "running" {
-		t.Fatalf("status = %q, want running for recent external Turn", turn.Status)
+	if turn.State != runtimecontract.LifecycleAccepted {
+		t.Fatalf("state = %q, want running for recent external Turn", turn.State)
+	}
+}
+
+func writeTestRollout(t *testing.T, dir, threadID, ts string) {
+	t.Helper()
+	day := filepath.Join(dir, "2026", "07", "08")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(day, "rollout-2026-07-08T10-00-00-"+threadID+".jsonl")
+	data := `{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-running"}}
+{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"user_message","message":"keep working"}}
+`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -928,20 +829,5 @@ func TestAgentViewDoesNotAliasLastTurn(t *testing.T) {
 
 	if view.LastTurn == nil || view.LastTurn.Status != "completed" {
 		t.Fatalf("AgentView LastTurn changed through Hub state alias: %#v", view.LastTurn)
-	}
-}
-
-func writeTestRollout(t *testing.T, dir, threadID, ts string) {
-	t.Helper()
-	day := filepath.Join(dir, "2026", "07", "08")
-	if err := os.MkdirAll(day, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(day, "rollout-2026-07-08T10-00-00-"+threadID+".jsonl")
-	data := `{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-running"}}
-{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"user_message","message":"keep working"}}
-`
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		t.Fatal(err)
 	}
 }

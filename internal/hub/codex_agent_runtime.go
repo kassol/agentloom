@@ -17,7 +17,7 @@ type codexAgentRuntime struct {
 
 func (r *codexAgentRuntime) Alive() bool { return r != nil && r.client != nil && !r.client.Closed() }
 
-func (r *codexAgentRuntime) Create(request RuntimeBindingRequest) (string, error) {
+func (r *codexAgentRuntime) Create(request nativeBindingRequest) (string, error) {
 	result, err := r.client.Request("thread/start", threadBindingParams(request.Sandbox, request.Cwd, request.ProviderID, request.Model, request.DisabledSkillPaths), 30*time.Second)
 	if err != nil {
 		return "", err
@@ -33,7 +33,7 @@ func (r *codexAgentRuntime) Create(request RuntimeBindingRequest) (string, error
 	return parsed.Thread.ID, nil
 }
 
-func (r *codexAgentRuntime) Resume(request RuntimeBindingRequest, timeout time.Duration) error {
+func (r *codexAgentRuntime) Resume(request nativeBindingRequest, timeout time.Duration) error {
 	params := threadBindingParams(request.Sandbox, request.Cwd, request.ProviderID, request.Model, request.DisabledSkillPaths)
 	params["threadId"] = request.NativeRef
 	_, err := r.client.Request("thread/resume", params, timeout)
@@ -51,13 +51,13 @@ func (r *codexAgentRuntime) InjectDeveloperContext(nativeRef, content string, ti
 	return err
 }
 
-func (r *codexAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
+func (r *codexAgentRuntime) StartTurn(request nativeTurnRequest) (string, error) {
 	input := make([]map[string]any, 0, len(request.Input))
 	for _, item := range request.Input {
 		switch item.Kind {
-		case RuntimeInputText:
+		case nativeInputText:
 			input = append(input, map[string]any{"type": "text", "text": item.Text})
-		case RuntimeInputLocalImage:
+		case nativeInputLocalImage:
 			input = append(input, map[string]any{"type": "localImage", "path": item.Path})
 		}
 	}
@@ -119,7 +119,7 @@ func (r *codexAgentRuntime) Interrupt(nativeRef, nativeTurnID string, timeout ti
 	return err
 }
 
-func (r *codexAgentRuntime) NormalizeEvent(method string, params json.RawMessage) []RuntimeEvent {
+func (r *codexAgentRuntime) NormalizeEvent(method string, params json.RawMessage) []nativeEvent {
 	var envelope struct {
 		ThreadID string `json:"threadId"`
 		TurnID   string `json:"turnId"`
@@ -151,14 +151,14 @@ func (r *codexAgentRuntime) NormalizeEvent(method string, params json.RawMessage
 	if nativeTurnID == "" {
 		nativeTurnID = strings.TrimSpace(envelope.Turn.ID)
 	}
-	event := RuntimeEvent{NativeRef: nativeRef, NativeTurnID: nativeTurnID, ItemID: envelope.ItemID, Text: envelope.Delta, Item: envelope.Item, Status: envelope.Turn.Status}
+	event := nativeEvent{NativeRef: nativeRef, NativeTurnID: nativeTurnID, ItemID: envelope.ItemID, Text: envelope.Delta, Item: envelope.Item, Status: envelope.Turn.Status}
 	switch method {
 	case "turn/started":
-		event.Kind = RuntimeTurnStarted
+		event.Kind = nativeTurnStarted
 	case "item/agentMessage/delta":
-		event.Kind = RuntimeTextDelta
+		event.Kind = nativeTextDelta
 	case "item/reasoning/delta":
-		event.Kind = RuntimeReasoningDelta
+		event.Kind = nativeReasoningDelta
 	case "item/started", "item/updated", "item/completed":
 		itemType, _ := envelope.Item["type"].(string)
 		if id, _ := envelope.Item["id"].(string); event.ItemID == "" {
@@ -166,31 +166,31 @@ func (r *codexAgentRuntime) NormalizeEvent(method string, params json.RawMessage
 		}
 		switch itemType {
 		case "userMessage":
-			event.Kind = RuntimeUserInput
+			event.Kind = nativeUserInput
 			event.Text = notificationUserText(params)
 		case "agentMessage":
 			if method != "item/completed" {
 				return nil
 			}
-			event.Kind = RuntimeTextCompleted
+			event.Kind = nativeTextCompleted
 			event.Text = completedFinalAnswer(method, params)
 		case "reasoning":
 			if method != "item/completed" {
 				return nil
 			}
-			event.Kind = RuntimeReasoningCompleted
+			event.Kind = nativeReasoningCompleted
 		default:
 			switch method {
 			case "item/started":
-				event.Kind = RuntimeToolStarted
+				event.Kind = nativeToolStarted
 			case "item/updated":
-				event.Kind = RuntimeToolUpdated
+				event.Kind = nativeToolUpdated
 			case "item/completed":
-				event.Kind = RuntimeToolCompleted
+				event.Kind = nativeToolCompleted
 			}
 		}
 	case "turn/completed", "turn/failed", "turn/aborted":
-		event.Kind = RuntimeTurnCompleted
+		event.Kind = nativeTurnCompleted
 		if envelope.Turn.Error != nil {
 			event.Error = envelope.Turn.Error.Message
 		} else if envelope.Error != nil {
@@ -198,20 +198,20 @@ func (r *codexAgentRuntime) NormalizeEvent(method string, params json.RawMessage
 		}
 		switch {
 		case method == "turn/failed", envelope.Turn.Status == "failed":
-			event.Kind = RuntimeTurnFailed
+			event.Kind = nativeTurnFailed
 		case method == "turn/aborted", envelope.Turn.Status == "interrupted", envelope.Turn.Status == "aborted", envelope.Turn.Status == "cancelled", envelope.Turn.Status == "canceled":
-			event.Kind = RuntimeTurnInterrupted
+			event.Kind = nativeTurnInterrupted
 		}
 	default:
 		return nil
 	}
-	return []RuntimeEvent{event}
+	return []nativeEvent{event}
 }
 
-func (r *codexAgentRuntime) ReadHistory(nativeRef string, count, offset int) (RuntimeHistory, error) {
+func (r *codexAgentRuntime) ReadHistory(nativeRef string, count, offset int) (nativeHistory, error) {
 	window, total, err := rollout.ReadWindow(nativeRef, count, offset)
 	if err != nil {
-		return RuntimeHistory{}, err
+		return nativeHistory{}, err
 	}
 	usageByTurn := map[string]rollout.TurnUsage{}
 	if report, usageErr := rollout.ReadUsage(nativeRef); usageErr == nil {
@@ -219,9 +219,9 @@ func (r *codexAgentRuntime) ReadHistory(nativeRef string, count, offset int) (Ru
 			usageByTurn[turn.TurnID] = turn
 		}
 	}
-	result := RuntimeHistory{Total: total}
+	result := nativeHistory{Total: total}
 	for _, turn := range window.Turns {
-		item := RuntimeHistoryTurn{ID: turn.ID, Status: turn.Status, Items: turn.Items}
+		item := nativeHistoryTurn{ID: turn.ID, Status: turn.Status, Items: turn.Items}
 		if usage, ok := usageByTurn[turn.ID]; ok {
 			item.Model = usage.Model
 			item.Usage = runtimeTokenUsage(usage.Usage)
@@ -232,12 +232,12 @@ func (r *codexAgentRuntime) ReadHistory(nativeRef string, count, offset int) (Ru
 	return result, nil
 }
 
-func (r *codexAgentRuntime) ReadTurn(nativeRef, nativeTurnID string) (RuntimeHistoryTurn, error) {
+func (r *codexAgentRuntime) ReadTurn(nativeRef, nativeTurnID string) (nativeHistoryTurn, error) {
 	turn, err := rollout.ReadTurn(nativeRef, nativeTurnID)
 	if err != nil {
-		return RuntimeHistoryTurn{}, err
+		return nativeHistoryTurn{}, err
 	}
-	result := RuntimeHistoryTurn{ID: turn.ID, Status: turn.Status, Items: turn.Items}
+	result := nativeHistoryTurn{ID: turn.ID, Status: turn.Status, Items: turn.Items}
 	if report, usageErr := rollout.ReadUsage(nativeRef); usageErr == nil {
 		for _, activity := range report.Activity {
 			if activity.TurnID == nativeTurnID {
@@ -266,28 +266,20 @@ func (r *codexAgentRuntime) ReadTurn(nativeRef, nativeTurnID string) (RuntimeHis
 	return result, nil
 }
 
-func (r *codexAgentRuntime) LatestTurn(nativeRef string) (*RuntimeHistoryTurn, error) {
+func (r *codexAgentRuntime) LatestTurn(nativeRef string) (*nativeHistoryTurn, error) {
 	turn, err := rollout.LatestTurn(nativeRef)
 	if err != nil || turn == nil {
 		return nil, err
 	}
-	return &RuntimeHistoryTurn{ID: turn.ID, Status: turn.Status, UpdatedAt: turn.UpdatedAt, Task: turn.Task}, nil
-}
-
-func (r *codexAgentRuntime) Capabilities() RuntimeCapabilities {
-	return RuntimeCapabilities{
-		History: true, CausalSteer: true, Interrupt: true, Goal: true, Remote: true,
-		Usage: true, Provider: true, Compaction: true, Approval: true, Skills: true,
-		Naming: true, Archive: true, Sandbox: true, ImageInput: true,
-	}
+	return &nativeHistoryTurn{ID: turn.ID, Status: turn.Status, UpdatedAt: turn.UpdatedAt, Task: turn.Task}, nil
 }
 
 // Close releases per-binding resources. Codex bindings share one host-owned
 // app-server client, so the binding itself has nothing to close.
 func (r *codexAgentRuntime) Close() {}
 
-func runtimeTokenUsage(usage rollout.TokenUsage) *RuntimeTokenUsage {
-	return &RuntimeTokenUsage{
+func runtimeTokenUsage(usage rollout.TokenUsage) *nativeTokenUsage {
+	return &nativeTokenUsage{
 		InputTokens: usage.InputTokens, CachedInputTokens: usage.CachedInputTokens,
 		OutputTokens: usage.OutputTokens, ReasoningOutputTokens: usage.ReasoningOutputTokens,
 		TotalTokens: usage.TotalTokens, Calls: usage.Calls,

@@ -46,10 +46,6 @@ func PreflightPiRuntime(ctx context.Context) error {
 }
 
 func (d *piRuntimeHostDriver) Acquire(ctx context.Context, request AgentHostRequest) (AgentHost, error) {
-	return d.acquireWhileHubLocked(ctx, request)
-}
-
-func (d *piRuntimeHostDriver) acquireWhileHubLocked(ctx context.Context, request AgentHostRequest) (AgentHost, error) {
 	if err := d.Preflight(ctx); err != nil {
 		return nil, err
 	}
@@ -69,7 +65,6 @@ func (d *piRuntimeHostDriver) acquireWhileHubLocked(ctx context.Context, request
 	handle := &piAgentHost{native: native, contract: contract}
 	contract.host = handle
 	contract.release = handle.Close
-	handle.facade = &piRuntimeV1Facade{host: handle, contract: contract, native: native}
 	native.SetRuntimeEventHandlers(contract.handleNativeEvent, handle.fail)
 	native.SetRuntimeDiagnosticHandler(func(raw json.RawMessage) {
 		d.hub.mu.Lock()
@@ -115,7 +110,6 @@ type piAgentHost struct {
 	mu       sync.Mutex
 	native   *piAgentRuntime
 	contract *piRuntimeContract
-	facade   *piRuntimeV1Facade
 	failure  func(error)
 	closed   bool
 }
@@ -150,11 +144,9 @@ func (h *piAgentHost) started() bool {
 
 func (h *piAgentHost) Contract() runtimecontract.Contract { return h.contract }
 
-func (h *piAgentHost) legacyRuntime() AgentRuntime { return h.facade }
-
 func (h *piAgentHost) waitRuntimeHostReady(context.Context) error { return nil }
 
-func (h *piAgentHost) createBinding(request RuntimeBindingRequest) (string, error) {
+func (h *piAgentHost) createBinding(request nativeBindingRequest) (string, error) {
 	h.mu.Lock()
 	closed, native := h.closed, h.native
 	h.mu.Unlock()
@@ -164,7 +156,7 @@ func (h *piAgentHost) createBinding(request RuntimeBindingRequest) (string, erro
 	return native.Create(request)
 }
 
-func (h *piAgentHost) resumeBinding(request RuntimeBindingRequest, timeout time.Duration) error {
+func (h *piAgentHost) resumeBinding(request nativeBindingRequest, timeout time.Duration) error {
 	h.mu.Lock()
 	closed, native := h.closed, h.native
 	h.mu.Unlock()

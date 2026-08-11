@@ -134,21 +134,16 @@ func (h *Hub) recoverInterruptedTurnClaimed(agentID, predecessorTurnID string) {
 			log.Printf("[codex-loom] acquire Runtime for interrupted Turn inspection on Agent %s: %v", agentID, acquireErr)
 		}
 	}
-	var inspect func(context.Context, runtimecontract.TurnTarget) (RuntimeInterruptionEvidence, error)
-	if rt != nil {
-		if inspector, ok := rt.runtimeContract.(runtimeInterruptedTurnInspector); ok {
-			inspect = inspector.InspectInterruptedTurn
-		} else if legacy, ok := runtimeBackend(rt).(RuntimeInterruptedTurnInspector); ok {
-			// Compatibility only for injected v1 test doubles.
-			inspect = func(_ context.Context, target runtimecontract.TurnTarget) (RuntimeInterruptionEvidence, error) {
-				return legacy.InspectInterruptedTurn(target.Binding.NativeRef, target.RuntimeTurnRef)
-			}
-		}
-	}
 	h.mu.Unlock()
 	var runtimeReadyErr error
 	if rt != nil && rt.ready != nil {
 		runtimeReadyErr = waitReady(rt)
+	}
+	var inspect func(context.Context, runtimecontract.TurnTarget) (RuntimeInterruptionEvidence, error)
+	if runtimeReadyErr == nil && rt != nil {
+		if inspector, ok := rt.runtimeContract.(runtimeInterruptedTurnInspector); ok {
+			inspect = inspector.InspectInterruptedTurn
+		}
 	}
 	// A Pi process can close immediately after replying to get_entries. The
 	// failure callback then races the serialized StartTurn caller that records
@@ -374,9 +369,6 @@ func ambiguousRecoveryContext(predecessor TurnSummary, evidence RuntimeInterrupt
 		}
 		if tool.Command != "" {
 			fmt.Fprintf(&b, ". Command: %s", tool.Command)
-		}
-		if len(tool.Arguments) > 0 {
-			fmt.Fprintf(&b, ". Arguments: %v", tool.Arguments)
 		}
 		b.WriteString(".\n")
 	}

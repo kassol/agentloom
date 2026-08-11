@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -521,10 +520,10 @@ func newContextHistoryHarness(epochID string) *contextHistoryHarness {
 	return &contextHistoryHarness{epochID: epochID, persisted: map[string]bool{}}
 }
 
-func (harness *contextHistoryHarness) probe(_ string, query rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
+func (harness *contextHistoryHarness) probe(_ string, query RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error) {
 	harness.mu.Lock()
 	defer harness.mu.Unlock()
-	state := rollout.ContextHistoryState{
+	state := RuntimeContextEvidence{
 		EpochID: harness.epochID, DeliveriesPersisted: len(query.Deliveries) > 0,
 		PersistedDeliveryKeys: map[string]bool{},
 	}

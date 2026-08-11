@@ -2,8 +2,8 @@ package hub
 
 import (
 	"context"
+	"time"
 
-	"github.com/yan5xu/codex-loom/internal/codex"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
@@ -28,24 +28,10 @@ type AgentHost interface {
 	Close()
 }
 
-// hubLockedRuntimeHostDriver is the narrow internal acquisition seam used by
-// Hub while its registry lock is held. Runtime selection happens once in the
-// driver registry rather than throughout product consumers.
-type hubLockedRuntimeHostDriver interface {
-	RuntimeHostDriver
-	acquireWhileHubLocked(context.Context, AgentHostRequest) (AgentHost, error)
-}
-
-// legacyRuntimeHost is the temporary v1 compatibility projection for product
-// readers and controls assigned to later capability tickets.
-type legacyRuntimeHost interface {
-	legacyRuntime() AgentRuntime
-}
-
-// codexCompatibilityHost carries raw Codex notification routing only until
-// the canonical public-stream ticket removes it from ordinary delivery.
-type codexCompatibilityHost interface {
-	codexCompatibility() (*codex.Client, uint64)
+// runtimeHostGenerationSource identifies handles that share one failure
+// domain without exposing the Host's native protocol client to the Hub.
+type runtimeHostGenerationSource interface {
+	RuntimeHostGeneration() uint64
 }
 
 type runtimeTurnCorrelationSeeder interface {
@@ -67,12 +53,99 @@ type runtimeHostReadier interface {
 	waitRuntimeHostReady(context.Context) error
 }
 
-// runtimeCompatibilityControls carries existing sandbox/provider/model/
-// Approval/Skill inputs until their optional capability tickets replace the
-// compatibility fields. Product lifecycle consumers still call v2 only.
-type runtimeCompatibilityControls interface {
-	setCompatibilityBinding(RuntimeBindingRequest)
-	setCompatibilityTurn(RuntimeTurnRequest)
+type runtimeSandboxConfiguration interface{ SetRuntimeSandbox(string) }
+type runtimeProviderConfiguration interface{ SetRuntimeProvider(string, string) }
+type runtimeModelConfiguration interface{ SetRuntimeModel(string) }
+type runtimeSkillsConfiguration interface{ SetRuntimeDisabledSkills([]string) }
+type runtimeApprovalConfiguration interface{ SetRuntimeApprovalPolicy(string) }
+type runtimeEffortConfiguration interface{ SetRuntimeEffort(string) }
+type runtimeContextTimeoutConfiguration interface{ SetRuntimeDeveloperContextTimeout(time.Duration) }
+
+type runtimeInputCapability interface {
+	ValidateRuntimeInput(context.Context, runtimecontract.Binding, []runtimecontract.InputBlock) *runtimecontract.Failure
+}
+
+type runtimeGoalCapability interface {
+	RuntimeGoal(context.Context, runtimecontract.Binding) (*ThreadGoal, error)
+	UpdateRuntimeGoal(context.Context, runtimecontract.Binding, GoalUpdateParams) (*ThreadGoal, error)
+	ClearRuntimeGoal(context.Context, runtimecontract.Binding) (bool, error)
+}
+
+type runtimeUsageCapability interface {
+	RuntimeUsage(context.Context, runtimecontract.Binding) (*RuntimeUsageReport, error)
+}
+
+type runtimeModelCatalogCapability interface {
+	RuntimeModels(context.Context, runtimecontract.Binding) (RuntimeModelState, error)
+	SwitchRuntimeModel(context.Context, runtimecontract.Binding, RuntimeModelSelection) (RuntimeModelState, error)
+}
+
+type runtimeCompactionCapability interface {
+	CompactRuntimeBinding(context.Context, runtimecontract.Binding) error
+}
+
+type RuntimeContextDeliveryProbe struct {
+	Role   string
+	Marker string
+	Hash   string
+}
+
+type RuntimeContextEvidenceQuery struct {
+	TurnID     string
+	Deliveries []RuntimeContextDeliveryProbe
+}
+
+type RuntimeContextEvidence struct {
+	EpochID               string
+	WindowNumber          int
+	CompactedAt           string
+	DeliveriesPersisted   bool
+	PersistedDeliveryKeys map[string]bool
+}
+
+type runtimeContextEvidenceCapability interface {
+	RuntimeContextEvidence(context.Context, runtimecontract.Binding, RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error)
+}
+
+type RuntimeProviderHistorySanitizeResult struct {
+	Changed      int
+	OriginalPath string
+	BackupPath   string
+}
+
+type runtimeProviderHistoryCapability interface {
+	SanitizeProviderHistory(context.Context, string, string) (RuntimeProviderHistorySanitizeResult, error)
+	RestoreProviderHistory(context.Context, string, string) error
+}
+
+func configureRuntimeBinding(contract runtimecontract.Contract, sandbox, providerID, model string, disabledSkillPaths []string) {
+	if capability, ok := contract.(runtimeSandboxConfiguration); ok {
+		capability.SetRuntimeSandbox(sandbox)
+	}
+	if capability, ok := contract.(runtimeProviderConfiguration); ok {
+		capability.SetRuntimeProvider(providerID, model)
+	}
+	if capability, ok := contract.(runtimeSkillsConfiguration); ok {
+		capability.SetRuntimeDisabledSkills(disabledSkillPaths)
+	}
+}
+
+func configureRuntimeTurn(contract runtimecontract.Contract, approvalPolicy, sandbox, model, effort string, developerContextTimeout time.Duration) {
+	if capability, ok := contract.(runtimeSandboxConfiguration); ok {
+		capability.SetRuntimeSandbox(sandbox)
+	}
+	if capability, ok := contract.(runtimeModelConfiguration); ok {
+		capability.SetRuntimeModel(model)
+	}
+	if capability, ok := contract.(runtimeApprovalConfiguration); ok {
+		capability.SetRuntimeApprovalPolicy(approvalPolicy)
+	}
+	if capability, ok := contract.(runtimeEffortConfiguration); ok {
+		capability.SetRuntimeEffort(effort)
+	}
+	if capability, ok := contract.(runtimeContextTimeoutConfiguration); ok {
+		capability.SetRuntimeDeveloperContextTimeout(developerContextTimeout)
+	}
 }
 
 // runtimeInterruptedTurnInspector is an optional v2 recovery capability. It

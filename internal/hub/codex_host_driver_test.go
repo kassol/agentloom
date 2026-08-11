@@ -15,6 +15,10 @@ import (
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
+func contractBinding(nativeRef string) runtimecontract.Binding {
+	return runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: nativeRef}
+}
+
 func TestCodexHostDriverAcquiresDistinctAgentContractsOnOneSharedHost(t *testing.T) {
 	logPath := installFakeSharedCodexHost(t)
 	st, err := store.Open(t.TempDir())
@@ -272,8 +276,8 @@ func TestCodexHostDriverRoutesEventsAndFailuresToEachAgentHandleOnce(t *testing.
 	firstHandle, secondHandle := first.(*codexAgentHost), second.(*codexAgentHost)
 	ready := make(chan struct{})
 	close(ready)
-	firstRuntime := &runtime{agentID: "agent-1", agentRuntime: firstHandle.facade, agentHost: first, runtimeContract: first.Contract(), client: firstHandle.host.client, hostGeneration: firstHandle.host.generation, ready: ready, approvals: map[string]*approval{}}
-	secondRuntime := &runtime{agentID: "agent-2", agentRuntime: secondHandle.facade, agentHost: second, runtimeContract: second.Contract(), client: secondHandle.host.client, hostGeneration: secondHandle.host.generation, ready: ready, approvals: map[string]*approval{}}
+	firstRuntime := &runtime{agentID: "agent-1", agentHost: first, runtimeContract: first.Contract(), hostGeneration: firstHandle.host.generation, ready: ready, approvals: map[string]*approval{}}
+	secondRuntime := &runtime{agentID: "agent-2", agentHost: second, runtimeContract: second.Contract(), hostGeneration: secondHandle.host.generation, ready: ready, approvals: map[string]*approval{}}
 	h.bindCodexContract(firstAgent, firstRuntime, firstHandle.contract)
 	h.bindCodexContract(secondAgent, secondRuntime, secondHandle.contract)
 	first.SetFailureHandler(func(err error) { h.onCodexHostFailure(firstRuntime, err) })
@@ -313,7 +317,10 @@ func TestCodexHostDriverRoutesEventsAndFailuresToEachAgentHandleOnce(t *testing.
 			t.Fatalf("terminal count for %s = %d", agentID, terminals)
 		}
 	}
-	if err := driver.Shutdown(ctx); err != nil {
+	// Host failure recovery is finite Hub-owned work. Shut the Hub down so the
+	// recovery workers finish before TempDir removes their Store.
+	h.Shutdown()
+	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -379,27 +386,6 @@ func TestCodexRuntimeContractV2ExecutesCoreLifecycle(t *testing.T) {
 	}
 }
 
-func TestCodexV1FacadePreservesTypedIndeterminateTimeout(t *testing.T) {
-	installFakeIndeterminateThreadHost(t, "thread/resume")
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := testHub(st)
-	driver := newCodexRuntimeHostDriver(h)
-	handle, err := driver.Acquire(context.Background(), AgentHostRequest{AgentID: "agent-timeout"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = handle.(*codexAgentHost).facade.Resume(RuntimeBindingRequest{NativeRef: "thread-target"}, 5*time.Millisecond)
-	if err == nil || !codex.IsRequestTimeout(err) {
-		t.Fatalf("v1 facade timeout = %T %v, want codex.RequestTimeoutError", err, err)
-	}
-	if err := driver.Shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestCodexV2MutatingBindingAndContextTransportLossIsIndeterminate(t *testing.T) {
 	for _, phase := range []runtimecontract.FailurePhase{
 		runtimecontract.FailurePhaseBindingCreate,
@@ -420,25 +406,6 @@ func TestCodexV2MutatingBindingAndContextTransportLossIsIndeterminate(t *testing
 				}
 			})
 		}
-	}
-}
-
-func TestCodexLiveFacadeTreatsMissingRolloutAsEmptyHistory(t *testing.T) {
-	installFakeSharedCodexHost(t)
-	t.Setenv("CODEX_SESSIONS_DIR", t.TempDir())
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := testHub(st)
-	defer h.Shutdown()
-	agent, err := h.CreateAgent(CreateParams{Name: "no-rollout", Cwd: "/tmp/one", RuntimeKind: "codex"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	history, err := h.History(agent.ID, 10, 0)
-	if err != nil || history.Total != 0 || len(history.Turns) != 0 {
-		t.Fatalf("missing rollout history = %#v, err=%v", history, err)
 	}
 }
 
@@ -471,20 +438,20 @@ func TestCodexRuntimeContractCorrelatesEventBeforeStartResponse(t *testing.T) {
 	h.mu.Lock()
 	h.agents["agent-early"] = &Agent{ID: "agent-early", Name: "early", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"}, Status: "running", CurrentTurnID: "turn-loom-early"}
 	h.runtimes["agent-early"] = &runtime{
-		agentID: "agent-early", agentHost: handle, runtimeContract: contract, client: handle.(*codexAgentHost).host.client, hostGeneration: handle.(*codexAgentHost).host.generation,
+		agentID: "agent-early", agentHost: handle, runtimeContract: contract, hostGeneration: handle.(*codexAgentHost).host.generation,
 		activeTurn: &turnState{turnID: "turn-loom-early", startedAt: time.Now(), stopWatchdog: make(chan struct{})},
 	}
 	h.mu.Unlock()
 
-	facade := handle.(*codexAgentHost).facade
-	if err := facade.Resume(RuntimeBindingRequest{NativeRef: "thr-stale"}, time.Second); err != nil {
-		t.Fatal(err)
+	binding := contractBinding("thr-stale")
+	if outcome := contract.ResumeBinding(context.Background(), binding); outcome.State != runtimecontract.LifecycleCompleted {
+		t.Fatalf("ResumeBinding = %#v", outcome)
 	}
-	nativeTurnID, err := facade.StartTurn(RuntimeTurnRequest{
-		LoomTurnID: "turn-loom-early", NativeRef: "thr-stale", Input: []RuntimeInput{{Kind: RuntimeInputText, Text: "early-event"}}, Timeout: time.Second,
+	outcome := contract.StartTurn(context.Background(), runtimecontract.TurnRequest{
+		Binding: binding, TurnID: "turn-loom-early", Input: []runtimecontract.InputBlock{{Kind: runtimecontract.InputText, Text: "early-event"}},
 	})
-	if err != nil || nativeTurnID != "turn-native-early" {
-		t.Fatalf("StartTurn = %q, %v", nativeTurnID, err)
+	if outcome.State != runtimecontract.LifecycleAccepted || outcome.RuntimeTurnRef != "turn-native-early" {
+		t.Fatalf("StartTurn = %#v", outcome)
 	}
 	for index := 0; index < 2; index++ {
 		select {
@@ -515,7 +482,6 @@ func TestCodexHubConsumesCanonicalContractEventWithoutRawNormalization(t *testin
 	}
 	h.mu.Lock()
 	rt := h.runtimes[agent.ID]
-	rt.agentRuntime = &fakeAgentRuntime{} // the raw v1 compatibility path deliberately yields no events
 	turn := &turnState{turnID: "turn-loom-canonical", nativeTurnID: "turn-native-canonical", startedConfirmed: true, startedAt: time.Now(), stopWatchdog: make(chan struct{})}
 	rt.activeTurn = turn
 	h.agents[agent.ID].Status = "running"
@@ -543,8 +509,8 @@ func TestCodexHubConsumesCanonicalContractEventWithoutRawNormalization(t *testin
 			rawCount++
 		}
 	}
-	if rawCount != 1 {
-		t.Fatalf("raw compatibility event count = %d, events = %#v", rawCount, events)
+	if rawCount != 0 {
+		t.Fatalf("canonical stream retained raw Runtime event: %#v", events)
 	}
 }
 
@@ -579,21 +545,9 @@ func TestCodexContractPreservesStreamingAndToolLifecycle(t *testing.T) {
 			t.Fatalf("event %d = %#v", index, event)
 		}
 	}
-	wantLegacyKinds := []RuntimeEventKind{
-		RuntimeTextDelta, RuntimeTextCompleted, RuntimeReasoningCompleted, RuntimeToolStarted, RuntimeToolUpdated, RuntimeToolCompleted,
-	}
-	for index, event := range events {
-		legacy := compatibilityRuntimeEvent(event)
-		if legacy.Kind != wantLegacyKinds[index] {
-			t.Fatalf("legacy event %d = %#v", index, legacy)
-		}
-		if index > 0 && legacy.Item == nil {
-			t.Fatalf("legacy tool item %d was lost: %#v", index, legacy)
-		}
-	}
-	if events[1].Content == nil || compatibilityRuntimeEvent(events[1]).Item["type"] != "agentMessage" ||
-		events[2].Content == nil || compatibilityRuntimeEvent(events[2]).Item["type"] != "reasoning" {
-		t.Fatalf("completed text/reasoning native payload was lost: %#v", events)
+	if events[1].Content == nil || events[1].Content.Kind != runtimecontract.ContentAssistantText ||
+		events[2].Content == nil || events[2].Content.Kind != runtimecontract.ContentReasoning {
+		t.Fatalf("completed text/reasoning content was lost: %#v", events)
 	}
 	if events[0].Content == nil || events[0].Content.Kind != runtimecontract.ContentAssistantText || events[0].Content.Text != "hi" {
 		t.Fatalf("assistant delta = %#v", events[0])
@@ -605,7 +559,10 @@ func TestCodexContractPreservesStreamingAndToolLifecycle(t *testing.T) {
 		events[5].Content.ToolResult.ToolCallID != "tool-1" || events[5].Content.ToolResult.Text != "/repo\n" || !events[5].Content.ToolResult.Success {
 		t.Fatalf("tool result = %#v", events[5])
 	}
-	completedItem := compatibilityRuntimeEvent(events[5]).Item
+	completedItem := map[string]any{}
+	if err := json.Unmarshal(events[5].Content.Diagnostic, &completedItem); err != nil {
+		t.Fatalf("decode adapter diagnostic: %v", err)
+	}
 	for key, want := range map[string]any{"type": "commandExecution", "command": "pwd", "output": "/repo\n", "status": "completed", "exitCode": float64(0), "durationMs": float64(12)} {
 		if completedItem[key] != want {
 			t.Fatalf("completed tool item[%s] = %#v, want %#v; item=%#v", key, completedItem[key], want, completedItem)
@@ -661,11 +618,6 @@ func TestCodexRuntimeContractHistoryIsLazyAndCanonical(t *testing.T) {
 		result.ToolResult.ToolCallID != call.ID || result.ToolResult.Text == "" || !result.ToolResult.Success {
 		t.Fatalf("canonical command history = %#v", turn.Content)
 	}
-	facade := &codexRuntimeV1Facade{contract: contract, native: contract.native}
-	legacy, err := facade.ReadHistory(threadID, 10, 0)
-	if err != nil || legacy.Total != 1 || len(legacy.Turns) != 1 || legacy.Turns[0].ID != "native-turn" || legacy.Turns[0].Status != "completed" || len(legacy.Turns[0].Items) < 2 {
-		t.Fatalf("v1 facade history = %#v, err = %v", legacy, err)
-	}
 }
 
 func TestCodexInspectorTreatsRealRolloutUnpairedFunctionCallAsAmbiguous(t *testing.T) {
@@ -684,9 +636,10 @@ func TestCodexInspectorTreatsRealRolloutUnpairedFunctionCallAsAmbiguous(t *testi
 		t.Fatal(err)
 	}
 	t.Setenv("CODEX_SESSIONS_DIR", sessions)
-	facade := &codexRuntimeV1Facade{native: &codexAgentRuntime{}}
-
-	evidence, err := facade.InspectInterruptedTurn(threadID, "native-turn")
+	contract := &codexRuntimeContract{native: &codexAgentRuntime{}}
+	evidence, err := contract.InspectInterruptedTurn(context.Background(), runtimecontract.TurnTarget{
+		Binding: contractBinding(threadID), TurnID: "turn-loom", RuntimeTurnRef: "native-turn",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

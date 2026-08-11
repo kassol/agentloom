@@ -1,7 +1,6 @@
 package hub
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -53,13 +52,13 @@ func TestCompactAgentThreadRejectsActiveTurnAndGoal(t *testing.T) {
 		ID: "agent-1", Name: "worker", ThreadID: "loom-thr-stale", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-stale"}, Status: "idle",
 	}
 
-	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", agentRuntime: &codexAgentRuntime{}, activeTurn: &turnState{finished: false}}
+	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", activeTurn: &turnState{finished: false}}
 	_, err = h.CompactAgentThread("agent-1")
 	if err == nil || !strings.Contains(err.Error(), "active Turn") {
 		t.Fatalf("active Turn compact error = %v", err)
 	}
 	h.runtimes["agent-1"].activeTurn = nil
-	h.runtimes["agent-1"].approvals = map[string]*approval{"ap-1": {rpcID: json.RawMessage(`1`)}}
+	h.runtimes["agent-1"].approvals = map[string]*approval{"ap-1": {}}
 	_, err = h.CompactAgentThread("agent-1")
 	if err == nil || !strings.Contains(err.Error(), "pending approval") {
 		t.Fatalf("pending approval compact error = %v", err)

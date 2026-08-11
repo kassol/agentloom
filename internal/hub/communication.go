@@ -829,27 +829,16 @@ func (h *Hub) requestTurnSteer(rt *runtime, threadID, expectedTurnID, input stri
 	}
 	h.mu.Unlock()
 
-	var err error
-	if rt.runtimeContract != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		outcome := rt.runtimeContract.ContinueTurn(ctx, runtimecontract.CausalInput{
-			Binding: binding, TurnID: expectedTurnID, RuntimeTurnRef: expectedNativeTurnID,
-			Input: []runtimecontract.InputBlock{{Kind: runtimecontract.InputText, Text: input}},
-		})
-		err = compatibilityLifecycleOutcomeError(outcome)
-	} else {
-		// Compatibility-only path for injected v1 test doubles while their
-		// dedicated migration ticket remains open.
-		backend := runtimeBackend(rt)
-		if backend == nil {
-			return "", errors.New("Agent Runtime is unavailable")
-		}
-		if expectedNativeTurnID == "" {
-			return "", errors.New("active Turn has no native Runtime binding for causal steer")
-		}
-		_, err = backend.Steer(threadID, expectedNativeTurnID, input, timeout)
+	if rt.runtimeContract == nil {
+		return "", errors.New("Agent Runtime Contract is unavailable")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	outcome := rt.runtimeContract.ContinueTurn(ctx, runtimecontract.CausalInput{
+		Binding: binding, TurnID: expectedTurnID, RuntimeTurnRef: expectedNativeTurnID,
+		Input: []runtimecontract.InputBlock{{Kind: runtimecontract.InputText, Text: input}},
+	})
+	err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleAccepted, false)
 	if err != nil {
 		if isRuntimeIndeterminate(err) {
 			h.onRuntimeIndeterminate(rt, err)

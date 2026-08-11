@@ -2,6 +2,7 @@ package hub
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	_ "embed"
@@ -14,7 +15,6 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
@@ -121,7 +121,7 @@ type turnContextSource struct {
 	DisplayText string
 }
 
-type contextHistoryProbeFunc func(threadID string, query rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error)
+type contextHistoryProbeFunc func(threadID string, query RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error)
 
 type contextFragment struct {
 	ContextDeliveryFragment
@@ -404,7 +404,7 @@ func (h *Hub) prepareTurnContext(agentID string, source turnContextSource, artif
 	}
 	h.contextCoverageMu.Lock()
 	defer h.contextCoverageMu.Unlock()
-	history, err := h.contextHistory(threadID, rollout.ContextHistoryQuery{})
+	history, err := h.contextHistory(threadID, RuntimeContextEvidenceQuery{})
 	if err != nil {
 		return TurnContextPlan{}, errf(500, "read context epoch: %s", err)
 	}
@@ -528,7 +528,7 @@ func contextDeliveryMarker(attemptID, channel string) string {
 	return `delivery_id="` + attemptID + `:` + channel + `"`
 }
 
-func (h *Hub) loadContextCoverage(agentID, threadID string, history rollout.ContextHistoryState, persistReset bool) (ContextCoverageLedger, error) {
+func (h *Hub) loadContextCoverage(agentID, threadID string, history RuntimeContextEvidence, persistReset bool) (ContextCoverageLedger, error) {
 	ledger := ContextCoverageLedger{}
 	if err := h.st.LoadContextCoverage(threadID, &ledger); err != nil {
 		return ledger, errf(500, "load context coverage: %s", err)
@@ -555,6 +555,14 @@ func (h *Hub) loadContextCoverage(agentID, threadID string, history rollout.Cont
 }
 
 func (h *Hub) reconcilePendingContext(ledger *ContextCoverageLedger) error {
+	return h.reconcilePendingContextUsing(ledger, h.contextHistory)
+}
+
+func (h *Hub) reconcilePendingContextLocked(ledger *ContextCoverageLedger) error {
+	return h.reconcilePendingContextUsing(ledger, h.contextHistoryLocked)
+}
+
+func (h *Hub) reconcilePendingContextUsing(ledger *ContextCoverageLedger, read func(string, RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error)) error {
 	if ledger == nil || ledger.Pending == nil || ledger.Pending.EpochID != ledger.Epoch.ID {
 		return nil
 	}
@@ -562,16 +570,16 @@ func (h *Hub) reconcilePendingContext(ledger *ContextCoverageLedger) error {
 	if pending.ModelEventObservedAt == "" || pending.TurnID == "" {
 		return nil
 	}
-	query := rollout.ContextHistoryQuery{
+	query := RuntimeContextEvidenceQuery{
 		TurnID:     pending.TurnID,
-		Deliveries: make([]rollout.ContextDeliveryProbe, 0, len(pending.Deliveries)),
+		Deliveries: make([]RuntimeContextDeliveryProbe, 0, len(pending.Deliveries)),
 	}
 	for _, delivery := range pending.Deliveries {
-		query.Deliveries = append(query.Deliveries, rollout.ContextDeliveryProbe{
+		query.Deliveries = append(query.Deliveries, RuntimeContextDeliveryProbe{
 			Role: delivery.Role, Marker: delivery.Marker, Hash: delivery.Hash,
 		})
 	}
-	history, err := h.contextHistory(ledger.ThreadID, query)
+	history, err := read(ledger.ThreadID, query)
 	if err != nil {
 		return errf(500, "verify replayable context deliveries: %s", err)
 	}
@@ -664,7 +672,7 @@ func (h *Hub) observeContextModelEventLocked(meta *Agent, turn *turnState) {
 		observedNow = true
 	}
 	if observedNow {
-		_ = h.reconcilePendingContext(&ledger)
+		_ = h.reconcilePendingContextLocked(&ledger)
 	}
 }
 
@@ -685,7 +693,7 @@ func (h *Hub) ContextCoverage(key string) (ContextCoverageLedger, error) {
 	h.mu.Unlock()
 	h.contextCoverageMu.Lock()
 	defer h.contextCoverageMu.Unlock()
-	history, err := h.contextHistory(runtimeRef, rollout.ContextHistoryQuery{})
+	history, err := h.contextHistory(runtimeRef, RuntimeContextEvidenceQuery{})
 	if err != nil {
 		return ContextCoverageLedger{}, err
 	}
@@ -728,11 +736,63 @@ func (h *Hub) ExplainContext(key string) (ContextExplainView, error) {
 	return view, nil
 }
 
-func (h *Hub) contextHistory(threadID string, query rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
+func (h *Hub) contextHistory(threadID string, query RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error) {
 	if h.contextHistoryProbe != nil {
 		return h.contextHistoryProbe(threadID, query)
 	}
-	return rollout.ContextHistory(threadID, query)
+	h.mu.Lock()
+	capability, binding, err := h.contextEvidenceCapabilityLocked(threadID)
+	h.mu.Unlock()
+	if err != nil {
+		return RuntimeContextEvidence{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return capability.RuntimeContextEvidence(ctx, binding, query)
+}
+
+// contextHistoryLocked is used only from the canonical event reducer, which
+// already owns h.mu. It preserves the reducer's atomic coverage transition
+// without recursively acquiring the Hub mutex.
+func (h *Hub) contextHistoryLocked(threadID string, query RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error) {
+	if h.contextHistoryProbe != nil {
+		return h.contextHistoryProbe(threadID, query)
+	}
+	capability, binding, err := h.contextEvidenceCapabilityLocked(threadID)
+	if err != nil {
+		return RuntimeContextEvidence{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return capability.RuntimeContextEvidence(ctx, binding, query)
+}
+
+func (h *Hub) contextEvidenceCapabilityLocked(threadID string) (runtimeContextEvidenceCapability, runtimecontract.Binding, error) {
+	var meta *Agent
+	for _, candidate := range h.agents {
+		if candidate.RuntimeBinding.NativeRef == threadID {
+			meta = candidate
+			break
+		}
+	}
+	if meta == nil {
+		return nil, runtimecontract.Binding{}, fmt.Errorf("Runtime binding for context evidence was not found")
+	}
+	driver, err := h.runtimeHostDriverLocked(meta.RuntimeBinding.Kind)
+	binding := runtimeContractBinding(meta)
+	if err != nil {
+		return nil, runtimecontract.Binding{}, err
+	}
+	provider, ok := driver.(runtimeHistoryContractProvider)
+	if !ok {
+		return nil, runtimecontract.Binding{}, unsupportedRuntimeCapability(meta, "context evidence")
+	}
+	contract := provider.HistoryContract(AgentHostRequest{AgentID: meta.ID})
+	capability, ok := contract.(runtimeContextEvidenceCapability)
+	if !ok {
+		return nil, runtimecontract.Binding{}, unsupportedRuntimeCapability(meta, "context evidence")
+	}
+	return capability, binding, nil
 }
 
 func renderLoomAgentProfileData(agent Agent, profile AgentProfile, revision string) string {

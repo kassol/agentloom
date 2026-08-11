@@ -26,8 +26,7 @@ export interface Agent {
   cwd: string;
   threadId: string;
   runtimeBinding: { kind: string };
-  runtimeCapabilities: RuntimeCapabilities;
-  capabilitySnapshot?: CapabilitySnapshot;
+  capabilitySnapshot: CapabilitySnapshot;
   sandbox: string;
   approvalPolicy: string;
   providerId?: string;
@@ -61,23 +60,6 @@ export interface CapabilitySnapshot {
     revision: string;
     scope: { runtimeKind: string; bindingRevision: string; model: string; configurationRevision: string };
   }>;
-}
-
-export interface RuntimeCapabilities {
-  history: boolean;
-  causalSteer: boolean;
-  interrupt: boolean;
-  goal: boolean;
-  remote: boolean;
-  usage: boolean;
-  provider: boolean;
-  compaction: boolean;
-  approval: boolean;
-  skills: boolean;
-  naming: boolean;
-  archive: boolean;
-  sandbox: boolean;
-  imageInput: boolean;
 }
 
 export interface RuntimeModel {

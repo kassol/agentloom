@@ -85,12 +85,9 @@ func (h *Hub) Shutdown() {
 			binding  runtimecontract.Binding
 		}
 		bindings := make([]bindingClose, 0, len(h.runtimes))
-		backends := make([]AgentRuntime, 0, len(h.runtimes))
 		for _, rt := range h.runtimes {
 			if rt.runtimeContract != nil {
 				bindings = append(bindings, bindingClose{contract: rt.runtimeContract, binding: rt.binding})
-			} else if backend := runtimeBackend(rt); backend != nil && rt.agentHost == nil {
-				backends = append(backends, backend)
 			}
 		}
 		drivers := make([]RuntimeHostDriver, 0, len(h.runtimeHostDrivers)+2)
@@ -117,7 +114,7 @@ func (h *Hub) Shutdown() {
 		}
 		h.mu.Unlock()
 		for _, item := range bindings {
-			if err := compatibilityLifecycleOutcomeError(item.contract.CloseBinding(context.Background(), item.binding)); err != nil {
+			if err := runtimeLifecycleOutcomeError(item.contract.CloseBinding(context.Background(), item.binding), runtimecontract.LifecycleCompleted, false); err != nil {
 				log.Printf("[codex-loom] close Runtime binding during shutdown: %v", err)
 			}
 		}
@@ -128,9 +125,6 @@ func (h *Hub) Shutdown() {
 		}
 		if len(drivers) == 0 && host != nil {
 			host.close()
-		}
-		for _, backend := range backends {
-			backend.Close()
 		}
 		if h.writerOwnership != nil {
 			h.writerOwnership.Release()

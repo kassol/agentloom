@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -185,7 +186,7 @@ func TestTerminalModelRouteFailureIsClassifiedWithoutRetryNotification(t *testin
 		agentID: "agent-1", approvals: map[string]*approval{},
 		activeTurn: &turnState{turnID: "turn-loom-1", nativeTurnID: "turn-1", task: "Do work", startedAt: time.Now(), stopWatchdog: make(chan struct{})},
 	}
-	h.onNotification(rt, "turn/completed", json.RawMessage(`{
+	deliverTestNativeNotification(h, rt, "turn/completed", json.RawMessage(`{
 		"threadId":"thread-1",
 		"turn":{"id":"turn-1","status":"failed","error":{"message":"503: No available channel for model Display-Only under group default"}}
 	}`))
@@ -220,13 +221,13 @@ func TestManagedProvidersAreNotClassifiedAsCustomModelRouteFailures(t *testing.T
 			turn := &turnState{turnID: "turn-loom-1", nativeTurnID: "turn-1", task: "Do work", startedAt: time.Now(), stopWatchdog: make(chan struct{})}
 			rt := &runtime{agentID: "agent-1", approvals: map[string]*approval{}, activeTurn: turn}
 			detail := fmt.Sprintf("503: No available channel for model %s under group default", tc.model)
-			h.onNotification(rt, "error", json.RawMessage(fmt.Sprintf(`{
+			deliverTestNativeNotification(h, rt, "error", json.RawMessage(fmt.Sprintf(`{
 				"threadId":"thread-1","turnId":"turn-1","willRetry":true,"error":{"message":%q}
 			}`, detail)))
 			if turn.forcedFailure != "" {
 				t.Fatalf("managed Provider was classified as custom: %q", turn.forcedFailure)
 			}
-			h.onNotification(rt, "turn/completed", json.RawMessage(fmt.Sprintf(`{
+			deliverTestNativeNotification(h, rt, "turn/completed", json.RawMessage(fmt.Sprintf(`{
 				"threadId":"thread-1","turn":{"id":"turn-1","status":"failed","error":{"message":%q}}
 			}`, detail)))
 			if got := h.agents["agent-1"].LastError; got != detail {
@@ -260,7 +261,7 @@ func TestDelayedModelRouteStopDoesNotInterruptSuccessorTurn(t *testing.T) {
 		stopWatchdog: make(chan struct{}),
 	}
 	rt := &runtime{
-		agentID: "agent-1", client: host.client, hostGeneration: host.generation,
+		agentID: "agent-1", hostGeneration: host.generation,
 		ready: host.ready, approvals: map[string]*approval{}, activeTurn: original,
 	}
 	h.mu.Lock()
@@ -318,8 +319,10 @@ func TestModelRouteInterruptWaitsForAuthoritativeNativeTurnID(t *testing.T) {
 		stopWatchdog: make(chan struct{}),
 	}
 	rt := &runtime{
-		agentID: "agent-1", client: host.client, hostGeneration: host.generation,
-		ready: host.ready, approvals: map[string]*approval{}, activeTurn: turn,
+		agentID: "agent-1", hostGeneration: host.generation,
+		runtimeContract: &codexRuntimeContract{native: &codexAgentRuntime{client: host.client}, bindingRef: "thr-model-route-fence"},
+		binding:         runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: "thr-model-route-fence"},
+		ready:           host.ready, approvals: map[string]*approval{}, activeTurn: turn,
 	}
 	h.mu.Lock()
 	h.agents["agent-1"] = &Agent{

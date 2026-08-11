@@ -241,12 +241,6 @@ function applyThreadStatus(agent: Agent, event: any): Agent {
       updatedAt,
     };
   }
-  if (eventType === "thread/goal/updated" && data.goal) {
-    return { ...agent, goal: data.goal, updatedAt };
-  }
-  if (eventType === "thread/goal/cleared") {
-    return { ...agent, goal: undefined, updatedAt };
-  }
   if (["loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted"].includes(eventType)) {
     const failed = eventType === "loom/turn-failed";
     return {
@@ -735,7 +729,6 @@ export default function App() {
                       model: d.model ?? s.model,
                       providerId: d.providerId ?? s.providerId,
 					  processAlive: d.processAlive ?? s.processAlive,
-					  runtimeCapabilities: d.runtimeCapabilities ?? s.runtimeCapabilities,
 					  capabilitySnapshot: d.capabilitySnapshot ?? s.capabilitySnapshot,
                       effort: d.effort ?? s.effort,
                       sandbox: d.sandbox ?? s.sandbox,

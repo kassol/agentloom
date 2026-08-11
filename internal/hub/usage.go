@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -8,18 +9,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yan5xu/codex-loom/internal/rollout"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 type UsageDay struct {
-	Date  string             `json:"date"`
-	Usage rollout.TokenUsage `json:"usage"`
+	Date  string            `json:"date"`
+	Usage RuntimeTokenUsage `json:"usage"`
 }
 
 type UsageModel struct {
-	ProviderID string             `json:"providerId"`
-	Model      string             `json:"model"`
-	Usage      rollout.TokenUsage `json:"usage"`
+	ProviderID string            `json:"providerId"`
+	Model      string            `json:"model"`
+	Usage      RuntimeTokenUsage `json:"usage"`
 }
 
 type ContextUsage struct {
@@ -29,44 +30,44 @@ type ContextUsage struct {
 }
 
 type AgentUsage struct {
-	AgentID          string             `json:"agentId"`
-	AgentName        string             `json:"agentName"`
-	ThreadID         string             `json:"threadId,omitempty"`
-	Status           string             `json:"status"`
-	Available        bool               `json:"available"`
-	Lifetime         rollout.TokenUsage `json:"lifetime"`
-	Period           rollout.TokenUsage `json:"period"`
-	Previous         rollout.TokenUsage `json:"previous"`
-	Today            rollout.TokenUsage `json:"today"`
-	LatestCall       rollout.TokenUsage `json:"latestCall"`
-	LatestProviderID string             `json:"latestProviderId,omitempty"`
-	LatestModel      string             `json:"latestModel,omitempty"`
-	CacheHitPercent  float64            `json:"cacheHitPercent"`
-	Context          ContextUsage       `json:"context"`
-	Daily            []UsageDay         `json:"daily"`
-	Models           []UsageModel       `json:"models"`
-	LastUpdatedAt    string             `json:"lastUpdatedAt,omitempty"`
+	AgentID          string            `json:"agentId"`
+	AgentName        string            `json:"agentName"`
+	ThreadID         string            `json:"threadId,omitempty"`
+	Status           string            `json:"status"`
+	Available        bool              `json:"available"`
+	Lifetime         RuntimeTokenUsage `json:"lifetime"`
+	Period           RuntimeTokenUsage `json:"period"`
+	Previous         RuntimeTokenUsage `json:"previous"`
+	Today            RuntimeTokenUsage `json:"today"`
+	LatestCall       RuntimeTokenUsage `json:"latestCall"`
+	LatestProviderID string            `json:"latestProviderId,omitempty"`
+	LatestModel      string            `json:"latestModel,omitempty"`
+	CacheHitPercent  float64           `json:"cacheHitPercent"`
+	Context          ContextUsage      `json:"context"`
+	Daily            []UsageDay        `json:"daily"`
+	Models           []UsageModel      `json:"models"`
+	LastUpdatedAt    string            `json:"lastUpdatedAt,omitempty"`
 }
 
 type UsageOverview struct {
-	Days          int                `json:"days"`
-	Since         string             `json:"since"`
-	Through       string             `json:"through"`
-	Timezone      string             `json:"timezone"`
-	GeneratedAt   string             `json:"generatedAt"`
-	Live          bool               `json:"live"`
-	TrackedAgents int                `json:"trackedAgents"`
-	Lifetime      rollout.TokenUsage `json:"lifetime"`
-	Period        rollout.TokenUsage `json:"period"`
-	Previous      rollout.TokenUsage `json:"previous"`
-	Today         rollout.TokenUsage `json:"today"`
-	Daily         []UsageDay         `json:"daily"`
-	Models        []UsageModel       `json:"models"`
-	Agents        []AgentUsage       `json:"agents"`
+	Days          int               `json:"days"`
+	Since         string            `json:"since"`
+	Through       string            `json:"through"`
+	Timezone      string            `json:"timezone"`
+	GeneratedAt   string            `json:"generatedAt"`
+	Live          bool              `json:"live"`
+	TrackedAgents int               `json:"trackedAgents"`
+	Lifetime      RuntimeTokenUsage `json:"lifetime"`
+	Period        RuntimeTokenUsage `json:"period"`
+	Previous      RuntimeTokenUsage `json:"previous"`
+	Today         RuntimeTokenUsage `json:"today"`
+	Daily         []UsageDay        `json:"daily"`
+	Models        []UsageModel      `json:"models"`
+	Agents        []AgentUsage      `json:"agents"`
 }
 
 type agentUsageCacheEntry struct {
-	report *rollout.UsageReport
+	report *RuntimeUsageReport
 	usage  AgentUsage
 	access uint64
 }
@@ -79,7 +80,7 @@ var agentUsageCache = struct {
 	clock   uint64
 }{entries: map[string]agentUsageCacheEntry{}}
 
-func cachedAgentUsage(key string, report *rollout.UsageReport) (AgentUsage, bool) {
+func cachedAgentUsage(key string, report *RuntimeUsageReport) (AgentUsage, bool) {
 	agentUsageCache.Lock()
 	defer agentUsageCache.Unlock()
 	cached, ok := agentUsageCache.entries[key]
@@ -96,7 +97,7 @@ func cachedAgentUsage(key string, report *rollout.UsageReport) (AgentUsage, bool
 	return cached.usage, true
 }
 
-func cacheAgentUsage(key string, report *rollout.UsageReport, usage AgentUsage) {
+func cacheAgentUsage(key string, report *RuntimeUsageReport, usage AgentUsage) {
 	agentUsageCache.Lock()
 	defer agentUsageCache.Unlock()
 	agentUsageCache.clock++
@@ -138,13 +139,14 @@ func (h *Hub) AgentTokenUsageRange(key string, start, endExclusive time.Time) (A
 		h.mu.Unlock()
 		return AgentUsage{}, errf(404, "agent not found: %s", key)
 	}
-	if !h.runtimeCapabilitiesLocked(meta).Usage {
+	if !runtimeCapabilityAvailableLocked(meta, runtimecontract.CapabilityUsageReporting) {
 		h.mu.Unlock()
 		return AgentUsage{}, unsupportedRuntimeCapability(meta, "usage")
 	}
 	agent := h.viewLocked(meta)
 	h.mu.Unlock()
-	return buildAgentUsageRange(agent, start, endExclusive, time.Now().In(start.Location())), nil
+	report, _ := h.runtimeUsageReport(agent.ID, runtimeContractBinding(&agent.Agent))
+	return buildAgentUsageRange(agent, start, endExclusive, time.Now().In(start.Location()), report), nil
 }
 
 func (h *Hub) TokenUsageOverview(days int) UsageOverview {
@@ -163,7 +165,7 @@ func (h *Hub) TokenUsageOverviewRange(start, endExclusive time.Time) UsageOvervi
 		Timezone: usageTimezoneLabel(now), GeneratedAt: now.UTC().Format(time.RFC3339Nano), Live: usageRangeIsLive(endExclusive, now),
 		Daily: emptyUsageDays(start, days), Models: []UsageModel{}, Agents: []AgentUsage{},
 	}
-	modelUsage := map[string]rollout.TokenUsage{}
+	modelUsage := map[string]RuntimeTokenUsage{}
 	h.mu.Lock()
 	agents := make([]AgentView, 0, len(h.agents))
 	for _, meta := range h.agents {
@@ -171,7 +173,8 @@ func (h *Hub) TokenUsageOverviewRange(start, endExclusive time.Time) UsageOvervi
 	}
 	h.mu.Unlock()
 	for _, agent := range agents {
-		usage := buildAgentUsageRange(agent, start, endExclusive, now)
+		report, _ := h.runtimeUsageReport(agent.ID, runtimeContractBinding(&agent.Agent))
+		usage := buildAgentUsageRange(agent, start, endExclusive, now, report)
 		overview.Agents = append(overview.Agents, usage)
 		if usage.Available {
 			overview.TrackedAgents++
@@ -211,13 +214,13 @@ func (h *Hub) TokenUsageOverviewRange(start, endExclusive time.Time) UsageOvervi
 	return overview
 }
 
-func buildAgentUsage(agent AgentView, days int, now time.Time) AgentUsage {
+func buildAgentUsage(agent AgentView, days int, now time.Time, report *RuntimeUsageReport) AgentUsage {
 	days = normalizeUsageDays(days)
 	start, through := usageRange(now, days)
-	return buildAgentUsageRange(agent, start, through.AddDate(0, 0, 1), now)
+	return buildAgentUsageRange(agent, start, through.AddDate(0, 0, 1), now, report)
 }
 
-func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time) AgentUsage {
+func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time, report *RuntimeUsageReport) AgentUsage {
 	days := usageCalendarDays(start, endExclusive)
 	now = now.In(start.Location())
 	endLimit := endExclusive
@@ -230,14 +233,10 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time) A
 		AgentID: agent.ID, AgentName: agent.Name, ThreadID: agent.ThreadID, Status: agent.Status,
 		LatestProviderID: publicProviderID(agent.ProviderID), Daily: emptyUsageDays(start, days), Models: []UsageModel{},
 	}
+	if report == nil {
+		return result
+	}
 	runtimeRef := agent.nativeRuntimeRef
-	if strings.TrimSpace(runtimeRef) == "" {
-		return result
-	}
-	report, err := rollout.ReadUsage(runtimeRef)
-	if err != nil {
-		return result
-	}
 	historyVersion := strconv.Itoa(len(agent.ProviderHistory))
 	if len(agent.ProviderHistory) > 0 {
 		historyVersion += ":" + agent.ProviderHistory[len(agent.ProviderHistory)-1].SwitchedAt
@@ -269,7 +268,7 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time) A
 	for index, day := range result.Daily {
 		dailyIndex[day.Date] = index
 	}
-	models := map[string]rollout.TokenUsage{}
+	models := map[string]RuntimeTokenUsage{}
 	for _, event := range report.Events {
 		timestamp, err := time.Parse(time.RFC3339Nano, event.Timestamp)
 		if err != nil {
@@ -308,6 +307,30 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time) A
 	})
 	cacheAgentUsage(cacheKey, report, result)
 	return result
+}
+
+func (h *Hub) runtimeUsageReport(agentID string, binding runtimecontract.Binding) (*RuntimeUsageReport, error) {
+	h.mu.Lock()
+	driver, err := h.runtimeHostDriverLocked(binding.RuntimeKind)
+	h.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	provider, ok := driver.(runtimeHistoryContractProvider)
+	if !ok {
+		return nil, errf(501, "Runtime %s does not provide passive Contract access", binding.RuntimeKind)
+	}
+	contract := provider.HistoryContract(AgentHostRequest{AgentID: agentID})
+	if contract == nil || contract.ContractVersion() != runtimecontract.Version {
+		return nil, errf(500, "Runtime %s passive Contract is incompatible", binding.RuntimeKind)
+	}
+	capability, ok := contract.(runtimeUsageCapability)
+	if !ok {
+		return nil, errf(501, "Runtime %s does not provide usage reporting", binding.RuntimeKind)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return capability.RuntimeUsage(ctx, binding)
 }
 
 func providerAt(agent Agent, timestamp time.Time) string {

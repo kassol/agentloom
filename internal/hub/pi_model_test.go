@@ -69,8 +69,8 @@ func TestPiAgentSwitchesNativeModelWithoutReplacingSession(t *testing.T) {
 	if view.ID != agent.ID || view.ThreadID != agent.ThreadID || diagnosticsAfter.NativeRef != diagnostics.NativeRef {
 		t.Fatalf("model switch replaced durable identity: before=%#v/%#v after=%#v/%#v", agent, diagnostics, view, diagnosticsAfter)
 	}
-	if !view.RuntimeCapabilities.Provider {
-		t.Fatalf("Pi capabilities = %#v", view.RuntimeCapabilities)
+	if descriptor, ok := capabilityDescriptor(view.CapabilitySnapshot, runtimecontract.CapabilityModelConfiguration); !ok || descriptor.Availability != runtimecontract.CapabilityAvailable {
+		t.Fatalf("Pi capabilities = %#v", view.CapabilitySnapshot)
 	}
 	if len(view.CapabilitySnapshot.Capabilities) == 0 || view.CapabilitySnapshot.Capabilities[0].Scope.Model != "grok-4.5" {
 		t.Fatalf("fresh capability snapshot = %#v", view.CapabilitySnapshot)

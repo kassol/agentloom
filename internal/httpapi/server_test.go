@@ -35,40 +35,27 @@ func TestConnectorCommandStreamIsExclusivePerConnection(t *testing.T) {
 	}
 }
 
-func TestThreadSSEProjectsCanonicalAndLegacyNamespaces(t *testing.T) {
+func TestThreadSSEProjectsOnlyCanonicalNamespace(t *testing.T) {
 	event := store.Event{Seq: 7, Type: "hub/session-created", Data: json.RawMessage(`{"id":"agent-1"}`)}
 	var canonical bytes.Buffer
-	writeThreadSSE(&canonical, event, true)
+	writeThreadSSE(&canonical, event)
 	if got := canonical.String(); !strings.Contains(got, `"type":"loom/agent-created"`) || strings.Contains(got, `"type":"hub/session-created"`) {
 		t.Fatalf("canonical SSE = %q", got)
 	}
-
-	var legacy bytes.Buffer
-	writeThreadSSE(&legacy, event, false)
-	if got := legacy.String(); !strings.Contains(got, `"type":"hub/session-created"`) || strings.Contains(got, `"type":"loom/agent-created"`) {
-		t.Fatalf("legacy SSE = %q", got)
-	}
 }
 
-func TestGlobalSSEIsCanonicalUnlessCompatibilityIsExplicit(t *testing.T) {
+func TestGlobalSSEIsCanonical(t *testing.T) {
 	var output bytes.Buffer
-	writeGlobalSSE(&output, store.Event{Type: "hub/comms-message", Data: json.RawMessage(`{}`)}, false)
+	writeGlobalSSE(&output, store.Event{Type: "hub/comms-message", Data: json.RawMessage(`{}`)})
 	got := output.String()
 	if !strings.Contains(got, `"type":"loom/comms-message"`) || strings.Contains(got, `"type":"hub/comms-message"`) {
 		t.Fatalf("ordinary global SSE = %q", got)
-	}
-
-	output.Reset()
-	writeGlobalSSE(&output, store.Event{Type: "hub/comms-message", Data: json.RawMessage(`{}`)}, true)
-	got = output.String()
-	if !strings.Contains(got, `"type":"loom/comms-message"`) || !strings.Contains(got, `"type":"hub/comms-message"`) {
-		t.Fatalf("explicit compatibility global SSE = %q", got)
 	}
 }
 
 func TestGlobalThreadEventHasNoLegacyDuplicate(t *testing.T) {
 	var output bytes.Buffer
-	writeGlobalSSE(&output, store.Event{Type: "loom/thread-event", Data: json.RawMessage(`{"agentId":"agent-1"}`)}, true)
+	writeGlobalSSE(&output, store.Event{Type: "loom/thread-event", Data: json.RawMessage(`{"agentId":"agent-1"}`)})
 	got := output.String()
 	if strings.Count(got, `"type":"loom/thread-event"`) != 1 || strings.Contains(got, `"type":"hub/thread-event"`) {
 		t.Fatalf("multiplexed global SSE = %q", got)
@@ -78,23 +65,24 @@ func TestGlobalThreadEventHasNoLegacyDuplicate(t *testing.T) {
 func TestCanonicalRuntimeEventFilterCoversPersistedRawAndNestedGlobalRows(t *testing.T) {
 	cases := []store.Event{
 		{Type: "item/agentMessage/delta", Data: json.RawMessage(`{"delta":"old"}`)},
+		{Type: "loom/text-delta", Data: json.RawMessage(`{"delta":"old-normalized"}`)},
+		{Type: "hub/reasoning-delta", Data: json.RawMessage(`{"delta":"old-alias"}`)},
+		{Type: "loom/tool-completed", Data: json.RawMessage(`{"toolCallId":"old-tool"}`)},
 		{Type: "loom/runtime-event", Data: json.RawMessage(`{"compatibility":true}`)},
 		{Type: "loom/thread-event", Data: json.RawMessage(`{"event":{"type":"item/agentMessage/delta","data":{"delta":"old"}}}`)},
-	}
-	if isRuntimeCompatibilityEvent(store.Event{Type: "loom/text-delta", Data: json.RawMessage(`{"delta":"canonical-v1"}`)}) {
-		t.Fatal("public normalized event without compatibility marker was filtered")
+		{Type: "loom/thread-event", Data: json.RawMessage(`{"event":{"type":"hub/text-delta","data":{"delta":"old-nested-alias"}}}`)},
 	}
 	for _, event := range cases {
-		if !isRuntimeCompatibilityEvent(event) {
+		if !isHistoricalRawRuntimeEvent(event) {
 			t.Fatalf("event was not filtered: %#v", event)
 		}
 	}
-	if isRuntimeCompatibilityEvent(store.Event{Type: "loom/runtime-event", Data: json.RawMessage(`{"kind":"content"}`)}) {
+	if isHistoricalRawRuntimeEvent(store.Event{Type: "loom/runtime-event", Data: json.RawMessage(`{"kind":"content"}`)}) {
 		t.Fatal("typed canonical event was filtered")
 	}
 }
 
-func TestCanonicalGlobalRouteFiltersPersistedCompatibilityAndLegacyRouteIsDeprecated(t *testing.T) {
+func TestCanonicalGlobalRouteFiltersPersistedRawRowsAndLegacyRouteIsGone(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -125,12 +113,12 @@ func TestCanonicalGlobalRouteFiltersPersistedCompatibilityAndLegacyRouteIsDeprec
 		t.Fatalf("canonical stream marked deprecated: %#v", canonical.Header())
 	}
 	legacy := requestStream("/api/events?since=0")
-	if legacy.Code != http.StatusOK || !strings.Contains(legacy.Body.String(), "duplicate") || legacy.Header().Get("Deprecation") != "true" || legacy.Header().Get("Link") == "" {
-		t.Fatalf("legacy global stream = %d headers=%#v body=%s", legacy.Code, legacy.Header(), legacy.Body.String())
+	if legacy.Code != http.StatusNotFound {
+		t.Fatalf("legacy global stream = %d body=%s", legacy.Code, legacy.Body.String())
 	}
 }
 
-func TestCodexLoomAgentAPIAndLegacySessionAlias(t *testing.T) {
+func TestCodexLoomAgentAPIHasNoLegacySessionAlias(t *testing.T) {
 	t.Setenv("PINIX_EDGE_NAMES", t.TempDir()+"/missing.json")
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -140,7 +128,7 @@ func TestCodexLoomAgentAPIAndLegacySessionAlias(t *testing.T) {
 	defer h.Shutdown()
 	server := New(h, st, fstest.MapFS{"index.html": {Data: []byte("ok")}}).Handler()
 
-	for _, path := range []string{"/api/agents", "/api/sessions", "/api/usage", "/api/health"} {
+	for _, path := range []string{"/api/agents", "/api/usage", "/api/health"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		res := httptest.NewRecorder()
 		server.ServeHTTP(res, req)
@@ -150,6 +138,14 @@ func TestCodexLoomAgentAPIAndLegacySessionAlias(t *testing.T) {
 		var body map[string]any
 		if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
 			t.Fatalf("GET %s JSON: %v", path, err)
+		}
+	}
+	for _, path := range []string{"/api/sessions", "/api/events", "/api/images"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		res := httptest.NewRecorder()
+		server.ServeHTTP(res, req)
+		if res.Code != http.StatusNotFound {
+			t.Fatalf("GET %s = %d: %s", path, res.Code, res.Body.String())
 		}
 	}
 }

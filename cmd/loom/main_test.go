@@ -377,23 +377,6 @@ func TestEnabledState(t *testing.T) {
 	}
 }
 
-func TestLegacyAgentPath(t *testing.T) {
-	tests := map[string]string{
-		"/api/agents":                                   "/api/sessions",
-		"/api/agents/alpha":                             "/api/sessions/alpha",
-		"/api/agents/alpha/turns":                       "/api/sessions/alpha/messages",
-		"/api/agents/alpha/turns/current/interrupt":     "/api/sessions/alpha/interrupt",
-		"/api/agents/alpha/thread/history?count=10":     "/api/sessions/alpha/history?count=10",
-		"/api/agents/alpha/thread/events?tail=50":       "/api/sessions/alpha/events?tail=50",
-		"/api/agents/alpha/thread/approvals/approval-1": "/api/sessions/alpha/approvals/approval-1",
-	}
-	for input, want := range tests {
-		if got := legacyAgentPath(input); got != want {
-			t.Errorf("legacyAgentPath(%q) = %q, want %q", input, got, want)
-		}
-	}
-}
-
 func TestStageReplyAttachmentCopiesIntoLoomSpool(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("CODEX_LOOM_DATA", dataDir)

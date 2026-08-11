@@ -98,10 +98,10 @@ func TestPiResponsiblePublishesIntegratedTopicResultAcrossHTTPSSERestart(t *test
 		t.Fatalf("final Pi Topic result = %#v", final)
 	}
 
-	events := readGlobalSSE(t, h, "/api/events?since="+jsonNumber(cursor), 4)
+	events := readGlobalSSE(t, h, "/api/agents/events?since="+jsonNumber(cursor), 2)
 	canonical := make([]store.Event, 0, 2)
 	for index, event := range events {
-		if event.Type != "loom/topic-updated" && event.Type != "hub/topic-updated" {
+		if event.Type != "loom/topic-updated" {
 			t.Fatalf("publication SSE[%d] = %#v", index, event)
 		}
 		encoded := string(event.Data)

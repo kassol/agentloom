@@ -77,21 +77,8 @@ func parseArgs(argv []string) args {
 
 // ---- HTTP ----
 
-var legacyAgentAPI bool
-
 func api(method, path string, body any) (map[string]any, error) {
 	parsed, status, validJSON, err := apiRequest(method, path, body)
-	legacyPath := legacyAgentPath(path)
-	if legacyPath != "" && (status == http.StatusNotFound || status < 400 && !validJSON) {
-		legacyAgentAPI = true
-		parsed, status, validJSON, err = apiRequest(method, legacyPath, body)
-		if parsed["agent"] == nil && parsed["session"] != nil {
-			parsed["agent"] = parsed["session"]
-		}
-		if parsed["agents"] == nil && parsed["sessions"] != nil {
-			parsed["agents"] = parsed["sessions"]
-		}
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -180,26 +167,6 @@ func apiUpload(path, filePath string) (map[string]any, error) {
 		return nil, fmt.Errorf("(%d) %s", resp.StatusCode, message)
 	}
 	return parsed, nil
-}
-
-func legacyAgentPath(path string) string {
-	if !strings.HasPrefix(path, "/api/agents") {
-		return ""
-	}
-	rest := strings.TrimPrefix(path, "/api/agents")
-	switch {
-	case strings.Contains(rest, "/turns/current/interrupt"):
-		rest = strings.Replace(rest, "/turns/current/interrupt", "/interrupt", 1)
-	case strings.Contains(rest, "/thread/approvals/"):
-		rest = strings.Replace(rest, "/thread/approvals/", "/approvals/", 1)
-	case strings.Contains(rest, "/thread/history"):
-		rest = strings.Replace(rest, "/thread/history", "/history", 1)
-	case strings.Contains(rest, "/thread/events"):
-		rest = strings.Replace(rest, "/thread/events", "/events", 1)
-	case strings.HasSuffix(strings.Split(rest, "?")[0], "/turns"):
-		rest = strings.Replace(rest, "/turns", "/messages", 1)
-	}
-	return "/api/sessions" + rest
 }
 
 func fail(err error) {

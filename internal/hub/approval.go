@@ -6,14 +6,15 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 type runtimeApprovalRequest struct {
 	AgentID     string
 	TurnID      string
 	RuntimeKind string
-	Method      string
-	Params      json.RawMessage
+	Proposal    runtimecontract.ApprovalProposal
 }
 
 func newApprovalID(agentID string) string {
@@ -35,15 +36,6 @@ func normalizeApprovalDecision(decision string) (string, string, bool) {
 	}
 }
 
-// codexApprovalDecision is the Codex-specific wire adapter. Loom stores and
-// emits only Runtime-neutral decisions.
-func codexApprovalDecision(decision string) string {
-	if decision == "approve" {
-		return "accept"
-	}
-	return "cancel"
-}
-
 func approvalEventPayload(approval ApprovalView) map[string]any {
 	return map[string]any{
 		"approvalId": approval.ApprovalID, "agentId": approval.AgentID, "turnId": approval.TurnID,
@@ -56,22 +48,26 @@ func approvalEventPayload(approval ApprovalView) map[string]any {
 // requestRuntimeApprovalLocked is the Runtime-neutral ingress for a live
 // request. The callback receives only Loom decisions; each Runtime adapter is
 // responsible for its own wire vocabulary.
-func (h *Hub) requestRuntimeApprovalLocked(request runtimeApprovalRequest, respond func(decision string) error) (ApprovalView, error) {
+func (h *Hub) requestRuntimeApprovalLocked(request runtimeApprovalRequest, respond func(runtimecontract.ApprovalDecision) error) (ApprovalView, error) {
 	meta := h.agents[request.AgentID]
 	rt := h.runtimes[request.AgentID]
 	if meta == nil || rt == nil {
 		return ApprovalView{}, fmt.Errorf("Agent Runtime is unavailable")
 	}
 	requestedAt := now()
-	publicParams := canonicalApprovalParams(meta, request.TurnID, request.Params)
+	publicParams := canonicalApprovalParams(meta, request.TurnID, request.Proposal)
+	method := request.Proposal.Action
+	if method == "" {
+		method = request.Proposal.ToolName
+	}
 	next := ApprovalView{
 		ApprovalID: newApprovalID(request.AgentID), AgentID: request.AgentID, TurnID: request.TurnID,
-		RuntimeKind: request.RuntimeKind, Method: request.Method, Params: publicParams,
+		RuntimeKind: request.RuntimeKind, Method: method, Params: publicParams,
 		Status: "pending", RequestedAt: requestedAt, TS: requestedAt,
 	}
 	if err := h.commitApprovalLocked(next); err != nil {
 		if respond != nil {
-			h.startWorkerLocked(func() { _ = respond("abort") })
+			h.startWorkerLocked(func() { _ = respond(runtimecontract.ApprovalAbort) })
 		}
 		return ApprovalView{}, err
 	}
@@ -86,7 +82,7 @@ func (h *Hub) requestRuntimeApprovalLocked(request runtimeApprovalRequest, respo
 	return next, nil
 }
 
-func canonicalApprovalParams(meta *Agent, turnID string, raw json.RawMessage) json.RawMessage {
+func canonicalApprovalParams(meta *Agent, turnID string, proposal runtimecontract.ApprovalProposal) json.RawMessage {
 	public := map[string]any{}
 	if meta != nil && meta.ThreadID != "" {
 		public["threadId"] = meta.ThreadID
@@ -94,15 +90,20 @@ func canonicalApprovalParams(meta *Agent, turnID string, raw json.RawMessage) js
 	if turnID != "" {
 		public["turnId"] = turnID
 	}
-	var input map[string]any
-	if len(raw) == 0 || json.Unmarshal(raw, &input) != nil {
-		public["redacted"] = true
-	} else {
-		for key, value := range input {
-			if approvalActionKey(key) {
-				public[key] = projectApprovalAction(value)
+	if proposal.Action != "" {
+		public["action"] = proposal.Action
+	}
+	if proposal.ToolName != "" {
+		public["toolName"] = proposal.ToolName
+	}
+	if len(proposal.Arguments) > 0 {
+		arguments := make(map[string]any, len(proposal.Arguments))
+		for _, argument := range proposal.Arguments {
+			if approvalActionKey(argument.Name) {
+				arguments[argument.Name] = projectApprovalAction(argument.Value)
 			}
 		}
+		public["arguments"] = arguments
 	}
 	encoded, err := json.Marshal(public)
 	if err != nil {
@@ -127,6 +128,8 @@ func projectApprovalAction(value any) any {
 			projected[index] = projectApprovalAction(nested)
 		}
 		return projected
+	case string:
+		return redactRuntimeDiagnosticValue("value", typed)
 	default:
 		return value
 	}
@@ -219,7 +222,7 @@ func (h *Hub) abortTurnApprovalsLocked(agentID, turnID string, rt *runtime, reas
 		delete(rt.approvals, id)
 		if waiter != nil && waiter.respond != nil {
 			respond := waiter.respond
-			h.startWorkerLocked(func() { _ = respond("abort") })
+			h.startWorkerLocked(func() { _ = respond(runtimecontract.ApprovalAbort) })
 		}
 	}
 }

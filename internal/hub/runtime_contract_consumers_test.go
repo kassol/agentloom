@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +14,10 @@ import (
 )
 
 type controlPlaneContract struct {
+	createBinding    runtimecontract.Binding
+	createOutcome    runtimecontract.Outcome
+	createCalls      int
+	version          int
 	archiveOutcome   runtimecontract.Outcome
 	archiveCalls     int
 	archiveBinding   runtimecontract.Binding
@@ -31,6 +37,7 @@ type controlPlaneContract struct {
 	startRequest     runtimecontract.TurnRequest
 	resumeStarted    chan struct{}
 	resumeRelease    chan struct{}
+	resumeOutcome    runtimecontract.Outcome
 	startStarted     chan struct{}
 	startRelease     chan struct{}
 	closeOutcome     runtimecontract.Outcome
@@ -42,6 +49,12 @@ type controlPlaneContract struct {
 	snapshotHook     func()
 	history          runtimecontract.History
 	historyFailure   *runtimecontract.Failure
+	eventHandler     func(runtimecontract.Event)
+}
+
+func (c *controlPlaneContract) SetApprovalHandler(func(runtimecontract.ApprovalProposal)) {}
+func (c *controlPlaneContract) ResolveApproval(context.Context, string, runtimecontract.ApprovalDecision) error {
+	return nil
 }
 
 type controlPlaneHost struct {
@@ -56,18 +69,36 @@ func (h *controlPlaneHost) Close()                             { h.alive = false
 
 type controlPlaneDriver struct {
 	hosts                []*controlPlaneHost
+	acquireHost          AgentHost
 	shutdownCalls        int
 	closedBeforeShutdown bool
 	snapshot             runtimecontract.CapabilitySnapshot
 	historyContract      runtimecontract.Contract
 }
 
+type blockingAcquireDriver struct {
+	started chan struct{}
+	release chan struct{}
+	host    AgentHost
+	start   sync.Once
+	calls   atomic.Int32
+}
+
+func (d *blockingAcquireDriver) Preflight(context.Context) error { return nil }
+func (d *blockingAcquireDriver) Acquire(context.Context, AgentHostRequest) (AgentHost, error) {
+	d.calls.Add(1)
+	d.start.Do(func() { close(d.started) })
+	<-d.release
+	return d.host, nil
+}
+func (d *blockingAcquireDriver) Shutdown(context.Context) error { return nil }
+
 func (d *controlPlaneDriver) Preflight(context.Context) error { return nil }
 func (d *controlPlaneDriver) Acquire(context.Context, AgentHostRequest) (AgentHost, error) {
+	if d.acquireHost != nil {
+		return d.acquireHost, nil
+	}
 	return nil, errors.New("unexpected acquire")
-}
-func (d *controlPlaneDriver) acquireWhileHubLocked(ctx context.Context, request AgentHostRequest) (AgentHost, error) {
-	return d.Acquire(ctx, request)
 }
 func (d *controlPlaneDriver) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
 	return d.snapshot
@@ -87,18 +118,276 @@ func (d *controlPlaneDriver) Shutdown(context.Context) error {
 	return nil
 }
 
+func TestRuntimeAcquireDoesNotFreezeAgentReads(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	contract := &controlPlaneContract{createBinding: runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "pi", NativeRef: "native-blocking"}}
+	driver := &blockingAcquireDriver{
+		started: make(chan struct{}), release: make(chan struct{}),
+		host: &controlPlaneHost{contract: contract, alive: true},
+	}
+	h.runtimeHostDrivers["pi"] = driver
+	created := make(chan error, 1)
+	go func() {
+		_, err := h.CreateAgent(CreateParams{Name: "blocked-acquire", Cwd: t.TempDir(), RuntimeKind: "pi"})
+		created <- err
+	}()
+	select {
+	case <-driver.started:
+	case <-time.After(time.Second):
+		t.Fatal("Runtime acquire did not start")
+	}
+	listed := make(chan struct{})
+	go func() {
+		h.ListAgents()
+		close(listed)
+	}()
+	select {
+	case <-listed:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("ListAgents blocked behind Runtime host acquisition")
+	}
+	close(driver.release)
+	if err := <-created; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentRuntimeAcquireInstallsOneLiveHost(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	defer h.Shutdown()
+	contract := &controlPlaneContract{createBinding: runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "pi", NativeRef: "native-concurrent"}}
+	driver := &blockingAcquireDriver{
+		started: make(chan struct{}), release: make(chan struct{}),
+		host: &controlPlaneHost{contract: contract, alive: true},
+	}
+	h.runtimeHostDrivers["pi"] = driver
+	meta := &Agent{ID: "agent-concurrent", Name: "concurrent", Cwd: t.TempDir(), ThreadID: "thread-concurrent", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "pi"}, Status: "idle"}
+	h.agents[meta.ID] = meta
+	h.seqs[meta.ID] = 0
+	type result struct {
+		rt  *runtime
+		err error
+	}
+	acquire := func(ch chan<- result) {
+		h.mu.Lock()
+		rt, err := h.getRuntimeLocked(meta)
+		h.mu.Unlock()
+		ch <- result{rt: rt, err: err}
+	}
+	first := make(chan result, 1)
+	go acquire(first)
+	<-driver.started
+	second := make(chan result, 1)
+	go acquire(second)
+	secondResult := <-second
+	if secondResult.err != nil || secondResult.rt == nil {
+		t.Fatalf("second acquire = %#v", secondResult)
+	}
+	close(driver.release)
+	firstResult := <-first
+	if firstResult.err != nil || firstResult.rt != secondResult.rt {
+		t.Fatalf("concurrent acquires = first %#v second %#v", firstResult, secondResult)
+	}
+	if err := waitReady(firstResult.rt); err != nil {
+		t.Fatal(err)
+	}
+	if driver.calls.Load() != 1 || !firstResult.rt.agentHost.Alive() {
+		t.Fatalf("Driver calls=%d Host alive=%v", driver.calls.Load(), firstResult.rt.agentHost.Alive())
+	}
+}
+
+func TestRuntimeContractRejectsWrongVersionOrBindingBeforePersistence(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  int
+		binding  runtimecontract.Binding
+		wantText string
+	}{
+		{name: "Contract version", version: runtimecontract.Version + 1, wantText: "Contract version"},
+		{name: "binding schema", binding: runtimecontract.Binding{SchemaVersion: 1, RuntimeKind: "pi", NativeRef: "native"}, wantText: "schema version"},
+		{name: "binding kind", binding: runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: "native"}, wantText: "binding kind"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			st, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := testHub(st)
+			contract := &controlPlaneContract{version: test.version, createBinding: test.binding}
+			host := &controlPlaneHost{contract: contract, alive: true}
+			h.runtimeHostDrivers["pi"] = &controlPlaneDriver{acquireHost: host}
+			_, err = h.CreateAgent(CreateParams{Name: "invalid-contract", Cwd: t.TempDir(), RuntimeKind: "pi"})
+			if err == nil || !strings.Contains(err.Error(), test.wantText) {
+				t.Fatalf("CreateAgent error = %v, want %q", err, test.wantText)
+			}
+			if agents := h.ListAgents(); len(agents) != 0 {
+				t.Fatalf("invalid Runtime Contract persisted Agent: %#v", agents)
+			}
+			persisted := map[string]*Agent{}
+			loadErr := st.LoadAgents(&persisted)
+			if loadErr != nil || len(persisted) != 0 {
+				t.Fatalf("persisted invalid Runtime binding = %#v, err=%v", persisted, loadErr)
+			}
+			if host.Alive() {
+				t.Fatal("rejected Runtime Contract Host remained alive")
+			}
+		})
+	}
+}
+
+func TestRuntimeResumeCreatesOnlyForTypedBindingNotFound(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		outcome    runtimecontract.Outcome
+		wantCreate int
+	}{
+		{
+			name: "typed binding missing",
+			outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: &runtimecontract.Failure{
+				Code: runtimecontract.FailureCodeBindingNotFound, Phase: runtimecontract.FailurePhaseBindingResume, Message: "gone",
+			}},
+			wantCreate: 1,
+		},
+		{
+			name: "unrelated not found text",
+			outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleFailed, Failure: &runtimecontract.Failure{
+				Code: "model_error", Phase: runtimecontract.FailurePhaseBindingResume, Message: "model not found; bearer private-token",
+			}},
+		},
+		{
+			name: "indeterminate binding missing",
+			outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleIndeterminate, Failure: &runtimecontract.Failure{
+				Code: runtimecontract.FailureCodeBindingNotFound, Phase: runtimecontract.FailurePhaseBindingResume, Message: "transport result unknown",
+			}},
+		},
+		{
+			name: "failed binding missing",
+			outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleFailed, Failure: &runtimecontract.Failure{
+				Code: runtimecontract.FailureCodeBindingNotFound, Phase: runtimecontract.FailurePhaseBindingResume, Message: "failed",
+			}},
+		},
+		{
+			name: "wrong phase binding missing",
+			outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: &runtimecontract.Failure{
+				Code: runtimecontract.FailureCodeBindingNotFound, Phase: runtimecontract.FailurePhaseTurnStart, Message: "wrong phase",
+			}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			h := testHub(st)
+			meta := &Agent{ID: "agent-1", Name: "worker", Cwd: t.TempDir(), ThreadID: "thread-loom", RuntimeBinding: RuntimeBinding{
+				SchemaVersion: RuntimeBindingSchemaVersion, Kind: "fake", NativeRef: "native-old",
+			}, Status: "idle"}
+			h.agents[meta.ID] = meta
+			contract := &controlPlaneContract{
+				createBinding: runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "fake", NativeRef: "native-new"},
+				resumeOutcome: test.outcome,
+			}
+			rt := &runtime{agentID: meta.ID, runtimeContract: contract, binding: runtimeContractBinding(meta), ready: make(chan struct{}), approvals: map[string]*approval{}}
+			h.runtimes[meta.ID] = rt
+
+			h.initRuntime(meta.ID, rt)
+
+			if contract.createCalls != test.wantCreate {
+				t.Fatalf("CreateBinding calls = %d, want %d", contract.createCalls, test.wantCreate)
+			}
+			if test.wantCreate == 0 && rt.initErr == nil {
+				t.Fatal("resume failure was silently accepted")
+			}
+		})
+	}
+}
+
+func TestMandatoryRuntimeOperationsRejectWrongSuccessfulLifecycleStates(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		outcome    runtimecontract.Outcome
+		expected   runtimecontract.LifecycleState
+		requireRef bool
+	}{
+		{name: "create completed", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}, expected: runtimecontract.LifecycleAccepted},
+		{name: "resume accepted", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}, expected: runtimecontract.LifecycleCompleted},
+		{name: "start completed", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted, RuntimeTurnRef: "native-turn"}, expected: runtimecontract.LifecycleAccepted, requireRef: true},
+		{name: "start missing ref", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}, expected: runtimecontract.LifecycleAccepted, requireRef: true},
+		{name: "continue completed", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}, expected: runtimecontract.LifecycleAccepted},
+		{name: "interrupt accepted", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}, expected: runtimecontract.LifecycleInterrupted},
+		{name: "close interrupted", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted}, expected: runtimecontract.LifecycleCompleted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := runtimeLifecycleOutcomeError(test.outcome, test.expected, test.requireRef); err == nil {
+				t.Fatalf("wrong lifecycle outcome accepted: %#v", test.outcome)
+			}
+		})
+	}
+}
+
 func (c *controlPlaneContract) ContextDeliveryMode() runtimecontract.ContextDeliveryMode {
 	return c.contextMode
 }
-
-func (c *controlPlaneContract) ContractVersion() int { return runtimecontract.Version }
+func (c *controlPlaneContract) SetRuntimeSandbox(string)          {}
+func (c *controlPlaneContract) SetRuntimeProvider(string, string) {}
+func (c *controlPlaneContract) SetRuntimeModel(string)            {}
+func (c *controlPlaneContract) SetRuntimeDisabledSkills([]string) {}
+func (c *controlPlaneContract) SetRuntimeApprovalPolicy(string)   {}
+func (c *controlPlaneContract) SetRuntimeEffort(string)           {}
+func (c *controlPlaneContract) ValidateRuntimeInput(context.Context, runtimecontract.Binding, []runtimecontract.InputBlock) *runtimecontract.Failure {
+	return nil
+}
+func (c *controlPlaneContract) RuntimeGoal(context.Context, runtimecontract.Binding) (*ThreadGoal, error) {
+	return nil, nil
+}
+func (c *controlPlaneContract) UpdateRuntimeGoal(context.Context, runtimecontract.Binding, GoalUpdateParams) (*ThreadGoal, error) {
+	return nil, nil
+}
+func (c *controlPlaneContract) ClearRuntimeGoal(context.Context, runtimecontract.Binding) (bool, error) {
+	return false, nil
+}
+func (c *controlPlaneContract) RuntimeUsage(context.Context, runtimecontract.Binding) (*RuntimeUsageReport, error) {
+	return &RuntimeUsageReport{}, nil
+}
+func (c *controlPlaneContract) RuntimeModels(context.Context, runtimecontract.Binding) (RuntimeModelState, error) {
+	return RuntimeModelState{}, nil
+}
+func (c *controlPlaneContract) SwitchRuntimeModel(context.Context, runtimecontract.Binding, RuntimeModelSelection) (RuntimeModelState, error) {
+	return RuntimeModelState{}, nil
+}
+func (c *controlPlaneContract) CompactRuntimeBinding(context.Context, runtimecontract.Binding) error {
+	return nil
+}
+func (c *controlPlaneContract) ContractVersion() int {
+	if c.version != 0 {
+		return c.version
+	}
+	return runtimecontract.Version
+}
 func (c *controlPlaneContract) CreateBinding(context.Context, runtimecontract.BindingRequest) (runtimecontract.Binding, runtimecontract.Outcome) {
-	return runtimecontract.Binding{}, runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}
+	c.createCalls++
+	if c.createOutcome.State != "" {
+		return c.createBinding, c.createOutcome
+	}
+	return c.createBinding, runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}
 }
 func (c *controlPlaneContract) ResumeBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {
 	if c.resumeStarted != nil {
 		close(c.resumeStarted)
 		<-c.resumeRelease
+	}
+	if c.resumeOutcome.State != "" {
+		return c.resumeOutcome
 	}
 	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
 }
@@ -118,6 +407,9 @@ func (c *controlPlaneContract) StartTurn(_ context.Context, request runtimecontr
 		<-c.startRelease
 	}
 	if c.startOutcome.State != "" {
+		if c.eventHandler != nil && c.startOutcome.State == runtimecontract.LifecycleAccepted {
+			c.eventHandler(runtimecontract.Event{Kind: runtimecontract.EventTurnStarted, TurnID: request.TurnID, RuntimeTurnRef: c.startOutcome.RuntimeTurnRef})
+		}
 		return c.startOutcome
 	}
 	return runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}
@@ -139,13 +431,18 @@ func (c *controlPlaneContract) InterruptTurn(_ context.Context, request runtimec
 	}
 	return runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted}
 }
-func (c *controlPlaneContract) SetEventHandler(func(runtimecontract.Event)) {}
+func (c *controlPlaneContract) SetEventHandler(handler func(runtimecontract.Event)) {
+	c.eventHandler = handler
+}
 func (c *controlPlaneContract) ReadHistory(context.Context, runtimecontract.HistoryRequest) (runtimecontract.History, *runtimecontract.Failure) {
 	return c.history, c.historyFailure
 }
 func (c *controlPlaneContract) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
 	if c.snapshotHook != nil {
 		c.snapshotHook()
+	}
+	if c.snapshot.Revision == "" && len(c.snapshot.Capabilities) == 0 {
+		return runtimecontract.CapabilitySnapshot{Revision: "test-empty"}
 	}
 	return c.snapshot
 }
@@ -164,7 +461,7 @@ func TestCanonicalHistoryUsesRegisteredDriverWhenAgentIsCold(t *testing.T) {
 			Content: []runtimecontract.ContentBlock{{ID: "native-content", Kind: runtimecontract.ContentAssistantText, Text: "hello"}},
 		}},
 	}}
-	h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{"fake": &controlPlaneDriver{historyContract: contract}}
+	h.runtimeHostDrivers = map[string]RuntimeHostDriver{"fake": &controlPlaneDriver{historyContract: contract}}
 	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "cold", ThreadID: "loom-thread", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "fake", NativeRef: "/native/session"}, RuntimeTurnBindings: map[string]string{"turn-loom": "native-turn"}, Status: "idle"}
 
 	history, err := h.CanonicalHistory("agent-1", 10, 0)
@@ -184,7 +481,7 @@ func TestCanonicalHistoryUsesTypedNotFoundAndGetTurnPreservesBackendFailure(t *t
 	defer st.Close()
 	h := testHub(st)
 	driver := &controlPlaneDriver{historyContract: &controlPlaneContract{historyFailure: &runtimecontract.Failure{Code: "history_not_found", Phase: runtimecontract.FailurePhaseHistory, Message: "localized missing history"}}}
-	h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{"fake": driver}
+	h.runtimeHostDrivers = map[string]RuntimeHostDriver{"fake": driver}
 	h.agents["missing"] = &Agent{ID: "missing", Name: "missing", ThreadID: "loom-missing", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "fake", NativeRef: "/native/missing"}, Status: "idle"}
 	if history, err := h.CanonicalHistory("missing", 10, 0); err != nil || len(history.Turns) != 0 {
 		t.Fatalf("typed not found history=%#v err=%v", history, err)
@@ -228,7 +525,7 @@ func TestCanonicalTurnFailureFallsBackToPublicAgentError(t *testing.T) {
 	defer st.Close()
 	h := testHub(st)
 	contract := &controlPlaneContract{history: runtimecontract.History{Total: 1, Turns: []runtimecontract.HistoryTurn{{TurnID: "turn-loom", State: runtimecontract.LifecycleFailed, Content: []runtimecontract.ContentBlock{}}}}}
-	h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{"fake": &controlPlaneDriver{historyContract: contract}}
+	h.runtimeHostDrivers = map[string]RuntimeHostDriver{"fake": &controlPlaneDriver{historyContract: contract}}
 	nativeRef := "/private/native/session.jsonl"
 	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "failed", ThreadID: "thread-loom", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "fake", NativeRef: nativeRef}, Status: "idle", LastError: "read " + nativeRef + ": token=private"}
 	detail, err := h.GetCanonicalTurn("turn-loom")
@@ -247,7 +544,7 @@ func TestUnsupportedConfigUsesCapabilityReasonAndAlternativeBeforePersistence(t 
 	}
 	defer st.Close()
 	h := testHub(st)
-	contract := &controlPlaneContract{snapshot: runtimecontract.CapabilitySnapshot{Capabilities: []runtimecontract.CapabilityDescriptor{{
+	contract := &controlPlaneContract{snapshot: runtimecontract.CapabilitySnapshot{Revision: "test-1", Capabilities: []runtimecontract.CapabilityDescriptor{{
 		ID: runtimecontract.CapabilitySandboxConfiguration, Availability: runtimecontract.CapabilityUnavailable,
 		Reason: "no whole-process isolation", Alternative: "use per-tool Approval", Revision: "test-1",
 	}}}}
@@ -276,8 +573,8 @@ func TestCapabilitySnapshotRunsOutsideHubLockAndRevalidatesBinding(t *testing.T)
 	}
 	defer st.Close()
 	h := testHub(st)
-	contract := &controlPlaneContract{snapshot: runtimecontract.CapabilitySnapshot{Capabilities: []runtimecontract.CapabilityDescriptor{{
-		ID: runtimecontract.CapabilitySandboxConfiguration, Availability: runtimecontract.CapabilityAvailable,
+	contract := &controlPlaneContract{snapshot: runtimecontract.CapabilitySnapshot{Revision: "test-1", Capabilities: []runtimecontract.CapabilityDescriptor{{
+		ID: runtimecontract.CapabilitySandboxConfiguration, Availability: runtimecontract.CapabilityAvailable, Revision: "test-1",
 	}}}}
 	meta := &Agent{
 		ID: "agent-1", Name: "worker", ThreadID: "thread-loom",
@@ -328,9 +625,9 @@ func TestCapabilitySnapshotRejectsConcurrentModelOrConfigurationChange(t *testin
 			}
 			defer st.Close()
 			h := testHub(st)
-			contract := &controlPlaneContract{snapshot: runtimecontract.CapabilitySnapshot{Capabilities: []runtimecontract.CapabilityDescriptor{{
+			contract := &controlPlaneContract{snapshot: runtimecontract.CapabilitySnapshot{Revision: "test-1", Capabilities: []runtimecontract.CapabilityDescriptor{{
 				ID: runtimecontract.CapabilitySandboxConfiguration, Availability: runtimecontract.CapabilityAvailable,
-				Scope: runtimecontract.CapabilityScope{RuntimeKind: "fake"},
+				Scope: runtimecontract.CapabilityScope{RuntimeKind: "fake"}, Revision: "test-1",
 			}}}}
 			meta := &Agent{
 				ID: "agent-1", Name: "worker", ThreadID: "thread-loom", Model: "model-a", ApprovalPolicy: "on-request",
@@ -369,8 +666,8 @@ func TestCapabilityDescriptorScopeMustMatchCurrentRuntimeBindingModelAndConfigur
 			t.Fatal(err)
 		}
 		h := testHub(st)
-		contract := &controlPlaneContract{snapshot: runtimecontract.CapabilitySnapshot{Capabilities: []runtimecontract.CapabilityDescriptor{{
-			ID: runtimecontract.CapabilitySandboxConfiguration, Availability: runtimecontract.CapabilityAvailable, Scope: scope,
+		contract := &controlPlaneContract{snapshot: runtimecontract.CapabilitySnapshot{Revision: "test-1", Capabilities: []runtimecontract.CapabilityDescriptor{{
+			ID: runtimecontract.CapabilitySandboxConfiguration, Availability: runtimecontract.CapabilityAvailable, Scope: scope, Revision: "test-1",
 		}}}}
 		meta := &Agent{
 			ID: "agent-1", Name: "worker", ThreadID: "thread-loom", Model: "model-a", ApprovalPolicy: "on-request",
@@ -399,9 +696,9 @@ func TestColdCreateUsesRegisteredDriverCapabilitySnapshot(t *testing.T) {
 	}
 	defer st.Close()
 	h := testHub(st)
-	driver := &controlPlaneDriver{snapshot: runtimecontract.CapabilitySnapshot{Capabilities: []runtimecontract.CapabilityDescriptor{{
+	driver := &controlPlaneDriver{snapshot: runtimecontract.CapabilitySnapshot{Revision: "test-1", Capabilities: []runtimecontract.CapabilityDescriptor{{
 		ID: runtimecontract.CapabilitySandboxConfiguration, Availability: runtimecontract.CapabilityUnavailable,
-		Reason: "driver says no isolation", Alternative: "driver says use approval",
+		Reason: "driver says no isolation", Alternative: "driver says use approval", Revision: "test-1",
 	}}}}
 	h.runtimeHostDrivers["codex"] = driver
 
@@ -423,17 +720,14 @@ func TestCreateRejectsUnsupportedRuntimeConfigBeforeBindingOrPersistence(t *test
 	}
 	defer st.Close()
 	h := testHub(st)
-	fake := &fakeAgentRuntime{binding: "native-should-not-exist"}
-	h.agentRuntimeFactory = func(string) (AgentRuntime, error) { return fake, nil }
-
 	_, err = h.CreateAgent(CreateParams{
 		Name: "pi-worker", Cwd: t.TempDir(), RuntimeKind: "pi", Sandbox: "read-only",
 	})
 	if err == nil || !strings.Contains(err.Error(), "whole-process sandbox isolation") || !strings.Contains(err.Error(), "Approval policy") {
 		t.Fatalf("unsupported create config error=%v", err)
 	}
-	if fake.created || len(h.agents) != 0 || len(h.runtimes) != 0 || len(h.seqs) != 0 {
-		t.Fatalf("unsupported create reached binding/persistence: created=%v agents=%d runtimes=%d seqs=%d", fake.created, len(h.agents), len(h.runtimes), len(h.seqs))
+	if len(h.agents) != 0 || len(h.runtimes) != 0 || len(h.seqs) != 0 {
+		t.Fatalf("unsupported create reached binding/persistence: agents=%d runtimes=%d seqs=%d", len(h.agents), len(h.runtimes), len(h.seqs))
 	}
 }
 
@@ -914,7 +1208,7 @@ func TestShutdownClosesEveryV2BindingBeforeEachDriverOnce(t *testing.T) {
 	defer st.Close()
 	h := testHub(st)
 	driver := &controlPlaneDriver{}
-	h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{"fake": driver}
+	h.runtimeHostDrivers = map[string]RuntimeHostDriver{"fake": driver}
 	for _, id := range []string{"agent-1", "agent-2"} {
 		contract := &controlPlaneContract{}
 		host := &controlPlaneHost{contract: contract, alive: true}

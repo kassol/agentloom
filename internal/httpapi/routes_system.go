@@ -24,6 +24,9 @@ func (s *Server) registerSystemRoutes(mux *http.ServeMux) {
 	})
 
 	mux.HandleFunc("POST /api/admin/restart", s.adminRestart)
+	mux.HandleFunc("GET /api/admin/restart/status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"restart": s.restartSnapshot()})
+	})
 	mux.HandleFunc("GET /api/admin/backups", s.adminListBackups)
 	mux.HandleFunc("POST /api/admin/backup", s.adminBackup)
 	mux.HandleFunc("POST /api/admin/backups/prune", s.adminPruneBackups)

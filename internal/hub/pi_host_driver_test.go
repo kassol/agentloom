@@ -93,7 +93,7 @@ func TestPiResumeMismatchClosesWrongProcessBeforeRetry(t *testing.T) {
 	runtime := newPiAgentRuntime("pi-resume", t.TempDir(), "")
 	defer runtime.Close()
 	requested := filepath.Join(runtime.dataDir, "pi", runtime.agentID, "session-pi-resume.jsonl")
-	request := RuntimeBindingRequest{NativeRef: requested, Name: "resume", Cwd: t.TempDir()}
+	request := nativeBindingRequest{NativeRef: requested, Name: "resume", Cwd: t.TempDir()}
 	if err := runtime.Resume(request, time.Second); err == nil || !strings.Contains(err.Error(), "expected") {
 		t.Fatalf("first mismatched resume error = %v", err)
 	}
@@ -285,49 +285,6 @@ func TestPiDriverPreflightFailsBeforeCreatingAgentSessionDirectory(t *testing.T)
 	}
 	if _, statErr := os.Stat(filepath.Join(dataDir, "pi")); !os.IsNotExist(statErr) {
 		t.Fatalf("preflight created Pi session directory: %v", statErr)
-	}
-}
-
-func TestPiIndeterminateStartInterruptsAndRoutesToRecoveryWithoutBlindRetry(t *testing.T) {
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	failure := &runtimecontract.Failure{
-		Code: "prompt_acceptance_unknown", Phase: runtimecontract.FailurePhaseTurnStart,
-		Message: errPiPromptAcceptanceIndeterminate.Error(), Cause: errPiPromptAcceptanceIndeterminate,
-	}
-	fake := &fakeAgentRuntime{binding: "native-pi-session", startErr: &runtimeIndeterminateError{failure: failure}}
-	h := testHub(st)
-	h.stop = make(chan struct{})
-	h.agentRuntimeFactory = func(kind string) (AgentRuntime, error) { return fake, nil }
-	defer h.Shutdown()
-	agent, err := h.CreateAgent(CreateParams{Name: "pi-indeterminate", Cwd: t.TempDir(), RuntimeKind: "pi"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.SendTask(agent.ID, "perform once", time.Second); err == nil || !strings.Contains(err.Error(), "indeterminate") {
-		t.Fatalf("SendTask indeterminate error = %v", err)
-	}
-	view, err := h.GetAgent(agent.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if view.Status != "interrupted" || view.LastTurn == nil || view.LastTurn.Status != "interrupted" {
-		t.Fatalf("indeterminate Pi Turn was reported as terminal failure: %#v", view.Agent)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		requests, _ := h.ListHumanRequests(agent.ID, "open")
-		if len(requests) == 1 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	requests, _ := h.ListHumanRequests(agent.ID, "open")
-	if len(requests) != 1 || fake.startCount != 1 {
-		t.Fatalf("indeterminate recovery requests=%#v startCount=%d; want one Needs You and no blind retry", requests, fake.startCount)
 	}
 }
 

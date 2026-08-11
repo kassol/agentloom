@@ -5,8 +5,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/yan5xu/codex-loom/internal/rollout"
 )
 
 type WorkloadWaitStats struct {
@@ -111,10 +109,11 @@ type workloadSnapshot struct {
 	attempts      map[string]HandlingAttempt
 	humanRequests []HumanRequest
 	waitReasons   map[string]string
+	usageReports  map[string]*RuntimeUsageReport
 }
 
 func (h *Hub) WorkloadOverview(days int) WorkloadOverview {
-	return buildWorkloadOverview(h.workloadSnapshot(), days, time.Now())
+	return buildWorkloadOverview(h.workloadSnapshotWithUsage(), days, time.Now())
 }
 
 func buildWorkloadOverview(snapshot workloadSnapshot, days int, now time.Time) WorkloadOverview {
@@ -125,7 +124,7 @@ func buildWorkloadOverview(snapshot workloadSnapshot, days int, now time.Time) W
 
 func (h *Hub) WorkloadOverviewRange(start, endExclusive time.Time) WorkloadOverview {
 	now := time.Now().In(start.Location())
-	return buildWorkloadOverviewRange(h.workloadSnapshot(), start, endExclusive, now)
+	return buildWorkloadOverviewRange(h.workloadSnapshotWithUsage(), start, endExclusive, now)
 }
 
 func buildWorkloadOverviewRange(snapshot workloadSnapshot, start, endExclusive, now time.Time) WorkloadOverview {
@@ -156,7 +155,7 @@ func buildWorkloadOverviewRange(snapshot workloadSnapshot, start, endExclusive, 
 	queueByAgent := collectWorkloadQueueSamples(snapshot, start, windowEnd, now)
 	allSamples := []workloadQueueSample{}
 	for _, agent := range snapshot.agents {
-		workload := buildAgentWorkload(agent, queueByAgent[agent.ID], start, days, windowEnd)
+		workload := buildAgentWorkload(agent, queueByAgent[agent.ID], start, days, windowEnd, snapshot.usageReports[agent.ID])
 		overview.Agents = append(overview.Agents, workload)
 		if workload.ActivityAvailable {
 			overview.DataQuality.TrackedActivityAgents++
@@ -269,6 +268,18 @@ func (h *Hub) workloadSnapshot() workloadSnapshot {
 	return snapshot
 }
 
+func (h *Hub) workloadSnapshotWithUsage() workloadSnapshot {
+	snapshot := h.workloadSnapshot()
+	snapshot.usageReports = make(map[string]*RuntimeUsageReport, len(snapshot.agents))
+	for index := range snapshot.agents {
+		agent := &snapshot.agents[index]
+		if report, err := h.runtimeUsageReport(agent.ID, runtimeContractBinding(agent)); err == nil {
+			snapshot.usageReports[agent.ID] = report
+		}
+	}
+	return snapshot
+}
+
 func (h *Hub) currentWaitReasonLocked(agentID string) string {
 	if h.draining {
 		return "restart_drain"
@@ -285,7 +296,7 @@ func (h *Hub) currentWaitReasonLocked(agentID string) string {
 	return "ready_pending_dispatch"
 }
 
-func buildAgentWorkload(agent Agent, samples []workloadQueueSample, start time.Time, days int, rangeEnd time.Time) AgentWorkload {
+func buildAgentWorkload(agent Agent, samples []workloadQueueSample, start time.Time, days int, rangeEnd time.Time, report *RuntimeUsageReport) AgentWorkload {
 	observedStart := start
 	if createdAt, ok := workloadTime(agent.CreatedAt); ok && createdAt.After(observedStart) {
 		observedStart = createdAt
@@ -294,8 +305,7 @@ func buildAgentWorkload(agent Agent, samples []workloadQueueSample, start time.T
 		AgentID: agent.ID, AgentName: agent.Name, Status: agent.Status,
 		Daily: emptyWorkloadDays(start, days), Sources: []WorkloadSource{}, Evidence: []WorkloadEvidence{},
 	}
-	report, err := rollout.ReadUsage(agent.RuntimeBinding.NativeRef)
-	if err == nil {
+	if report != nil {
 		workload.ActivityAvailable = true
 		workload.ObservedSeconds = maxDurationSeconds(rangeEnd.Sub(observedStart))
 		intervals := workloadIntervals(report.Activity, observedStart, rangeEnd)
@@ -582,7 +592,7 @@ type workloadInterval struct {
 	end   time.Time
 }
 
-func workloadIntervals(activity []rollout.TurnActivity, start, now time.Time) []workloadInterval {
+func workloadIntervals(activity []RuntimeTurnActivity, start, now time.Time) []workloadInterval {
 	intervals := []workloadInterval{}
 	for _, turn := range activity {
 		turnStart, ok := workloadTime(turn.StartedAt)

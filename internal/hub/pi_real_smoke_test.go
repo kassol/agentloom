@@ -36,7 +36,7 @@ func TestPiRuntimeHostDriverRealRestartSafeStory(t *testing.T) {
 	if err := h.piDriverLocked().Preflight(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	agent, err := h.CreateAgent(CreateParams{Name: "pi-real-smoke", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-real-smoke", Cwd: t.TempDir(), RuntimeKind: "pi", ApprovalPolicy: "never"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,6 +57,7 @@ func TestPiRuntimeHostDriverRealRestartSafeStory(t *testing.T) {
 	if len(history.Turns) == 0 {
 		t.Fatal("real Pi history is empty")
 	}
+	interruptedTurnID := exerciseRealRuntimeSteerInterrupt(t, h, agent.ID)
 	loomThreadID := agent.ThreadID
 	h.Shutdown()
 	if err := st.Close(); err != nil {
@@ -88,8 +89,8 @@ func TestPiRuntimeHostDriverRealRestartSafeStory(t *testing.T) {
 	if err != nil || afterRestart.NativeRef != diagnostics.NativeRef {
 		t.Fatalf("reopened Pi diagnostics = %#v, err=%v; want %q", afterRestart, err, diagnostics.NativeRef)
 	}
-	reopenedHistory, err := h.History(agent.ID, 10, 0)
-	if err != nil || len(reopenedHistory.Turns) == 0 || reopenedHistory.Turns[len(reopenedHistory.Turns)-1].ID != dispatched.TurnID {
+	reopenedHistory, err := h.CanonicalHistory(agent.ID, 10, 0)
+	if err != nil || !canonicalHistoryHasTurn(reopenedHistory, dispatched.TurnID, "completed") || !canonicalHistoryHasTurn(reopenedHistory, interruptedTurnID, "interrupted") {
 		t.Fatalf("reopened Pi history = %#v, err=%v", reopenedHistory, err)
 	}
 	handle := rt.agentHost

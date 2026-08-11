@@ -2,26 +2,23 @@ package hub
 
 import (
 	"sort"
-	"strings"
 	"time"
-
-	"github.com/yan5xu/codex-loom/internal/rollout"
 )
 
 type DailyActivityAgentBucket struct {
-	ExecutingSeconds int64              `json:"executingSeconds"`
-	TurnCount        int                `json:"turnCount"`
-	Usage            rollout.TokenUsage `json:"usage"`
+	ExecutingSeconds int64             `json:"executingSeconds"`
+	TurnCount        int               `json:"turnCount"`
+	Usage            RuntimeTokenUsage `json:"usage"`
 }
 
 type DailyActivityBucket struct {
-	StartedAt        string             `json:"startedAt"`
-	EndedAt          string             `json:"endedAt"`
-	ObservedSeconds  int64              `json:"observedSeconds"`
-	ActiveAgents     int                `json:"activeAgents"`
-	ExecutingSeconds int64              `json:"executingSeconds"`
-	TurnCount        int                `json:"turnCount"`
-	Usage            rollout.TokenUsage `json:"usage"`
+	StartedAt        string            `json:"startedAt"`
+	EndedAt          string            `json:"endedAt"`
+	ObservedSeconds  int64             `json:"observedSeconds"`
+	ActiveAgents     int               `json:"activeAgents"`
+	ExecutingSeconds int64             `json:"executingSeconds"`
+	TurnCount        int               `json:"turnCount"`
+	Usage            RuntimeTokenUsage `json:"usage"`
 }
 
 type DailyAgentActivity struct {
@@ -30,7 +27,7 @@ type DailyAgentActivity struct {
 	Status           string                     `json:"status"`
 	ExecutingSeconds int64                      `json:"executingSeconds"`
 	TurnCount        int                        `json:"turnCount"`
-	Usage            rollout.TokenUsage         `json:"usage"`
+	Usage            RuntimeTokenUsage          `json:"usage"`
 	FirstActiveAt    string                     `json:"firstActiveAt,omitempty"`
 	LastActiveAt     string                     `json:"lastActiveAt,omitempty"`
 	Buckets          []DailyActivityAgentBucket `json:"buckets"`
@@ -54,7 +51,7 @@ type DailyActivityOverview struct {
 	TotalAgents      int                      `json:"totalAgents"`
 	ExecutingSeconds int64                    `json:"executingSeconds"`
 	TurnCount        int                      `json:"turnCount"`
-	Usage            rollout.TokenUsage       `json:"usage"`
+	Usage            RuntimeTokenUsage        `json:"usage"`
 	Buckets          []DailyActivityBucket    `json:"buckets"`
 	Agents           []DailyAgentActivity     `json:"agents"`
 	DataQuality      DailyActivityDataQuality `json:"dataQuality"`
@@ -69,19 +66,16 @@ func (h *Hub) DailyActivity(start, endExclusive time.Time, bucketMinutes int) Da
 	}
 	h.mu.Unlock()
 
-	reports := make(map[string]*rollout.UsageReport, len(agents))
+	reports := make(map[string]*RuntimeUsageReport, len(agents))
 	for _, agent := range agents {
-		if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" {
-			continue
-		}
-		if report, err := rollout.ReadUsage(agent.RuntimeBinding.NativeRef); err == nil {
+		if report, err := h.runtimeUsageReport(agent.ID, runtimeContractBinding(&agent.Agent)); err == nil {
 			reports[agent.ID] = report
 		}
 	}
 	return buildDailyActivity(agents, reports, start, endExclusive, now, bucketMinutes)
 }
 
-func buildDailyActivity(agents []AgentView, reports map[string]*rollout.UsageReport, start, endExclusive, now time.Time, bucketMinutes int) DailyActivityOverview {
+func buildDailyActivity(agents []AgentView, reports map[string]*RuntimeUsageReport, start, endExclusive, now time.Time, bucketMinutes int) DailyActivityOverview {
 	if bucketMinutes <= 0 {
 		bucketMinutes = 30
 	}

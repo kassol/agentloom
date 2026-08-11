@@ -208,8 +208,8 @@ func TestPiApprovalPolicyNeverProceedsWithoutDurableApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !agent.RuntimeCapabilities.Approval {
-		t.Fatalf("Pi capabilities = %#v", agent.RuntimeCapabilities)
+	if descriptor, ok := capabilityDescriptor(agent.CapabilitySnapshot, runtimecontract.CapabilityApprovalPolicy); !ok || descriptor.Availability != runtimecontract.CapabilityAvailable {
+		t.Fatalf("Pi capabilities = %#v", agent.CapabilitySnapshot)
 	}
 	if _, err := h.SendTask(agent.ID, "run without prompting", time.Second); err != nil {
 		t.Fatal(err)
@@ -330,7 +330,7 @@ func TestPiRuntimeExplicitlyLoadsLoomExtensionWithoutDisablingNativeResources(t 
 	dataDir := t.TempDir()
 	runtime := newPiAgentRuntime("agent-pi", dataDir, "http://127.0.0.1:6123")
 	defer runtime.Close()
-	if _, err := runtime.Create(RuntimeBindingRequest{Name: "Pi Worker", Cwd: t.TempDir()}); err != nil {
+	if _, err := runtime.Create(nativeBindingRequest{Name: "Pi Worker", Cwd: t.TempDir()}); err != nil {
 		t.Fatal(err)
 	}
 	args, err := os.ReadFile(os.Getenv("FAKE_PI_START_ARGS_FILE"))
@@ -384,18 +384,15 @@ func TestPiRuntimeSteersExactActiveNativeTurn(t *testing.T) {
 	dataDir := t.TempDir()
 	runtime := newPiAgentRuntime("agent-pi", dataDir, "http://127.0.0.1:6123")
 	defer runtime.Close()
-	nativeRef, err := runtime.Create(RuntimeBindingRequest{Name: "Pi Worker", Cwd: t.TempDir()})
+	nativeRef, err := runtime.Create(nativeBindingRequest{Name: "Pi Worker", Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	nativeTurnID, err := runtime.StartTurn(RuntimeTurnRequest{
-		NativeRef: nativeRef, Input: []RuntimeInput{{Kind: RuntimeInputText, Text: "request help"}}, Timeout: time.Second,
+	nativeTurnID, err := runtime.StartTurn(nativeTurnRequest{
+		NativeRef: nativeRef, Input: []nativeInput{{Kind: nativeInputText, Text: "request help"}}, Timeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if !runtime.Capabilities().CausalSteer {
-		t.Fatalf("Pi capabilities = %#v", runtime.Capabilities())
 	}
 	accepted, err := runtime.Steer(nativeRef, nativeTurnID, "causal reply", time.Second)
 	if err != nil {
@@ -425,8 +422,8 @@ func TestPiAgentSendsSupportedImagesAsNativeRPCContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !agent.RuntimeCapabilities.ImageInput {
-		t.Fatalf("Pi image capability = %#v", agent.RuntimeCapabilities)
+	if descriptor, ok := capabilityDescriptor(agent.CapabilitySnapshot, runtimecontract.CapabilityImageInput); !ok || descriptor.Availability != runtimecontract.CapabilityAvailable {
+		t.Fatalf("Pi image capability = %#v", agent.CapabilitySnapshot)
 	}
 	imageBytes := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0x5a}, 64)...)
 	image, err := h.StageThreadArtifact(agent.ID, "diagram.png", "image/png", bytes.NewReader(imageBytes))
@@ -463,13 +460,22 @@ func TestPiAgentSendsSupportedImagesAsNativeRPCContent(t *testing.T) {
 	if !strings.Contains(prompt.Message, document.Path) {
 		t.Fatalf("generic file was not path-only guidance: %s", data)
 	}
-	history, err := h.History(agent.ID, 1, 0)
+	history, err := h.CanonicalHistory(agent.ID, 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	attachments, _ := history.Turns[0].Items[0]["attachments"].([]map[string]any)
-	if len(attachments) != 2 || attachments[0]["id"] != image.ID || attachments[0]["url"] != image.URL || attachments[1]["id"] != document.ID {
-		t.Fatalf("Pi history attachments = %#v", attachments)
+	var historyImage *runtimecontract.Image
+	attachments := make([]*runtimecontract.Attachment, 0, 1)
+	for _, block := range history.Turns[0].Content {
+		if block.Image != nil {
+			historyImage = block.Image
+		}
+		if block.Attachment != nil {
+			attachments = append(attachments, block.Attachment)
+		}
+	}
+	if historyImage == nil || historyImage.ID != image.ID || historyImage.Ref != image.URL || len(attachments) != 1 || attachments[0].ID != document.ID {
+		t.Fatalf("Pi history image=%#v attachments=%#v", historyImage, attachments)
 	}
 }
 
@@ -477,7 +483,7 @@ func TestPiAgentWaitsForAcceptedImagePromptToCreateNativeUserEntry(t *testing.T)
 	configureFakePiHubRPC(t, "image-entry-delayed")
 	runtime := newPiAgentRuntime("agent-pi", t.TempDir(), "http://127.0.0.1:6123")
 	defer runtime.Close()
-	nativeRef, err := runtime.Create(RuntimeBindingRequest{Name: "Pi Vision", Cwd: t.TempDir()})
+	nativeRef, err := runtime.Create(nativeBindingRequest{Name: "Pi Vision", Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,11 +491,11 @@ func TestPiAgentWaitsForAcceptedImagePromptToCreateNativeUserEntry(t *testing.T)
 	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	nativeTurnID, err := runtime.StartTurn(RuntimeTurnRequest{
+	nativeTurnID, err := runtime.StartTurn(nativeTurnRequest{
 		NativeRef: nativeRef,
-		Input: []RuntimeInput{
-			{Kind: RuntimeInputText, Text: "Review this image"},
-			{Kind: RuntimeInputLocalImage, Path: imagePath, MimeType: "image/png"},
+		Input: []nativeInput{
+			{Kind: nativeInputText, Text: "Review this image"},
+			{Kind: nativeInputLocalImage, Path: imagePath, MimeType: "image/png"},
 		},
 		Timeout: time.Second,
 	})
@@ -638,11 +644,11 @@ func TestPiProcessLossWithUnfinishedToolCreatesOneNeedsYou(t *testing.T) {
 	if marker.Disposition != "needs_you" || marker.State != TurnRecoveryDispatched || marker.HumanRequestID != requests[0].ID || marker.RecoveryTurnID != "" {
 		t.Fatalf("ambiguous crash marker = %#v", marker)
 	}
-	history, err := h.History(agent.ID, 10, 0)
+	history, err := h.CanonicalHistory(agent.ID, 10, 0)
 	if err != nil || len(history.Turns) != 1 {
 		t.Fatalf("ambiguous crash history = %#v, err=%v", history, err)
 	}
-	if history.Turns[0].ID != predecessor.TurnID || history.Turns[0].Status != "interrupted" {
+	if history.Turns[0].TurnID != predecessor.TurnID || history.Turns[0].State != runtimecontract.LifecycleInterrupted {
 		t.Fatalf("ambiguous predecessor history = %#v, want interrupted", history.Turns[0])
 	}
 	prompts, err := os.ReadFile(os.Getenv("FAKE_PI_PROMPTS_FILE"))
@@ -671,18 +677,18 @@ func TestPiProcessLossWithUnfinishedToolCreatesOneNeedsYou(t *testing.T) {
 	if delivered.DeliveryStatus != "delivered" || delivered.ResumedTurnID == "" || delivered.ResumedTurnID == predecessor.TurnID || delivered.AgentID != agent.ID || delivered.ThreadID != agent.ThreadID {
 		t.Fatalf("eventual Needs You continuation = %#v", delivered)
 	}
-	history, err = h.History(agent.ID, 10, 0)
+	history, err = h.CanonicalHistory(agent.ID, 10, 0)
 	if err != nil || len(history.Turns) != 2 {
 		t.Fatalf("continued ambiguous crash history = %#v, err=%v", history, err)
 	}
-	if history.Turns[0].ID != predecessor.TurnID || history.Turns[0].Status != "interrupted" {
+	if history.Turns[0].TurnID != predecessor.TurnID || history.Turns[0].State != runtimecontract.LifecycleInterrupted {
 		t.Fatalf("continued ambiguous predecessor history = %#v, want interrupted", history.Turns[0])
 	}
-	if len(history.Turns[0].Items) != 2 || history.Turns[0].Items[1]["status"] != "interrupted" {
-		t.Fatalf("continued ambiguous predecessor tool history = %#v, want interrupted", history.Turns[0].Items)
+	if len(history.Turns[0].Content) != 2 || history.Turns[0].Content[1].ToolCall == nil {
+		t.Fatalf("continued ambiguous predecessor tool history = %#v, want unfinished tool call without synthetic success", history.Turns[0].Content)
 	}
-	detail, err := h.GetTurn(predecessor.TurnID)
-	if err != nil || detail.Status != "interrupted" || len(detail.Items) != 2 || detail.Items[1]["status"] != "interrupted" {
+	detail, err := h.GetCanonicalTurn(predecessor.TurnID)
+	if err != nil || detail.State != runtimecontract.LifecycleInterrupted || len(detail.Content) != 2 || detail.Content[1].ToolCall == nil {
 		t.Fatalf("continued ambiguous predecessor Turn = %#v, err=%v", detail, err)
 	}
 }
@@ -823,16 +829,16 @@ func TestPiRuntimeNormalizesStreamingTextReasoningAndToolLifecycle(t *testing.T)
 		`{"type":"tool_execution_end","toolCallId":"call-1","toolName":"bash","result":{"content":[{"type":"text","text":"/tmp/project"}]},"isError":false}`,
 		`{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"thinking","thinking":"checking files"},{"type":"text","text":"hello world"}]}}`,
 	}
-	var events []RuntimeEvent
+	var events []nativeEvent
 	for _, raw := range rawEvents {
 		events = append(events, runtime.NormalizeEvent("", json.RawMessage(raw))...)
 	}
 	if len(events) != 7 {
 		t.Fatalf("normalized events = %#v, want 7", events)
 	}
-	wantKinds := []RuntimeEventKind{
-		RuntimeReasoningDelta, RuntimeTextDelta, RuntimeToolStarted, RuntimeToolUpdated,
-		RuntimeToolCompleted, RuntimeReasoningCompleted, RuntimeTextCompleted,
+	wantKinds := []nativeEventKind{
+		nativeReasoningDelta, nativeTextDelta, nativeToolStarted, nativeToolUpdated,
+		nativeToolCompleted, nativeReasoningCompleted, nativeTextCompleted,
 	}
 	for i, want := range wantKinds {
 		if events[i].Kind != want {
@@ -1079,9 +1085,6 @@ func TestPiHistoryProjectsOnlyActiveBranchAndKeepsPreCompactionTurns(t *testing.
 	if err != nil || last == nil || last.ID != "user-2" {
 		t.Fatalf("LatestTurn = %#v, err=%v", last, err)
 	}
-	if capabilities := runtime.Capabilities(); !capabilities.History || capabilities.Compaction {
-		t.Fatalf("Pi capabilities = %#v", capabilities)
-	}
 }
 
 func TestPiHistoryKeepsCausalAgentMessageSteerInOriginalTurn(t *testing.T) {
@@ -1179,12 +1182,12 @@ func TestPiSessionResumesAfterStoreReopenWithStableLoomIdentityAndLatestContext(
 	if reopened.ID != worker.ID || reopened.ThreadID != loomThreadID || h2.agents[worker.ID].RuntimeBinding.NativeRef != nativeRef {
 		t.Fatalf("reopened Pi identity = %#v native=%q, want Agent %q Thread %q native %q", reopened.Agent, h2.agents[worker.ID].RuntimeBinding.NativeRef, worker.ID, loomThreadID, nativeRef)
 	}
-	reopenedHistory, err := h2.History(worker.ID, 10, 0)
-	if err != nil || reopenedHistory.Total != 1 || len(reopenedHistory.Turns) != 1 || reopenedHistory.Turns[0].ID != first.TurnID {
+	reopenedHistory, err := h2.CanonicalHistory(worker.ID, 10, 0)
+	if err != nil || reopenedHistory.Total != 1 || len(reopenedHistory.Turns) != 1 || reopenedHistory.Turns[0].TurnID != first.TurnID {
 		t.Fatalf("history before Pi process resume = %#v, err=%v", reopenedHistory, err)
 	}
-	reopenedTurn, err := h2.GetTurn(first.TurnID)
-	if err != nil || reopenedTurn.ID != first.TurnID || reopenedTurn.AgentID != worker.ID || reopenedTurn.Status != "completed" {
+	reopenedTurn, err := h2.GetCanonicalTurn(first.TurnID)
+	if err != nil || reopenedTurn.TurnID != first.TurnID || reopenedTurn.AgentID != worker.ID || reopenedTurn.State != runtimecontract.LifecycleCompleted {
 		t.Fatalf("Turn before Pi process resume = %#v, err=%v", reopenedTurn, err)
 	}
 	if _, err := h2.UpdateProfile(worker.ID, ProfileParams{Identity: "latest identity", Domain: "latest domain"}); err != nil {
@@ -1226,11 +1229,11 @@ func TestPiSessionResumesAfterStoreReopenWithStableLoomIdentityAndLatestContext(
 		}
 	}
 
-	history, err := h2.History(worker.ID, 10, 0)
+	history, err := h2.CanonicalHistory(worker.ID, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if history.Total != 2 || len(history.Turns) != 2 || history.Turns[0].ID != first.TurnID || history.Turns[1].ID != second.TurnID {
+	if history.Total != 2 || len(history.Turns) != 2 || history.Turns[0].TurnID != first.TurnID || history.Turns[1].TurnID != second.TurnID {
 		t.Fatalf("reopened Pi history = %#v", history)
 	}
 	encoded, _ := json.Marshal(history.Turns)
@@ -1261,8 +1264,8 @@ func TestPiSettledBeforeEntriesResponseStillPersistsLoomTurnBinding(t *testing.T
 	if native := h.agents[agent.ID].RuntimeTurnBindings[result.TurnID]; native != "user-1" {
 		t.Fatalf("fast-settled Loom→Pi binding = %q, want user-1 (all=%#v)", native, h.agents[agent.ID].RuntimeTurnBindings)
 	}
-	history, err := h.History(agent.ID, 10, 0)
-	if err != nil || len(history.Turns) != 1 || history.Turns[0].ID != result.TurnID {
+	history, err := h.CanonicalHistory(agent.ID, 10, 0)
+	if err != nil || len(history.Turns) != 1 || history.Turns[0].TurnID != result.TurnID {
 		t.Fatalf("fast-settled history = %#v, err=%v", history, err)
 	}
 }
@@ -1287,6 +1290,7 @@ func configureFakePiHubRPC(t *testing.T, scenario string) {
 	t.Setenv("FAKE_PI_START_ARGS_FILE", filepath.Join(dir, "start-args"))
 	t.Setenv("FAKE_PI_RUNTIME_ENV_FILE", filepath.Join(dir, "runtime-env"))
 	t.Setenv("FAKE_PI_STEER_FILE", filepath.Join(dir, "steer"))
+	t.Setenv("FAKE_PI_MODEL_FILE", filepath.Join(dir, "model"))
 	t.Setenv("FAKE_PI_TOOL_EFFECT_FILE", filepath.Join(dir, "tool-effect"))
 	t.Setenv("FAKE_PI_PID_FILE", filepath.Join(dir, "pid"))
 	t.Setenv("FAKE_PI_RESUME_MISMATCH_MARKER", filepath.Join(dir, "resume-mismatch"))
@@ -1338,13 +1342,60 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 			reportedSessionFile = filepath.Join(sessionDir, "session-wrong.jsonl")
 		}
 	}
-	if scenario := os.Getenv("FAKE_PI_HUB_SCENARIO"); scenario == "image" || scenario == "image-entry-delayed" {
-		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q,"model":{"id":"vision","input":["text","image"]}}}`+"\n", id, reportedSessionFile, sessionID)
+	if scenario := os.Getenv("FAKE_PI_HUB_SCENARIO"); scenario == "image" || scenario == "image-entry-delayed" || scenario == "conformance" {
+		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q,"model":{"provider":"fixture","id":"vision","input":["text","image"]}}}`+"\n", id, reportedSessionFile, sessionID)
 	} else {
 		fmt.Printf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"sessionFile":%q,"sessionId":%q}}`+"\n", id, reportedSessionFile, sessionID)
 	}
-	serveOneFakePiEntries(t, reader, sessionFile)
-	readFakePiCommand(t, reader, &command)
+	for {
+		readFakePiCommand(t, reader, &command)
+		id, _ = command["id"].(string)
+		switch command["type"] {
+		case "get_entries":
+			respondFakePiEntries(command, sessionFile)
+			goto entriesReady
+		case "get_available_models":
+			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"fixture","id":"vision","input":["text","image"],"contextWindow":128000,"reasoning":true},{"provider":"fixture","id":"vision-next","input":["text","image"],"contextWindow":128000,"reasoning":true}]}}`+"\n", id)
+		case "get_available_thinking_levels":
+			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","low","high"]}}`+"\n", id)
+		case "set_model":
+			provider, _ := command["provider"].(string)
+			model, _ := command["modelId"].(string)
+			_ = os.WriteFile(os.Getenv("FAKE_PI_MODEL_FILE"), []byte(provider+"/"+model), 0o600)
+			fmt.Printf(`{"id":%q,"type":"response","command":"set_model","success":true,"data":{"provider":%q,"id":%q,"input":["text","image"]}}`+"\n", id, provider, model)
+		case "set_thinking_level":
+			fmt.Printf(`{"id":%q,"type":"response","command":"set_thinking_level","success":true}`+"\n", id)
+		default:
+			os.Exit(34)
+		}
+	}
+
+entriesReady:
+	for {
+		readFakePiCommand(t, reader, &command)
+		id, _ = command["id"].(string)
+		switch command["type"] {
+		case "get_entries":
+			respondFakePiEntries(command, sessionFile)
+			continue
+		case "get_available_models":
+			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"fixture","id":"vision","input":["text","image"],"contextWindow":128000,"reasoning":true},{"provider":"fixture","id":"vision-next","input":["text","image"],"contextWindow":128000,"reasoning":true}]}}`+"\n", id)
+			continue
+		case "get_available_thinking_levels":
+			fmt.Printf(`{"id":%q,"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","low","high"]}}`+"\n", id)
+			continue
+		case "set_model":
+			provider, _ := command["provider"].(string)
+			model, _ := command["modelId"].(string)
+			_ = os.WriteFile(os.Getenv("FAKE_PI_MODEL_FILE"), []byte(provider+"/"+model), 0o600)
+			fmt.Printf(`{"id":%q,"type":"response","command":"set_model","success":true,"data":{"provider":%q,"id":%q,"input":["text","image"]}}`+"\n", id, provider, model)
+			continue
+		case "set_thinking_level":
+			fmt.Printf(`{"id":%q,"type":"response","command":"set_thinking_level","success":true}`+"\n", id)
+			continue
+		}
+		break
+	}
 	id, _ = command["id"].(string)
 	message, _ := command["message"].(string)
 	_ = os.WriteFile(os.Getenv("FAKE_PI_PROMPT_FILE"), []byte(message), 0o600)
@@ -1368,6 +1419,8 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 	switch scenario {
 	case "abort":
 		answer, stopReason = "before abort after abort", "aborted"
+	case "conformance":
+		answer, stopReason = "hello continued", "aborted"
 	case "retry-compaction":
 		answer = "recovered"
 	case "malformed-after-prompt":
@@ -1382,6 +1435,23 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 		appendFakePiInterruptedTurn(t, sessionFile, message, true)
 	} else {
 		appendFakePiTurn(t, sessionFile, message, answer, stopReason)
+	}
+	if scenario == "conformance" {
+		payload, _ := json.Marshal(map[string]any{
+			"version": 1, "operation": "request_approval", "toolCallId": "call-conformance",
+			"toolName": "bash", "input": map[string]any{"command": "printf conformance"},
+		})
+		event, _ := json.Marshal(map[string]any{
+			"type": "extension_ui_request", "id": "ui-conformance", "method": "input",
+			"title": "codex-loom:approval:v1", "placeholder": string(payload), "timeout": 5000,
+		})
+		fmt.Println(string(event))
+		readFakePiCommand(t, reader, &command)
+		if command["type"] != "extension_ui_response" || command["id"] != "ui-conformance" || command["value"] != "approve" {
+			fmt.Fprintf(os.Stderr, "unexpected conformance approval response: %#v\n", command)
+			os.Exit(36)
+		}
+		_ = os.WriteFile(os.Getenv("FAKE_PI_TOOL_EFFECT_FILE"), []byte("executed"), 0o600)
 	}
 	fmt.Printf(`{"id":%q,"type":"response","command":"prompt","success":true}`+"\n", id)
 	if scenario == "image-entry-delayed" {
@@ -1453,6 +1523,32 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 		_ = os.WriteFile(os.Getenv("FAKE_PI_STEER_FILE"), []byte(fmt.Sprint(command["message"])), 0o600)
 		fmt.Printf(`{"id":%q,"type":"response","command":"steer","success":true}`+"\n", id)
 		_, _ = reader.ReadString('\n')
+		return
+	}
+	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "conformance" {
+		fmt.Print("{\"type\":\"agent_start\"}\n")
+		fmt.Print("{\"type\":\"tool_execution_start\",\"toolCallId\":\"call-conformance\",\"toolName\":\"bash\",\"args\":{\"command\":\"printf conformance\"}}\n")
+		fmt.Print("{\"type\":\"tool_execution_end\",\"toolCallId\":\"call-conformance\",\"toolName\":\"bash\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"executed\"}]},\"isError\":false}\n")
+		fmt.Print("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n")
+		fmt.Print("{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"hello \"}}\n")
+		readFakePiCommand(t, reader, &command)
+		id, _ = command["id"].(string)
+		if command["type"] != "steer" {
+			os.Exit(35)
+		}
+		_ = os.WriteFile(os.Getenv("FAKE_PI_STEER_FILE"), []byte(fmt.Sprint(command["message"])), 0o600)
+		fmt.Printf(`{"id":%q,"type":"response","command":"steer","success":true}`+"\n", id)
+		fmt.Print("{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"continued\"}}\n")
+		readFakePiCommand(t, reader, &command)
+		id, _ = command["id"].(string)
+		if command["type"] != "abort" {
+			os.Exit(32)
+		}
+		fmt.Printf(`{"id":%q,"type":"response","command":"abort","success":true}`+"\n", id)
+		fmt.Print("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"aborted\",\"content\":[{\"type\":\"text\",\"text\":\"hello continued\"}]}}\n")
+		fmt.Print("{\"type\":\"agent_end\",\"willRetry\":false}\n")
+		fmt.Print("{\"type\":\"agent_settled\"}\n")
+		serveFakePiHistory(reader, sessionFile)
 		return
 	}
 	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "abort" {
@@ -1544,9 +1640,13 @@ func appendFakePiTurn(t *testing.T, sessionFile, prompt, answer, stopReason stri
 	if leafID != "" {
 		user["parentId"] = leafID
 	}
+	assistantMessage := map[string]any{"role": "assistant", "content": []map[string]any{{"type": "text", "text": answer}}, "stopReason": stopReason, "model": "fake-pi"}
+	if os.Getenv("FAKE_PI_HUB_SCENARIO") == "conformance" {
+		assistantMessage["usage"] = map[string]any{"input": 10, "output": 4, "cacheRead": 2, "totalTokens": 14}
+	}
 	assistant := map[string]any{
 		"type": "message", "id": assistantID, "parentId": userID, "timestamp": fmt.Sprintf("2026-08-10T01:00:%02d.500Z", index*2),
-		"message": map[string]any{"role": "assistant", "content": []map[string]any{{"type": "text", "text": answer}}, "stopReason": stopReason, "model": "fake-pi"},
+		"message": assistantMessage,
 	}
 	file, err := os.OpenFile(sessionFile, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {

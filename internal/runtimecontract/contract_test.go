@@ -128,6 +128,9 @@ func TestContractV2RejectsContradictoryContentAndLifecycleStates(t *testing.T) {
 		{State: runtimecontract.LifecycleFailed},
 		{State: runtimecontract.LifecycleIndeterminate},
 		{State: runtimecontract.LifecycleIndeterminate, Failure: &runtimecontract.Failure{Code: "timeout", Retryable: true}},
+		{State: runtimecontract.LifecycleFailed, Failure: &runtimecontract.Failure{Phase: runtimecontract.FailurePhaseTurnStart, Message: "failed"}},
+		{State: runtimecontract.LifecycleFailed, Failure: &runtimecontract.Failure{Code: "failed", Phase: runtimecontract.FailurePhaseTurnStart}},
+		{State: runtimecontract.LifecycleFailed, Failure: &runtimecontract.Failure{Code: "failed", Phase: "unknown", Message: "failed"}},
 	} {
 		if err := outcome.Validate(); err == nil {
 			t.Fatalf("invalid outcome validated: %#v", outcome)
@@ -136,13 +139,64 @@ func TestContractV2RejectsContradictoryContentAndLifecycleStates(t *testing.T) {
 }
 
 func TestMandatoryCoreLeavesLegacyControlsToCapabilityMigration(t *testing.T) {
-	legacy := []string{"Sandbox", "ApprovalPolicy", "ProviderID", "Model", "Effort", "DisabledSkillPaths"}
-	for _, request := range []any{runtimecontract.BindingRequest{}, runtimecontract.TurnRequest{}} {
-		typeOf := reflect.TypeOf(request)
-		for _, field := range legacy {
-			if _, exists := typeOf.FieldByName(field); exists {
-				t.Fatalf("mandatory %s still carries legacy control %s", typeOf.Name(), field)
-			}
+	legacy := map[string]bool{"Options": true, "Policy": true, "Sandbox": true, "ApprovalPolicy": true, "ProviderID": true, "Model": true, "Effort": true, "DisabledSkillPaths": true}
+	seen := map[reflect.Type]bool{}
+	var inspect func(reflect.Type)
+	inspect = func(typeOf reflect.Type) {
+		for typeOf.Kind() == reflect.Pointer || typeOf.Kind() == reflect.Slice || typeOf.Kind() == reflect.Array {
+			typeOf = typeOf.Elem()
 		}
+		if typeOf.Kind() != reflect.Struct || seen[typeOf] {
+			return
+		}
+		seen[typeOf] = true
+		for index := 0; index < typeOf.NumField(); index++ {
+			field := typeOf.Field(index)
+			if legacy[field.Name] {
+				t.Fatalf("mandatory request graph %s still carries legacy control %s", typeOf.Name(), field.Name)
+			}
+			inspect(field.Type)
+		}
+	}
+	for _, request := range []any{runtimecontract.BindingRequest{}, runtimecontract.TurnRequest{}} {
+		inspect(reflect.TypeOf(request))
+	}
+}
+
+func TestCapabilitySnapshotValidateRejectsMalformedDescriptors(t *testing.T) {
+	valid := runtimecontract.CapabilitySnapshot{Revision: "driver-1", Capabilities: []runtimecontract.CapabilityDescriptor{{
+		ID: "history", Availability: runtimecontract.CapabilityAvailable, Revision: "cap-1",
+	}}}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid snapshot: %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*runtimecontract.CapabilitySnapshot)
+	}{
+		{name: "snapshot revision", mutate: func(snapshot *runtimecontract.CapabilitySnapshot) { snapshot.Revision = "" }},
+		{name: "descriptor id", mutate: func(snapshot *runtimecontract.CapabilitySnapshot) { snapshot.Capabilities[0].ID = "" }},
+		{name: "descriptor revision", mutate: func(snapshot *runtimecontract.CapabilitySnapshot) { snapshot.Capabilities[0].Revision = "" }},
+		{name: "availability", mutate: func(snapshot *runtimecontract.CapabilitySnapshot) { snapshot.Capabilities[0].Availability = "maybe" }},
+		{name: "duplicate", mutate: func(snapshot *runtimecontract.CapabilitySnapshot) {
+			snapshot.Capabilities = append(snapshot.Capabilities, snapshot.Capabilities[0])
+		}},
+		{name: "unavailable reason", mutate: func(snapshot *runtimecontract.CapabilitySnapshot) {
+			snapshot.Capabilities[0].Availability = runtimecontract.CapabilityUnavailable
+			snapshot.Capabilities[0].Alternative = "use history"
+		}},
+		{name: "unavailable alternative", mutate: func(snapshot *runtimecontract.CapabilitySnapshot) {
+			snapshot.Capabilities[0].Availability = runtimecontract.CapabilityUnavailable
+			snapshot.Capabilities[0].Reason = "not supported"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := valid
+			snapshot.Capabilities = append([]runtimecontract.CapabilityDescriptor(nil), valid.Capabilities...)
+			test.mutate(&snapshot)
+			if err := snapshot.Validate(); err == nil {
+				t.Fatal("malformed capability snapshot validated")
+			}
+		})
 	}
 }

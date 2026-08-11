@@ -8,38 +8,42 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/pi"
-	"github.com/yan5xu/codex-loom/internal/rollout"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
+
+var errPiNativeTurnNotFound = errors.New("Pi native Turn not found")
 
 type piAgentRuntime struct {
 	agentID string
 	dataDir string
 	apiURL  string
 
-	mu               sync.Mutex
-	rpc              *pi.RPC
-	onEvent          func(RuntimeEvent)
-	onFailure        func(error)
-	onDiagnostic     func(json.RawMessage)
-	onApproval       func(RuntimeApprovalRequest)
-	developerContext string
-	approvalPolicy   string
-	messageSequence  uint64
-	currentMessage   uint64
-	pendingTerminal  RuntimeEvent
-	settled          chan struct{}
-	activeNativeTurn string
-	abortRequested   bool
-	imageInput       bool
-	currentModel     RuntimeModel
-	availableModels  []RuntimeModel
-	thinkingLevel    string
-	thinkingLevels   []string
+	mu                sync.Mutex
+	rpc               *pi.RPC
+	onEvent           func(nativeEvent)
+	onFailure         func(error)
+	onDiagnostic      func(json.RawMessage)
+	onApproval        func(runtimecontract.ApprovalProposal)
+	approvalResponses map[string]func(string) error
+	developerContext  string
+	approvalPolicy    string
+	messageSequence   uint64
+	currentMessage    uint64
+	pendingTerminal   nativeEvent
+	settled           chan struct{}
+	activeNativeTurn  string
+	abortRequested    bool
+	imageInput        bool
+	currentModel      RuntimeModel
+	availableModels   []RuntimeModel
+	thinkingLevel     string
+	thinkingLevels    []string
 }
 
 func newPiAgentRuntime(agentID, dataDir, apiURL string) *piAgentRuntime {
@@ -49,7 +53,7 @@ func newPiAgentRuntime(agentID, dataDir, apiURL string) *piAgentRuntime {
 	return &piAgentRuntime{agentID: agentID, dataDir: dataDir, apiURL: strings.TrimRight(apiURL, "/")}
 }
 
-func (r *piAgentRuntime) SetRuntimeEventHandlers(onEvent func(RuntimeEvent), onFailure func(error)) {
+func (r *piAgentRuntime) SetRuntimeEventHandlers(onEvent func(nativeEvent), onFailure func(error)) {
 	r.mu.Lock()
 	r.onEvent, r.onFailure = onEvent, onFailure
 	r.mu.Unlock()
@@ -61,10 +65,21 @@ func (r *piAgentRuntime) SetRuntimeDiagnosticHandler(onDiagnostic func(json.RawM
 	r.mu.Unlock()
 }
 
-func (r *piAgentRuntime) SetRuntimeApprovalHandler(onApproval func(RuntimeApprovalRequest)) {
+func (r *piAgentRuntime) SetApprovalHandler(onApproval func(runtimecontract.ApprovalProposal)) {
 	r.mu.Lock()
 	r.onApproval = onApproval
 	r.mu.Unlock()
+}
+
+func (r *piAgentRuntime) ResolveApproval(_ context.Context, proposalID string, decision runtimecontract.ApprovalDecision) error {
+	r.mu.Lock()
+	respond := r.approvalResponses[proposalID]
+	delete(r.approvalResponses, proposalID)
+	r.mu.Unlock()
+	if respond == nil {
+		return fmt.Errorf("Runtime Approval proposal %s is unavailable", proposalID)
+	}
+	return respond(string(decision))
 }
 
 func (r *piAgentRuntime) Alive() bool {
@@ -74,7 +89,7 @@ func (r *piAgentRuntime) Alive() bool {
 	return rpc != nil && rpc.Alive()
 }
 
-func (r *piAgentRuntime) Create(request RuntimeBindingRequest) (string, error) {
+func (r *piAgentRuntime) Create(request nativeBindingRequest) (string, error) {
 	state, err := r.start(request, "")
 	if err != nil {
 		return "", err
@@ -85,7 +100,7 @@ func (r *piAgentRuntime) Create(request RuntimeBindingRequest) (string, error) {
 	return state.SessionFile, nil
 }
 
-func (r *piAgentRuntime) Resume(request RuntimeBindingRequest, timeout time.Duration) error {
+func (r *piAgentRuntime) Resume(request nativeBindingRequest, timeout time.Duration) error {
 	if r.Alive() {
 		return nil
 	}
@@ -116,7 +131,7 @@ type piRuntimeModel struct {
 	ThinkingLevelMap map[string]*string `json:"thinkingLevelMap"`
 }
 
-func (r *piAgentRuntime) start(request RuntimeBindingRequest, nativeRef string) (piSessionState, error) {
+func (r *piAgentRuntime) start(request nativeBindingRequest, nativeRef string) (piSessionState, error) {
 	sessionDir := filepath.Join(r.dataDir, "pi", r.agentID)
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 		return piSessionState{}, fmt.Errorf("create Pi session directory: %w", err)
@@ -310,7 +325,7 @@ func (r *piAgentRuntime) InjectDeveloperContext(_ string, content string, _ time
 	return nil
 }
 
-func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
+func (r *piAgentRuntime) StartTurn(request nativeTurnRequest) (string, error) {
 	parts := make([]string, 0, len(request.Input)+1)
 	type piImage struct {
 		Type     string `json:"type"`
@@ -325,7 +340,7 @@ func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	}
 	rpc := r.rpc
 	imageInput := r.imageInput
-	r.pendingTerminal = RuntimeEvent{}
+	r.pendingTerminal = nativeEvent{}
 	r.currentMessage = 0
 	r.settled = make(chan struct{})
 	r.abortRequested = false
@@ -336,11 +351,11 @@ func (r *piAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
 	r.mu.Unlock()
 	for _, input := range request.Input {
 		switch input.Kind {
-		case RuntimeInputText:
+		case nativeInputText:
 			if text := strings.TrimSpace(input.Text); text != "" {
 				parts = append(parts, text)
 			}
-		case RuntimeInputLocalImage:
+		case nativeInputLocalImage:
 			if !imageInput {
 				return "", errors.New("Pi Runtime active model does not support image input")
 			}
@@ -462,7 +477,7 @@ func (r *piAgentRuntime) Interrupt(_ string, _ string, timeout time.Duration) er
 	}
 }
 
-func (r *piAgentRuntime) NormalizeEvent(_ string, raw json.RawMessage) []RuntimeEvent {
+func (r *piAgentRuntime) NormalizeEvent(_ string, raw json.RawMessage) []nativeEvent {
 	r.mu.Lock()
 	events, _ := r.normalizeEventLocked(raw)
 	r.mu.Unlock()
@@ -491,11 +506,11 @@ func (r *piAgentRuntime) handleEvent(raw json.RawMessage) {
 	var settled chan struct{}
 	if typeOnly.Type == "agent_settled" {
 		terminal = r.pendingTerminal
-		r.pendingTerminal = RuntimeEvent{}
-		if r.abortRequested && terminal.Kind != RuntimeTurnInterrupted {
-			terminal = RuntimeEvent{Kind: RuntimeTurnFailed, Error: "Pi settled an aborted Turn without a final aborted assistant state"}
+		r.pendingTerminal = nativeEvent{}
+		if r.abortRequested && terminal.Kind != nativeTurnInterrupted {
+			terminal = nativeEvent{Kind: nativeTurnFailed, Error: "Pi settled an aborted Turn without a final aborted assistant state"}
 		} else if terminal.Kind == "" {
-			terminal.Kind = RuntimeTurnCompleted
+			terminal.Kind = nativeTurnCompleted
 		}
 		events = append(events, terminal)
 		settled = r.settled
@@ -568,14 +583,56 @@ func (r *piAgentRuntime) handleApprovalEvent(raw json.RawMessage) bool {
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
-	handler(RuntimeApprovalRequest{
-		Method: "tool/" + payload.ToolName, Params: append(json.RawMessage(nil), []byte(envelope.Placeholder)...),
-		Timeout: timeout, Respond: respond,
+	proposalID := "runtime-approval-" + strings.TrimPrefix(newIntegrationID("proposal"), "proposal_")
+	r.mu.Lock()
+	if r.approvalResponses == nil {
+		r.approvalResponses = map[string]func(string) error{}
+	}
+	r.approvalResponses[proposalID] = respond
+	r.mu.Unlock()
+	handler(runtimecontract.ApprovalProposal{
+		ID: proposalID, ToolName: payload.ToolName, Action: "tool/" + payload.ToolName,
+		Arguments: piApprovalArguments(envelope.Placeholder), Timeout: timeout,
 	})
 	return true
 }
 
-func (r *piAgentRuntime) normalizeEventLocked(raw json.RawMessage) ([]RuntimeEvent, RuntimeEvent) {
+func piApprovalArguments(raw string) []runtimecontract.ApprovalArgument {
+	var input map[string]any
+	if json.Unmarshal([]byte(raw), &input) != nil {
+		return nil
+	}
+	if nested, ok := input["input"].(string); ok {
+		var actionable map[string]any
+		if json.Unmarshal([]byte(nested), &actionable) == nil {
+			for key, value := range actionable {
+				input[key] = value
+			}
+			delete(input, "input")
+		}
+	}
+	if actionable, ok := input["input"].(map[string]any); ok {
+		for key, value := range actionable {
+			input[key] = value
+		}
+		delete(input, "input")
+	}
+	arguments := make([]runtimecontract.ApprovalArgument, 0, len(input))
+	for key, value := range input {
+		if !approvalActionKey(key) {
+			continue
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			continue
+		}
+		arguments = append(arguments, runtimecontract.ApprovalArgument{Name: key, Value: strings.Trim(string(encoded), `"`)})
+	}
+	sort.Slice(arguments, func(i, j int) bool { return arguments[i].Name < arguments[j].Name })
+	return arguments
+}
+
+func (r *piAgentRuntime) normalizeEventLocked(raw json.RawMessage) ([]nativeEvent, nativeEvent) {
 	var envelope struct {
 		Type    string `json:"type"`
 		Message struct {
@@ -600,37 +657,37 @@ func (r *piAgentRuntime) normalizeEventLocked(raw json.RawMessage) ([]RuntimeEve
 		IsError       bool           `json:"isError"`
 	}
 	if json.Unmarshal(raw, &envelope) != nil {
-		return nil, RuntimeEvent{Kind: RuntimeTurnFailed, Error: "Pi emitted malformed event"}
+		return nil, nativeEvent{Kind: nativeTurnFailed, Error: "Pi emitted malformed event"}
 	}
 	switch envelope.Type {
 	case "agent_start":
-		return []RuntimeEvent{{Kind: RuntimeTurnStarted}}, RuntimeEvent{}
+		return []nativeEvent{{Kind: nativeTurnStarted}}, nativeEvent{}
 	case "message_start":
 		if envelope.Message.Role == "assistant" {
 			r.messageSequence++
 			r.currentMessage = r.messageSequence
 		}
-		return nil, RuntimeEvent{}
+		return nil, nativeEvent{}
 	case "message_update":
 		sequence := r.ensureCurrentMessageLocked()
 		switch envelope.AssistantMessageEvent.Type {
 		case "text_delta":
-			return []RuntimeEvent{{Kind: RuntimeTextDelta, ItemID: piMessageItemID(sequence), Text: envelope.AssistantMessageEvent.Delta}}, RuntimeEvent{}
+			return []nativeEvent{{Kind: nativeTextDelta, ItemID: piMessageItemID(sequence), Text: envelope.AssistantMessageEvent.Delta}}, nativeEvent{}
 		case "thinking_delta":
-			return []RuntimeEvent{{Kind: RuntimeReasoningDelta, ItemID: piReasoningItemID(sequence), Text: envelope.AssistantMessageEvent.Delta}}, RuntimeEvent{}
+			return []nativeEvent{{Kind: nativeReasoningDelta, ItemID: piReasoningItemID(sequence), Text: envelope.AssistantMessageEvent.Delta}}, nativeEvent{}
 		default:
-			return nil, RuntimeEvent{}
+			return nil, nativeEvent{}
 		}
 	case "tool_execution_start", "tool_execution_update", "tool_execution_end":
 		if envelope.ToolCallID == "" || envelope.ToolName == "" {
-			return nil, RuntimeEvent{}
+			return nil, nativeEvent{}
 		}
-		kind, status, result := RuntimeToolStarted, "running", map[string]any(nil)
+		kind, status, result := nativeToolStarted, "running", map[string]any(nil)
 		switch envelope.Type {
 		case "tool_execution_update":
-			kind, result = RuntimeToolUpdated, envelope.PartialResult
+			kind, result = nativeToolUpdated, envelope.PartialResult
 		case "tool_execution_end":
-			kind, result = RuntimeToolCompleted, envelope.Result
+			kind, result = nativeToolCompleted, envelope.Result
 			status = "completed"
 			if envelope.IsError {
 				status = "failed"
@@ -644,15 +701,15 @@ func (r *piAgentRuntime) normalizeEventLocked(raw json.RawMessage) ([]RuntimeEve
 		if envelope.IsError {
 			item["error"] = output
 		}
-		return []RuntimeEvent{{Kind: kind, ItemID: envelope.ToolCallID, Item: item, Status: status, Error: func() string {
+		return []nativeEvent{{Kind: kind, ItemID: envelope.ToolCallID, Item: item, Status: status, Error: func() string {
 			if envelope.IsError {
 				return output
 			}
 			return ""
-		}()}}, RuntimeEvent{}
+		}()}}, nativeEvent{}
 	case "message_end":
 		if envelope.Message.Role != "assistant" {
-			return nil, RuntimeEvent{}
+			return nil, nativeEvent{}
 		}
 		sequence := r.ensureCurrentMessageLocked()
 		r.currentMessage = 0
@@ -666,18 +723,18 @@ func (r *piAgentRuntime) normalizeEventLocked(raw json.RawMessage) ([]RuntimeEve
 			}
 		}
 		answer := strings.Join(text, "")
-		events := []RuntimeEvent{}
+		events := []nativeEvent{}
 		if thought := strings.Join(reasoning, ""); thought != "" {
 			itemID := piReasoningItemID(sequence)
-			events = append(events, RuntimeEvent{
-				Kind: RuntimeReasoningCompleted, ItemID: itemID, Text: thought,
+			events = append(events, nativeEvent{
+				Kind: nativeReasoningCompleted, ItemID: itemID, Text: thought,
 				Item: map[string]any{"id": itemID, "type": "reasoning", "text": thought},
 			})
 		}
 		if answer != "" {
 			itemID := piMessageItemID(sequence)
-			events = append(events, RuntimeEvent{
-				Kind: RuntimeTextCompleted, ItemID: itemID, Text: answer,
+			events = append(events, nativeEvent{
+				Kind: nativeTextCompleted, ItemID: itemID, Text: answer,
 				Item: map[string]any{"id": itemID, "type": "agentMessage", "text": answer},
 			})
 		}
@@ -687,14 +744,14 @@ func (r *piAgentRuntime) normalizeEventLocked(raw json.RawMessage) ([]RuntimeEve
 			if message == "" {
 				message = "Pi assistant message ended with an error"
 			}
-			return events, RuntimeEvent{Kind: RuntimeTurnFailed, Error: message}
+			return events, nativeEvent{Kind: nativeTurnFailed, Error: message}
 		case "aborted":
-			return events, RuntimeEvent{Kind: RuntimeTurnInterrupted, Error: "Pi Turn aborted"}
+			return events, nativeEvent{Kind: nativeTurnInterrupted, Error: "Pi Turn aborted"}
 		default:
-			return events, RuntimeEvent{Kind: RuntimeTurnCompleted}
+			return events, nativeEvent{Kind: nativeTurnCompleted}
 		}
 	default:
-		return nil, RuntimeEvent{}
+		return nil, nativeEvent{}
 	}
 }
 
@@ -737,14 +794,14 @@ func piResultText(result map[string]any) string {
 	return strings.Join(parts, "")
 }
 
-func (r *piAgentRuntime) ReadHistory(nativeRef string, count, offset int) (RuntimeHistory, error) {
+func (r *piAgentRuntime) ReadHistory(nativeRef string, count, offset int) (nativeHistory, error) {
 	entries, leafID, err := r.piSessionEntries(nativeRef)
 	if err != nil {
-		return RuntimeHistory{}, err
+		return nativeHistory{}, err
 	}
 	history, err := projectPiHistory(entries, leafID)
 	if err != nil {
-		return RuntimeHistory{}, err
+		return nativeHistory{}, err
 	}
 	if count <= 0 {
 		count = 10
@@ -764,37 +821,30 @@ func (r *piAgentRuntime) ReadHistory(nativeRef string, count, offset int) (Runti
 	return history, nil
 }
 
-func (r *piAgentRuntime) ReadTurn(nativeRef, nativeTurnID string) (RuntimeHistoryTurn, error) {
+func (r *piAgentRuntime) ReadTurn(nativeRef, nativeTurnID string) (nativeHistoryTurn, error) {
 	entries, leafID, err := r.piSessionEntries(nativeRef)
 	if err != nil {
-		return RuntimeHistoryTurn{}, err
+		return nativeHistoryTurn{}, err
 	}
 	history, err := projectPiHistory(entries, leafID)
 	if err != nil {
-		return RuntimeHistoryTurn{}, err
+		return nativeHistoryTurn{}, err
 	}
 	for _, turn := range history.Turns {
 		if turn.ID == nativeTurnID {
 			return turn, nil
 		}
 	}
-	return RuntimeHistoryTurn{}, fmt.Errorf("%w: %s", rollout.ErrTurnNotFound, nativeTurnID)
+	return nativeHistoryTurn{}, fmt.Errorf("%w: %s", errPiNativeTurnNotFound, nativeTurnID)
 }
 
-func (r *piAgentRuntime) LatestTurn(nativeRef string) (*RuntimeHistoryTurn, error) {
+func (r *piAgentRuntime) LatestTurn(nativeRef string) (*nativeHistoryTurn, error) {
 	history, err := r.ReadHistory(nativeRef, 1, 0)
 	if err != nil || len(history.Turns) == 0 {
 		return nil, err
 	}
 	turn := history.Turns[0]
 	return &turn, nil
-}
-
-func (r *piAgentRuntime) Capabilities() RuntimeCapabilities {
-	r.mu.Lock()
-	imageInput := r.imageInput
-	r.mu.Unlock()
-	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true, Approval: true, Provider: true, ImageInput: imageInput}
 }
 
 func (r *piAgentRuntime) Close() {

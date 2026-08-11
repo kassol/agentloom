@@ -44,7 +44,7 @@ func TestBuildWorkloadOverviewCombinesActivityWaitAndBacklog(t *testing.T) {
 		waitReasons: map[string]string{"agent-1": "agent_busy"},
 	}
 
-	overview := buildWorkloadOverview(snapshot, 1, now)
+	overview := buildWorkloadOverview(withTestWorkloadUsage(t, snapshot), 1, now)
 	if overview.ExecutingSeconds != 90*60 || overview.ExecutingPercent != 12.5 || overview.IdleProxyPercent != 87.5 {
 		t.Fatalf("activity overview = %#v", overview)
 	}
@@ -126,7 +126,7 @@ func TestBuildWorkloadOverviewRangeSeparatesHistoricalSamplesFromCurrentBacklog(
 	start := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
 	endExclusive := start.AddDate(0, 0, 1)
 	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
-	overview := buildWorkloadOverviewRange(workloadSnapshot{
+	overview := buildWorkloadOverviewRange(withTestWorkloadUsage(t, workloadSnapshot{
 		agents: []Agent{{ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, CreatedAt: "2026-07-14T00:00:00Z"}},
 		messages: []AgentMessage{
 			{ID: "msg-selected", ToAgentID: "agent-1", CreatedAt: "2026-07-15T03:00:00Z", DeliveredAt: "2026-07-15T03:10:00Z", DeliveryStatus: "delivered"},
@@ -134,7 +134,7 @@ func TestBuildWorkloadOverviewRangeSeparatesHistoricalSamplesFromCurrentBacklog(
 			{ID: "msg-current", ToAgentID: "agent-1", CreatedAt: "2026-07-17T11:00:00Z", DeliveryStatus: "queued"},
 		},
 		waitReasons: map[string]string{"agent-1": "agent_busy"},
-	}, start, endExclusive, now)
+	}), start, endExclusive, now)
 
 	if overview.Live || overview.Days != 1 || overview.Since != "2026-07-15" || overview.Through != "2026-07-15" {
 		t.Fatalf("historical window = %#v", overview)
@@ -171,9 +171,9 @@ func TestBuildWorkloadOverviewRangeClipsTodayAtNow(t *testing.T) {
 	start := time.Date(2026, 7, 16, 0, 0, 0, 0, time.UTC)
 	endExclusive := start.AddDate(0, 0, 1)
 	now := start.Add(12 * time.Hour)
-	overview := buildWorkloadOverviewRange(workloadSnapshot{
+	overview := buildWorkloadOverviewRange(withTestWorkloadUsage(t, workloadSnapshot{
 		agents: []Agent{{ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, CreatedAt: "2026-07-15T00:00:00Z"}},
-	}, start, endExclusive, now)
+	}), start, endExclusive, now)
 
 	if !overview.Live || overview.ObservedSeconds != 12*60*60 || overview.ExecutingSeconds != 60*60 {
 		t.Fatalf("live workload window = %#v", overview)
@@ -181,4 +181,15 @@ func TestBuildWorkloadOverviewRangeClipsTodayAtNow(t *testing.T) {
 	if len(overview.Daily) != 1 || overview.Daily[0].ObservedSeconds != 12*60*60 {
 		t.Fatalf("live daily denominator = %#v", overview.Daily)
 	}
+}
+
+func withTestWorkloadUsage(t *testing.T, snapshot workloadSnapshot) workloadSnapshot {
+	t.Helper()
+	snapshot.usageReports = make(map[string]*RuntimeUsageReport, len(snapshot.agents))
+	for _, agent := range snapshot.agents {
+		if agent.RuntimeBinding.NativeRef != "" {
+			snapshot.usageReports[agent.ID] = readTestRuntimeUsage(t, agent.RuntimeBinding.NativeRef)
+		}
+	}
+	return snapshot
 }

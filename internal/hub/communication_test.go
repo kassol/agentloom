@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -103,18 +104,18 @@ func TestCausalReplyUsesNativeTurnAtRuntimeAndPersistsLoomTurn(t *testing.T) {
 	root, reply := causalReplyFixture()
 	h.comms[root.ID], h.comms[reply.ID] = root, reply
 	h.commOrder = []string{root.ID, reply.ID}
-	backend := &fakeAgentRuntime{}
+	contract := &controlPlaneContract{}
 	h.runtimes["agent-a"] = &runtime{
-		agentRuntime: backend,
-		activeTurn:   &turnState{turnID: "turn-alpha", nativeTurnID: "native-turn-alpha"},
+		runtimeContract: contract, binding: runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "pi", NativeRef: "thread-alpha"},
+		activeTurn: &turnState{turnID: "turn-alpha", nativeTurnID: "native-turn-alpha"},
 	}
 
 	delivered, ok := h.tryDeliverReplyToActiveTurn("agent-a", time.Second)
 	if !ok || delivered == nil {
 		t.Fatalf("delivery = %#v, %v", delivered, ok)
 	}
-	if backend.steeredNativeRef != "thread-alpha" || backend.steeredExpected != "native-turn-alpha" {
-		t.Fatalf("Runtime steer target = %q %q", backend.steeredNativeRef, backend.steeredExpected)
+	if contract.continueRequest.Binding.NativeRef != "thread-alpha" || contract.continueRequest.RuntimeTurnRef != "native-turn-alpha" {
+		t.Fatalf("Runtime steer target = %#v", contract.continueRequest)
 	}
 	if delivered.DeliveredTurnID != "turn-alpha" {
 		t.Fatalf("durable delivered Turn = %q, want Loom Turn", delivered.DeliveredTurnID)
@@ -127,16 +128,16 @@ func TestMixedRuntimeMessageDeliveryHandlingAndCausalReturn(t *testing.T) {
 	h.agents["agent-a"].Status = "running"
 	h.agents["agent-b"].RuntimeBinding.Kind = "codex"
 	h.agents["agent-b"].Status = "idle"
-	piBackend := &fakeAgentRuntime{}
-	codexBackend := &fakeAgentRuntime{}
+	piContract := &controlPlaneContract{}
+	codexContract := &controlPlaneContract{startOutcome: runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted, RuntimeTurnRef: "native-turn-codex"}}
 	piReady, codexReady := make(chan struct{}), make(chan struct{})
 	close(piReady)
 	close(codexReady)
 	h.runtimes["agent-a"] = &runtime{
-		agentID: "agent-a", agentRuntime: piBackend, ready: piReady,
+		agentID: "agent-a", runtimeContract: piContract, binding: runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "pi", NativeRef: "thread-alpha"}, ready: piReady,
 		activeTurn: &turnState{turnID: "turn-pi", nativeTurnID: "native-turn-pi", startedAt: time.Now(), stopWatchdog: make(chan struct{})},
 	}
-	h.runtimes["agent-b"] = &runtime{agentID: "agent-b", agentRuntime: codexBackend, ready: codexReady}
+	h.runtimes["agent-b"] = &runtime{agentID: "agent-b", runtimeContract: codexContract, binding: runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: "thread-beta"}, ready: codexReady}
 
 	request, err := h.SendAgentMessage(CommParams{
 		From: "agent-a", To: "agent-b", Subject: "Need Codex review", Body: "Review the Runtime contract.", Response: "required",
@@ -148,8 +149,8 @@ func TestMixedRuntimeMessageDeliveryHandlingAndCausalReturn(t *testing.T) {
 	if root.SourceTurnID != "turn-pi" || root.DeliveryStatus != "delivered" || root.DeliveryMode != "turn_start" || root.HandlingStatus != "running" {
 		t.Fatalf("mixed Runtime request = %#v", root)
 	}
-	if h.agents["agent-b"].Status != "running" || !codexBackend.started {
-		t.Fatalf("Codex receiver did not start handling: agent=%#v runtime=%#v", h.agents["agent-b"], codexBackend)
+	if h.agents["agent-b"].Status != "running" || codexContract.startCalls != 1 {
+		t.Fatalf("Codex receiver did not start handling: agent=%#v calls=%d", h.agents["agent-b"], codexContract.startCalls)
 	}
 
 	reply, err := h.SendAgentMessage(CommParams{From: "agent-b", ReplyTo: root.ID, Body: "The narrow contract is correct."})
@@ -159,8 +160,8 @@ func TestMixedRuntimeMessageDeliveryHandlingAndCausalReturn(t *testing.T) {
 	if reply.Message.ReplyTo != root.ID || reply.Message.DeliveryMode != "turn_steer" || reply.Message.DeliveredTurnID != "turn-pi" {
 		t.Fatalf("mixed Runtime causal reply = %#v", reply.Message)
 	}
-	if !piBackend.steered || piBackend.steeredExpected != "native-turn-pi" {
-		t.Fatalf("Pi causal return = %#v", piBackend)
+	if piContract.continueCalls != 1 || piContract.continueRequest.RuntimeTurnRef != "native-turn-pi" {
+		t.Fatalf("Pi causal return = %#v", piContract.continueRequest)
 	}
 	answered, err := h.GetAgentMessage(root.ID)
 	if err != nil || answered.Status != "answered" || answered.Resolution != "reply" {

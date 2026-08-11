@@ -1,9 +1,8 @@
 package hub
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
@@ -20,255 +18,98 @@ type fakeAgentRuntime struct {
 	created, resumed, started, steered, interrupted bool
 	closed                                          atomic.Bool
 	binding                                         string
-	history                                         RuntimeHistory
 	historyErr                                      error
+	history                                         runtimecontract.History
 	interruptedNative                               string
 	steeredNativeRef, steeredExpected, steeredInput string
-	capabilities                                    *RuntimeCapabilities
-	lastTurnRequest                                 RuntimeTurnRequest
 	startErr                                        error
 	steerErr, interruptErr                          error
 	startCount                                      int
 }
 
 func (f *fakeAgentRuntime) Alive() bool { return !f.closed.Load() }
-func (f *fakeAgentRuntime) Create(RuntimeBindingRequest) (string, error) {
+func (f *fakeAgentRuntime) Close()      { f.closed.Store(true) }
+
+func (f *fakeAgentRuntime) ContractVersion() int { return runtimecontract.Version }
+func (f *fakeAgentRuntime) CreateBinding(context.Context, runtimecontract.BindingRequest) (runtimecontract.Binding, runtimecontract.Outcome) {
 	f.created = true
-	return f.binding, nil
+	return runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "pi", NativeRef: f.binding}, runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}
 }
-func (f *fakeAgentRuntime) Resume(RuntimeBindingRequest, time.Duration) error {
+func (f *fakeAgentRuntime) ResumeBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {
 	f.resumed = true
-	return nil
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
 }
-func (f *fakeAgentRuntime) InjectDeveloperContext(string, string, time.Duration) error { return nil }
-func (f *fakeAgentRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
+func (f *fakeAgentRuntime) UpdateBindingName(context.Context, runtimecontract.Binding, string) runtimecontract.Outcome {
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
+}
+func fakeRuntimeFailure(err error, phase runtimecontract.FailurePhase) runtimecontract.Outcome {
+	if failure := runtimeFailureFromError(err); failure != nil {
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleIndeterminate, Failure: failure}
+	}
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleFailed, Failure: &runtimecontract.Failure{Code: "test_failure", Phase: phase, Message: err.Error(), Cause: err}}
+}
+func (f *fakeAgentRuntime) StartTurn(_ context.Context, request runtimecontract.TurnRequest) runtimecontract.Outcome {
 	f.started = true
 	f.startCount++
-	f.lastTurnRequest = request
 	if f.startErr != nil {
-		return "", f.startErr
+		return fakeRuntimeFailure(f.startErr, runtimecontract.FailurePhaseTurnStart)
 	}
-	return "native-turn-1", nil
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted, RuntimeTurnRef: "native-turn-1"}
 }
-func (f *fakeAgentRuntime) Steer(nativeRef, expectedNativeTurnID, input string, _ time.Duration) (string, error) {
+func (f *fakeAgentRuntime) ContinueTurn(_ context.Context, request runtimecontract.CausalInput) runtimecontract.Outcome {
 	f.steered = true
-	f.steeredNativeRef, f.steeredExpected, f.steeredInput = nativeRef, expectedNativeTurnID, input
-	return expectedNativeTurnID, f.steerErr
+	f.steeredNativeRef, f.steeredExpected = request.Binding.NativeRef, request.RuntimeTurnRef
+	if len(request.Input) > 0 {
+		f.steeredInput = request.Input[0].Text
+	}
+	if f.steerErr != nil {
+		return fakeRuntimeFailure(f.steerErr, runtimecontract.FailurePhaseTurnContinue)
+	}
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted, RuntimeTurnRef: request.RuntimeTurnRef}
 }
-func (f *fakeAgentRuntime) Interrupt(_ string, nativeTurnID string, _ time.Duration) error {
+func (f *fakeAgentRuntime) InterruptTurn(_ context.Context, request runtimecontract.TurnTarget) runtimecontract.Outcome {
 	f.interrupted = true
-	f.interruptedNative = nativeTurnID
-	return f.interruptErr
-}
-func (f *fakeAgentRuntime) NormalizeEvent(string, json.RawMessage) []RuntimeEvent { return nil }
-func (f *fakeAgentRuntime) ReadHistory(string, int, int) (RuntimeHistory, error) {
-	return f.history, f.historyErr
-}
-func (f *fakeAgentRuntime) ReadTurn(string, string) (RuntimeHistoryTurn, error) {
-	return RuntimeHistoryTurn{}, rollout.ErrTurnNotFound
-}
-func (f *fakeAgentRuntime) LatestTurn(string) (*RuntimeHistoryTurn, error) { return nil, nil }
-func (f *fakeAgentRuntime) Capabilities() RuntimeCapabilities {
-	if f.capabilities != nil {
-		return *f.capabilities
+	f.interruptedNative = request.RuntimeTurnRef
+	if f.interruptErr != nil {
+		return fakeRuntimeFailure(f.interruptErr, runtimecontract.FailurePhaseTurnInterrupt)
 	}
-	return RuntimeCapabilities{History: true, CausalSteer: true, Interrupt: true}
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted, RuntimeTurnRef: request.RuntimeTurnRef}
 }
-func (f *fakeAgentRuntime) Close() { f.closed.Store(true) }
-
-func TestHistorySurfacesRuntimeReadFailure(t *testing.T) {
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+func (f *fakeAgentRuntime) SetEventHandler(func(runtimecontract.Event)) {}
+func (f *fakeAgentRuntime) ReadHistory(context.Context, runtimecontract.HistoryRequest) (runtimecontract.History, *runtimecontract.Failure) {
+	if f.historyErr != nil {
+		return runtimecontract.History{}, &runtimecontract.Failure{Code: "history_failed", Phase: runtimecontract.FailurePhaseHistory, Message: f.historyErr.Error(), Cause: f.historyErr}
 	}
-	fake := &fakeAgentRuntime{historyErr: errors.New("corrupt native history")}
-	h := testHub(st)
-	h.agents["agent-1"] = &Agent{
-		ID: "agent-1", Name: "worker", ThreadID: "thr-loom", Status: "idle",
-		RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: "native-session"},
+	if f.history.Turns != nil {
+		return f.history, nil
 	}
-	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", agentRuntime: fake}
-
-	if _, err := h.History("agent-1", 10, 0); err == nil || !strings.Contains(err.Error(), "corrupt native history") {
-		t.Fatalf("History error = %v, want Runtime read failure", err)
-	}
+	return runtimecontract.History{Total: 0, Turns: []runtimecontract.HistoryTurn{}}, nil
+}
+func (f *fakeAgentRuntime) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
+	return controlPlaneCapabilitySnapshot("pi")
+}
+func (f *fakeAgentRuntime) CloseBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {
+	f.Close()
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
+}
+func (f *fakeAgentRuntime) ArchiveBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
+}
+func (f *fakeAgentRuntime) ContextDeliveryMode() runtimecontract.ContextDeliveryMode {
+	return runtimecontract.ContextDeliveryFullPerTurn
 }
 
-func TestHubRoutesCoreExecutionThroughAgentRuntime(t *testing.T) {
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+func testRuntime(agentID, kind string, contract runtimecontract.Contract, ready chan struct{}) *runtime {
+	if ready == nil {
+		ready = make(chan struct{})
+		close(ready)
 	}
-	fake := &fakeAgentRuntime{
-		binding: "native-thread-1",
-		history: RuntimeHistory{Total: 1, Turns: []RuntimeHistoryTurn{{ID: "native-turn-1", Status: "completed"}}},
-	}
-	h := testHub(st)
-	h.agentRuntimeFactory = func(string) (AgentRuntime, error) { return fake, nil }
-	h.contextHistoryProbe = func(threadID string, _ rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
-		return rollout.ContextHistoryState{EpochID: "initial:" + threadID}, nil
-	}
-
-	agent, err := h.CreateAgent(CreateParams{Name: "worker", Cwd: t.TempDir(), RuntimeKind: "codex"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !fake.created || agent.RuntimeBinding.Kind != "codex" {
-		t.Fatalf("created Agent = %#v, Runtime create=%v", agent.Agent, fake.created)
-	}
-	result, err := h.SendTask(agent.ID, "do the work", time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !fake.resumed || !fake.started || result.TurnID == "" || result.TurnID == "native-turn-1" {
-		t.Fatalf("send result = %#v, resumed=%v started=%v", result, fake.resumed, fake.started)
-	}
-	if got := h.agents[agent.ID].RuntimeTurnBindings[result.TurnID]; got != "native-turn-1" {
-		t.Fatalf("durable Runtime Turn binding = %q", got)
-	}
-
-	history, err := h.History(agent.ID, 10, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if history.Total != 1 || len(history.Turns) != 1 || history.Turns[0].ID != result.TurnID {
-		t.Fatalf("History = %#v", history)
-	}
-
-	if _, err := h.Interrupt(agent.ID, "stop"); err != nil {
-		t.Fatal(err)
-	}
-	if !fake.interrupted || fake.interruptedNative != "native-turn-1" {
-		t.Fatalf("Interrupt native Turn = %q", fake.interruptedNative)
-	}
-	h.Shutdown()
-	if !fake.closed.Load() {
-		t.Fatal("Shutdown did not close Agent Runtime")
-	}
-}
-
-func TestSendTaskRejectsImageWhenRuntimeDoesNotAdvertiseImageInput(t *testing.T) {
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	capabilities := RuntimeCapabilities{Interrupt: true}
-	fake := &fakeAgentRuntime{binding: "/tmp/pi-session.jsonl", capabilities: &capabilities}
-	h := testHub(st)
-	defer h.Shutdown()
-	h.agentRuntimeFactory = func(string) (AgentRuntime, error) { return fake, nil }
-	h.contextHistoryProbe = func(threadID string, _ rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
-		return rollout.ContextHistoryState{EpochID: "initial:" + threadID}, nil
-	}
-	agent, err := h.CreateAgent(CreateParams{Name: "pi-worker", Cwd: t.TempDir(), RuntimeKind: "pi"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	imageBytes := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0}, 64)...)
-	image, err := h.StageThreadArtifact(agent.ID, "diagram.png", "image/png", bytes.NewReader(imageBytes))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = h.SendTaskWithArtifacts(agent.ID, "Inspect the diagram", []string{image.ID}, time.Minute)
-	if err == nil || !strings.Contains(err.Error(), "image input") || !strings.Contains(err.Error(), "Pi Runtime") {
-		t.Fatalf("unsupported image error = %v", err)
-	}
-	if fake.started {
-		t.Fatal("unsupported image reached the Agent Runtime")
-	}
-}
-
-func TestArchivePersistenceFailureLeavesActiveRuntimeUntouched(t *testing.T) {
-	dir := t.TempDir()
-	writable, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writable.Close(); err != nil {
-		t.Fatal(err)
-	}
-	readOnly, err := store.OpenWithOptions(dir, store.OpenOptions{ReadOnly: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer readOnly.Close()
-	h := testHub(readOnly)
-	fake := &fakeAgentRuntime{binding: "native-binding"}
-	turn := &turnState{
-		turnID: "turn-active", nativeTurnID: "native-turn", task: "keep working",
-		startedAt: time.Now(), lastActivity: time.Now(), stopWatchdog: make(chan struct{}),
-	}
-	meta := &Agent{
-		ID: "agent-1", Name: "worker", ThreadID: "thread-loom", RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: "native-binding"},
-		Status: "running", CurrentTask: turn.task, CurrentTurnID: turn.turnID, CreatedAt: now(), UpdatedAt: now(),
-	}
-	rt := &runtime{agentID: meta.ID, agentRuntime: fake, activeTurn: turn, approvals: map[string]*approval{}}
-	h.agents[meta.ID] = meta
-	h.runtimes[meta.ID] = rt
-
-	if _, err := h.ArchiveAgent(meta.ID); err == nil {
-		t.Fatal("Archive succeeded despite registry persistence failure")
-	}
-	if fake.interrupted || fake.closed.Load() || rt.activeTurn != turn || turn.finished {
-		t.Fatalf("failed Loom archive changed Runtime: interrupted=%v closed=%v active=%#v finished=%v", fake.interrupted, fake.closed.Load(), rt.activeTurn, turn.finished)
-	}
-	if _, err := h.GetAgent(meta.ID); err != nil {
-		t.Fatalf("failed Loom archive removed Agent: %v", err)
-	}
-	turn.finished = true
-	close(turn.stopWatchdog)
-}
-
-func TestSendTaskBuildsRuntimeImageInputAndFilePathGuidance(t *testing.T) {
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	capabilities := RuntimeCapabilities{Interrupt: true, ImageInput: true}
-	fake := &fakeAgentRuntime{binding: "/tmp/pi-session.jsonl", capabilities: &capabilities}
-	h := testHub(st)
-	defer h.Shutdown()
-	h.agentRuntimeFactory = func(string) (AgentRuntime, error) { return fake, nil }
-	h.contextHistoryProbe = func(threadID string, _ rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
-		return rollout.ContextHistoryState{EpochID: "initial:" + threadID}, nil
-	}
-	agent, err := h.CreateAgent(CreateParams{Name: "pi-vision", Cwd: t.TempDir(), RuntimeKind: "pi"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	imageBytes := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0}, 64)...)
-	image, err := h.StageThreadArtifact(agent.ID, "diagram.png", "image/png", bytes.NewReader(imageBytes))
-	if err != nil {
-		t.Fatal(err)
-	}
-	document, err := h.StageThreadArtifact(agent.ID, "brief.pdf", "application/pdf", strings.NewReader("%PDF-1.4\nloom"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := h.SendTaskWithArtifacts(agent.ID, "Review the inputs", []string{image.ID, document.ID}, time.Minute); err != nil {
-		t.Fatal(err)
-	}
-	var imageInputs []RuntimeInput
-	var textInputs []string
-	for _, input := range fake.lastTurnRequest.Input {
-		switch input.Kind {
-		case RuntimeInputLocalImage:
-			imageInputs = append(imageInputs, input)
-		case RuntimeInputText:
-			textInputs = append(textInputs, input.Text)
-		}
-	}
-	if len(imageInputs) != 1 || imageInputs[0].Path != image.Path || imageInputs[0].MimeType != "image/png" {
-		t.Fatalf("Runtime image inputs = %#v", imageInputs)
-	}
-	joinedText := strings.Join(textInputs, "\n")
-	if !strings.Contains(joinedText, document.Path) {
-		t.Fatalf("generic file path guidance missing from Runtime text: %s", joinedText)
-	}
-	if strings.Contains(joinedText, `"type":"file"`) || strings.Contains(joinedText, "data:application/pdf") {
-		t.Fatalf("generic file was encoded as Runtime content: %s", joinedText)
+	return &runtime{
+		agentID:         agentID,
+		runtimeContract: contract,
+		binding:         runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: kind, NativeRef: "native-" + agentID},
+		ready:           ready,
+		approvals:       map[string]*approval{},
 	}
 }
 
@@ -300,17 +141,16 @@ func TestCodexHistoryAndReadTranslateLoomAndNativeTurnIDs(t *testing.T) {
 		RuntimeBinding:      RuntimeBinding{Kind: "codex", NativeRef: nativeThreadID},
 		RuntimeTurnBindings: map[string]string{loomTurnID: nativeTurnID},
 	}
-	history, err := h.History("agent-1", 10, 0)
-	if err != nil || len(history.Turns) != 1 || history.Turns[0].ID != loomTurnID {
+	history, err := h.CanonicalHistory("agent-1", 10, 0)
+	if err != nil || len(history.Turns) != 1 || history.Turns[0].TurnID != loomTurnID {
 		t.Fatalf("mapped History = %#v, err=%v", history, err)
 	}
-	detail, err := h.GetTurn(loomTurnID)
-	if err != nil || detail.ID != loomTurnID {
+	detail, err := h.GetCanonicalTurn(loomTurnID)
+	if err != nil || detail.TurnID != loomTurnID {
 		t.Fatalf("mapped GetTurn = %#v, err=%v", detail, err)
 	}
-	legacyDetail, err := h.GetTurn(nativeTurnID)
-	if err != nil || legacyDetail.ID != nativeTurnID {
-		t.Fatalf("native compatibility GetTurn = %#v, err=%v", legacyDetail, err)
+	if _, err := h.GetCanonicalTurn(nativeTurnID); err == nil {
+		t.Fatal("canonical Turn lookup accepted a native Runtime Turn ID")
 	}
 }
 
@@ -319,13 +159,13 @@ func TestCodexRuntimeNormalizesCoreExecutionEvents(t *testing.T) {
 	tests := []struct {
 		method string
 		params string
-		kind   RuntimeEventKind
+		kind   nativeEventKind
 	}{
-		{"turn/started", `{"threadId":"native-thread","turn":{"id":"native-turn"}}`, RuntimeTurnStarted},
-		{"item/agentMessage/delta", `{"threadId":"native-thread","turnId":"native-turn","itemId":"answer","delta":"hello"}`, RuntimeTextDelta},
-		{"item/reasoning/delta", `{"threadId":"native-thread","turnId":"native-turn","itemId":"thought","delta":"hmm"}`, RuntimeReasoningDelta},
-		{"item/started", `{"threadId":"native-thread","turnId":"native-turn","item":{"id":"tool","type":"commandExecution"}}`, RuntimeToolStarted},
-		{"turn/completed", `{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed"}}`, RuntimeTurnCompleted},
+		{"turn/started", `{"threadId":"native-thread","turn":{"id":"native-turn"}}`, nativeTurnStarted},
+		{"item/agentMessage/delta", `{"threadId":"native-thread","turnId":"native-turn","itemId":"answer","delta":"hello"}`, nativeTextDelta},
+		{"item/reasoning/delta", `{"threadId":"native-thread","turnId":"native-turn","itemId":"thought","delta":"hmm"}`, nativeReasoningDelta},
+		{"item/started", `{"threadId":"native-thread","turnId":"native-turn","item":{"id":"tool","type":"commandExecution"}}`, nativeToolStarted},
+		{"turn/completed", `{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed"}}`, nativeTurnCompleted},
 	}
 	for _, tt := range tests {
 		t.Run(tt.method, func(t *testing.T) {
@@ -347,8 +187,8 @@ func TestHubPublishesCanonicalCoreEventAndKeepsNativePayloadDiagnostic(t *testin
 		ID: "agent-1", Name: "worker", ThreadID: "thr-loom",
 		RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-native"},
 	}
-	rt := &runtime{agentID: "agent-1", agentRuntime: &codexAgentRuntime{}}
-	h.onNotification(rt, "item/agentMessage/delta", json.RawMessage(`{
+	rt := &runtime{agentID: "agent-1", activeTurn: &turnState{turnID: "turn-loom", nativeTurnID: "turn-1", startedAt: time.Now(), stopWatchdog: make(chan struct{})}}
+	deliverTestNativeNotification(h, rt, "item/agentMessage/delta", json.RawMessage(`{
 		"threadId":"thr-native","thread":{"id":"thr-native"},"turnId":"turn-1","itemId":"answer-1","delta":"hello"
 	}`))
 
@@ -356,7 +196,7 @@ func TestHubPublishesCanonicalCoreEventAndKeepsNativePayloadDiagnostic(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 2 || events[0].Type != "loom/runtime-event" || events[1].Type != "item/agentMessage/delta" {
+	if len(events) != 1 || events[0].Type != "loom/runtime-event" {
 		t.Fatalf("events = %#v", events)
 	}
 	for _, event := range events {
@@ -499,7 +339,7 @@ func TestRuntimeFailureProjectionIsSafeAcrossAgentControlAndTypedTerminal(t *tes
 	rt := &runtime{agentID: meta.ID, activeTurn: &turnState{turnID: "turn-loom", nativeTurnID: nativeTurn, startedAt: time.Now(), stopWatchdog: make(chan struct{})}, approvals: map[string]*approval{}}
 	h.mu.Lock()
 	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
-	h.onRuntimeEventLocked(meta, rt, RuntimeEvent{Kind: RuntimeTurnFailed, LoomTurnID: "turn-loom", NativeTurnID: nativeTurn, Error: rawFailure}, runtimecontract.Event{
+	h.onRuntimeEventLocked(meta, rt, runtimecontract.Event{
 		Kind: runtimecontract.EventTerminal, TurnID: "turn-loom", RuntimeTurnRef: nativeTurn,
 		Outcome: &runtimecontract.Outcome{State: runtimecontract.LifecycleFailed, RuntimeTurnRef: nativeTurn, Failure: &runtimecontract.Failure{Code: "runtime_error", Phase: runtimecontract.FailurePhaseTurnStart, Message: rawFailure, Diagnostic: rawFailure}},
 	})
@@ -566,7 +406,7 @@ func TestRuntimePublicEventsDeeplyRedactNativeIdentityAcrossReopen(t *testing.T)
 		activeTurn: &turnState{turnID: "turn-loom", nativeTurnID: "native-turn-secret", startedConfirmed: true, startedAt: time.Now(), stopWatchdog: make(chan struct{})},
 	}
 	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
-	h.onNotification(rt, "item/completed", json.RawMessage(`{
+	deliverTestNativeNotification(h, rt, "item/completed", json.RawMessage(`{
 		"threadId":"native-thread-secret","turnId":"native-turn-secret","itemId":"native-item-secret",
 		"sessionId":"native-session-secret","sessionPath":"/private/native-session-secret.jsonl",
 		"item":{"id":"native-item-secret","type":"commandExecution","command":"printf safe","status":"completed","output":"safe output",
@@ -581,7 +421,7 @@ func TestRuntimePublicEventsDeeplyRedactNativeIdentityAcrossReopen(t *testing.T)
 				t.Fatalf("public Runtime event leaked %q: %s", secret, encoded)
 			}
 		}
-		for _, actionable := range []string{"printf safe", "completed", "safe output", "loom-thread", "turn-loom"} {
+		for _, actionable := range []string{"completed", "safe output", "turn-loom"} {
 			if !strings.Contains(string(encoded), actionable) {
 				t.Fatalf("public Runtime event omitted %q: %s", actionable, encoded)
 			}

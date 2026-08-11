@@ -23,17 +23,22 @@ vi.mock("@tanstack/react-virtual", () => ({
 import { AgentPane } from "./AgentPane";
 import { publishThreadEvent } from "./thread-events";
 
+const testScope = { runtimeKind: "codex", bindingRevision: "binding", model: "model", configurationRevision: "config" };
+
+function capabilitySnapshot(...ids: string[]): Agent["capabilitySnapshot"] {
+  return {
+    revision: "test-snapshot",
+    capabilities: ids.map((id) => ({ id, availability: "available", revision: "test", scope: testScope })),
+  };
+}
+
 const testAgent: Agent = {
   id: "agent-scroll",
   name: "agent-scroll",
   cwd: "/workspace/agent-scroll",
   threadId: "thread-scroll",
   runtimeBinding: { kind: "codex" },
-  runtimeCapabilities: {
-    history: true, causalSteer: true, interrupt: true, goal: true, remote: true,
-    usage: true, provider: true, compaction: true, approval: true, skills: true,
-    naming: true, archive: true, sandbox: true, imageInput: true,
-  },
+  capabilitySnapshot: capabilitySnapshot("provider_configuration", "sandbox_configuration", "approval_policy", "model_configuration", "goal", "remote", "usage_reporting", "manual_compaction", "image_input"),
   sandbox: "workspace-write",
   approvalPolicy: "on-request",
   status: "idle",
@@ -135,8 +140,8 @@ describe("AgentPane scroll restoration", () => {
 	publishThreadEvent(testAgent.id, {
 	  seq: 1,
 	  ts: "2026-08-10T00:00:01Z",
-	  type: "loom/text-delta",
-	  data: { itemId: "answer-1", delta: "streaming" },
+	  type: "loom/runtime-event",
+	  data: { kind: "content", turnId: "turn-latest", contentPhase: "delta", content: { id: "answer-1", kind: "assistant_text", text: "streaming" } },
 	});
 	await new Promise((resolve) => window.setTimeout(resolve, 10));
 	scrollTop = 250;
@@ -188,11 +193,7 @@ describe("AgentPane scroll restoration", () => {
       ...testAgent,
       runtimeBinding: { kind: "pi" },
 	  processAlive: false,
-      runtimeCapabilities: {
-        history: true, causalSteer: false, interrupt: true, goal: false, remote: false,
-        usage: false, provider: true, compaction: false, approval: true, skills: false,
-        naming: false, archive: false, sandbox: false, imageInput: false,
-      },
+      capabilitySnapshot: capabilitySnapshot("approval_policy", "model_configuration", "context_delivery"),
     };
     const view = render(<AgentPane {...props} agent={piAgent} onError={onError} active configRequestNonce={1} />);
 
@@ -201,7 +202,7 @@ describe("AgentPane scroll restoration", () => {
     expect(view.getByText("History").nextElementSibling).toHaveTextContent("Available");
     expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Unavailable");
     expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();
-    expect(view.getByText("Provider configuration").nextElementSibling).toHaveTextContent("Available");
+    expect(view.getByText("Provider configuration").nextElementSibling).toHaveTextContent("Unavailable");
 	const providerSelect = () => view.getByText("Provider").closest("label")?.querySelector("select") as HTMLSelectElement;
 	const modelSelect = () => view.getByText("Model").closest("label")?.querySelector("select") as HTMLSelectElement;
 	const thinkingSelect = () => view.getByText("Thinking Effort").closest("label")?.querySelector("select") as HTMLSelectElement;
@@ -257,7 +258,7 @@ describe("AgentPane scroll restoration", () => {
 	const piAgent: Agent = {
 	  ...testAgent,
 	  runtimeBinding: { kind: "pi" },
-	  runtimeCapabilities: { ...testAgent.runtimeCapabilities, imageInput: false },
+	  capabilitySnapshot: capabilitySnapshot("approval_policy", "model_configuration", "context_delivery"),
 	};
 	const view = render(<AgentPane {...props} agent={piAgent} onError={onError} active />);
 	const input = view.container.querySelector('input[type="file"]') as HTMLInputElement;
@@ -280,7 +281,6 @@ describe("AgentPane scroll restoration", () => {
 	expect(await view.findByText("snapshot revision-1")).toBeInTheDocument();
 	view.rerender(<AgentPane {...props} agent={{
 	  ...before,
-	  runtimeCapabilities: { ...before.runtimeCapabilities, imageInput: false },
 	  capabilitySnapshot: { revision: "revision-2", capabilities: [] },
 	}} active configRequestNonce={1} />);
 	expect(view.getByText("snapshot revision-2")).toBeInTheDocument();
@@ -290,7 +290,6 @@ describe("AgentPane scroll restoration", () => {
   it("gates Runtime controls from the typed Capability Snapshot instead of flat v1 flags", () => {
 	const agent: Agent = {
 	  ...testAgent,
-	  runtimeCapabilities: { ...testAgent.runtimeCapabilities, sandbox: true, approval: false },
 	  capabilitySnapshot: { revision: "snapshot-data", capabilities: [
 		{ id: "sandbox_configuration", availability: "unavailable", revision: "1", scope: { runtimeKind: "codex", bindingRevision: "b", model: "m", configurationRevision: "c" } },
 		{ id: "approval_policy", availability: "available", revision: "1", scope: { runtimeKind: "codex", bindingRevision: "b", model: "m", configurationRevision: "c" } },

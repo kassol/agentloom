@@ -17,7 +17,7 @@ func TestGoalNotificationProjectsNativeGoalIntoAgentView(t *testing.T) {
 	h.agents["agent-1"] = &Agent{ID: "agent-1", Name: "research", ThreadID: "thread-1", Status: "idle"}
 	runtime := &runtime{agentID: "agent-1", approvals: map[string]*approval{}}
 
-	h.onNotification(runtime, "thread/goal/updated", json.RawMessage(`{
+	deliverTestNativeNotification(h, runtime, "thread/goal/updated", json.RawMessage(`{
 		"threadId":"thread-1",
 		"turnId":null,
 		"goal":{"threadId":"thread-1","objective":"Complete the audit","status":"active","tokenBudget":120000,"tokensUsed":4300,"timeUsedSeconds":92,"createdAt":100,"updatedAt":200}
@@ -37,7 +37,7 @@ func TestGoalNotificationProjectsNativeGoalIntoAgentView(t *testing.T) {
 		t.Fatal("active Goal did not reserve its Thread")
 	}
 
-	h.onNotification(runtime, "thread/goal/cleared", json.RawMessage(`{"threadId":"thread-1"}`))
+	deliverTestNativeNotification(h, runtime, "thread/goal/cleared", json.RawMessage(`{"threadId":"thread-1"}`))
 	h.mu.Lock()
 	view = h.viewLocked(h.agents["agent-1"])
 	reserved = h.activeGoalReservesThreadLocked("agent-1")

@@ -35,7 +35,8 @@ func TestInterruptedRecoveryCheckpointFailurePublishesNothing(t *testing.T) {
 		Status: "running", CurrentTurnID: turn.turnID, CurrentTask: turn.task, CreatedAt: now(), UpdatedAt: now(),
 	}
 	fake := &fakeAgentRuntime{binding: "native-thread"}
-	rt := &runtime{agentID: meta.ID, agentRuntime: fake, activeTurn: turn, approvals: map[string]*approval{}}
+	rt := testRuntime(meta.ID, "codex", fake, nil)
+	rt.activeTurn = turn
 	h.agents[meta.ID] = meta
 	h.runtimes[meta.ID] = rt
 
@@ -57,12 +58,12 @@ func TestInterruptedRecoveryCheckpointFailurePublishesNothing(t *testing.T) {
 	if h.seqs[meta.ID] != 0 || len(h.turnRecoveryInFlight) != 0 || len(h.humanRequests) != 0 {
 		t.Fatalf("failed checkpoint published recovery: seq=%d inFlight=%v requests=%v", h.seqs[meta.ID], h.turnRecoveryInFlight, h.humanRequests)
 	}
-	for _, event := range []RuntimeEvent{
-		{Kind: RuntimeTurnStarted, LoomTurnID: turn.turnID, NativeTurnID: "native-late"},
-		{Kind: RuntimeTextDelta, LoomTurnID: turn.turnID, NativeTurnID: "native-late", Text: "late"},
-		{Kind: RuntimeTurnCompleted, LoomTurnID: turn.turnID, NativeTurnID: "native-late"},
+	for _, event := range []nativeEvent{
+		{Kind: nativeTurnStarted, LoomTurnID: turn.turnID, NativeTurnID: "native-late"},
+		{Kind: nativeTextDelta, LoomTurnID: turn.turnID, NativeTurnID: "native-late", Text: "late"},
+		{Kind: nativeTurnCompleted, LoomTurnID: turn.turnID, NativeTurnID: "native-late"},
 	} {
-		h.onRuntimeEvent(rt, event)
+		deliverTestNativeEvent(h, rt, event)
 	}
 	if rt.activeTurn != turn || turn.finished || meta.Status != "running" || h.seqs[meta.ID] != 0 {
 		t.Fatalf("late events polluted failed checkpoint snapshot: Agent=%#v active=%#v seq=%d", meta, rt.activeTurn, h.seqs[meta.ID])
@@ -127,10 +128,10 @@ func TestStoreReopenConvergesObservedRecoveryMarkerOnce(t *testing.T) {
 }
 
 func TestLateCanonicalEventsCannotSupersedeOrRenderOnSuccessor(t *testing.T) {
-	for _, event := range []RuntimeEvent{
-		{Kind: RuntimeTurnStarted, LoomTurnID: "turn-old", NativeTurnID: "native-old"},
-		{Kind: RuntimeTextDelta, LoomTurnID: "turn-old", NativeTurnID: "native-old", Text: "stale"},
-		{Kind: RuntimeTurnCompleted, LoomTurnID: "turn-old", NativeTurnID: "native-old"},
+	for _, event := range []nativeEvent{
+		{Kind: nativeTurnStarted, LoomTurnID: "turn-old", NativeTurnID: "native-old"},
+		{Kind: nativeTextDelta, LoomTurnID: "turn-old", NativeTurnID: "native-old", Text: "stale"},
+		{Kind: nativeTurnCompleted, LoomTurnID: "turn-old", NativeTurnID: "native-old"},
 	} {
 		t.Run(string(event.Kind), func(t *testing.T) {
 			st, err := store.Open(t.TempDir())
@@ -152,7 +153,7 @@ func TestLateCanonicalEventsCannotSupersedeOrRenderOnSuccessor(t *testing.T) {
 			h.runtimes[meta.ID] = rt
 			before := h.seqs[meta.ID]
 
-			h.onRuntimeEvent(rt, event)
+			deliverTestNativeEvent(h, rt, event)
 
 			if rt.activeTurn != turn || turn.finished || meta.CurrentTurnID != turn.turnID || meta.Status != "running" {
 				t.Fatalf("late event changed successor: event=%#v Agent=%#v active=%#v", event, meta, rt.activeTurn)
@@ -186,7 +187,7 @@ func TestLateCodexCompatibilityEventDoesNotRenderOnSuccessor(t *testing.T) {
 	h.runtimes[meta.ID] = rt
 	before := h.seqs[meta.ID]
 
-	h.onCodexCompatibilityNotification(rt, "item/agentMessage/delta", json.RawMessage(`{"threadId":"thread-native","turnId":"native-old","delta":"stale"}`), true)
+	h.onCodexNativeNotification(rt, "item/agentMessage/delta", json.RawMessage(`{"threadId":"thread-native","turnId":"native-old","delta":"stale"}`), true)
 
 	if h.seqs[meta.ID] != before || rt.activeTurn != turn || turn.finished {
 		t.Fatalf("late compatibility event changed successor: seq=%d active=%#v", h.seqs[meta.ID], rt.activeTurn)
@@ -212,12 +213,12 @@ func TestObservedRecoveryFencesAllRuntimeEventsWithoutActiveTurn(t *testing.T) {
 	h.agents[meta.ID] = meta
 	h.runtimes[meta.ID] = rt
 
-	for _, event := range []RuntimeEvent{
-		{Kind: RuntimeTurnStarted, LoomTurnID: "turn-old", NativeTurnID: "native-old"},
-		{Kind: RuntimeTextDelta, LoomTurnID: "turn-old", NativeTurnID: "native-old", Text: "stale"},
-		{Kind: RuntimeTurnCompleted, LoomTurnID: "turn-old", NativeTurnID: "native-old"},
+	for _, event := range []nativeEvent{
+		{Kind: nativeTurnStarted, LoomTurnID: "turn-old", NativeTurnID: "native-old"},
+		{Kind: nativeTextDelta, LoomTurnID: "turn-old", NativeTurnID: "native-old", Text: "stale"},
+		{Kind: nativeTurnCompleted, LoomTurnID: "turn-old", NativeTurnID: "native-old"},
 	} {
-		h.onRuntimeEvent(rt, event)
+		deliverTestNativeEvent(h, rt, event)
 	}
 	if rt.activeTurn != nil || meta.Status != "interrupted" || h.seqs[meta.ID] != 0 {
 		t.Fatalf("observed recovery accepted old events: Agent=%#v active=%#v seq=%d", meta, rt.activeTurn, h.seqs[meta.ID])
@@ -227,15 +228,15 @@ func TestObservedRecoveryFencesAllRuntimeEventsWithoutActiveTurn(t *testing.T) {
 func TestCodexInterruptedTurnInspectorDistinguishesCleanAmbiguousAndTerminal(t *testing.T) {
 	for _, test := range []struct {
 		name string
-		turn RuntimeHistoryTurn
+		turn nativeHistoryTurn
 		want string
 	}{
-		{name: "clean", turn: RuntimeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"id": "assistant-1", "type": "agentMessage"}}}, want: RuntimeInterruptionClean},
-		{name: "unfinished tool", turn: RuntimeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"id": "tool-1", "type": "commandExecution", "command": "deploy", "status": "inProgress"}}}, want: RuntimeInterruptionAmbiguous},
-		{name: "projected completed tool is conservative", turn: RuntimeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"id": "tool-1", "type": "commandExecution", "command": "deploy", "status": "completed"}}}, want: RuntimeInterruptionAmbiguous},
-		{name: "raw paired call is clean", turn: RuntimeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"type": "function_call", "call_id": "call-1", "name": "exec"}, {"type": "function_call_output", "call_id": "call-1"}}}, want: RuntimeInterruptionClean},
-		{name: "raw unpaired call is ambiguous", turn: RuntimeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"type": "function_call", "call_id": "call-1", "name": "exec"}}}, want: RuntimeInterruptionAmbiguous},
-		{name: "terminal", turn: RuntimeHistoryTurn{ID: "native-1", Status: "completed"}, want: RuntimeInterruptionTerminal},
+		{name: "clean", turn: nativeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"id": "assistant-1", "type": "agentMessage"}}}, want: RuntimeInterruptionClean},
+		{name: "unfinished tool", turn: nativeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"id": "tool-1", "type": "commandExecution", "command": "deploy", "status": "inProgress"}}}, want: RuntimeInterruptionAmbiguous},
+		{name: "projected completed tool is conservative", turn: nativeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"id": "tool-1", "type": "commandExecution", "command": "deploy", "status": "completed"}}}, want: RuntimeInterruptionAmbiguous},
+		{name: "raw paired call is clean", turn: nativeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"type": "function_call", "call_id": "call-1", "name": "exec"}, {"type": "function_call_output", "call_id": "call-1"}}}, want: RuntimeInterruptionClean},
+		{name: "raw unpaired call is ambiguous", turn: nativeHistoryTurn{ID: "native-1", Status: "running", Items: []map[string]any{{"type": "function_call", "call_id": "call-1", "name": "exec"}}}, want: RuntimeInterruptionAmbiguous},
+		{name: "terminal", turn: nativeHistoryTurn{ID: "native-1", Status: "completed"}, want: RuntimeInterruptionTerminal},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			evidence := inspectCodexInterruptedTurn(test.turn)
@@ -292,7 +293,7 @@ func TestCleanCodexEvidenceCreatesOneReservedRecoveryTurn(t *testing.T) {
 		},
 		CreatedAt: stamp, UpdatedAt: stamp,
 	}
-	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", agentRuntime: fake, ready: ready, approvals: map[string]*approval{}}
+	h.runtimes["agent-1"] = testRuntime("agent-1", "codex", fake, ready)
 
 	h.recoverInterruptedTurn("agent-1", "turn-before")
 	h.recoverInterruptedTurn("agent-1", "turn-before")
@@ -474,7 +475,7 @@ func TestRecoveryTurnCompletionPersistenceFailurePublishesNothing(t *testing.T) 
 	rt := &runtime{agentID: "agent-1", activeTurn: turn, approvals: map[string]*approval{}}
 	h.runtimes["agent-1"] = rt
 
-	h.onRuntimeEvent(rt, RuntimeEvent{Kind: RuntimeTurnCompleted, LoomTurnID: turn.turnID, NativeTurnID: turn.nativeTurnID})
+	deliverTestNativeEvent(h, rt, nativeEvent{Kind: nativeTurnCompleted, LoomTurnID: turn.turnID, NativeTurnID: turn.nativeTurnID})
 	view, err := h.GetAgent("agent-1")
 	if err != nil {
 		t.Fatal(err)
@@ -499,7 +500,7 @@ func TestRecoveryTurnCompletionPersistenceFailurePublishesNothing(t *testing.T) 
 	}
 	defer reopened.Close()
 	h.st = reopened
-	h.onRuntimeEvent(rt, RuntimeEvent{Kind: RuntimeTurnCompleted, LoomTurnID: turn.turnID, NativeTurnID: turn.nativeTurnID})
+	deliverTestNativeEvent(h, rt, nativeEvent{Kind: nativeTurnCompleted, LoomTurnID: turn.turnID, NativeTurnID: turn.nativeTurnID})
 	events, err := reopened.ReadEvents("agent-1", 0, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -551,7 +552,8 @@ func TestIndeterminateSteerAndInterruptUseSameDurableRecovery(t *testing.T) {
 				ID: "agent-1", Name: "worker", RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: "native-thread"},
 				Status: "running", CurrentTask: turn.task, CurrentTurnID: turn.turnID, CreatedAt: now(), UpdatedAt: now(),
 			}
-			rt := &runtime{agentID: meta.ID, agentRuntime: fake, activeTurn: turn, approvals: map[string]*approval{}}
+			rt := testRuntime(meta.ID, "pi", fake, nil)
+			rt.activeTurn = turn
 			h.agents[meta.ID] = meta
 			h.runtimes[meta.ID] = rt
 
@@ -597,7 +599,8 @@ func TestIndeterminateCheckpointFencesRuntimeBeforeEvidenceInspection(t *testing
 		RuntimeTurnBindings: map[string]string{"turn-1": "native-turn"}, Status: "running", CurrentTask: turn.task, CurrentTurnID: turn.turnID,
 		CreatedAt: now(), UpdatedAt: now(),
 	}
-	rt := &runtime{agentID: meta.ID, agentRuntime: fake, activeTurn: turn, approvals: map[string]*approval{}}
+	rt := testRuntime(meta.ID, "pi", fake, nil)
+	rt.activeTurn = turn
 	h.agents[meta.ID] = meta
 	h.runtimes[meta.ID] = rt
 
@@ -645,10 +648,9 @@ func TestSharedCodexIndeterminateClosesHostBeforeAnyRecoveryInspection(t *testin
 			CreatedAt: now(), UpdatedAt: now(),
 		}
 		h.agents[agentID] = meta
-		h.runtimes[agentID] = &runtime{
-			agentID: agentID, agentRuntime: fake, client: host.client, hostGeneration: host.generation,
-			activeTurn: turn, approvals: map[string]*approval{},
-		}
+		rt := testRuntime(agentID, "codex", fake, nil)
+		rt.hostGeneration, rt.activeTurn = host.generation, turn
+		h.runtimes[agentID] = rt
 	}
 
 	h.onRuntimeIndeterminate(h.runtimes["agent-1"], failure)

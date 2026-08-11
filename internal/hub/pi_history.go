@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 type piSessionEntry struct {
@@ -224,7 +226,7 @@ func inspectPiInterruptedTurn(entries []piSessionEntry, leafID, nativeTurnID str
 				}
 				pending[block.ID] = RuntimeToolEvidence{
 					ID: block.ID, Name: block.Name, Command: piToolCommand(block.Name, block.Arguments),
-					Arguments: block.Arguments, StartedAt: entry.Timestamp,
+					StartedAt: entry.Timestamp,
 				}
 			}
 			switch message.StopReason {
@@ -261,13 +263,13 @@ func inspectPiInterruptedTurn(entries []piSessionEntry, leafID, nativeTurnID str
 	return evidence, nil
 }
 
-func projectPiHistory(entries []piSessionEntry, leafID string) (RuntimeHistory, error) {
+func projectPiHistory(entries []piSessionEntry, leafID string) (nativeHistory, error) {
 	branch, err := piActiveBranch(entries, leafID)
 	if err != nil {
-		return RuntimeHistory{}, err
+		return nativeHistory{}, err
 	}
-	history := RuntimeHistory{}
-	var turn *RuntimeHistoryTurn
+	history := nativeHistory{}
+	var turn *nativeHistoryTurn
 	commands := map[string]map[string]any{}
 	for _, entry := range branch {
 		if entry.Type != "message" {
@@ -275,7 +277,7 @@ func projectPiHistory(entries []piSessionEntry, leafID string) (RuntimeHistory, 
 		}
 		var message piSessionMessage
 		if err := json.Unmarshal(entry.Message, &message); err != nil {
-			return RuntimeHistory{}, fmt.Errorf("parse Pi message entry %s: %w", entry.ID, err)
+			return nativeHistory{}, fmt.Errorf("parse Pi message entry %s: %w", entry.ID, err)
 		}
 		blocks := piMessageContent(message.Content)
 		switch message.Role {
@@ -294,7 +296,7 @@ func projectPiHistory(entries []piSessionEntry, leafID string) (RuntimeHistory, 
 			if turn != nil && turn.Status == "running" {
 				turn.Status = "completed"
 			}
-			history.Turns = append(history.Turns, RuntimeHistoryTurn{
+			history.Turns = append(history.Turns, nativeHistoryTurn{
 				ID: entry.ID, Status: "running", StartedAt: entry.Timestamp, UpdatedAt: entry.Timestamp,
 				Task: visibleText, Items: []map[string]any{item},
 			})
@@ -351,6 +353,140 @@ func projectPiHistory(entries []piSessionEntry, leafID string) (RuntimeHistory, 
 	}
 	history.Total = len(history.Turns)
 	return history, nil
+}
+
+func projectPiCanonicalHistory(entries []piSessionEntry, leafID string) (runtimecontract.History, error) {
+	branch, err := piActiveBranch(entries, leafID)
+	if err != nil {
+		return runtimecontract.History{}, err
+	}
+	history := runtimecontract.History{}
+	var turn *runtimecontract.HistoryTurn
+	for _, entry := range branch {
+		if entry.Type != "message" {
+			continue
+		}
+		var message piSessionMessage
+		if err := json.Unmarshal(entry.Message, &message); err != nil {
+			return runtimecontract.History{}, fmt.Errorf("parse Pi message entry %s: %w", entry.ID, err)
+		}
+		blocks := piMessageContent(message.Content)
+		switch message.Role {
+		case "user":
+			userText := piContentText(blocks)
+			visibleText := piVisibleUserText(userText)
+			content := []runtimecontract.ContentBlock{{ID: piCanonicalContentID(entry.ID, "user"), Kind: runtimecontract.ContentUserText, Text: visibleText}}
+			for index, attachment := range piUserCanonicalAttachments(userText) {
+				blockID := piCanonicalContentID(entry.ID, fmt.Sprintf("attachment-%d", index+1))
+				if strings.HasPrefix(strings.ToLower(attachment.MIMEType), "image/") {
+					image := runtimecontract.Image(attachment)
+					content = append(content, runtimecontract.ContentBlock{ID: blockID, Kind: runtimecontract.ContentImage, Image: &image})
+				} else {
+					copy := attachment
+					content = append(content, runtimecontract.ContentBlock{ID: blockID, Kind: runtimecontract.ContentAttachment, Attachment: &copy})
+				}
+			}
+			if turn != nil && turn.State == runtimecontract.LifecycleAccepted && piCausalAgentMessage(userText) {
+				turn.Content = append(turn.Content, content...)
+				continue
+			}
+			if turn != nil && turn.State == runtimecontract.LifecycleAccepted {
+				turn.State = runtimecontract.LifecycleCompleted
+			}
+			history.Turns = append(history.Turns, runtimecontract.HistoryTurn{
+				RuntimeTurnRef: entry.ID, State: runtimecontract.LifecycleAccepted, Content: content, StartedAt: entry.Timestamp,
+			})
+			turn = &history.Turns[len(history.Turns)-1]
+		case "assistant":
+			if turn == nil {
+				continue
+			}
+			for index, block := range blocks {
+				blockID := piCanonicalContentID(entry.ID, block.ID, fmt.Sprint(index+1))
+				switch block.Type {
+				case "thinking":
+					if block.Thinking != "" {
+						turn.Content = append(turn.Content, runtimecontract.ContentBlock{ID: blockID, Kind: runtimecontract.ContentReasoning, Text: block.Thinking})
+					}
+				case "text":
+					if block.Text != "" {
+						turn.Content = append(turn.Content, runtimecontract.ContentBlock{ID: blockID, Kind: runtimecontract.ContentAssistantText, Text: block.Text})
+					}
+				case "toolCall":
+					arguments, _ := json.Marshal(block.Arguments)
+					turn.Content = append(turn.Content, runtimecontract.ContentBlock{ID: piCanonicalContentID("tool-call", block.ID), Kind: runtimecontract.ContentToolCall, ToolCall: &runtimecontract.ToolCall{Name: block.Name, Arguments: arguments}})
+				}
+			}
+			turn.Usage = addPiContractUsage(turn.Usage, message)
+			switch message.StopReason {
+			case "stop", "length":
+				turn.State, turn.CompletedAt = runtimecontract.LifecycleCompleted, entry.Timestamp
+			case "error":
+				turn.State, turn.CompletedAt = runtimecontract.LifecycleFailed, entry.Timestamp
+			case "aborted":
+				turn.State, turn.CompletedAt = runtimecontract.LifecycleInterrupted, entry.Timestamp
+			}
+		case "toolResult":
+			if turn == nil {
+				continue
+			}
+			toolCallID := piCanonicalContentID("tool-call", message.ToolCallID)
+			if message.ToolCallID == "" {
+				toolCallID = piCanonicalContentID(entry.ID, "tool")
+			}
+			turn.Content = append(turn.Content, runtimecontract.ContentBlock{
+				ID: piCanonicalContentID(entry.ID, "result"), Kind: runtimecontract.ContentToolResult,
+				ToolResult: &runtimecontract.ToolResult{ToolCallID: toolCallID, Text: piContentText(blocks), Success: !message.IsError},
+			})
+		}
+	}
+	history.Total = len(history.Turns)
+	return history, nil
+}
+
+func piCanonicalContentID(parts ...string) string {
+	return "content_" + sha256Hex([]byte(strings.Join(parts, "\x00")))[:16]
+}
+
+func piUserCanonicalAttachments(text string) []runtimecontract.Attachment {
+	raw := piUserAttachments(text)
+	result := make([]runtimecontract.Attachment, 0, len(raw))
+	for _, source := range raw {
+		id, _ := source["id"].(string)
+		name, _ := source["name"].(string)
+		mimeType, _ := source["mimeType"].(string)
+		ref, _ := source["url"].(string)
+		if id != "" {
+			ref = "artifact:" + id
+		}
+		if ref == "" {
+			continue
+		}
+		size, _ := source["size"].(int64)
+		result = append(result, runtimecontract.Attachment{ID: id, Name: name, MIMEType: mimeType, Size: size, Ref: ref})
+	}
+	return result
+}
+
+func addPiContractUsage(current *runtimecontract.Usage, message piSessionMessage) *runtimecontract.Usage {
+	usage := message.Usage
+	if usage.Input == 0 && usage.Output == 0 && usage.CacheRead == 0 && usage.TotalTokens == 0 {
+		return current
+	}
+	if current == nil {
+		current = &runtimecontract.Usage{}
+	}
+	add := func(metric *runtimecontract.UsageMetric, value int64) {
+		metric.Available, metric.Value, metric.Source = true, metric.Value+value, "native"
+	}
+	add(&current.InputTokens, usage.Input)
+	add(&current.CachedInputTokens, usage.CacheRead)
+	add(&current.OutputTokens, usage.Output)
+	add(&current.TotalTokens, usage.TotalTokens)
+	add(&current.Calls, 1)
+	current.ReasoningOutputTokens.Source = "runtime_unavailable"
+	current.CostMicros.Source = "runtime_unavailable"
+	return current
 }
 
 func piCausalAgentMessage(text string) bool {
@@ -441,13 +577,13 @@ func piUserAttachments(text string) []map[string]any {
 	return attachments
 }
 
-func addPiUsage(current *RuntimeTokenUsage, message piSessionMessage) *RuntimeTokenUsage {
+func addPiUsage(current *nativeTokenUsage, message piSessionMessage) *nativeTokenUsage {
 	usage := message.Usage
 	if usage.Input == 0 && usage.Output == 0 && usage.CacheRead == 0 && usage.TotalTokens == 0 {
 		return current
 	}
 	if current == nil {
-		current = &RuntimeTokenUsage{}
+		current = &nativeTokenUsage{}
 	}
 	current.InputTokens += usage.Input
 	current.CachedInputTokens += usage.CacheRead

@@ -1,13 +1,14 @@
 package hub
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/yan5xu/codex-loom/internal/rollout"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 // ProviderSwitchBinding is persisted before the shared CodexHost is restarted.
@@ -196,7 +197,10 @@ func (h *Hub) finishProviderSwitchMaintenance() {
 
 func (h *Hub) rollbackProviderSwitch(agentID string, previous Agent, cause error, rolloutBackup *providerSwitchRolloutBackup) error {
 	if rolloutBackup != nil {
-		if err := rollout.RestoreRolloutBackup(rolloutBackup.backupPath, rolloutBackup.originalPath); err != nil {
+		h.mu.Lock()
+		maintenance := runtimeProviderHistoryCapability(h.codexDriverLocked())
+		h.mu.Unlock()
+		if err := maintenance.RestoreProviderHistory(context.Background(), rolloutBackup.backupPath, rolloutBackup.originalPath); err != nil {
 			cause = fmt.Errorf("%v; restore rollout backup: %w", cause, err)
 		}
 	}
@@ -229,9 +233,19 @@ func (h *Hub) rollbackProviderSwitch(agentID string, previous Agent, cause error
 func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (AgentView, error) {
 	h.mu.Lock()
 	agent := h.resolveLocked(key)
-	piRuntime := agent != nil && agent.RuntimeBinding.Kind == "pi"
+	agentID := ""
+	if agent != nil {
+		agentID = agent.ID
+	}
 	h.mu.Unlock()
-	if piRuntime {
+	if agentID != "" {
+		h.refreshRuntimeCapabilitySnapshot(agentID, false)
+	}
+	h.mu.Lock()
+	agent = h.resolveLocked(key)
+	nativeModelSwitch := agent != nil && runtimeCapabilityAvailableLocked(agent, runtimecontract.CapabilityModelConfiguration)
+	h.mu.Unlock()
+	if nativeModelSwitch {
 		if _, err := h.SwitchRuntimeModel(key, RuntimeModelSelection{Provider: params.ProviderID, Model: params.Model}); err != nil {
 			return AgentView{}, err
 		}
@@ -260,7 +274,7 @@ func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (Agen
 		h.mu.Unlock()
 		return AgentView{}, errf(404, "agent not found: %s", key)
 	}
-	if !h.runtimeCapabilitiesLocked(agent).Provider {
+	if !runtimeCapabilityAvailableLocked(agent, runtimecontract.CapabilityProviderConfiguration) {
 		h.mu.Unlock()
 		return AgentView{}, unsupportedRuntimeCapability(agent, "Provider switching")
 	}
@@ -278,7 +292,7 @@ func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (Agen
 		return AgentView{}, err
 	}
 	h.providerSwitching = true
-	agentID := agent.ID
+	agentID = agent.ID
 	h.mu.Unlock()
 	if _, err := h.startProviderSwitchHost(); err != nil {
 		h.finishProviderSwitchMaintenance()
@@ -331,7 +345,10 @@ func (h *Hub) SwitchAgentProvider(key string, params ProviderSwitchParams) (Agen
 		if h.st != nil {
 			backupDir = filepath.Join(h.st.Dir(), "backups", "provider-switch")
 		}
-		result, sanitizeErr := rollout.SanitizeReasoningContent(previous.RuntimeBinding.NativeRef, backupDir)
+		h.mu.Lock()
+		maintenance := runtimeProviderHistoryCapability(h.codexDriverLocked())
+		h.mu.Unlock()
+		result, sanitizeErr := maintenance.SanitizeProviderHistory(context.Background(), previous.RuntimeBinding.NativeRef, backupDir)
 		if sanitizeErr != nil {
 			return AgentView{}, errf(500, "switch Provider: %s", h.rollbackProviderSwitch(agentID, previous, sanitizeErr, rolloutBackup))
 		}

@@ -28,7 +28,7 @@ func TestGlobalEventsReplayAfterCursor(t *testing.T) {
 	h.EmitGlobal("loom/test-two", map[string]any{"value": 2})
 	secondSeq := h.LastGlobalSeq()
 
-	types := readGlobalSSE(t, h, fmt.Sprintf("/api/events?since=%d", firstSeq), 1)
+	types := readGlobalSSE(t, h, fmt.Sprintf("/api/agents/events?since=%d", firstSeq), 1)
 	event := types[0]
 	if event.Type != "loom/test-two" || event.Seq != secondSeq {
 		t.Fatalf("replayed event = %#v, want loom/test-two seq %d", event, secondSeq)
@@ -53,7 +53,7 @@ func TestGlobalEventsRequestsReconcileWhenCursorWasCompacted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events := readGlobalSSE(t, h, "/api/events?since=1", 1)
+	events := readGlobalSSE(t, h, "/api/agents/events?since=1", 1)
 	if events[0].Type != "loom/reconcile" {
 		t.Fatalf("first event after compacted cursor = %#v", events[0])
 	}

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/modelcatalog"
-	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
@@ -25,7 +24,6 @@ func (h *Hub) ListAgents() []AgentView {
 	}
 	h.mu.Unlock()
 	for i := range out {
-		applyRolloutStatus(&out[i])
 		if snapshot, ok := h.refreshRuntimeCapabilitySnapshot(out[i].ID, false); ok {
 			out[i].CapabilitySnapshot = snapshot
 		}
@@ -80,9 +78,6 @@ func boundedDisplayTask(text string, limit int) string {
 	return strings.TrimSpace(string(runes[:limit])) + "…"
 }
 
-// ListSessions is the pre-CodexLoom compatibility method.
-func (h *Hub) ListSessions() []SessionView { return h.ListAgents() }
-
 func (h *Hub) GetAgent(key string) (AgentView, error) {
 	h.mu.Lock()
 	meta := h.resolveLocked(key)
@@ -92,7 +87,6 @@ func (h *Hub) GetAgent(key string) (AgentView, error) {
 	}
 	view := h.viewLocked(meta)
 	h.mu.Unlock()
-	applyRolloutStatus(&view)
 	if snapshot, ok := h.refreshRuntimeCapabilitySnapshot(view.ID, false); ok {
 		view.CapabilitySnapshot = snapshot
 	}
@@ -116,9 +110,6 @@ func (h *Hub) GetRuntimeDiagnostics(key string) (RuntimeDiagnostics, error) {
 	}, nil
 }
 
-// GetSession is the pre-CodexLoom compatibility method.
-func (h *Hub) GetSession(key string) (SessionView, error) { return h.GetAgent(key) }
-
 func (h *Hub) ActiveAgents() []ActiveAgent {
 	views := h.ListAgents()
 	out := []ActiveAgent{}
@@ -136,9 +127,6 @@ func (h *Hub) ActiveAgents() []ActiveAgent {
 	})
 	return out
 }
-
-// RunningSessions is the pre-CodexLoom compatibility method.
-func (h *Hub) RunningSessions() []RunningSession { return h.ActiveAgents() }
 
 type CreateParams struct {
 	Name           string `json:"name"`
@@ -185,9 +173,6 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 	p.RuntimeKind = strings.TrimSpace(p.RuntimeKind)
 	if p.RuntimeKind == "" {
 		return AgentView{}, errf(400, "runtimeKind is required")
-	}
-	if p.RuntimeKind != "codex" && p.RuntimeKind != "pi" {
-		return AgentView{}, errf(400, "unsupported Runtime kind %q", p.RuntimeKind)
 	}
 	if err := h.validateRequestedRuntimeConfiguration(
 		p.RuntimeKind, p.Sandbox,
@@ -305,9 +290,6 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	if p.RuntimeBinding.SchemaVersion != RuntimeBindingSchemaVersion {
 		return AgentView{}, errf(400, "unsupported Runtime Binding schema version %d", p.RuntimeBinding.SchemaVersion)
 	}
-	if p.RuntimeBinding.Kind != "codex" && p.RuntimeBinding.Kind != "pi" {
-		return AgentView{}, errf(400, "unsupported Runtime kind %q", p.RuntimeBinding.Kind)
-	}
 	if err := h.validateRequestedRuntimeConfiguration(
 		p.RuntimeBinding.Kind, p.Sandbox,
 		strings.TrimSpace(p.ProviderID) != "" || strings.TrimSpace(p.Model) != "" || strings.TrimSpace(p.Effort) != "",
@@ -375,9 +357,6 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	h.emitStatusLocked(meta, meta.Status)
 	return h.viewLocked(meta), nil
 }
-
-// CreateSession is the pre-CodexLoom compatibility method.
-func (h *Hub) CreateSession(p CreateParams) (SessionView, error) { return h.CreateAgent(p) }
 
 func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 	h.mu.Lock()
@@ -539,11 +518,6 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 	return view, nil
 }
 
-// UpdateConfig is the pre-CodexLoom compatibility method.
-func (h *Hub) UpdateConfig(key string, p ConfigParams) (SessionView, error) {
-	return h.UpdateAgentConfig(key, p)
-}
-
 func (h *Hub) syncRuntimeBindingName(rt *runtime, binding runtimecontract.Binding, name string) error {
 	if rt == nil || rt.runtimeContract == nil {
 		return nil
@@ -554,15 +528,22 @@ func (h *Hub) syncRuntimeBindingName(rt *runtime, binding runtimecontract.Bindin
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return compatibilityLifecycleOutcomeError(capability.UpdateBindingName(ctx, binding, name))
+	return runtimeLifecycleOutcomeError(capability.UpdateBindingName(ctx, binding, name), runtimecontract.LifecycleCompleted, false)
 }
 
 func runtimeContractBinding(meta *Agent) runtimecontract.Binding {
 	if meta == nil {
 		return runtimecontract.Binding{}
 	}
+	schemaVersion := meta.RuntimeBinding.SchemaVersion
+	// Agents loaded through Store migration already carry the canonical schema.
+	// Keep the in-memory test/adoption seam equally narrow: schema 0/1 was the
+	// post-fork Binding shape and maps directly to v2 when kind/ref are present.
+	if schemaVersion == 0 || schemaVersion == 1 {
+		schemaVersion = runtimecontract.BindingSchemaVersion
+	}
 	return runtimecontract.Binding{
-		SchemaVersion: meta.RuntimeBinding.SchemaVersion,
+		SchemaVersion: schemaVersion,
 		RuntimeKind:   meta.RuntimeBinding.Kind,
 		NativeRef:     meta.RuntimeBinding.NativeRef,
 	}
@@ -805,21 +786,21 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		rt.startMu.Unlock()
 		return SendResult{}, err
 	}
-	backend := runtimeBackend(rt)
-	if hasImageArtifact && (backend == nil || !backend.Capabilities().ImageInput) {
-		rt.startMu.Unlock()
-		return SendResult{}, imageCapabilityErr
+	if hasImageArtifact {
+		capability, ok := rt.runtimeContract.(runtimeInputCapability)
+		if !ok {
+			rt.startMu.Unlock()
+			return SendResult{}, imageCapabilityErr
+		}
+		if failure := capability.ValidateRuntimeInput(context.Background(), rt.binding, []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage}}); failure != nil {
+			rt.startMu.Unlock()
+			return SendResult{}, imageCapabilityErr
+		}
 	}
 	contextPlan, err := h.prepareTurnContext(agentID, source, artifacts)
 	if err != nil {
 		rt.startMu.Unlock()
 		return SendResult{}, err
-	}
-	if rt.runtimeContract == nil && contextPlan.DeveloperContext != "" {
-		if err := h.injectLegacyDeveloperContext(agentID, rt, contextPlan.DeveloperContext); err != nil {
-			rt.startMu.Unlock()
-			return SendResult{}, err
-		}
 	}
 	input := codexArtifactInput(text, contextPlan.InputContext, artifacts)
 	h.mu.Lock()
@@ -903,36 +884,26 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 
 	h.startWorker(func() { h.watchdog(agentID, turn, inactivity) })
 
-	startTurn := func() (string, error) {
-		if contract != nil {
-			controls := RuntimeTurnRequest{
-				LoomTurnID: turn.turnID, NativeRef: threadID, Input: input, ApprovalPolicy: approvalPolicy,
-				Sandbox: sandbox, Model: model, Effort: effort, Timeout: 30 * time.Second,
-			}
-			if compatibility, ok := contract.(runtimeCompatibilityControls); ok {
-				compatibility.setCompatibilityTurn(controls)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			outcome := contract.StartTurn(ctx, runtimecontract.TurnRequest{
-				Binding: binding, TurnID: turn.turnID, Input: runtimeContractTurnInput(contextPlan.DeveloperContext, input),
-			})
-			return outcome.RuntimeTurnRef, compatibilityLifecycleOutcomeError(outcome)
+	startTurn := func() (string, runtimecontract.Outcome, error) {
+		if contract == nil {
+			return "", runtimecontract.Outcome{}, errors.New("Agent Runtime Contract is unavailable")
 		}
-		if backend == nil {
-			return "", errors.New("Agent Runtime is unavailable")
-		}
-		return backend.StartTurn(RuntimeTurnRequest{
-			LoomTurnID: turn.turnID, NativeRef: threadID, Input: input, ApprovalPolicy: approvalPolicy,
-			Sandbox: sandbox, Model: model, Effort: effort, Timeout: 30 * time.Second,
+		configureRuntimeTurn(contract, approvalPolicy, sandbox, model, effort, h.effectiveDeveloperContextTimeout())
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		outcome := contract.StartTurn(ctx, runtimecontract.TurnRequest{
+			Binding: binding, TurnID: turn.turnID, Input: runtimeContractTurnInput(contextPlan.DeveloperContext, input),
 		})
+		return outcome.RuntimeTurnRef, outcome, runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleAccepted, true)
 	}
-	turnID, err := startTurn()
-	if err != nil && isThreadNotFoundError(err) {
+	turnID, startOutcome, err := startTurn()
+	typedBindingMissing := startOutcome.State == runtimecontract.LifecycleRejected && startOutcome.Failure != nil &&
+		startOutcome.Failure.Code == runtimecontract.FailureCodeBindingNotFound && startOutcome.Failure.Phase == runtimecontract.FailurePhaseTurnStart
+	if err != nil && typedBindingMissing {
 		// The Thread can be evicted between resume and turn/start. Keep the
 		// already-reserved Turn and retry this idempotent pre-start sequence once.
 		if resumeErr := h.resumeAgentThread(agentID, rt); resumeErr == nil {
-			turnID, err = startTurn()
+			turnID, _, err = startTurn()
 		} else {
 			err = fmt.Errorf("%v; retry %v", err, resumeErr)
 		}
@@ -1012,47 +983,51 @@ func codexTaskText(text string, artifacts []ThreadArtifact) string {
 	return taskText
 }
 
-func codexArtifactInput(text, loomContext string, artifacts []ThreadArtifact) []RuntimeInput {
-	input := make([]RuntimeInput, 0, len(artifacts)+2)
+func codexArtifactInput(text, loomContext string, artifacts []ThreadArtifact) []nativeInput {
+	input := make([]nativeInput, 0, len(artifacts)+2)
 	original := strings.TrimSpace(text)
 	if original == "" && len(artifacts) > 0 {
 		original = "Review the attached files."
 	}
 	if original != "" {
-		input = append(input, RuntimeInput{Kind: RuntimeInputText, Text: original})
+		input = append(input, nativeInput{Kind: nativeInputText, Text: original})
 	}
 	if strings.TrimSpace(loomContext) != "" {
-		input = append(input, RuntimeInput{Kind: RuntimeInputText, Text: loomContext})
+		input = append(input, nativeInput{Kind: nativeInputText, Text: loomContext})
 	}
 	for _, artifact := range artifacts {
 		if strings.HasPrefix(strings.ToLower(artifact.MimeType), "image/") {
-			input = append(input, RuntimeInput{Kind: RuntimeInputLocalImage, Path: artifact.Path, MimeType: artifact.MimeType})
+			input = append(input, nativeInput{Kind: nativeInputLocalImage, Path: artifact.Path, MimeType: artifact.MimeType})
 		}
 	}
 	return input
 }
 
-func runtimeContractTurnInput(developerContext string, input []RuntimeInput) []runtimecontract.InputBlock {
+func runtimeContractTurnInput(developerContext string, input []nativeInput) []runtimecontract.InputBlock {
 	blocks := make([]runtimecontract.InputBlock, 0, len(input)+1)
 	if developerContext = strings.TrimSpace(developerContext); developerContext != "" {
 		blocks = append(blocks, runtimecontract.InputBlock{
 			Kind: runtimecontract.InputText, Role: runtimecontract.InputRoleDeveloper, Text: developerContext,
 		})
 	}
-	for _, block := range v1InputToContract(input) {
+	for _, block := range nativeInputToContract(input) {
 		block.Role = runtimecontract.InputRoleUser
 		blocks = append(blocks, block)
 	}
 	return blocks
 }
 
-func isThreadNotFoundError(err error) bool {
-	if err == nil {
-		return false
+func nativeInputToContract(input []nativeInput) []runtimecontract.InputBlock {
+	result := make([]runtimecontract.InputBlock, 0, len(input))
+	for _, item := range input {
+		switch item.Kind {
+		case nativeInputText:
+			result = append(result, runtimecontract.InputBlock{Kind: runtimecontract.InputText, Text: item.Text})
+		case nativeInputLocalImage:
+			result = append(result, runtimecontract.InputBlock{Kind: runtimecontract.InputImage, Ref: item.Path, MIMEType: item.MimeType})
+		}
 	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "thread not found") ||
-		(strings.Contains(message, "thread") && strings.Contains(message, "not found"))
+	return result
 }
 
 func (h *Hub) watchdog(agentID string, turn *turnState, inactivity time.Duration) {
@@ -1141,14 +1116,12 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	}
 	turn := rt.activeTurn
 	agentID := meta.ID
-	threadID := meta.RuntimeBinding.NativeRef
 	turnID := turn.nativeTurnID
 	contract := rt.runtimeContract
 	binding := rt.binding
 	if binding.RuntimeKind == "" {
 		binding = runtimeContractBinding(meta)
 	}
-	backend := runtimeBackend(rt)
 	heldMessageID := turn.agentMessageID
 	heldSubject := ""
 	if message := h.comms[heldMessageID]; message != nil {
@@ -1156,58 +1129,20 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	}
 	h.mu.Unlock()
 
-	if contract == nil && turnID == "" {
+	if contract == nil {
+		return InterruptResult{}, errf(500, "Agent Runtime Contract is unavailable")
+	}
+	if turnID == "" {
 		return InterruptResult{}, errf(409, "active Turn is still starting; retry shortly")
 	}
 	interrupt := func(targetTurnID string) error {
-		if contract != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			return compatibilityLifecycleOutcomeError(contract.InterruptTurn(ctx, runtimecontract.TurnTarget{
-				Binding: binding, TurnID: turn.turnID, RuntimeTurnRef: targetTurnID,
-			}))
-		}
-		if backend == nil {
-			return errors.New("Agent Runtime is unavailable")
-		}
-		return backend.Interrupt(threadID, targetTurnID, 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return runtimeLifecycleOutcomeError(contract.InterruptTurn(ctx, runtimecontract.TurnTarget{
+			Binding: binding, TurnID: turn.turnID, RuntimeTurnRef: targetTurnID,
+		}), runtimecontract.LifecycleInterrupted, false)
 	}
 	err := interrupt(turnID)
-	if actualTurnID, mismatch := activeTurnInterruptMismatch(err); contract == nil && mismatch && actualTurnID != turnID {
-		h.mu.Lock()
-		currentMeta := h.agents[agentID]
-		currentRuntime := h.runtimes[agentID]
-		var retryTurn *turnState
-		if currentMeta != nil && currentRuntime == rt && rt.activeTurn != nil && !rt.activeTurn.finished {
-			current := rt.activeTurn
-			switch {
-			case current.nativeTurnID == actualTurnID:
-				retryTurn = current
-			case current.nativeTurnID == turnID && !current.startedConfirmed:
-				h.bindActiveNativeTurnIDLocked(currentMeta, current, actualTurnID)
-				current.startedConfirmed = true
-				retryTurn = current
-			case current.nativeTurnID == turnID:
-				h.finishTurnLocked(currentMeta, rt, "interrupted", "superseded by active Turn "+actualTurnID)
-				retryTurn = h.adoptRemoteTurnLocked(currentMeta, rt, actualTurnID)
-			}
-		}
-		h.mu.Unlock()
-		if retryTurn != nil {
-			turn = retryTurn
-			turnID = actualTurnID
-			heldMessageID = retryTurn.agentMessageID
-			heldSubject = ""
-			if heldMessageID != "" {
-				h.mu.Lock()
-				if message := h.comms[heldMessageID]; message != nil {
-					heldSubject = message.Subject
-				}
-				h.mu.Unlock()
-			}
-			err = interrupt(actualTurnID)
-		}
-	}
 	if err != nil {
 		if isRuntimeIndeterminate(err) {
 			h.onRuntimeIndeterminate(rt, err)
@@ -1345,9 +1280,9 @@ func interruptRuntimeForArchive(rt *runtime, binding runtimecontract.Binding, tu
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return compatibilityLifecycleOutcomeError(rt.runtimeContract.InterruptTurn(ctx, runtimecontract.TurnTarget{
+	return runtimeLifecycleOutcomeError(rt.runtimeContract.InterruptTurn(ctx, runtimecontract.TurnTarget{
 		Binding: binding, TurnID: turnID, RuntimeTurnRef: runtimeTurnRef,
-	}))
+	}), runtimecontract.LifecycleInterrupted, false)
 }
 
 func archiveRuntimeBinding(rt *runtime, binding runtimecontract.Binding) {
@@ -1360,43 +1295,25 @@ func archiveRuntimeBinding(rt *runtime, binding runtimecontract.Binding) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := compatibilityLifecycleOutcomeError(capability.ArchiveBinding(ctx, binding)); err != nil {
+	if err := runtimeLifecycleOutcomeError(capability.ArchiveBinding(ctx, binding), runtimecontract.LifecycleCompleted, false); err != nil {
 		log.Printf("[codex-loom] archive native Runtime binding for Agent: %v", err)
 	}
 }
 
 func closeRuntimeBinding(rt *runtime, binding runtimecontract.Binding) {
-	if rt == nil {
+	if rt == nil || rt.runtimeContract == nil {
 		return
 	}
-	if rt.runtimeContract != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		outcome := rt.runtimeContract.CloseBinding(ctx, binding)
-		err := compatibilityLifecycleOutcomeError(outcome)
-		if err == nil && outcome.State == runtimecontract.LifecycleCompleted {
-			if rt.agentHost != nil && rt.agentHost.Alive() {
-				rt.agentHost.Close()
-			}
-			return
-		}
-		if err == nil {
-			err = fmt.Errorf("Runtime returned non-completed close state %q", outcome.State)
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	outcome := rt.runtimeContract.CloseBinding(ctx, binding)
+	if err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false); err != nil {
 		log.Printf("[codex-loom] close Runtime binding: %v; forcing Agent Host close", err)
-		if rt.agentHost != nil {
-			rt.agentHost.Close()
-			return
-		}
 	}
-	// Compatibility-only test runtimes are removed after the v2 consumer seam.
-	if backend := runtimeBackend(rt); backend != nil {
-		backend.Close()
+	if rt.agentHost != nil {
+		rt.agentHost.Close()
 	}
 }
-
-// KillSession is the pre-CodexLoom compatibility method.
-func (h *Hub) KillSession(key string) (map[string]any, error) { return h.ArchiveAgent(key) }
 
 // ---- history (read from codex rollout files) ----
 //
@@ -1408,25 +1325,6 @@ func (h *Hub) KillSession(key string) (map[string]any, error) { return h.Archive
 // (from an Agent CodexLoom is actively driving) still flow through the store
 // event log for real-time SSE broadcast — but historical viewing always reads
 // the rollout, so a non-driven Agent is fully viewable too.
-
-type HistoryTurn struct {
-	ID             string              `json:"id"`
-	Status         string              `json:"status"`
-	Items          []map[string]any    `json:"items"`
-	Model          string              `json:"model,omitempty"`
-	Usage          *rollout.TokenUsage `json:"usage,omitempty"`
-	UsageUpdatedAt string              `json:"usageUpdatedAt,omitempty"`
-}
-
-type History struct {
-	ID       string        `json:"id"`
-	Name     string        `json:"name"`
-	Cwd      string        `json:"cwd"`
-	ThreadID string        `json:"threadId"`
-	Status   string        `json:"status"`
-	Total    int           `json:"total"` // total turns in the rollout (for scroll-up paging)
-	Turns    []HistoryTurn `json:"turns"`
-}
 
 // CanonicalHistory is the Runtime Contract v2 history projection returned by
 // ordinary Agent APIs. Native Runtime references and diagnostic payloads are
@@ -1461,89 +1359,6 @@ type TurnReference struct {
 	Kind    string `json:"kind"`
 	ID      string `json:"id,omitempty"`
 	TopicID string `json:"topicId,omitempty"`
-}
-
-type TurnDetail struct {
-	ID             string              `json:"id"`
-	AgentID        string              `json:"agentId"`
-	Agent          string              `json:"agent"`
-	ThreadID       string              `json:"threadId"`
-	Cwd            string              `json:"cwd"`
-	Status         string              `json:"status"`
-	StartedAt      string              `json:"startedAt,omitempty"`
-	CompletedAt    string              `json:"completedAt,omitempty"`
-	Model          string              `json:"model,omitempty"`
-	Usage          *rollout.TokenUsage `json:"usage,omitempty"`
-	UsageUpdatedAt string              `json:"usageUpdatedAt,omitempty"`
-	Source         *TurnReference      `json:"source,omitempty"`
-	Error          string              `json:"error,omitempty"`
-	Items          []map[string]any    `json:"items"`
-}
-
-// GetTurn locates a Loom Turn while the Runtime remains the history source.
-func (h *Hub) GetTurn(turnID string) (TurnDetail, error) {
-	turnID = strings.TrimSpace(turnID)
-	if turnID == "" {
-		return TurnDetail{}, errf(400, "turn id is required")
-	}
-
-	h.mu.Lock()
-	agents := make([]AgentView, 0, len(h.agents))
-	for _, agent := range h.agents {
-		if agent.ThreadID != "" {
-			agents = append(agents, h.viewLocked(agent))
-		}
-	}
-	h.mu.Unlock()
-	for i := range agents {
-		applyRolloutStatus(&agents[i])
-	}
-	sort.Slice(agents, func(i, j int) bool {
-		if agents[i].Name != agents[j].Name {
-			return agents[i].Name < agents[j].Name
-		}
-		return agents[i].ID < agents[j].ID
-	})
-
-	var lookupErr error
-	for _, agent := range agents {
-		backend := runtimeForKind(agent.RuntimeBinding.Kind)
-		if backend == nil || !backend.Capabilities().History {
-			continue
-		}
-		nativeTurnID := nativeTurnIDFor(&agent, turnID)
-		turn, err := backend.ReadTurn(agent.nativeRuntimeRef, nativeTurnID)
-		if err != nil {
-			if !errors.Is(err, rollout.ErrTurnNotFound) && !errors.Is(err, rollout.ErrRolloutNotFound) && lookupErr == nil {
-				lookupErr = fmt.Errorf("Agent %s (%s): %w", agent.Name, agent.ThreadID, err)
-			}
-			continue
-		}
-		applyInterruptedHistoryTurn(&agent, turnID, &turn)
-		items := turn.Items
-		if items == nil {
-			items = []map[string]any{}
-		}
-		detail := TurnDetail{
-			ID: turnID, AgentID: agent.ID, Agent: agent.Name, ThreadID: agent.ThreadID,
-			Cwd: agent.Cwd, Status: turn.Status, StartedAt: turn.StartedAt, CompletedAt: turn.CompletedAt,
-			Model: turn.Model, Usage: rolloutTokenUsage(turn.Usage), UsageUpdatedAt: turn.UsageUpdatedAt, Items: items,
-		}
-		if detail.Status == "running" && (agent.Status != "running" || agent.CurrentTurnID != turnID) {
-			detail.Status = "interrupted"
-		}
-		h.mu.Lock()
-		detail.Source, detail.Error = h.turnReferenceLocked(agent.ID, turnID)
-		if detail.Error == "" && agent.LastTurn != nil && agent.LastTurn.TurnID == turnID && agent.LastError != "" {
-			detail.Error = agent.LastError
-		}
-		h.mu.Unlock()
-		return detail, nil
-	}
-	if lookupErr != nil {
-		return TurnDetail{}, errf(500, "turn lookup failed: %v", lookupErr)
-	}
-	return TurnDetail{}, errf(404, "turn not found: %s", turnID)
 }
 
 func (h *Hub) turnReferenceLocked(agentID, turnID string) (*TurnReference, string) {
@@ -1592,79 +1407,8 @@ func (h *Hub) turnReferenceLocked(agentID, turnID string) (*TurnReference, strin
 	return nil, ""
 }
 
-func (h *Hub) History(key string, count, offset int) (History, error) {
-	if count <= 0 {
-		count = 10
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	h.mu.Lock()
-	meta := h.resolveLocked(key)
-	if meta == nil {
-		h.mu.Unlock()
-		return History{}, errf(404, "agent not found: %s", key)
-	}
-	if !h.runtimeCapabilitiesLocked(meta).History {
-		h.mu.Unlock()
-		return History{}, unsupportedRuntimeCapability(meta, "history")
-	}
-	view := h.viewLocked(meta)
-	backend := runtimeForKind(meta.RuntimeBinding.Kind)
-	if rt := h.runtimes[meta.ID]; rt != nil {
-		backend = runtimeBackend(rt)
-	}
-	h.mu.Unlock()
-	applyRolloutStatus(&view)
-
-	threadID := view.nativeRuntimeRef
-	hist := History{ID: view.ID, Name: view.Name, Cwd: view.Cwd, ThreadID: view.ThreadID, Status: view.Status}
-
-	if threadID == "" {
-		return hist, nil // no thread started yet → no rollout, no history
-	}
-
-	if backend == nil || !backend.Capabilities().History {
-		return History{}, errf(503, "%s Runtime history backend is unavailable", view.RuntimeBinding.Kind)
-	}
-	window, err := backend.ReadHistory(threadID, count, offset)
-	if err != nil {
-		if errors.Is(err, rollout.ErrRolloutNotFound) {
-			return hist, nil
-		}
-		return History{}, errf(500, "read %s Runtime history: %v", view.RuntimeBinding.Kind, err)
-	}
-	all := window.Turns
-	for i := range all {
-		all[i].ID = loomTurnIDFor(&view, all[i].ID)
-		applyInterruptedHistoryTurn(&view, all[i].ID, &all[i])
-	}
-	hist.Total = window.Total
-	if len(all) > 0 && all[len(all)-1].Status == "running" && hist.Status != "running" {
-		if latest, err := backend.LatestTurn(threadID); err == nil && latest != nil && latest.Status == "running" && externalTurnLooksLive(threadID, latest.UpdatedAt) {
-			hist.Status = "running"
-		} else {
-			all[len(all)-1].Status = "interrupted"
-		}
-	}
-	for _, t := range all {
-		items := t.Items
-		if items == nil {
-			items = []map[string]any{}
-		}
-		turn := HistoryTurn{ID: t.ID, Status: t.Status, Items: items}
-		if t.Usage != nil {
-			turn.Model = t.Model
-			turn.Usage = rolloutTokenUsage(t.Usage)
-			turn.UsageUpdatedAt = t.UsageUpdatedAt
-		}
-		hist.Turns = append(hist.Turns, turn)
-	}
-	return hist, nil
-}
-
 // CanonicalHistory reads through Runtime Contract v2 and applies the public
-// Loom identity projection. The v1 History method remains for /api/sessions.
+// Loom identity projection.
 func (h *Hub) CanonicalHistory(key string, count, offset int) (CanonicalHistory, error) {
 	if count <= 0 {
 		count = 10
@@ -1690,7 +1434,6 @@ func (h *Hub) CanonicalHistory(key string, count, offset int) (CanonicalHistory,
 		}
 	}
 	h.mu.Unlock()
-	applyRolloutStatus(&view)
 	result := CanonicalHistory{ID: view.ID, Name: view.Name, Cwd: view.Cwd, ThreadID: view.ThreadID, Status: view.Status, Turns: []CanonicalHistoryTurn{}}
 	if view.nativeRuntimeRef == "" {
 		return result, nil
@@ -1704,15 +1447,24 @@ func (h *Hub) CanonicalHistory(key string, count, offset int) (CanonicalHistory,
 	if contract == nil {
 		return CanonicalHistory{}, errf(503, "%s Runtime history backend is unavailable", view.RuntimeBinding.Kind)
 	}
+	if contract.ContractVersion() != runtimecontract.Version {
+		return CanonicalHistory{}, errf(503, "%s Runtime history Contract version %d is unsupported; expected %d", view.RuntimeBinding.Kind, contract.ContractVersion(), runtimecontract.Version)
+	}
 	history, failure := contract.ReadHistory(context.Background(), runtimecontract.HistoryRequest{
 		Binding: runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: view.RuntimeBinding.Kind, NativeRef: view.nativeRuntimeRef},
 		Count:   count, Offset: offset,
 	})
 	if failure != nil {
+		if err := failure.Validate(); err != nil {
+			return CanonicalHistory{}, errf(500, "read %s Runtime history: invalid Contract failure: %s", view.RuntimeBinding.Kind, err)
+		}
 		if failure.Code == "history_not_found" {
 			return result, nil
 		}
 		return CanonicalHistory{}, errf(500, "read %s Runtime history: %s", view.RuntimeBinding.Kind, publicRuntimeFailureMessage(&view.Agent, "", failure.Message))
+	}
+	if err := history.Validate(); err != nil {
+		return CanonicalHistory{}, errf(500, "read %s Runtime history: invalid Contract history: %s", view.RuntimeBinding.Kind, err)
 	}
 	result.Total = history.Total
 	for _, turn := range history.Turns {
@@ -1817,56 +1569,6 @@ func (h *Hub) GetCanonicalTurn(turnID string) (CanonicalTurnDetail, error) {
 		return CanonicalTurnDetail{}, firstErr
 	}
 	return CanonicalTurnDetail{}, errf(404, "turn not found: %s", turnID)
-}
-
-func applyInterruptedHistoryTurn(view *AgentView, turnID string, turn *RuntimeHistoryTurn) {
-	if view == nil || turn == nil {
-		return
-	}
-	marker, ok := view.turnRecoveryMarkers[turnID]
-	if !ok {
-		return
-	}
-	turn.Status = "interrupted"
-	if turn.CompletedAt == "" {
-		turn.CompletedAt = marker.CreatedAt
-	}
-	for _, item := range turn.Items {
-		if item["type"] == "command" && item["status"] == "running" {
-			item["status"] = "interrupted"
-		}
-	}
-}
-
-func nativeTurnIDFor(view *AgentView, turnID string) string {
-	if view != nil {
-		if nativeTurnID := view.nativeTurnBindings[turnID]; nativeTurnID != "" {
-			return nativeTurnID
-		}
-	}
-	return turnID
-}
-
-func loomTurnIDFor(view *AgentView, nativeTurnID string) string {
-	if view != nil {
-		for turnID, candidate := range view.nativeTurnBindings {
-			if candidate == nativeTurnID {
-				return turnID
-			}
-		}
-	}
-	return nativeTurnID
-}
-
-func rolloutTokenUsage(usage *RuntimeTokenUsage) *rollout.TokenUsage {
-	if usage == nil {
-		return nil
-	}
-	return &rollout.TokenUsage{
-		InputTokens: usage.InputTokens, CachedInputTokens: usage.CachedInputTokens,
-		OutputTokens: usage.OutputTokens, ReasoningOutputTokens: usage.ReasoningOutputTokens,
-		TotalTokens: usage.TotalTokens, Calls: usage.Calls,
-	}
 }
 
 // Shutdown closes all codex processes. Running agents keep status=running

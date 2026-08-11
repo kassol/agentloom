@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"strings"
 	"time"
 )
@@ -34,10 +35,6 @@ func (h *Hub) CompactAgentThread(key string) (ThreadCompactResult, error) {
 		h.mu.Unlock()
 		return ThreadCompactResult{}, errf(404, "agent not found: %s", key)
 	}
-	if !h.runtimeCapabilitiesLocked(agent).Compaction {
-		h.mu.Unlock()
-		return ThreadCompactResult{}, unsupportedRuntimeCapability(agent, "manual compaction")
-	}
 	if agent.Status == "running" {
 		h.mu.Unlock()
 		return ThreadCompactResult{}, errf(409, "agent %q is running; stop the active Turn before compacting", agent.Name)
@@ -54,25 +51,35 @@ func (h *Hub) CompactAgentThread(key string) (ThreadCompactResult, error) {
 		h.mu.Unlock()
 		return ThreadCompactResult{}, errf(409, "agent %q has an active Goal; pause it before compacting", agent.Name)
 	}
+	rt, err := h.getRuntimeLocked(agent)
+	if err != nil {
+		h.mu.Unlock()
+		return ThreadCompactResult{}, err
+	}
 	agentID, agentName := agent.ID, agent.Name
 	loomThreadID := agent.ThreadID
-	threadID, sandbox, cwd := strings.TrimSpace(agent.RuntimeBinding.NativeRef), agent.Sandbox, agent.Cwd
-	providerID, model := effectiveProviderBinding(agent)
-	disabledSkillPaths := h.disabledSkillPathsLocked(agent.ID)
+	threadID := strings.TrimSpace(agent.RuntimeBinding.NativeRef)
 	h.mu.Unlock()
 
 	if threadID == "" {
 		return ThreadCompactResult{}, errf(409, "agent has no Codex Thread binding")
 	}
-	host, err := h.ensureCodexHost()
-	if err != nil {
-		return ThreadCompactResult{}, err
+	rt.startMu.Lock()
+	defer rt.startMu.Unlock()
+	if err := waitReady(rt); err != nil {
+		return ThreadCompactResult{}, errf(500, "Runtime not ready: %s", err)
 	}
-	if err := resumeThread(host.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths); err != nil {
-		return ThreadCompactResult{}, errf(500, "resume Thread before compaction: %s", err)
+	if err := h.resumeAgentThread(agentID, rt); err != nil {
+		return ThreadCompactResult{}, errf(500, "resume Runtime binding before compaction: %s", err)
 	}
-	if _, err := host.client.Request("thread/compact/start", map[string]any{"threadId": threadID}, 60*time.Second); err != nil {
-		return ThreadCompactResult{}, errf(500, "start Codex compaction: %s", err)
+	capability, ok := rt.runtimeContract.(runtimeCompactionCapability)
+	if !ok {
+		return ThreadCompactResult{}, unsupportedRuntimeCapability(agent, "manual compaction")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := capability.CompactRuntimeBinding(ctx, rt.binding); err != nil {
+		return ThreadCompactResult{}, errf(500, "start Runtime compaction: %s", err)
 	}
 
 	h.mu.Lock()

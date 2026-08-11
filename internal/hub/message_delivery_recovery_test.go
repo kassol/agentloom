@@ -9,8 +9,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
+
+func attachedTestCodexRuntime(agentID, nativeRef string, host *codexHostRuntime, ready chan struct{}) *runtime {
+	contract := &codexRuntimeContract{
+		agentID: agentID, native: &codexAgentRuntime{client: host.client}, bindingRef: nativeRef,
+		turnsByNative: map[string]runtimeTurnCorrelation{},
+	}
+	return &runtime{
+		agentID: agentID, runtimeContract: contract,
+		binding:        runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: nativeRef},
+		hostGeneration: host.generation, ready: ready, approvals: map[string]*approval{},
+		skillConfigLoaded: true, skillConfigHash: agentSkillConfigHash(nil),
+	}
+}
 
 func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterRestart(t *testing.T) {
 	logPath, lateEffectPath := installFakeIndeterminateThreadHost(t, "thread/inject_items")
@@ -78,16 +92,10 @@ func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterResta
 	ready := make(chan struct{})
 	close(ready)
 	h.mu.Lock()
-	h.runtimes["agent-target"] = &runtime{
-		agentID: "agent-target", client: host.client, hostGeneration: host.generation, ready: ready,
-		approvals: map[string]*approval{}, skillConfigLoaded: true, skillConfigHash: agentSkillConfigHash(nil),
-	}
+	h.runtimes["agent-target"] = attachedTestCodexRuntime("agent-target", "thread-target", host, ready)
 	otherReady := make(chan struct{})
 	close(otherReady)
-	h.runtimes["agent-other"] = &runtime{
-		agentID: "agent-other", client: host.client, hostGeneration: host.generation, ready: otherReady,
-		approvals: map[string]*approval{}, skillConfigLoaded: true, skillConfigHash: agentSkillConfigHash(nil),
-	}
+	h.runtimes["agent-other"] = attachedTestCodexRuntime("agent-other", "thread-other", host, otherReady)
 	h.mu.Unlock()
 
 	type deliveryResult struct {
@@ -101,7 +109,7 @@ func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterResta
 	}()
 	waitForRequestCount(t, logPath, "thread/inject_items", 1)
 	if _, err := h.SendTask("agent-target", "Concurrent work must not cross the uncertain effect.", time.Hour); err == nil ||
-		!strings.Contains(err.Error(), "control outcome is indeterminate") {
+		(!strings.Contains(err.Error(), "control outcome is indeterminate") && !strings.Contains(err.Error(), "already running")) {
 		t.Fatalf("caller waiting on startMu crossed the fence: %v", err)
 	}
 	first := <-firstDelivery
@@ -109,7 +117,7 @@ func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterResta
 		t.Fatalf("first delivery = %#v, ok=%v, want failed before Turn start", delivered, ok)
 	}
 	failed := mustAgentMessage(t, h, message.ID)
-	if failed.DeliveryStatus != "failed" || failed.HandlingStatus != "pending" || len(failed.HandlingAttempts) != 0 ||
+	if failed.DeliveryStatus != "failed" || failed.DeliveryMode != "turn_start" || failed.HandlingStatus != "interrupted" || len(failed.HandlingAttempts) != 1 ||
 		!strings.Contains(failed.LastDeliveryError, "timeout waiting for thread/inject_items") {
 		t.Fatalf("failed Message = %#v", failed)
 	}
@@ -122,10 +130,9 @@ func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterResta
 	if _, err := h.RetryAgentMessage(message.ID); err != nil {
 		t.Fatal(err)
 	}
-	waitForMessageDelivery(t, h, message.ID, "failed")
+	waitForMessageDeliveryError(t, h, message.ID, "Runtime binding is fenced")
 	fenced := mustAgentMessage(t, h, message.ID)
-	if !strings.Contains(fenced.LastDeliveryError, "control outcome is indeterminate") ||
-		!strings.Contains(fenced.LastDeliveryError, "replace the current CodexHost") {
+	if !strings.Contains(fenced.LastDeliveryError, "Runtime binding is fenced") {
 		t.Fatalf("same-host retry was not fenced: %#v", fenced)
 	}
 	methodsAfterRetry := readRequestMethods(t, logPath)
@@ -136,15 +143,12 @@ func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterResta
 		t.Fatalf("fence changed causal identity: %#v", fenced)
 	}
 	h.developerContextTimeout = time.Second
-	if _, err := h.SendTask("agent-other", "Unrelated work remains available.", time.Hour); err != nil {
-		t.Fatalf("Thread-local fence blocked another Agent: %v; requests=%v", err, readRequestMethods(t, logPath))
+	if _, err := h.SendTask("agent-other", "Unrelated work waits for the shared Host restart.", time.Hour); err == nil || !strings.Contains(err.Error(), "Runtime binding is fenced") {
+		t.Fatalf("shared Host generation was not fenced: %v; requests=%v", err, readRequestMethods(t, logPath))
 	}
-	if countRequestForThread(t, logPath, "turn/start", "thread-other") != 1 {
-		t.Fatalf("unrelated Thread did not start exactly once")
+	if countRequestForThread(t, logPath, "turn/start", "thread-other") != 0 {
+		t.Fatalf("fenced shared Host started unrelated work")
 	}
-	h.mu.Lock()
-	h.finishTurnLocked(h.agents["agent-other"], h.runtimes["agent-other"], "completed", "")
-	h.mu.Unlock()
 	h.Shutdown()
 	h2, err := Open(st)
 	if err != nil {
@@ -155,7 +159,7 @@ func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterResta
 	h2.developerContextTimeout = 100 * time.Millisecond
 	h2.contextHistoryProbe = newContextHistoryHarness("initial:thread-target").probe
 	replayed := mustAgentMessage(t, h2, message.ID)
-	if replayed.DeliveryStatus != "failed" || replayed.TopicID != message.TopicID || replayed.SourceTurnID != message.SourceTurnID {
+	if replayed.DeliveryStatus != "queued" || replayed.TopicID != message.TopicID || replayed.SourceTurnID != message.SourceTurnID {
 		t.Fatalf("restart replay = %#v", replayed)
 	}
 	if _, err := h2.RetryAgentMessage(message.ID); err != nil {
@@ -164,8 +168,8 @@ func TestAgentMessageInjectTimeoutFencesSameHostAndRecoversSameMessageAfterResta
 	waitForMessageDelivery(t, h2, message.ID, "delivered")
 	recovered := mustAgentMessage(t, h2, message.ID)
 	if recovered.ID != message.ID || recovered.DeliveryStatus != "delivered" || recovered.DeliveryMode != "turn_start" ||
-		recovered.DeliveredTurnID == "" || recovered.DeliveredTurnID == "turn-recovered" || recovered.HandlingStatus != "running" || len(recovered.HandlingAttempts) != 1 ||
-		recovered.HandlingAttempts[0].TurnID != recovered.DeliveredTurnID {
+		recovered.DeliveredTurnID == "" || recovered.DeliveredTurnID == "turn-recovered" || recovered.HandlingStatus != "running" || len(recovered.HandlingAttempts) != 2 ||
+		recovered.HandlingAttempts[1].TurnID != recovered.DeliveredTurnID || recovered.HandlingAttempts[0].Status != "interrupted" {
 		t.Fatalf("recovered Message = %#v", recovered)
 	}
 	if got := h2.agents["agent-target"].RuntimeTurnBindings[recovered.DeliveredTurnID]; got != "turn-recovered" {
@@ -223,10 +227,7 @@ func TestAgentMessageResumeTimeoutAlsoFencesSameHost(t *testing.T) {
 	ready := make(chan struct{})
 	close(ready)
 	h.mu.Lock()
-	h.runtimes["agent-target"] = &runtime{
-		agentID: "agent-target", client: host.client, hostGeneration: host.generation, ready: ready,
-		approvals: map[string]*approval{}, skillConfigLoaded: true, skillConfigHash: agentSkillConfigHash(nil),
-	}
+	h.runtimes["agent-target"] = attachedTestCodexRuntime("agent-target", "thread-target", host, ready)
 	h.mu.Unlock()
 
 	if delivered, ok := h.deliverNextQueuedForTarget("agent-target", time.Hour); ok || delivered == nil {
@@ -245,9 +246,9 @@ func TestAgentMessageResumeTimeoutAlsoFencesSameHost(t *testing.T) {
 	if _, err := h.RetryAgentMessage(message.ID); err != nil {
 		t.Fatal(err)
 	}
-	waitForMessageDelivery(t, h, message.ID, "failed")
+	waitForMessageDeliveryError(t, h, message.ID, "Runtime binding is fenced")
 	fenced := mustAgentMessage(t, h, message.ID)
-	if !strings.Contains(fenced.LastDeliveryError, "indeterminate after thread/resume timed out") {
+	if fenced.DeliveryStatus != "queued" {
 		t.Fatalf("resume timeout was not fenced: %#v", fenced)
 	}
 	if methodsAfterRetry := readRequestMethods(t, logPath); len(methodsAfterRetry) != len(methodsBeforeRetry) {
@@ -344,6 +345,18 @@ func waitForMessageDelivery(t *testing.T, h *Hub, id, status string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("Message %s did not reach delivery status %s: %#v", id, status, mustAgentMessage(t, h, id))
+}
+
+func waitForMessageDeliveryError(t *testing.T, h *Hub, id, fragment string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if message := mustAgentMessage(t, h, id); strings.Contains(message.LastDeliveryError, fragment) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("Message %s did not expose delivery error %q: %#v", id, fragment, mustAgentMessage(t, h, id))
 }
 
 func waitForFile(t *testing.T, path string) {

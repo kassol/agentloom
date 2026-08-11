@@ -24,6 +24,10 @@ func newAddressLifecycleFixture(t *testing.T) addressLifecycleFixture {
 		t.Fatal(err)
 	}
 	h := New(st)
+	t.Cleanup(func() {
+		h.Shutdown()
+		_ = st.Close()
+	})
 	seedInboxAgent(t, h, "agent-a", "alpha")
 	seedInboxAgent(t, h, "agent-b", "beta")
 	connection, err := h.CreateConnection(ConnectionParams{Provider: "parall", Capabilities: []string{"receive_events", "provider_native_read"}})

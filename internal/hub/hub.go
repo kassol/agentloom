@@ -102,15 +102,11 @@ type Agent struct {
 	capabilitySnapshot runtimecontract.CapabilitySnapshot
 }
 
-// Session is the pre-CodexLoom compatibility name.
-type Session = Agent
-
 // AgentView is what the canonical API returns: governance metadata plus live
 // Codex Thread runtime state.
 type AgentView struct {
 	Agent
 	ProcessAlive        bool                               `json:"processAlive"`
-	RuntimeCapabilities RuntimeCapabilities                `json:"runtimeCapabilities"`
 	CapabilitySnapshot  runtimecontract.CapabilitySnapshot `json:"capabilitySnapshot"`
 	PendingApprovals    []ApprovalView                     `json:"pendingApprovals"`
 	Goal                *ThreadGoal                        `json:"goal,omitempty"`
@@ -141,9 +137,6 @@ type RuntimeDiagnostics struct {
 	TurnBindings map[string]string `json:"turnBindings"`
 }
 
-// SessionView is the pre-CodexLoom compatibility name.
-type SessionView = AgentView
-
 type ApprovalView struct {
 	ApprovalID      string          `json:"approvalId"`
 	AgentID         string          `json:"agentId"`
@@ -164,9 +157,6 @@ type ActiveAgent struct {
 	Name        string `json:"name"`
 	CurrentTask string `json:"currentTask"`
 }
-
-// RunningSession is the pre-CodexLoom compatibility name.
-type RunningSession = ActiveAgent
 
 type AgentMessage struct {
 	ID                 string                        `json:"id"`
@@ -274,8 +264,7 @@ type approvalRecord struct {
 }
 
 type approval struct {
-	rpcID   json.RawMessage // retained for compact-state compatibility
-	respond func(decision string) error
+	respond func(decision runtimecontract.ApprovalDecision) error
 	done    chan struct{}
 }
 
@@ -303,16 +292,15 @@ type turnState struct {
 
 type runtime struct {
 	agentID           string
-	agentRuntime      AgentRuntime
 	agentHost         AgentHost
 	runtimeContract   runtimecontract.Contract
-	client            *codex.Client
 	hostGeneration    uint64
 	skillConfigHash   string
 	skillConfigLoaded bool
 	binding           runtimecontract.Binding
 	ready             chan struct{}
 	initErr           error
+	acquiring         bool
 	startMu           sync.Mutex
 
 	activeTurn *turnState           // guarded by Hub.mu
@@ -338,76 +326,74 @@ type Hub struct {
 	runtimeAPIURL   string
 	writerOwnership *store.WritableOwnership
 
-	mu                      sync.Mutex
-	contextCoverageMu       sync.Mutex
-	modelProviderMu         sync.Mutex
-	agents                  map[string]*Agent
-	agentSkillConfigs       map[string]*AgentSkillConfig
-	comms                   map[string]*AgentMessage
-	commOrder               []string
-	schedules               map[string]*Schedule
-	triggers                map[string]*Trigger
-	topics                  map[string]*Topic
-	profiles                map[string]*AgentProfile
-	teamLinks               map[string]*TeamRelationship
-	loomAgentPrompt         *LoomAgentPrompt
-	collaborationGroups     map[string]*CollaborationGroup
-	organizationLinks       map[string]*OrganizationRelationship
-	connections             map[string]*PlatformConnection
-	addresses               map[string]*AgentAddress
-	addressOperations       map[string]*AddressLifecycleOperation
-	memberships             map[string]*ConversationMembership
-	conversationCandidates  map[string]*ConversationCandidate
-	messages                map[string]*InboxMessage
-	messageOrder            []string
-	externalMessages        map[string]string
-	inbox                   map[string]*InboxItem
-	inboxOrder              []string
-	attempts                map[string]*HandlingAttempt
-	outbox                  map[string]*OutboxItem
-	outboxOrder             []string
-	providerOperations      map[string]*ProviderOperation
-	providerOperationOrder  []string
-	approvals               map[string]*ApprovalView
-	approvalOrder           []string
-	humanRequests           map[string]*HumanRequest
-	humanRequestOrder       []string
-	goals                   map[string]*ThreadGoal
-	seqs                    map[string]int64
-	globalSeq               int64
-	runtimes                map[string]*runtime
-	turnRecoveryInFlight    map[string]bool
-	subs                    map[string]map[*subscriber]struct{}
-	globalSubs              map[*subscriber]struct{}
-	remoteConfig            RemoteConfig
-	remoteStatus            RemoteStatus
-	remotePairing           *RemotePairing
-	remoteRuntime           *remoteRuntime
-	remoteGeneration        uint64
-	remoteStartMu           sync.Mutex
-	remoteEnabledGeneration uint64
-	codexHost               *codexHostRuntime
-	codexHostDriver         *codexRuntimeHostDriver
-	piHostDriver            *piRuntimeHostDriver
-	runtimeHostDrivers      map[string]hubLockedRuntimeHostDriver
-	codexHostGeneration     uint64
-	stop                    chan struct{}
-	stopOnce                sync.Once
-	shutdownOnce            sync.Once
-	stopping                bool
-	draining                bool
-	providerSwitching       bool
-	triggerObservations     map[string]struct{}
-	background              sync.WaitGroup
-	workers                 sync.WaitGroup
-	steerTurn               func(threadID, expectedTurnID, input string, timeout time.Duration) (string, error)
-	dispatchHumanAnswer     func(key, text string) (SendResult, error)
-	observeTrigger          triggerObserver
-	contextHistoryProbe     contextHistoryProbeFunc
-	threadResumeTimeout     time.Duration
-	developerContextTimeout time.Duration
-	agentRuntimeFactory     func(kind string) (AgentRuntime, error)
-
+	mu                               sync.Mutex
+	contextCoverageMu                sync.Mutex
+	modelProviderMu                  sync.Mutex
+	agents                           map[string]*Agent
+	agentSkillConfigs                map[string]*AgentSkillConfig
+	comms                            map[string]*AgentMessage
+	commOrder                        []string
+	schedules                        map[string]*Schedule
+	triggers                         map[string]*Trigger
+	topics                           map[string]*Topic
+	profiles                         map[string]*AgentProfile
+	teamLinks                        map[string]*TeamRelationship
+	loomAgentPrompt                  *LoomAgentPrompt
+	collaborationGroups              map[string]*CollaborationGroup
+	organizationLinks                map[string]*OrganizationRelationship
+	connections                      map[string]*PlatformConnection
+	addresses                        map[string]*AgentAddress
+	addressOperations                map[string]*AddressLifecycleOperation
+	memberships                      map[string]*ConversationMembership
+	conversationCandidates           map[string]*ConversationCandidate
+	messages                         map[string]*InboxMessage
+	messageOrder                     []string
+	externalMessages                 map[string]string
+	inbox                            map[string]*InboxItem
+	inboxOrder                       []string
+	attempts                         map[string]*HandlingAttempt
+	outbox                           map[string]*OutboxItem
+	outboxOrder                      []string
+	providerOperations               map[string]*ProviderOperation
+	providerOperationOrder           []string
+	approvals                        map[string]*ApprovalView
+	approvalOrder                    []string
+	humanRequests                    map[string]*HumanRequest
+	humanRequestOrder                []string
+	goals                            map[string]*ThreadGoal
+	seqs                             map[string]int64
+	globalSeq                        int64
+	runtimes                         map[string]*runtime
+	turnRecoveryInFlight             map[string]bool
+	subs                             map[string]map[*subscriber]struct{}
+	globalSubs                       map[*subscriber]struct{}
+	remoteConfig                     RemoteConfig
+	remoteStatus                     RemoteStatus
+	remotePairing                    *RemotePairing
+	remoteRuntime                    *remoteRuntime
+	remoteGeneration                 uint64
+	remoteStartMu                    sync.Mutex
+	remoteEnabledGeneration          uint64
+	codexHost                        *codexHostRuntime
+	codexHostDriver                  *codexRuntimeHostDriver
+	piHostDriver                     *piRuntimeHostDriver
+	runtimeHostDrivers               map[string]RuntimeHostDriver
+	codexHostGeneration              uint64
+	stop                             chan struct{}
+	stopOnce                         sync.Once
+	shutdownOnce                     sync.Once
+	stopping                         bool
+	draining                         bool
+	providerSwitching                bool
+	triggerObservations              map[string]struct{}
+	background                       sync.WaitGroup
+	workers                          sync.WaitGroup
+	steerTurn                        func(threadID, expectedTurnID, input string, timeout time.Duration) (string, error)
+	dispatchHumanAnswer              func(key, text string) (SendResult, error)
+	observeTrigger                   triggerObserver
+	contextHistoryProbe              contextHistoryProbeFunc
+	threadResumeTimeout              time.Duration
+	developerContextTimeout          time.Duration
 	integrationNormalizationPending  bool
 	gatewayState                     gatewayState
 	gatewayFoundationPoisoned        bool
@@ -508,7 +494,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		goals:                  map[string]*ThreadGoal{},
 		seqs:                   map[string]int64{},
 		runtimes:               map[string]*runtime{},
-		runtimeHostDrivers:     map[string]hubLockedRuntimeHostDriver{},
+		runtimeHostDrivers:     map[string]RuntimeHostDriver{},
 		turnRecoveryInFlight:   map[string]bool{},
 		subs:                   map[string]map[*subscriber]struct{}{},
 		globalSubs:             map[*subscriber]struct{}{},
@@ -558,7 +544,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		default:
 			return nil, fmt.Errorf("load agents: Agent %s uses unsupported Runtime Binding schema version %d", id, meta.RuntimeBinding.SchemaVersion)
 		}
-		if meta.RuntimeBinding.Kind == "pi" && meta.Status == "idle" && meta.LastError == piShutdownInterruptError && meta.LastTurn != nil && meta.LastTurn.Status == "completed" {
+		if meta.Status == "idle" && meta.LastError == piShutdownInterruptError && meta.LastTurn != nil && meta.LastTurn.Status == "completed" {
 			meta.LastError = ""
 			meta.UpdatedAt = now()
 			agentRegistryRecovered = true
@@ -1054,30 +1040,29 @@ func (h *Hub) emitLocked(agentID, typ string, data any) store.Event {
 
 func (h *Hub) emitStatusLocked(meta *Agent, status string) {
 	processAlive := false
-	if rt := h.runtimes[meta.ID]; rt != nil && runtimeBackend(rt) != nil {
-		processAlive = runtimeBackend(rt).Alive()
+	if rt := h.runtimes[meta.ID]; rt != nil && rt.agentHost != nil {
+		processAlive = rt.agentHost.Alive()
 	}
 	data := map[string]any{
-		"id":                  meta.ID,
-		"name":                meta.Name,
-		"cwd":                 meta.Cwd,
-		"threadId":            meta.ThreadID,
-		"runtimeKind":         meta.RuntimeBinding.Kind,
-		"source":              meta.Source,
-		"status":              status,
-		"currentTask":         meta.CurrentTask,
-		"currentTurnId":       meta.CurrentTurnID,
-		"lastError":           publicRuntimeFailureMessage(meta, meta.CurrentTurnID, meta.LastError),
-		"lastTurn":            meta.LastTurn,
-		"model":               meta.Model,
-		"effort":              meta.Effort,
-		"sandbox":             meta.Sandbox,
-		"approvalPolicy":      meta.ApprovalPolicy,
-		"providerId":          meta.ProviderID,
-		"processAlive":        processAlive,
-		"runtimeCapabilities": h.runtimeCapabilitiesLocked(meta),
-		"capabilitySnapshot":  meta.capabilitySnapshot,
-		"updatedAt":           meta.UpdatedAt,
+		"id":                 meta.ID,
+		"name":               meta.Name,
+		"cwd":                meta.Cwd,
+		"threadId":           meta.ThreadID,
+		"runtimeKind":        meta.RuntimeBinding.Kind,
+		"source":             meta.Source,
+		"status":             status,
+		"currentTask":        meta.CurrentTask,
+		"currentTurnId":      meta.CurrentTurnID,
+		"lastError":          publicRuntimeFailureMessage(meta, meta.CurrentTurnID, meta.LastError),
+		"lastTurn":           meta.LastTurn,
+		"model":              meta.Model,
+		"effort":             meta.Effort,
+		"sandbox":            meta.Sandbox,
+		"approvalPolicy":     meta.ApprovalPolicy,
+		"providerId":         meta.ProviderID,
+		"processAlive":       processAlive,
+		"capabilitySnapshot": meta.capabilitySnapshot,
+		"updatedAt":          meta.UpdatedAt,
 	}
 	if recovery := recoveryView(meta); recovery != nil {
 		data["recovery"] = recovery
@@ -1154,6 +1139,9 @@ func (h *Hub) LastSeq(key string) int64 {
 
 // getRuntimeLocked returns an Agent binding to the shared CodexHost.
 func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
+	if rt := h.runtimes[meta.ID]; rt != nil && rt.acquiring {
+		return rt, nil
+	}
 	if rt, ok := h.runtimes[meta.ID]; ok && runtimeHandleAlive(rt) {
 		select {
 		case <-rt.ready:
@@ -1168,30 +1156,88 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 		}
 	}
 	var rt *runtime
-	if h.agentRuntimeFactory != nil {
-		backend, err := h.agentRuntimeFactory(meta.RuntimeBinding.Kind)
-		if err != nil {
-			return nil, err
-		}
-		rt = &runtime{agentID: meta.ID, agentRuntime: backend, ready: make(chan struct{}), approvals: map[string]*approval{}}
-	} else {
+	{
 		driver, err := h.runtimeHostDriverLocked(meta.RuntimeBinding.Kind)
 		if err != nil {
 			return nil, err
 		}
-		handle, err := driver.acquireWhileHubLocked(context.Background(), AgentHostRequest{AgentID: meta.ID})
+		agentID, binding := meta.ID, meta.RuntimeBinding
+		rt = &runtime{agentID: agentID, ready: make(chan struct{}), approvals: map[string]*approval{}, acquiring: true}
+		h.runtimes[agentID] = rt
+		h.mu.Unlock()
+		handle, err := driver.Acquire(context.Background(), AgentHostRequest{AgentID: agentID})
+		h.mu.Lock()
 		if err != nil {
+			rt.initErr = err
+			rt.acquiring = false
+			if h.runtimes[agentID] == rt {
+				delete(h.runtimes, agentID)
+			}
+			close(rt.ready)
 			return nil, err
 		}
-		rt = &runtime{
-			agentID: meta.ID, agentHost: handle, runtimeContract: handle.Contract(),
-			ready: make(chan struct{}), approvals: map[string]*approval{},
+		current := h.agents[agentID]
+		if current == nil || current.RuntimeBinding != binding {
+			handle.Close()
+			rt.initErr = errf(409, "Agent Runtime binding changed while its Host was acquired; retry")
+			rt.acquiring = false
+			if h.runtimes[agentID] == rt {
+				delete(h.runtimes, agentID)
+			}
+			close(rt.ready)
+			return nil, rt.initErr
 		}
-		if compatibility, ok := handle.(legacyRuntimeHost); ok {
-			rt.agentRuntime = compatibility.legacyRuntime()
+		meta = current
+		contract := handle.Contract()
+		if contract == nil || contract.ContractVersion() != runtimecontract.Version {
+			handle.Close()
+			version := 0
+			if contract != nil {
+				version = contract.ContractVersion()
+			}
+			rt.initErr = errf(500, "Runtime Contract version %d is unsupported; expected %d", version, runtimecontract.Version)
+			rt.acquiring = false
+			delete(h.runtimes, agentID)
+			close(rt.ready)
+			return nil, rt.initErr
 		}
-		if compatibility, ok := handle.(codexCompatibilityHost); ok {
-			rt.client, rt.hostGeneration = compatibility.codexCompatibility()
+		capabilityBinding := runtimeContractBinding(meta)
+		h.mu.Unlock()
+		capabilitySnapshot := contract.CapabilitySnapshot(context.Background(), capabilityBinding)
+		h.mu.Lock()
+		current = h.agents[agentID]
+		if current == nil || current.RuntimeBinding != binding || h.runtimes[agentID] != rt {
+			handle.Close()
+			rt.initErr = errf(409, "Agent Runtime binding changed while its capabilities were checked; retry")
+			rt.acquiring = false
+			if h.runtimes[agentID] == rt {
+				delete(h.runtimes, agentID)
+			}
+			close(rt.ready)
+			return nil, rt.initErr
+		}
+		meta = current
+		if err := capabilitySnapshot.Validate(); err != nil {
+			handle.Close()
+			rt.initErr = errf(500, "Runtime returned invalid capability snapshot: %s", err)
+			rt.acquiring = false
+			delete(h.runtimes, agentID)
+			close(rt.ready)
+			return nil, rt.initErr
+		}
+		if err := validateRuntimeCapabilityHooks(contract, capabilitySnapshot); err != nil {
+			handle.Close()
+			rt.initErr = err
+			rt.acquiring = false
+			delete(h.runtimes, agentID)
+			close(rt.ready)
+			return nil, rt.initErr
+		}
+		rt.agentHost = handle
+		rt.runtimeContract = contract
+		rt.acquiring = false
+		if source, ok := handle.(runtimeHostGenerationSource); ok {
+			rt.hostGeneration = source.RuntimeHostGeneration()
 		}
 		handle.SetFailureHandler(func(err error) { h.onRuntimeFailure(rt, err) })
 		if seeder, ok := rt.runtimeContract.(runtimeTurnCorrelationSeeder); ok {
@@ -1199,21 +1245,20 @@ func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
 		}
 		rt.runtimeContract.SetEventHandler(func(event runtimecontract.Event) { h.onCanonicalRuntimeEvent(rt, event) })
 	}
-	if source, ok := runtimeBackend(rt).(RuntimeEventSource); ok {
-		source.SetRuntimeEventHandlers(
-			func(event RuntimeEvent) { h.onRuntimeEvent(rt, event) },
-			func(err error) { h.onRuntimeFailure(rt, err) },
-		)
-	}
-	if source, ok := runtimeBackend(rt).(RuntimeApprovalSource); ok {
-		source.SetRuntimeApprovalHandler(func(request RuntimeApprovalRequest) {
+	if source, ok := rt.runtimeContract.(runtimecontract.ApprovalCapability); ok {
+		source.SetApprovalHandler(func(request runtimecontract.ApprovalProposal) {
 			h.onRuntimeApprovalRequest(rt, request)
 		})
 	}
 	h.runtimes[meta.ID] = rt
 	if !h.startWorkerLocked(func() { h.initRuntime(meta.ID, rt) }) {
 		delete(h.runtimes, meta.ID)
-		return nil, errf(503, "CodexLoom is shutting down")
+		if rt.agentHost != nil {
+			rt.agentHost.Close()
+		}
+		rt.initErr = errf(503, "CodexLoom is shutting down")
+		close(rt.ready)
+		return nil, rt.initErr
 	}
 	return rt, nil
 }
@@ -1230,8 +1275,7 @@ func runtimeHandleAlive(rt *runtime) bool {
 		// process handle. Production contracts always arrive through AgentHost.
 		return true
 	}
-	backend := runtimeBackend(rt)
-	return backend != nil && backend.Alive()
+	return false
 }
 
 func (h *Hub) piDriverLocked() *piRuntimeHostDriver {
@@ -1239,13 +1283,13 @@ func (h *Hub) piDriverLocked() *piRuntimeHostDriver {
 		h.piHostDriver = newPiRuntimeHostDriver(h)
 	}
 	if h.runtimeHostDrivers == nil {
-		h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{}
+		h.runtimeHostDrivers = map[string]RuntimeHostDriver{}
 	}
 	h.runtimeHostDrivers["pi"] = h.piHostDriver
 	return h.piHostDriver
 }
 
-func (h *Hub) runtimeHostDriverLocked(kind string) (hubLockedRuntimeHostDriver, error) {
+func (h *Hub) runtimeHostDriverLocked(kind string) (RuntimeHostDriver, error) {
 	if h.runtimeHostDrivers != nil {
 		if driver := h.runtimeHostDrivers[kind]; driver != nil {
 			return driver, nil
@@ -1261,18 +1305,10 @@ func (h *Hub) runtimeHostDriverLocked(kind string) (hubLockedRuntimeHostDriver, 
 	}
 }
 
-func (h *Hub) bindPiContract(meta *Agent, rt *runtime, contract *piRuntimeContract) {
-	if contract == nil {
-		return
-	}
-	contract.seedTurnBindings(meta.RuntimeTurnBindings)
-	contract.SetEventHandler(func(event runtimecontract.Event) { h.onCanonicalRuntimeEvent(rt, event) })
-}
-
 func (h *Hub) initRuntime(agentID string, rt *runtime) {
 	defer close(rt.ready)
 	if rt.runtimeContract == nil {
-		h.initLegacyRuntime(agentID, rt)
+		rt.initErr = fmt.Errorf("Agent Runtime Contract is unavailable")
 		return
 	}
 	if readier, ok := rt.agentHost.(runtimeHostReadier); ok {
@@ -1294,22 +1330,19 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
 	persistedBinding := runtimeContractBinding(meta)
 	h.mu.Unlock()
-	controls := RuntimeBindingRequest{
-		NativeRef: threadID, Name: threadName, Sandbox: sandbox, Cwd: cwd,
-		ProviderID: providerID, Model: model, DisabledSkillPaths: disabledSkillPaths,
-	}
-	if compatibility, ok := rt.runtimeContract.(runtimeCompatibilityControls); ok {
-		compatibility.setCompatibilityBinding(controls)
-	}
+	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, disabledSkillPaths)
 	startBinding := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 		defer cancel()
 		binding, outcome := rt.runtimeContract.CreateBinding(ctx, runtimecontract.BindingRequest{AgentID: agentID, Name: threadName, Cwd: cwd})
-		if err := compatibilityLifecycleOutcomeError(outcome); err != nil {
+		if err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleAccepted, false); err != nil {
 			return err
 		}
-		if strings.TrimSpace(binding.NativeRef) == "" {
-			return fmt.Errorf("Runtime accepted binding creation without a native reference")
+		if err := binding.Validate(); err != nil {
+			return fmt.Errorf("Runtime returned invalid binding: %w", err)
+		}
+		if binding.RuntimeKind != persistedBinding.RuntimeKind {
+			return fmt.Errorf("Runtime returned binding kind %q for registered %q Driver", binding.RuntimeKind, persistedBinding.RuntimeKind)
 		}
 		rt.binding = binding
 		h.mu.Lock()
@@ -1337,12 +1370,16 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		return
 	}
 	rt.binding = persistedBinding
+	if err := persistedBinding.Validate(); err != nil {
+		rt.initErr = fmt.Errorf("persisted Runtime binding is invalid: %w", err)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 	outcome := rt.runtimeContract.ResumeBinding(ctx, persistedBinding)
 	cancel()
-	if err := compatibilityLifecycleOutcomeError(outcome); err != nil {
-		msg := strings.ToLower(err.Error())
-		if strings.Contains(msg, "no rollout") || strings.Contains(msg, "not found") {
+	if err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false); err != nil {
+		if outcome.State == runtimecontract.LifecycleRejected && outcome.Failure != nil &&
+			outcome.Failure.Code == runtimecontract.FailureCodeBindingNotFound && outcome.Failure.Phase == runtimecontract.FailurePhaseBindingResume {
 			rt.initErr = startBinding()
 		} else {
 			rt.initErr = err
@@ -1385,117 +1422,6 @@ func (h *Hub) markRuntimeSkillConfigApplied(agentID string, rt *runtime, skillCo
 		}
 	}
 	h.mu.Unlock()
-}
-
-// initLegacyRuntime is retained only for injected v1 test doubles while the
-// production Runtime Host registry is fully v2.
-func (h *Hub) initLegacyRuntime(agentID string, rt *runtime) {
-	h.mu.Lock()
-	meta := h.agents[agentID]
-	if meta == nil {
-		h.mu.Unlock()
-		rt.initErr = errf(404, "agent vanished")
-		return
-	}
-	threadID, threadName, sandbox, cwd := meta.RuntimeBinding.NativeRef, meta.Name, meta.Sandbox, meta.Cwd
-	providerID, model := effectiveProviderBinding(meta)
-	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
-	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
-	h.mu.Unlock()
-
-	backend := runtimeBackend(rt)
-	if backend == nil {
-		rt.initErr = fmt.Errorf("Agent Runtime is unavailable")
-		return
-	}
-	if rt.client != nil {
-		h.mu.Lock()
-		host := h.codexHost
-		h.mu.Unlock()
-		if host == nil || host.generation != rt.hostGeneration {
-			rt.initErr = fmt.Errorf("CodexHost changed while thread was initializing")
-			return
-		}
-		if err := waitCodexHost(host); err != nil {
-			rt.initErr = err
-			return
-		}
-	}
-	binding := RuntimeBindingRequest{
-		NativeRef: threadID, Name: threadName, Sandbox: sandbox, Cwd: cwd,
-		ProviderID: providerID, Model: model, DisabledSkillPaths: disabledSkillPaths,
-	}
-	startThread := func() error {
-		threadID, err := backend.Create(binding)
-		if err != nil {
-			return err
-		}
-		h.mu.Lock()
-		if m := h.agents[agentID]; m != nil {
-			previous := *m
-			m.RuntimeBinding.NativeRef = threadID
-			m.UpdatedAt = now()
-			if err := h.persistAgentsLocked(); err != nil {
-				*m = previous
-				h.mu.Unlock()
-				return fmt.Errorf("persist started Thread binding: %w", err)
-			}
-		}
-		h.mu.Unlock()
-		if rt.client != nil {
-			if err := setThreadName(rt.client, threadID, threadName); err != nil {
-				log.Printf("[codex-loom] set thread name %s to %q: %v", threadID, threadName, err)
-			}
-		}
-		h.mu.Lock()
-		if h.runtimes[agentID] == rt {
-			rt.skillConfigHash = skillConfigHash
-			rt.skillConfigLoaded = true
-		}
-		h.mu.Unlock()
-		return nil
-	}
-	if threadID == "" {
-		rt.initErr = startThread()
-		return
-	}
-	err := backend.Resume(binding, h.effectiveThreadResumeTimeout())
-	if err != nil {
-		if codex.IsRequestTimeout(err) {
-			h.markThreadControlIndeterminate(rt, threadID, "thread/resume")
-		}
-		msg := strings.ToLower(err.Error())
-		if strings.Contains(msg, "no rollout") || strings.Contains(msg, "not found") {
-			rt.initErr = startThread()
-		} else {
-			rt.initErr = err
-		}
-		return
-	}
-	if rt.client != nil {
-		if err := setThreadName(rt.client, threadID, threadName); err != nil {
-			log.Printf("[codex-loom] set thread name %s to %q: %v", threadID, threadName, err)
-		}
-	}
-	h.mu.Lock()
-	if h.runtimes[agentID] == rt {
-		rt.skillConfigHash = skillConfigHash
-		rt.skillConfigLoaded = true
-	}
-	h.mu.Unlock()
-}
-
-func runtimeBackend(rt *runtime) AgentRuntime {
-	if rt == nil {
-		return nil
-	}
-	if rt.agentRuntime != nil {
-		return rt.agentRuntime
-	}
-	if rt.client != nil {
-		return &codexAgentRuntime{client: rt.client}
-	}
-	return nil
 }
 
 func threadBindingParams(sandbox, cwd, providerID, model string, disabledSkillPaths []string) map[string]any {
@@ -1552,7 +1478,7 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 		h.mu.Unlock()
 		return errf(404, "agent vanished")
 	}
-	threadID, name, sandbox, cwd := meta.RuntimeBinding.NativeRef, meta.Name, meta.Sandbox, meta.Cwd
+	threadID, sandbox := meta.RuntimeBinding.NativeRef, meta.Sandbox
 	providerID, model := effectiveProviderBinding(meta)
 	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
 	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
@@ -1564,46 +1490,21 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 	if strings.TrimSpace(threadID) == "" {
 		return errf(409, "agent has no Runtime conversation binding")
 	}
-	controls := RuntimeBindingRequest{
-		NativeRef: threadID, Name: name, Sandbox: sandbox, Cwd: cwd,
-		ProviderID: providerID, Model: model, DisabledSkillPaths: disabledSkillPaths,
+	if rt.runtimeContract == nil {
+		return errf(500, "Agent Runtime Contract is unavailable")
 	}
-	var err error
-	if rt.runtimeContract != nil {
-		if compatibility, ok := rt.runtimeContract.(runtimeCompatibilityControls); ok {
-			controls.Name = name
-			compatibility.setCompatibilityBinding(controls)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
-		outcome := rt.runtimeContract.ResumeBinding(ctx, rt.binding)
-		cancel()
-		err = compatibilityLifecycleOutcomeError(outcome)
-	} else {
-		backend := runtimeBackend(rt)
-		if backend == nil {
-			return errf(500, "Agent Runtime is unavailable")
-		}
-		err = backend.Resume(controls, h.effectiveThreadResumeTimeout())
-		if codex.IsRequestTimeout(err) {
-			h.markThreadControlIndeterminate(rt, threadID, "thread/resume")
-		}
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
+	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, disabledSkillPaths)
+	outcome := rt.runtimeContract.ResumeBinding(ctx, rt.binding)
+	cancel()
+	err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false)
 	if err != nil {
 		if isRuntimeIndeterminate(err) {
 			h.onRuntimeIndeterminate(rt, err)
 		}
 		return errf(500, "resume Runtime conversation: %s", err)
 	}
-	if rt.runtimeContract != nil {
-		h.markRuntimeSkillConfigApplied(agentID, rt, skillConfigHash)
-	} else {
-		h.mu.Lock()
-		if h.runtimes[agentID] == rt {
-			rt.skillConfigHash = skillConfigHash
-			rt.skillConfigLoaded = true
-		}
-		h.mu.Unlock()
-	}
+	h.markRuntimeSkillConfigApplied(agentID, rt, skillConfigHash)
 	return nil
 }
 
@@ -1774,144 +1675,17 @@ func (h *Hub) recordRuntimeTurnBindingLocked(meta *Agent, turnID, nativeTurnID s
 	}
 }
 
-func (h *Hub) onNotification(rt *runtime, method string, params json.RawMessage) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	meta := h.agents[rt.agentID]
-	if meta == nil {
+func (h *Hub) onCanonicalRuntimeEvent(rt *runtime, event runtimecontract.Event) {
+	if err := event.Validate(); err != nil {
+		h.onRuntimeFailure(rt, fmt.Errorf("invalid Runtime Contract event: %w", err))
 		return
 	}
-	runtimeEvents := normalizeRuntimeEvents(rt, method, params)
-	for _, runtimeEvent := range runtimeEvents {
-		turnID := runtimeEvent.LoomTurnID
-		if turnID == "" && rt.activeTurn != nil {
-			turnID = rt.activeTurn.turnID
-		}
-		canonical := runtimeContractEvent(runtimeEvent, runtimeTurnCorrelation{turnID: turnID})
-		h.onRuntimeEventLocked(meta, rt, runtimeEvent, canonical)
-	}
-	// Codex reports model-route failures as raw `error` notifications. They do
-	// not normalize into a RuntimeEvent, but still need to affect the active
-	// Turn exactly once.
-	if method == "error" && rt.activeTurn != nil && !rt.activeTurn.finished && rt.activeTurn.forcedFailure == "" {
-		if failure, interrupt := customProviderModelRouteFailure(meta.ProviderID, meta.Model, params); failure != "" {
-			rt.activeTurn.forcedFailure = failure
-			if interrupt {
-				h.scheduleModelRouteInterruptLocked(meta.ID, rt.activeTurn, failure)
-			}
-		}
-	}
-	if method == "thread/goal/updated" || method == "thread/goal/cleared" {
-		h.onGoalNotificationLocked(meta.ID, method, params)
-	}
-	turnID := ""
-	if rt.activeTurn != nil {
-		turnID = rt.activeTurn.turnID
-	}
-	h.emitLocked(meta.ID, method, runtimePublicPayload(params, meta.ThreadID, turnID, true))
-	h.appendRuntimeDiagnosticLocked(meta.ID, method, params)
-}
-
-func (h *Hub) onRuntimeEvent(rt *runtime, event RuntimeEvent) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	meta := h.agents[rt.agentID]
 	if meta != nil {
-		turnID := event.LoomTurnID
-		if turnID == "" && rt.activeTurn != nil {
-			turnID = rt.activeTurn.turnID
-		}
-		canonical := runtimeContractEvent(event, runtimeTurnCorrelation{turnID: turnID})
-		h.onRuntimeEventLocked(meta, rt, event, canonical)
+		h.onRuntimeEventLocked(meta, rt, event)
 	}
-}
-
-func (h *Hub) onCanonicalRuntimeEvent(rt *runtime, event runtimecontract.Event) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	meta := h.agents[rt.agentID]
-	if meta != nil {
-		h.onRuntimeEventLocked(meta, rt, compatibilityRuntimeEvent(event), event)
-	}
-}
-
-func compatibilityRuntimeEvent(event runtimecontract.Event) RuntimeEvent {
-	result := RuntimeEvent{LoomTurnID: event.TurnID, NativeTurnID: event.RuntimeTurnRef}
-	switch event.Kind {
-	case runtimecontract.EventTurnStarted:
-		result.Kind = RuntimeTurnStarted
-	case runtimecontract.EventContent:
-		if event.Content == nil {
-			return result
-		}
-		result.ItemID = event.Content.ID
-		result.Text = event.Content.Text
-		if len(event.Content.Diagnostic) > 0 {
-			_ = json.Unmarshal(event.Content.Diagnostic, &result.Item)
-		}
-		switch event.Content.Kind {
-		case runtimecontract.ContentUserText:
-			result.Kind = RuntimeUserInput
-		case runtimecontract.ContentAssistantText:
-			if event.ContentPhase == runtimecontract.ContentPhaseDelta {
-				result.Kind = RuntimeTextDelta
-			} else {
-				result.Kind = RuntimeTextCompleted
-			}
-		case runtimecontract.ContentReasoning:
-			if event.ContentPhase == runtimecontract.ContentPhaseDelta {
-				result.Kind = RuntimeReasoningDelta
-			} else {
-				result.Kind = RuntimeReasoningCompleted
-			}
-		case runtimecontract.ContentToolCall:
-			if event.Content.ToolCall != nil {
-				_ = json.Unmarshal(event.Content.ToolCall.Arguments, &result.Item)
-			}
-			switch event.ContentPhase {
-			case runtimecontract.ContentPhaseUpdated:
-				result.Kind = RuntimeToolUpdated
-			case runtimecontract.ContentPhaseCompleted:
-				result.Kind = RuntimeToolCompleted
-			default:
-				result.Kind = RuntimeToolStarted
-			}
-		case runtimecontract.ContentToolResult:
-			result.Kind = RuntimeToolCompleted
-			if event.Content.ToolResult != nil {
-				if result.Item == nil {
-					result.Item = map[string]any{}
-				}
-				status := "failed"
-				if event.Content.ToolResult.Success {
-					status = "completed"
-				}
-				if _, ok := result.Item["id"]; !ok {
-					result.Item["id"] = event.Content.ToolResult.ToolCallID
-				}
-				if _, ok := result.Item["output"]; !ok {
-					result.Item["output"] = event.Content.ToolResult.Text
-				}
-				if _, ok := result.Item["status"]; !ok {
-					result.Item["status"] = status
-				}
-			}
-		}
-	case runtimecontract.EventTerminal:
-		result.Kind = RuntimeTurnCompleted
-		if event.Outcome != nil {
-			if event.Outcome.Failure != nil {
-				result.Error = event.Outcome.Failure.Message
-			}
-			switch event.Outcome.State {
-			case runtimecontract.LifecycleFailed, runtimecontract.LifecycleRejected, runtimecontract.LifecycleIndeterminate:
-				result.Kind = RuntimeTurnFailed
-			case runtimecontract.LifecycleInterrupted:
-				result.Kind = RuntimeTurnInterrupted
-			}
-		}
-	}
-	return result
 }
 
 func (h *Hub) onRuntimeFailure(rt *runtime, err error) {
@@ -1971,12 +1745,12 @@ func (h *Hub) checkpointRuntimeFailure(rt *runtime, err error) (string, string, 
 	return agentID, predecessorTurnID, checkpointed
 }
 
-func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent RuntimeEvent, canonical runtimecontract.Event) {
+func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, event runtimecontract.Event) {
 	if recoveryEventFenced(meta, rt) {
 		return
 	}
-	nativeTurnID := runtimeEvent.NativeTurnID
-	eventTurnID := runtimeEvent.LoomTurnID
+	nativeTurnID := event.RuntimeTurnRef
+	eventTurnID := event.TurnID
 	if eventTurnID == "" && nativeTurnID != "" {
 		for loomTurnID, boundNativeTurnID := range meta.RuntimeTurnBindings {
 			if boundNativeTurnID == nativeTurnID {
@@ -1997,7 +1771,7 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent Runtim
 		h.bindActiveNativeTurnIDLocked(meta, rt.activeTurn, nativeTurnID)
 	}
 
-	if runtimeEvent.Kind == RuntimeTurnStarted {
+	if event.Kind == runtimecontract.EventTurnStarted {
 		switch turn := rt.activeTurn; {
 		case turn == nil || turn.finished:
 			if nativeTurnID != "" {
@@ -2019,9 +1793,9 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent Runtim
 		}
 	}
 	activeEvent := rt.activeTurn != nil && !rt.activeTurn.finished &&
-		(runtimeEvent.LoomTurnID == "" || rt.activeTurn.turnID == runtimeEvent.LoomTurnID) &&
+		(event.TurnID == "" || rt.activeTurn.turnID == event.TurnID) &&
 		(nativeTurnID == "" || rt.activeTurn.nativeTurnID == nativeTurnID)
-	if text := runtimeEvent.Text; runtimeEvent.Kind == RuntimeUserInput && text != "" && activeEvent {
+	if text := runtimeEventText(event); runtimeEventIsUserInput(event) && text != "" && activeEvent {
 		task := displayUserTask(text)
 		rt.activeTurn.task = task
 		meta.CurrentTask = task
@@ -2031,16 +1805,15 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent Runtim
 	}
 	if activeEvent {
 		rt.activeTurn.lastActivity = time.Now()
-		if runtimeEvent.Kind == RuntimeTextCompleted && runtimeEvent.Text != "" {
-			rt.activeTurn.finalAnswer = runtimeEvent.Text
+		if runtimeEventIsFinalAnswer(event) {
+			rt.activeTurn.finalAnswer = event.Content.Text
 		}
-		if runtimeEventIsModelProduced(runtimeEvent.Kind) {
+		if runtimeEventIsModelProduced(event) {
 			h.observeContextModelEventLocked(meta, rt.activeTurn)
 		}
 	}
 
-	switch runtimeEvent.Kind {
-	case RuntimeTurnCompleted, RuntimeTurnFailed, RuntimeTurnInterrupted:
+	if event.Kind == runtimecontract.EventTerminal {
 		if rt.activeTurn == nil || rt.activeTurn.finished {
 			return
 		}
@@ -2053,97 +1826,60 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, runtimeEvent Runtim
 			return
 		}
 		status := "completed"
-		errMsg := runtimeEvent.Error
+		errMsg := runtimeEventError(event)
 		if rt.activeTurn.forcedFailure == "" {
 			rt.activeTurn.forcedFailure = customProviderModelRouteFailureDetail(meta.ProviderID, meta.Model, errMsg)
 		}
 		if rt.activeTurn.forcedFailure != "" {
 			status = "failed"
 			errMsg = rt.activeTurn.forcedFailure
-			runtimeEvent.Kind = RuntimeTurnFailed
-			canonical.Kind = runtimecontract.EventTerminal
-			canonical.Outcome = &runtimecontract.Outcome{
+			event.Outcome = &runtimecontract.Outcome{
 				State:   runtimecontract.LifecycleFailed,
 				Failure: &runtimecontract.Failure{Code: "runtime_failed", Phase: runtimecontract.FailurePhaseTurnStart, Message: errMsg},
 			}
 		}
-		switch runtimeEvent.Kind {
-		case RuntimeTurnFailed:
+		switch event.Outcome.State {
+		case runtimecontract.LifecycleFailed, runtimecontract.LifecycleRejected, runtimecontract.LifecycleIndeterminate:
 			status = "failed"
-		case RuntimeTurnInterrupted:
+		case runtimecontract.LifecycleInterrupted:
 			status = "interrupted"
 		}
-		if canonical.TurnID == "" {
-			canonical.TurnID = rt.activeTurn.turnID
+		if event.TurnID == "" {
+			event.TurnID = rt.activeTurn.turnID
 		}
 		if h.finishTurnLocked(meta, rt, status, errMsg) {
-			h.emitCanonicalRuntimeEventLocked(meta, rt, canonical)
+			h.emitCanonicalRuntimeEventLocked(meta, rt, event)
 		}
-	default:
-		h.emitCanonicalRuntimeEventLocked(meta, rt, canonical)
+		return
 	}
+	h.emitCanonicalRuntimeEventLocked(meta, rt, event)
 }
 
-func normalizeRuntimeEvents(rt *runtime, method string, params json.RawMessage) []RuntimeEvent {
-	if backend := runtimeBackend(rt); backend != nil {
-		return backend.NormalizeEvent(method, params)
+func runtimeEventText(event runtimecontract.Event) string {
+	if event.Content == nil {
+		return ""
 	}
-	// Unit-level notification tests historically construct a Runtime without a
-	// live client. Their events are Codex-shaped, so use the same adapter.
-	return (&codexAgentRuntime{}).NormalizeEvent(method, params)
+	return event.Content.Text
 }
 
-func runtimeEventIsModelProduced(kind RuntimeEventKind) bool {
-	switch kind {
-	case RuntimeTextDelta, RuntimeTextCompleted, RuntimeReasoningDelta, RuntimeReasoningCompleted,
-		RuntimeToolStarted, RuntimeToolUpdated, RuntimeToolCompleted:
-		return true
-	default:
-		return false
-	}
+func runtimeEventIsUserInput(event runtimecontract.Event) bool {
+	return event.Kind == runtimecontract.EventContent && event.Content != nil && event.Content.Kind == runtimecontract.ContentUserText
 }
 
-func runtimePublicPayload(params json.RawMessage, threadID, turnID string, compatibility bool) any {
-	var payload map[string]any
-	if json.Unmarshal(params, &payload) == nil {
-		public := make(map[string]any, len(payload))
-		nativeItemID, _ := payload["itemId"].(string)
-		if item, ok := payload["item"].(map[string]any); ok && nativeItemID == "" {
-			nativeItemID, _ = item["id"].(string)
-		}
-		itemID := publicRuntimeItemID(turnID, nativeItemID)
-		for key, value := range payload {
-			switch strings.ToLower(strings.TrimSpace(key)) {
-			case "threadid":
-				if threadID != "" {
-					public["threadId"] = threadID
-				}
-			case "thread":
-				public["thread"] = runtimePublicIdentityObject(value, threadID, "")
-			case "turnid":
-				if turnID != "" {
-					public["turnId"] = turnID
-				}
-			case "turn":
-				public["turn"] = runtimePublicIdentityObject(value, "", turnID)
-			case "itemid":
-				public["itemId"] = itemID
-			case "item":
-				if item, ok := value.(map[string]any); ok {
-					public["item"] = canonicalRuntimeItem(item, itemID, threadID, turnID)
-				}
-			default:
-				if runtimePublicActionKey(key) {
-					public[key] = projectRuntimePublicAction(value, threadID, turnID)
-				}
-			}
-		}
-		if compatibility {
-			public["compatibility"] = true
-		}
-		return public
+func runtimeEventIsFinalAnswer(event runtimecontract.Event) bool {
+	return event.Kind == runtimecontract.EventContent && event.Content != nil &&
+		event.Content.Kind == runtimecontract.ContentAssistantText && event.ContentPhase == runtimecontract.ContentPhaseCompleted && event.Content.Text != ""
+}
+
+func runtimeEventIsModelProduced(event runtimecontract.Event) bool {
+	return event.Kind == runtimecontract.EventContent && event.Content != nil && event.Content.Kind != runtimecontract.ContentUserText
+}
+
+func runtimeEventError(event runtimecontract.Event) string {
+	if event.Outcome == nil || event.Outcome.Failure == nil {
+		return ""
 	}
-	return map[string]any{"compatibility": compatibility, "redacted": true}
+	return event.Outcome.Failure.Message
 }
 
 func publicRuntimeItemID(turnID, nativeItemID string) string {
@@ -2152,86 +1888,6 @@ func publicRuntimeItemID(turnID, nativeItemID string) string {
 	}
 	digest := sha256Hex([]byte(turnID + "\x00" + nativeItemID))
 	return "item_" + digest[:16]
-}
-
-func runtimePublicIdentityObject(value any, threadID, turnID string) map[string]any {
-	result := map[string]any{}
-	if threadID != "" {
-		result["id"] = threadID
-	}
-	if turnID != "" {
-		result["id"] = turnID
-	}
-	if object, ok := value.(map[string]any); ok {
-		for key, nested := range object {
-			if strings.EqualFold(key, "id") {
-				continue
-			}
-			if runtimePublicActionKey(key) {
-				result[key] = projectRuntimePublicAction(nested, threadID, turnID)
-			}
-		}
-	}
-	return result
-}
-
-func canonicalRuntimeItem(item map[string]any, itemID, threadID, turnID string) map[string]any {
-	result := map[string]any{"id": itemID}
-	for key, value := range item {
-		if strings.EqualFold(key, "id") {
-			continue
-		}
-		if runtimePublicActionKey(key) {
-			result[key] = projectRuntimePublicAction(value, threadID, turnID)
-		}
-	}
-	return result
-}
-
-func projectRuntimePublicAction(value any, threadID, turnID string) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		result := map[string]any{}
-		for key, nested := range typed {
-			switch strings.ToLower(strings.TrimSpace(key)) {
-			case "threadid":
-				if threadID != "" {
-					result["threadId"] = threadID
-				}
-			case "turnid":
-				if turnID != "" {
-					result["turnId"] = turnID
-				}
-			default:
-				if runtimePublicActionKey(key) {
-					result[key] = projectRuntimePublicAction(nested, threadID, turnID)
-				}
-			}
-		}
-		return result
-	case []any:
-		result := make([]any, len(typed))
-		for index, nested := range typed {
-			result[index] = projectRuntimePublicAction(nested, threadID, turnID)
-		}
-		return result
-	default:
-		return value
-	}
-}
-
-func runtimePublicActionKey(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "type", "text", "delta", "status", "command", "cwd", "path", "filepath", "source", "destination", "target",
-		"url", "data", "mimetype", "name", "toolname", "args", "arguments", "input", "content", "summary", "phase",
-		"changes", "kind", "action", "diff", "patch", "aggregatedoutput", "output", "exitcode", "durationms", "iserror",
-		"error", "message", "reason", "objective", "tokenbudget", "tokensused", "timeusedseconds", "createdat", "updatedat",
-		"willretry", "goal", "result", "partialresult", "model", "providerid", "usage", "inputtokens", "cachedinputtokens",
-		"outputtokens", "reasoningoutputtokens", "totaltokens", "width", "height":
-		return true
-	default:
-		return false
-	}
 }
 
 func (h *Hub) emitCanonicalRuntimeEventLocked(meta *Agent, rt *runtime, event runtimecontract.Event) {
@@ -2393,62 +2049,34 @@ func projectRuntimePublicToolArguments(value any) any {
 	}
 }
 
-func (h *Hub) onServerRequest(rt *runtime, id json.RawMessage, method string, params json.RawMessage) {
-	h.mu.Lock()
-	meta := h.agents[rt.agentID]
-	if strings.Contains(strings.ToLower(method), "approval") {
-		turnID, runtimeKind := "", ""
-		if rt.activeTurn != nil && !rt.activeTurn.finished {
-			turnID = rt.activeTurn.turnID
-		}
-		if meta != nil {
-			runtimeKind = meta.RuntimeBinding.Kind
-		}
-		respond := func(decision string) error {
-			if rt.client == nil {
-				return nil
-			}
-			return rt.client.Respond(id, map[string]any{"decision": codexApprovalDecision(decision)})
-		}
-		created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{
-			AgentID: rt.agentID, TurnID: turnID, RuntimeKind: runtimeKind, Method: method, Params: params,
-		}, respond)
-		if err != nil {
-			if meta != nil {
-				h.emitLocked(meta.ID, "loom/error", map[string]any{"message": "persist Approval request: " + err.Error()})
-			}
-			h.mu.Unlock()
-			return
-		}
-		rt.approvals[created.ApprovalID].rpcID = append(json.RawMessage(nil), id...)
-		h.mu.Unlock()
-		return
-	}
-	// Unknown server->client request: answer with an error so codex won't hang.
-	if meta != nil {
-		h.emitLocked(meta.ID, "loom/server-request", map[string]any{"method": method, "params": params})
-	}
-	client := rt.client
-	h.mu.Unlock()
-	if client != nil {
-		_ = client.RespondError(id, -32601, "CodexLoom does not handle "+method)
-	}
-}
-
-func (h *Hub) onRuntimeApprovalRequest(rt *runtime, request RuntimeApprovalRequest) {
+func (h *Hub) onRuntimeApprovalRequest(rt *runtime, request runtimecontract.ApprovalProposal) {
 	h.mu.Lock()
 	meta := h.agents[rt.agentID]
 	if meta == nil || h.runtimes[rt.agentID] != rt || rt.activeTurn == nil || rt.activeTurn.finished {
-		if request.Respond != nil {
-			h.startWorkerLocked(func() { _ = request.Respond("abort") })
+		if source, ok := rt.runtimeContract.(runtimecontract.ApprovalCapability); ok {
+			h.startWorkerLocked(func() { _ = source.ResolveApproval(context.Background(), request.ID, runtimecontract.ApprovalAbort) })
 		}
 		h.mu.Unlock()
 		return
 	}
+	turnID := rt.activeTurn.turnID
+	if request.TurnID != "" && request.TurnID != turnID {
+		if source, ok := rt.runtimeContract.(runtimecontract.ApprovalCapability); ok {
+			h.startWorkerLocked(func() { _ = source.ResolveApproval(context.Background(), request.ID, runtimecontract.ApprovalAbort) })
+		}
+		h.mu.Unlock()
+		return
+	}
+	respond := func(decision runtimecontract.ApprovalDecision) error {
+		source, ok := rt.runtimeContract.(runtimecontract.ApprovalCapability)
+		if !ok {
+			return fmt.Errorf("Runtime Approval capability is unavailable")
+		}
+		return source.ResolveApproval(context.Background(), request.ID, decision)
+	}
 	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{
-		AgentID: rt.agentID, TurnID: rt.activeTurn.turnID, RuntimeKind: meta.RuntimeBinding.Kind,
-		Method: request.Method, Params: request.Params,
-	}, request.Respond)
+		AgentID: rt.agentID, TurnID: turnID, RuntimeKind: meta.RuntimeBinding.Kind, Proposal: request,
+	}, respond)
 	if err != nil {
 		h.emitLocked(meta.ID, "loom/error", map[string]any{"message": "persist Approval request: " + err.Error()})
 		h.mu.Unlock()
@@ -2516,7 +2144,7 @@ func (h *Hub) ResolveApproval(key, approvalID, decision string) (map[string]any,
 		respond := ap.respond
 		h.mu.Unlock()
 		if respond != nil {
-			_ = respond("abort")
+			_ = respond(runtimecontract.ApprovalAbort)
 		}
 		return nil, errf(500, "%s", next.ResolutionError)
 	}
@@ -2526,7 +2154,7 @@ func (h *Hub) ResolveApproval(key, approvalID, decision string) (map[string]any,
 	h.mu.Unlock()
 
 	if respond != nil {
-		if err := respond(decision); err != nil {
+		if err := respond(runtimecontract.ApprovalDecision(decision)); err != nil {
 			h.mu.Lock()
 			failed := next
 			failed.Status = "aborted"
@@ -2834,7 +2462,6 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 	view.RuntimeBinding.SchemaVersion = 0
 	view.RuntimeTurnBindings = nil
 	view.TurnRecoveryMarkers = nil
-	view.RuntimeCapabilities = h.runtimeCapabilitiesLocked(meta)
 	view.CapabilitySnapshot = meta.capabilitySnapshot
 	if view.LastError != "" {
 		turnID := view.CurrentTurnID
@@ -2848,7 +2475,7 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 		view.Goal = &copy
 	}
 	view.PendingApprovals = h.pendingApprovalsLocked(meta.ID)
-	if rt, ok := h.runtimes[meta.ID]; ok && runtimeBackend(rt) != nil && runtimeBackend(rt).Alive() {
+	if rt, ok := h.runtimes[meta.ID]; ok && rt.agentHost != nil && rt.agentHost.Alive() {
 		view.ProcessAlive = true
 	}
 	return view
@@ -2869,18 +2496,12 @@ func recoveryView(meta *Agent) *RecoveryView {
 	}
 }
 
-func (h *Hub) runtimeCapabilitiesLocked(meta *Agent) RuntimeCapabilities {
+func runtimeCapabilityAvailableLocked(meta *Agent, id string) bool {
 	if meta == nil {
-		return RuntimeCapabilities{}
+		return false
 	}
-	backend := runtimeForKind(meta.RuntimeBinding.Kind)
-	if rt := h.runtimes[meta.ID]; rt != nil {
-		backend = runtimeBackend(rt)
-	}
-	if backend == nil {
-		return RuntimeCapabilities{}
-	}
-	return backend.Capabilities()
+	descriptor, ok := capabilityDescriptor(meta.capabilitySnapshot, id)
+	return ok && descriptor.Availability == runtimecontract.CapabilityAvailable
 }
 
 func unsupportedRuntimeCapability(agent *Agent, capability string) error {
@@ -2891,101 +2512,6 @@ func unsupportedRuntimeCapability(agent *Agent, capability string) error {
 		}
 	}
 	return errf(409, "%s Runtime does not support %s", kind, capability)
-}
-
-func runtimeForKind(kind string) AgentRuntime {
-	switch kind {
-	case "codex":
-		return &codexAgentRuntime{}
-	case "pi":
-		return &piAgentRuntime{}
-	default:
-		return nil
-	}
-}
-
-func applyRolloutStatus(view *AgentView) {
-	if view.nativeRuntimeRef == "" {
-		return
-	}
-	if view.Status == "running" && view.ProcessAlive {
-		return
-	}
-	kind := view.RuntimeBinding.Kind
-	if kind == "" {
-		kind = "codex"
-	}
-	backend := runtimeForKind(kind)
-	if backend == nil || !backend.Capabilities().History {
-		return
-	}
-	latest, err := backend.LatestTurn(view.nativeRuntimeRef)
-	if err != nil || latest == nil || latest.ID == "" {
-		return
-	}
-	latest.ID = loomTurnIDFor(view, latest.ID)
-	// A Loom-owned durable terminal result wins over a stale or less precise
-	// native history marker for the same Turn (for example, forced failure or
-	// restart interruption).
-	if view.LastTurn != nil && view.LastTurn.TurnID == latest.ID {
-		switch view.LastTurn.Status {
-		case "completed", "failed", "interrupted":
-			return
-		}
-	}
-	switch latest.Status {
-	case "running":
-		if !externalTurnLooksLive(view.nativeRuntimeRef, latest.UpdatedAt) {
-			view.Status = "interrupted"
-			view.CurrentTask = ""
-			view.CurrentTurnID = ""
-			view.LastError = "interrupted: active Turn ended without a terminal event"
-			view.LastTurn = &TurnSummary{
-				TurnID:      latest.ID,
-				Task:        displayRolloutTask(latest.Task),
-				Status:      "interrupted",
-				CompletedAt: latest.UpdatedAt,
-			}
-			if latest.UpdatedAt != "" {
-				view.UpdatedAt = latest.UpdatedAt
-			}
-			return
-		}
-		task := displayRolloutTask(latest.Task)
-		if task == "" {
-			task = "external turn " + latest.ID
-		}
-		view.Status = "running"
-		view.CurrentTask = task
-		view.CurrentTurnID = latest.ID
-		view.LastError = ""
-		if latest.UpdatedAt != "" {
-			view.UpdatedAt = latest.UpdatedAt
-		}
-	case "completed", "interrupted":
-		if !view.ProcessAlive {
-			view.Status = "idle"
-			view.CurrentTask = ""
-			view.CurrentTurnID = ""
-		}
-		view.LastTurn = &TurnSummary{
-			TurnID:      latest.ID,
-			Task:        displayRolloutTask(latest.Task),
-			Status:      latest.Status,
-			CompletedAt: latest.UpdatedAt,
-		}
-	}
-}
-
-func displayRolloutTask(task string) string {
-	if strings.TrimSpace(task) == "" {
-		return ""
-	}
-	return displayUserTask(task)
-}
-
-func externalTurnLooksLive(threadID, updatedAt string) bool {
-	return timestampWithin(updatedAt, externalRunningStaleAfter)
 }
 
 func timestampWithin(ts string, d time.Duration) bool {

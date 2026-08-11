@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"strings"
 	"time"
 )
@@ -34,10 +35,6 @@ func (h *Hub) GetRuntimeModels(key string) (RuntimeModelState, error) {
 		h.mu.Unlock()
 		return RuntimeModelState{}, errf(404, "agent not found: %s", key)
 	}
-	if agent.RuntimeBinding.Kind != "pi" {
-		h.mu.Unlock()
-		return RuntimeModelState{}, unsupportedRuntimeCapability(agent, "native Runtime model catalog")
-	}
 	rt, err := h.getRuntimeLocked(agent)
 	h.mu.Unlock()
 	if err != nil {
@@ -48,13 +45,15 @@ func (h *Hub) GetRuntimeModels(key string) (RuntimeModelState, error) {
 	if err := waitReady(rt); err != nil {
 		return RuntimeModelState{}, errf(500, "Runtime not ready: %s", err)
 	}
-	backend, ok := piNativeRuntime(rt)
+	capability, ok := rt.runtimeContract.(runtimeModelCatalogCapability)
 	if !ok {
-		return RuntimeModelState{}, errf(500, "Pi Runtime model control is unavailable")
+		return RuntimeModelState{}, unsupportedRuntimeCapability(agent, "native Runtime model catalog")
 	}
-	state, err := backend.models(15 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	state, err := capability.RuntimeModels(ctx, rt.binding)
 	if err != nil {
-		return RuntimeModelState{}, errf(500, "list Pi models: %s", err)
+		return RuntimeModelState{}, errf(500, "list Runtime models: %s", err)
 	}
 	return state, nil
 }
@@ -75,10 +74,6 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 	if agent == nil {
 		h.mu.Unlock()
 		return RuntimeModelState{}, errf(404, "agent not found: %s", key)
-	}
-	if agent.RuntimeBinding.Kind != "pi" {
-		h.mu.Unlock()
-		return RuntimeModelState{}, unsupportedRuntimeCapability(agent, "native Runtime model switching")
 	}
 	if agent.Status == "running" {
 		h.mu.Unlock()
@@ -102,13 +97,15 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 	if busy {
 		return RuntimeModelState{}, errf(409, "agent is running; switch models between Turns")
 	}
-	backend, ok := piNativeRuntime(rt)
+	capability, ok := rt.runtimeContract.(runtimeModelCatalogCapability)
 	if !ok {
-		return RuntimeModelState{}, errf(500, "Pi Runtime model control is unavailable")
+		return RuntimeModelState{}, unsupportedRuntimeCapability(agent, "native Runtime model switching")
 	}
-	state, err := backend.switchModel(selection, 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	state, err := capability.SwitchRuntimeModel(ctx, rt.binding, selection)
 	if err != nil {
-		return RuntimeModelState{}, errf(409, "switch Pi model: %s", err)
+		return RuntimeModelState{}, errf(409, "switch Runtime model: %s", err)
 	}
 	h.mu.Lock()
 	if agent = h.agents[agentID]; agent != nil {
@@ -121,15 +118,4 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 	h.mu.Unlock()
 	h.refreshRuntimeCapabilitySnapshot(agentID, true)
 	return state, nil
-}
-
-func piNativeRuntime(rt *runtime) (*piAgentRuntime, bool) {
-	switch backend := runtimeBackend(rt).(type) {
-	case *piAgentRuntime:
-		return backend, true
-	case *piRuntimeV1Facade:
-		return backend.native, backend.native != nil
-	default:
-		return nil, false
-	}
 }

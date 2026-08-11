@@ -48,7 +48,7 @@ func TestUpdateConfigSyncsRenamedThread(t *testing.T) {
 	defer host.close()
 	name := "new-name"
 
-	view, err := h.UpdateConfig("sess", ConfigParams{Name: &name})
+	view, err := h.UpdateAgentConfig("sess", ConfigParams{Name: &name})
 	if err != nil {
 		t.Fatal(err)
 	}

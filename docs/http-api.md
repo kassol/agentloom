@@ -6,7 +6,7 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 
 所有 `/api/...` 响应默认是 JSON。错误响应由 `writeErr` 统一编码，通常包含
 `{"error": "..."}` 和对应的 4xx/5xx HTTP 状态。WebUI 之外的客户端应优先使用规范
-`/api/agents/...`，不要新增对 `/api/sessions/...` 的依赖。
+`/api/agents/...`。已删除的 v1 路由统一返回 JSON 404。
 
 ## 通用约定
 
@@ -298,32 +298,22 @@ Native Runtime identity 和 protocol evidence 只在显式 Developer 入口
 以及 URL userinfo/sensitive query。普通 Agent、history、Turn、SSE 和 backup 不包含这些
 diagnostic event logs。
 
-### Compatibility
+### Removed v1 surface
 
-`/api/sessions/...` 与 `GET /api/events` 是 raw v1 兼容面，用于旧客户端迁移；
-`/api/images` 是受管 Artifact 服务化之前的图片读取兼容入口。
+The v1 runtime routes `/api/sessions/...`, `GET /api/events`, and `GET /api/images`
+were removed with the Runtime v2 boundary. Their canonical replacements are
+`/api/agents/{key}/...`, `/api/agents/events`, and managed Agent Artifact URLs.
+Unknown `/api/...` paths return JSON 404 and never fall through to the Web SPA.
 
-兼容 history/SSE 响应带 `Deprecation: true` 和指向本节的 `Link`。它们在 #21 完成
-v1 facade removal 前保留，迁移目标分别是 `/api/agents/{key}/thread/history`、
-`/api/agents/{key}/thread/events` 和 `/api/agents/events`。没有承诺虚构的日历下线日期；
-删除将由 #21 的发布说明明确宣布。
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/api/sessions` | Compatibility list |
-| POST | `/api/sessions` | Compatibility create |
-| GET | `/api/sessions/{key}` | Compatibility get |
-| PATCH | `/api/sessions/{key}/config` | Compatibility update config |
-| GET | `/api/sessions/{key}/profile` | Compatibility get profile |
-| PUT | `/api/sessions/{key}/profile` | Compatibility update profile |
-| DELETE | `/api/sessions/{key}` | Compatibility archive |
-| POST | `/api/sessions/{key}/messages` | Compatibility legacy message path |
-| POST | `/api/sessions/{key}/interrupt` | Compatibility interrupt |
-| POST | `/api/sessions/{key}/approvals/{approvalId}` | Compatibility approval |
-| GET | `/api/sessions/{key}/history` | Compatibility history |
-| GET | `/api/sessions/{key}/events` | Compatibility SSE |
-| GET | `/api/events` | Compatibility global SSE |
-| GET | `/api/images` | Legacy image serving |
+The Hub execution boundary is Runtime Contract v2 only. A registered Host
+Driver returns one versioned Contract per Agent; mandatory lifecycle requests
+contain Loom-neutral identity and typed input only. Runtime controls and
+optional product behavior are exposed through capability-specific hooks. An
+`available` capability is rejected unless its typed hook is present, and
+malformed bindings, outcomes, events, history, or capability snapshots fail
+before Loom state is changed. Adapter-native maps remain private diagnostics;
+the read-time event filter only tombstones raw rows already present in older
+post-fork Stores and is not a compatibility API.
 
 ## 维护方式
 

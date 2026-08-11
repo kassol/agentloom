@@ -243,12 +243,10 @@ Agent history 不在这里，仍在 `~/.codex/sessions/**/rollout-*.jsonl`。
 
 ### `internal/httpapi`
 
-提供 REST、SSE、内嵌 WebUI、图片读取和管理 API。
+提供 REST、SSE、内嵌 WebUI 和管理 API。
 
 - 规范路由：`/api/agents/...`。
-- 兼容路由：`/api/sessions/...`。
-- 规范 Agent SSE 把旧持久化事件投影为 `loom/*`；Codex `turn/*` / `item/*` 保持原名。
-- 兼容 Session SSE 保持 `hub/*`。
+- 规范 Agent SSE 只公开 canonical `loom/*`；旧持久化 raw Runtime 事件在读取时过滤。
 - 全局 SSE 使用持久单调 seq 作为 SSE `id`，按 `Last-Event-ID` 重放。cursor 已被压缩时发送
   `loom/reconcile`，所有打开的 Agent pane 和治理页面重新读取权威快照/history，而不是静默漏事件。
 
@@ -759,7 +757,7 @@ GET    /api/integrations/addresses
 GET    /api/integrations/conversations
 GET    /api/remote
 GET    /api/usage?from=YYYY-MM-DD&to=YYYY-MM-DD&tz=Area/City
-GET    /api/events
+GET    /api/agents/events
 
 POST   /api/admin/backup
 GET    /api/admin/backups
@@ -767,7 +765,12 @@ POST   /api/admin/restart
 GET    /api/admin/restart/status
 ```
 
-旧 `/api/sessions/...` 是兼容别名，不应出现在新调用方。
+已删除的 `/api/sessions/...`、`/api/events` 与 `/api/images` 返回 JSON 404。
+Runtime 执行只走 versioned Contract v2：Host Driver 管进程与连接，per-Agent Contract
+管 typed lifecycle/history/events，CapabilitySnapshot 只把存在对应 typed hook 的能力标成
+available。旧 post-fork Store 中的 raw event 只在读取时被过滤，不再有公开 v1 Runtime
+route、raw duplicate 或 Web fallback。完整的前后置条件、ownership、事件顺序、failure
+语义和认证矩阵见 [Runtime Contract v2](runtime-contract.md)。
 
 ## 延伸文档
 

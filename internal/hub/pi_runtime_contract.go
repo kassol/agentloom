@@ -2,33 +2,35 @@ package hub
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 var errPiPromptAcceptanceIndeterminate = errors.New("Pi accepted prompt without a new native user entry")
 
 // piRuntimeContract is Pi's authoritative v2 lifecycle boundary. Native model,
-// Approval, and developer-context controls remain compatibility extras.
+// Approval, and developer-context controls stay behind typed optional hooks.
 type piRuntimeContract struct {
 	agentID string
 	native  *piAgentRuntime
 	host    *piAgentHost
 
-	mu             sync.Mutex
-	bindingRequest RuntimeBindingRequest
-	turnRequest    RuntimeTurnRequest
-	handler        func(runtimecontract.Event)
-	release        func()
-	pendingTurn    runtimeTurnCorrelation
-	turnsByNative  map[string]runtimeTurnCorrelation
+	mu                      sync.Mutex
+	sandbox                 string
+	providerID              string
+	model                   string
+	approvalPolicy          string
+	effort                  string
+	developerContextTimeout time.Duration
+	handler                 func(runtimecontract.Event)
+	release                 func()
+	pendingTurn             runtimeTurnCorrelation
+	turnsByNative           map[string]runtimeTurnCorrelation
 }
 
 var _ runtimecontract.Contract = (*piRuntimeContract)(nil)
@@ -43,26 +45,68 @@ func (c *piRuntimeContract) ContextDeliveryMode() runtimecontract.ContextDeliver
 	return runtimecontract.ContextDeliveryFullPerTurn
 }
 
-func (c *piRuntimeContract) setCompatibilityBinding(request RuntimeBindingRequest) {
+func (c *piRuntimeContract) SetRuntimeSandbox(value string) {
 	c.mu.Lock()
-	c.bindingRequest = request
+	c.sandbox = value
 	c.mu.Unlock()
 }
 
-func (c *piRuntimeContract) setCompatibilityTurn(request RuntimeTurnRequest) {
+func (c *piRuntimeContract) SetRuntimeProvider(providerID, model string) {
 	c.mu.Lock()
-	c.turnRequest = request
+	c.providerID, c.model = providerID, model
 	c.mu.Unlock()
+}
+
+func (c *piRuntimeContract) SetRuntimeModel(model string) {
+	c.mu.Lock()
+	c.model = model
+	c.mu.Unlock()
+}
+
+func (c *piRuntimeContract) SetRuntimeApprovalPolicy(value string) {
+	c.mu.Lock()
+	c.approvalPolicy = value
+	c.mu.Unlock()
+}
+
+func (c *piRuntimeContract) SetRuntimeEffort(value string) {
+	c.mu.Lock()
+	c.effort = value
+	c.mu.Unlock()
+}
+
+func (c *piRuntimeContract) SetRuntimeDeveloperContextTimeout(value time.Duration) {
+	c.mu.Lock()
+	c.developerContextTimeout = value
+	c.mu.Unlock()
+}
+
+func (c *piRuntimeContract) contextDeliveryTimeout() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.developerContextTimeout > 0 {
+		return c.developerContextTimeout
+	}
+	return 30 * time.Second
+}
+
+func (c *piRuntimeContract) nativeBindingRequest(name, cwd, nativeRef string) nativeBindingRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return nativeBindingRequest{NativeRef: nativeRef, Name: name, Cwd: cwd, Sandbox: c.sandbox, ProviderID: c.providerID, Model: c.model}
+}
+
+func (c *piRuntimeContract) nativeTurnRequest(request runtimecontract.TurnRequest) nativeTurnRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return nativeTurnRequest{LoomTurnID: request.TurnID, NativeRef: request.Binding.NativeRef, Input: contractInputToV1(request.Input), ApprovalPolicy: c.approvalPolicy, Sandbox: c.sandbox, Model: c.model, Effort: c.effort}
 }
 
 func (c *piRuntimeContract) CreateBinding(ctx context.Context, request runtimecontract.BindingRequest) (runtimecontract.Binding, runtimecontract.Outcome) {
 	if failure := contextFailure(ctx, runtimecontract.FailurePhaseBindingCreate); failure != nil {
 		return runtimecontract.Binding{}, *failure
 	}
-	c.mu.Lock()
-	controls := c.bindingRequest
-	c.mu.Unlock()
-	controls.Name, controls.Cwd = request.Name, request.Cwd
+	controls := c.nativeBindingRequest(request.Name, request.Cwd, "")
 	nativeRef, err := c.host.createBinding(controls)
 	if err != nil {
 		return runtimecontract.Binding{}, piFailureOutcome(err, runtimecontract.FailurePhaseBindingCreate)
@@ -74,11 +118,14 @@ func (c *piRuntimeContract) ResumeBinding(ctx context.Context, binding runtimeco
 	if failure := contextFailure(ctx, runtimecontract.FailurePhaseBindingResume); failure != nil {
 		return *failure
 	}
-	c.mu.Lock()
-	request := c.bindingRequest
-	c.mu.Unlock()
-	request.NativeRef = binding.NativeRef
+	request := c.nativeBindingRequest("", "", binding.NativeRef)
 	if err := c.host.resumeBinding(request, contractTimeout(ctx, 60*time.Second)); err != nil {
+		if os.IsNotExist(err) {
+			return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: &runtimecontract.Failure{
+				Code: runtimecontract.FailureCodeBindingNotFound, Phase: runtimecontract.FailurePhaseBindingResume,
+				Message: "Runtime binding was not found", Diagnostic: err.Error(), Cause: err,
+			}}
+		}
 		return piFailureOutcome(err, runtimecontract.FailurePhaseBindingResume)
 	}
 	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
@@ -88,18 +135,15 @@ func (c *piRuntimeContract) StartTurn(ctx context.Context, request runtimecontra
 	if failure := contextFailure(ctx, runtimecontract.FailurePhaseTurnStart); failure != nil {
 		return *failure
 	}
+	controls := c.nativeTurnRequest(request)
 	c.mu.Lock()
-	controls := c.turnRequest
 	c.pendingTurn = runtimeTurnCorrelation{turnID: request.TurnID}
 	c.mu.Unlock()
 	if developerContext := contractDeveloperContext(request.Input); developerContext != "" {
-		if err := c.native.InjectDeveloperContext(request.Binding.NativeRef, developerContext, contractTimeout(ctx, 30*time.Second)); err != nil {
+		if err := c.native.InjectDeveloperContext(request.Binding.NativeRef, developerContext, contractTimeout(ctx, c.contextDeliveryTimeout())); err != nil {
 			return piFailureOutcome(err, runtimecontract.FailurePhaseContextDelivery)
 		}
 	}
-	controls.LoomTurnID = request.TurnID
-	controls.NativeRef = request.Binding.NativeRef
-	controls.Input = contractInputToV1(request.Input)
 	controls.Timeout = contractTimeout(ctx, 4*time.Hour)
 	nativeTurnID, err := c.native.StartTurn(controls)
 	if err != nil {
@@ -151,7 +195,7 @@ func (c *piRuntimeContract) SetEventHandler(handler func(runtimecontract.Event))
 	c.mu.Unlock()
 }
 
-func (c *piRuntimeContract) handleNativeEvent(event RuntimeEvent) {
+func (c *piRuntimeContract) handleNativeEvent(event nativeEvent) {
 	c.mu.Lock()
 	correlation := c.turnsByNative[event.NativeTurnID]
 	if correlation.turnID == "" {
@@ -160,7 +204,7 @@ func (c *piRuntimeContract) handleNativeEvent(event RuntimeEvent) {
 			c.turnsByNative[event.NativeTurnID] = correlation
 		}
 	}
-	if event.Kind == RuntimeTurnCompleted || event.Kind == RuntimeTurnFailed || event.Kind == RuntimeTurnInterrupted {
+	if event.Kind == nativeTurnCompleted || event.Kind == nativeTurnFailed || event.Kind == nativeTurnInterrupted {
 		if c.pendingTurn.turnID == correlation.turnID {
 			c.pendingTurn = runtimeTurnCorrelation{}
 		}
@@ -192,33 +236,53 @@ func (c *piRuntimeContract) seedTurnBindings(bindings map[string]string) {
 }
 
 func (c *piRuntimeContract) turnIDForNative(nativeTurnID string) string {
+	return c.correlationForNative(nativeTurnID).turnID
+}
+
+func (c *piRuntimeContract) correlationForNative(nativeTurnID string) runtimeTurnCorrelation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.turnsByNative[nativeTurnID].turnID
+	return c.turnsByNative[nativeTurnID]
 }
 
 func (c *piRuntimeContract) ReadHistory(ctx context.Context, request runtimecontract.HistoryRequest) (runtimecontract.History, *runtimecontract.Failure) {
 	if failure := contextFailure(ctx, runtimecontract.FailurePhaseHistory); failure != nil {
 		return runtimecontract.History{}, failure.Failure
 	}
-	native, err := c.native.ReadHistory(request.Binding.NativeRef, request.Count, request.Offset)
+	entries, leafID, err := c.native.piSessionEntries(request.Binding.NativeRef)
 	if err != nil {
-		if os.IsNotExist(err) || errors.Is(err, rollout.ErrRolloutNotFound) || errors.Is(err, rollout.ErrTurnNotFound) {
+		if os.IsNotExist(err) {
 			return runtimecontract.History{}, &runtimecontract.Failure{Code: "history_not_found", Phase: runtimecontract.FailurePhaseHistory, Message: "Runtime history not found"}
 		}
 		outcome := piFailureOutcome(err, runtimecontract.FailurePhaseHistory)
 		return runtimecontract.History{}, outcome.Failure
 	}
-	history := runtimecontract.History{Total: native.Total}
-	for _, turn := range native.Turns {
-		diagnostic, _ := json.Marshal(turn)
-		history.Turns = append(history.Turns, runtimecontract.HistoryTurn{
-			TurnID: c.turnIDForNative(turn.ID), RuntimeTurnRef: turn.ID,
-			State: codexHistoryState(turn.Status), Content: codexHistoryContent(turn.Items),
-			Usage: codexContractUsage(turn.Usage), StartedAt: turn.StartedAt, CompletedAt: turn.CompletedAt,
-			Diagnostic: diagnostic,
-		})
+	history, err := projectPiCanonicalHistory(entries, leafID)
+	if err != nil {
+		outcome := piFailureOutcome(err, runtimecontract.FailurePhaseHistory)
+		return runtimecontract.History{}, outcome.Failure
 	}
+	for index := range history.Turns {
+		correlation := c.correlationForNative(history.Turns[index].RuntimeTurnRef)
+		history.Turns[index].TurnID = correlation.turnID
+		history.Turns[index].PredecessorTurnID = correlation.predecessorTurnID
+	}
+	count, offset := request.Count, request.Offset
+	if count <= 0 {
+		count = 10
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	end := history.Total - offset
+	if end < 0 {
+		end = 0
+	}
+	start := end - count
+	if start < 0 {
+		start = 0
+	}
+	history.Turns = history.Turns[start:end]
 	return history, nil
 }
 
@@ -236,10 +300,70 @@ func (c *piRuntimeContract) InspectInterruptedTurn(ctx context.Context, target r
 }
 
 func (c *piRuntimeContract) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
-	return piControlPlaneCapabilitySnapshot()
+	if c.native == nil {
+		return piControlPlaneCapabilitySnapshot()
+	}
+	c.native.mu.Lock()
+	imageInput := c.native.imageInput
+	c.native.mu.Unlock()
+	return piControlPlaneCapabilitySnapshot(imageInput)
 }
 
-func (c *piRuntimeContract) CloseBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {
+func (c *piRuntimeContract) ValidateRuntimeInput(_ context.Context, _ runtimecontract.Binding, input []runtimecontract.InputBlock) *runtimecontract.Failure {
+	imageInput := false
+	if c.native != nil {
+		c.native.mu.Lock()
+		imageInput = c.native.imageInput
+		c.native.mu.Unlock()
+	}
+	if imageInput {
+		return nil
+	}
+	for _, block := range input {
+		if block.Kind == runtimecontract.InputImage {
+			return &runtimecontract.Failure{Code: "image_input_unavailable", Phase: runtimecontract.FailurePhaseTurnStart, Message: "the active Runtime model does not accept image input"}
+		}
+	}
+	return nil
+}
+
+func (c *piRuntimeContract) RuntimeModels(ctx context.Context, _ runtimecontract.Binding) (RuntimeModelState, error) {
+	if err := ctx.Err(); err != nil {
+		return RuntimeModelState{}, err
+	}
+	if c.native == nil {
+		return RuntimeModelState{}, errors.New("Pi Runtime model catalog is unavailable")
+	}
+	return c.native.models(contractTimeout(ctx, 15*time.Second))
+}
+
+func (c *piRuntimeContract) SwitchRuntimeModel(ctx context.Context, _ runtimecontract.Binding, selection RuntimeModelSelection) (RuntimeModelState, error) {
+	if err := ctx.Err(); err != nil {
+		return RuntimeModelState{}, err
+	}
+	if c.native == nil {
+		return RuntimeModelState{}, errors.New("Pi Runtime model switching is unavailable")
+	}
+	return c.native.switchModel(selection, contractTimeout(ctx, 15*time.Second))
+}
+
+func (c *piRuntimeContract) SetApprovalHandler(handler func(runtimecontract.ApprovalProposal)) {
+	if c.native != nil {
+		c.native.SetApprovalHandler(handler)
+	}
+}
+
+func (c *piRuntimeContract) ResolveApproval(ctx context.Context, proposalID string, decision runtimecontract.ApprovalDecision) error {
+	if c.native == nil {
+		return errors.New("Pi Runtime Approval is unavailable")
+	}
+	return c.native.ResolveApproval(ctx, proposalID, decision)
+}
+
+func (c *piRuntimeContract) CloseBinding(ctx context.Context, _ runtimecontract.Binding) runtimecontract.Outcome {
+	if failure := contextFailure(ctx, runtimecontract.FailurePhaseClose); failure != nil {
+		return *failure
+	}
 	if c.release != nil {
 		c.release()
 	}

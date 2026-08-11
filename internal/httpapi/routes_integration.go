@@ -701,6 +701,4 @@ func (s *Server) registerIntegrationRoutes(mux *http.ServeMux) {
 		writeJSON(w, 202, map[string]any{"outboxItem": item})
 	})
 
-	// CodexLoom Agent API. The /api/sessions routes below remain compatibility
-	// aliases for older chub binaries and open browser tabs.
 }

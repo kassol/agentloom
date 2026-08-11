@@ -589,7 +589,7 @@ function UserAttachmentRows({ attachments }: { attachments: ExternalAttachment[]
   return (
     <div className={`${attachments.some((attachment) => attachment.mimeType?.startsWith("image/") && (attachment.url || attachment.path)) ? "mt-2" : ""} space-y-1.5`}>
       {attachments.map((attachment, index) => {
-        const href = attachment.url || (attachment.mimeType?.startsWith("image/") && attachment.path ? `/api/images?path=${encodeURIComponent(attachment.path)}` : undefined);
+        const href = attachment.url;
         const label = attachment.name || attachment.id || `Attachment ${index + 1}`;
         if (attachment.mimeType?.startsWith("image/") && href) {
           return (

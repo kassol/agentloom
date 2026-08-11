@@ -24,7 +24,7 @@ type InterruptedTurnAction struct {
 // the final runtime checkpoint raced with process loss.
 func reconcileInterruptedTurn(meta *Agent) (*TurnSummary, bool) {
 	summary := &TurnSummary{
-		TurnID: meta.CurrentTurnID, Task: displayRolloutTask(meta.CurrentTask),
+		TurnID: meta.CurrentTurnID, Task: displayUserTask(meta.CurrentTask),
 		Status: "interrupted", CompletedAt: now(),
 	}
 	// Startup records only Loom's durable observation. The recovery worker
@@ -137,7 +137,6 @@ func (h *Hub) DismissInterruptedTurn(key string) (AgentView, error) {
 	}
 	view := h.viewLocked(meta)
 	h.mu.Unlock()
-	applyRolloutStatus(&view)
 	return view, nil
 }
 

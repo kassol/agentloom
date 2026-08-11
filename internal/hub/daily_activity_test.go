@@ -3,8 +3,6 @@ package hub
 import (
 	"testing"
 	"time"
-
-	"github.com/yan5xu/codex-loom/internal/rollout"
 )
 
 func TestBuildDailyActivitySplitsExecutionAndTokensIntoAlignedBuckets(t *testing.T) {
@@ -17,19 +15,19 @@ func TestBuildDailyActivitySplitsExecutionAndTokensIntoAlignedBuckets(t *testing
 		{Agent: Agent{ID: "agent-b", Name: "beta", Status: "idle"}},
 		{Agent: Agent{ID: "agent-c", Name: "inactive", Status: "idle"}},
 	}
-	reports := map[string]*rollout.UsageReport{
+	reports := map[string]*RuntimeUsageReport{
 		"agent-a": {
-			Activity: []rollout.TurnActivity{
+			Activity: []RuntimeTurnActivity{
 				{TurnID: "turn-a1", StartedAt: start.Add(20 * time.Minute).UTC().Format(time.RFC3339Nano), EndedAt: start.Add(40 * time.Minute).UTC().Format(time.RFC3339Nano)},
 				{TurnID: "turn-a2", StartedAt: start.Add(50 * time.Minute).UTC().Format(time.RFC3339Nano)},
 			},
-			Events: []rollout.UsageEvent{
-				{Timestamp: start.Add(25 * time.Minute).UTC().Format(time.RFC3339Nano), Usage: rollout.TokenUsage{TotalTokens: 100, Calls: 1}},
-				{Timestamp: start.Add(65 * time.Minute).UTC().Format(time.RFC3339Nano), Usage: rollout.TokenUsage{TotalTokens: 250, Calls: 1}},
+			Events: []RuntimeUsageEvent{
+				{Timestamp: start.Add(25 * time.Minute).UTC().Format(time.RFC3339Nano), Usage: RuntimeTokenUsage{TotalTokens: 100, Calls: 1}},
+				{Timestamp: start.Add(65 * time.Minute).UTC().Format(time.RFC3339Nano), Usage: RuntimeTokenUsage{TotalTokens: 250, Calls: 1}},
 			},
 		},
 		"agent-b": {
-			Activity: []rollout.TurnActivity{{TurnID: "turn-b1", StartedAt: start.Add(10 * time.Minute).UTC().Format(time.RFC3339Nano), EndedAt: start.Add(70 * time.Minute).UTC().Format(time.RFC3339Nano)}},
+			Activity: []RuntimeTurnActivity{{TurnID: "turn-b1", StartedAt: start.Add(10 * time.Minute).UTC().Format(time.RFC3339Nano), EndedAt: start.Add(70 * time.Minute).UTC().Format(time.RFC3339Nano)}},
 		},
 		"agent-c": {},
 	}
@@ -69,7 +67,7 @@ func TestBuildDailyActivityHistoricalDayUsesFullWindow(t *testing.T) {
 	start := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
 	activity := buildDailyActivity(
 		[]AgentView{{Agent: Agent{ID: "agent-a", Name: "alpha"}}},
-		map[string]*rollout.UsageReport{"agent-a": {}},
+		map[string]*RuntimeUsageReport{"agent-a": {}},
 		start,
 		start.AddDate(0, 0, 1),
 		start.AddDate(0, 0, 2),

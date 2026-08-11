@@ -3,13 +3,9 @@ import { executionState, isAgentExecuting, isOwnerResultEvent, oldestWaitingMs }
 import type { Agent, InboxEntry } from "./types";
 
 function agent(status: string, goalStatus?: Agent["goal"] extends infer G ? any : never): Agent {
-  return {
+	return {
 	id: "a1", name: "research", cwd: "/tmp", threadId: "t1", runtimeBinding: { kind: "codex" }, sandbox: "danger-full-access",
-    runtimeCapabilities: {
-      history: true, causalSteer: true, interrupt: true, goal: true, remote: true,
-      usage: true, provider: true, compaction: true, approval: true, skills: true,
-      naming: true, archive: true, sandbox: true, imageInput: true,
-    },
+    capabilitySnapshot: { revision: "test", capabilities: [] },
     approvalPolicy: "never", status, currentTask: "", currentTurnId: "", lastError: "",
     createdAt: "2026-07-17T00:00:00Z", updatedAt: "2026-07-17T00:00:00Z", processAlive: true,
     pendingApprovals: [], lastSeq: 0,

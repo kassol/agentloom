@@ -42,7 +42,7 @@ func TestHumanRequestHTTPAndSSECausalitySurvivesRestart(t *testing.T) {
 	if created["threadId"] != "loom-thread-release" || created["sourceTurnId"] != "turn-upload" || created["blockedWork"] != "Upload the release" {
 		t.Fatalf("created request causality = %#v", created)
 	}
-	events := readGlobalSSE(t, h, "/api/events?since="+strconv.FormatInt(cursor, 10), 1)
+	events := readGlobalSSE(t, h, "/api/agents/events?since="+strconv.FormatInt(cursor, 10), 1)
 	assertHumanRequestEvent(t, events[0], requestID, "open", "waiting")
 
 	h.Shutdown()
@@ -72,7 +72,7 @@ func TestHumanRequestHTTPAndSSECausalitySurvivesRestart(t *testing.T) {
 	if answered["state"] != "answered" || answered["deliveryStatus"] != "queued" {
 		t.Fatalf("answered request = %#v", answered)
 	}
-	events = readGlobalSSE(t, restarted, "/api/events?since="+strconv.FormatInt(cursor, 10), 1)
+	events = readGlobalSSE(t, restarted, "/api/agents/events?since="+strconv.FormatInt(cursor, 10), 1)
 	assertHumanRequestEvent(t, events[0], requestID, "answered", "queued")
 }
 

@@ -66,6 +66,7 @@ should be verified against the current build before publication.
 |---|---|
 | [Development handbook](handbook.md) | Architecture, storage, APIs, migration, build, and operations |
 | [HTTP/SSE API reference](http-api.md) | Current REST and SSE route contract, grouped by domain |
+| [Runtime Contract v2](runtime-contract.md) | Driver/Contract ownership, typed lifecycle, capabilities, and conformance |
 | [Documentation coverage matrix](documentation-coverage.md) | Code-area to owning-document audit and remaining gaps |
 | [Model Provider and catalog](model-provider.md) | Per-Agent Provider switching and static model catalog operations |
 | [Codex app-server protocol](codex-app-server-protocol.md) | Adapter and protocol observations |

@@ -100,6 +100,12 @@ func topicTestHub(t *testing.T) *Hub {
 		t.Fatal(err)
 	}
 	h := testHub(st)
+	t.Cleanup(func() {
+		h.Shutdown()
+		if err := st.Close(); err != nil {
+			t.Errorf("close Topic test Store: %v", err)
+		}
+	})
 	h.topics = map[string]*Topic{}
 	h.agents["lead"] = &Agent{ID: "lead", Name: "parall-dev-lead", ThreadID: "loom-thread-lead", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-lead"}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
 	h.agents["edge"] = &Agent{ID: "edge", Name: "parall-edge-dev", ThreadID: "loom-thread-edge", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-edge"}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
@@ -554,6 +560,9 @@ func TestTopicHumanAnswerResumesWithLatestContext(t *testing.T) {
 	if _, err := h.AnswerHumanRequest(request.ID, AnswerHumanRequestParams{Answer: "Yes, use the replacement."}); err != nil {
 		t.Fatal(err)
 	}
+	// The automatically scheduled delivery must observe the deliberately busy
+	// Agent before this test switches it to idle and performs the assertion.
+	h.workers.Wait()
 	var envelope string
 	h.dispatchHumanAnswer = func(_ string, text string) (SendResult, error) {
 		envelope = text
@@ -583,6 +592,7 @@ func TestTopicHumanAnswerFallsBackWhenParticipantWasRemoved(t *testing.T) {
 	if _, err := h.AnswerHumanRequest(request.ID, AnswerHumanRequestParams{Answer: "Yes."}); err != nil {
 		t.Fatal(err)
 	}
+	h.workers.Wait()
 	h.mu.Lock()
 	h.agents["edge"].Status = "idle"
 	h.runtimes["edge"].activeTurn = nil

@@ -53,7 +53,7 @@ func TestMixedRuntimeMessagesShareDurableHTTPAndSSEControlPlaneAcrossRestart(t *
 		t.Fatalf("Codex to Pi reply = %#v", reply)
 	}
 
-	events := readGlobalSSE(t, h, "/api/events?since=0", 4)
+	events := readGlobalSSE(t, h, "/api/agents/events?since=0", 4)
 	loomMessages := map[string]bool{}
 	for _, event := range events {
 		if event.Type != "loom/comms-message" {

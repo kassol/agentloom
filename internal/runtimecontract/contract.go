@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 const (
@@ -15,9 +16,7 @@ const (
 
 // Contract is the mandatory Runtime Contract v2 core. Optional product
 // behavior is negotiated through CapabilitySnapshot and capability-scoped
-// interfaces rather than added here. During migration the v1 compatibility
-// shim continues to carry sandbox, Approval, Provider/model/effort, and Skill
-// controls until their capability tickets move them off the mandatory core.
+// interfaces rather than added here.
 type Contract interface {
 	ContractVersion() int
 	CreateBinding(context.Context, BindingRequest) (Binding, Outcome)
@@ -45,10 +44,54 @@ type BindingArchiveCapability interface {
 	ArchiveBinding(context.Context, Binding) Outcome
 }
 
+// ApprovalCapability lets a Runtime propose a side effect in Loom vocabulary
+// and later receive the Owner's typed decision. Native request IDs, protocol
+// payloads, and response handles remain private to the adapter.
+type ApprovalCapability interface {
+	SetApprovalHandler(func(ApprovalProposal))
+	ResolveApproval(context.Context, string, ApprovalDecision) error
+}
+
+type ApprovalDecision string
+
+const (
+	ApprovalApprove ApprovalDecision = "approve"
+	ApprovalDeny    ApprovalDecision = "deny"
+	ApprovalTimeout ApprovalDecision = "timeout"
+	ApprovalAbort   ApprovalDecision = "abort"
+)
+
+type ApprovalArgument struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type ApprovalProposal struct {
+	ID        string             `json:"id"`
+	TurnID    string             `json:"turnId,omitempty"`
+	ToolName  string             `json:"toolName"`
+	Action    string             `json:"action,omitempty"`
+	Arguments []ApprovalArgument `json:"arguments,omitempty"`
+	Timeout   time.Duration      `json:"-"`
+}
+
 type Binding struct {
 	SchemaVersion int    `json:"schemaVersion"`
 	RuntimeKind   string `json:"runtimeKind"`
 	NativeRef     string `json:"nativeRef"`
+}
+
+func (b Binding) Validate() error {
+	if b.SchemaVersion != BindingSchemaVersion {
+		return fmt.Errorf("unsupported Runtime binding schema version %d", b.SchemaVersion)
+	}
+	if b.RuntimeKind == "" {
+		return fmt.Errorf("Runtime binding kind is required")
+	}
+	if b.NativeRef == "" {
+		return fmt.Errorf("Runtime binding native reference is required")
+	}
+	return nil
 }
 
 type BindingRequest struct {
@@ -139,6 +182,11 @@ func (o Outcome) Validate() error {
 	default:
 		return fmt.Errorf("unknown lifecycle state %q", o.State)
 	}
+	if o.Failure != nil {
+		if err := o.Failure.Validate(); err != nil {
+			return err
+		}
+	}
 	if o.State == LifecycleIndeterminate {
 		if o.Failure == nil {
 			return fmt.Errorf("indeterminate outcome requires a failure")
@@ -173,6 +221,26 @@ type Failure struct {
 	Diagnostic string       `json:"-"`
 	Cause      error        `json:"-"`
 }
+
+func (f Failure) Validate() error {
+	if f.Code == "" {
+		return fmt.Errorf("Runtime failure code is required")
+	}
+	if f.Message == "" {
+		return fmt.Errorf("Runtime failure message is required")
+	}
+	switch f.Phase {
+	case FailurePhaseBindingCreate, FailurePhaseBindingResume, FailurePhaseTurnStart,
+		FailurePhaseTurnContinue, FailurePhaseTurnInterrupt, FailurePhaseHistory,
+		FailurePhaseClose, FailurePhaseBindingName, FailurePhaseBindingArchive,
+		FailurePhaseContextDelivery:
+		return nil
+	default:
+		return fmt.Errorf("Runtime failure has unknown phase %q", f.Phase)
+	}
+}
+
+const FailureCodeBindingNotFound = "native_binding_not_found"
 
 type CapabilityAvailability string
 
@@ -209,6 +277,35 @@ type CapabilitySnapshot struct {
 	Capabilities []CapabilityDescriptor `json:"capabilities"`
 }
 
+func (s CapabilitySnapshot) Validate() error {
+	if s.Revision == "" {
+		return fmt.Errorf("capability snapshot revision is required")
+	}
+	seen := make(map[string]struct{}, len(s.Capabilities))
+	for _, descriptor := range s.Capabilities {
+		if descriptor.ID == "" {
+			return fmt.Errorf("capability descriptor ID is required")
+		}
+		if _, exists := seen[descriptor.ID]; exists {
+			return fmt.Errorf("duplicate capability descriptor %q", descriptor.ID)
+		}
+		seen[descriptor.ID] = struct{}{}
+		if descriptor.Revision == "" {
+			return fmt.Errorf("capability descriptor %q revision is required", descriptor.ID)
+		}
+		switch descriptor.Availability {
+		case CapabilityAvailable:
+		case CapabilityUnavailable:
+			if descriptor.Reason == "" || descriptor.Alternative == "" {
+				return fmt.Errorf("unavailable capability descriptor %q requires a reason and alternative", descriptor.ID)
+			}
+		default:
+			return fmt.Errorf("capability descriptor %q has unknown availability %q", descriptor.ID, descriptor.Availability)
+		}
+	}
+	return nil
+}
+
 const (
 	CapabilitySandboxConfiguration  = "sandbox_configuration"
 	CapabilityProviderConfiguration = "provider_configuration"
@@ -217,6 +314,12 @@ const (
 	CapabilityContextDelivery       = "context_delivery"
 	CapabilityNativeRename          = "native_rename"
 	CapabilityNativeArchive         = "native_archive"
+	CapabilityGoal                  = "goal"
+	CapabilityRemote                = "remote"
+	CapabilityUsageReporting        = "usage_reporting"
+	CapabilityModelConfiguration    = "model_configuration"
+	CapabilityManualCompaction      = "manual_compaction"
+	CapabilityImageInput            = "image_input"
 )
 
 type ContentKind string
@@ -351,6 +454,47 @@ type Event struct {
 	Outcome           *Outcome      `json:"outcome,omitempty"`
 }
 
+func (e Event) Validate() error {
+	if e.TurnID == "" {
+		return fmt.Errorf("Runtime event Turn ID is required")
+	}
+	switch e.Kind {
+	case EventTurnStarted:
+		if e.Content != nil || e.Usage != nil || e.Outcome != nil {
+			return fmt.Errorf("turn_started event cannot carry content, usage, or outcome")
+		}
+	case EventContent:
+		if e.Content == nil || e.Usage != nil || e.Outcome != nil {
+			return fmt.Errorf("content event requires only content")
+		}
+		switch e.ContentPhase {
+		case ContentPhaseStarted, ContentPhaseDelta, ContentPhaseUpdated, ContentPhaseCompleted:
+		default:
+			return fmt.Errorf("content event has unknown phase %q", e.ContentPhase)
+		}
+		if err := e.Content.Validate(); err != nil {
+			return fmt.Errorf("invalid Runtime event content: %w", err)
+		}
+	case EventUsage:
+		if e.Usage == nil || e.Content != nil || e.Outcome != nil {
+			return fmt.Errorf("usage event requires only usage")
+		}
+	case EventTerminal:
+		if e.Outcome == nil || e.Content != nil || e.Usage != nil {
+			return fmt.Errorf("terminal event requires only an outcome")
+		}
+		if err := e.Outcome.Validate(); err != nil {
+			return fmt.Errorf("invalid terminal outcome: %w", err)
+		}
+		if e.Outcome.State == LifecycleAccepted {
+			return fmt.Errorf("terminal event cannot carry accepted outcome")
+		}
+	default:
+		return fmt.Errorf("unknown Runtime event kind %q", e.Kind)
+	}
+	return nil
+}
+
 type UsageMetric struct {
 	Available bool   `json:"available"`
 	Value     int64  `json:"value,omitempty"`
@@ -374,17 +518,40 @@ type HistoryRequest struct {
 }
 
 type HistoryTurn struct {
-	TurnID         string          `json:"turnId"`
-	RuntimeTurnRef string          `json:"-"`
-	State          LifecycleState  `json:"state"`
-	Content        []ContentBlock  `json:"content"`
-	Usage          *Usage          `json:"usage,omitempty"`
-	StartedAt      string          `json:"startedAt,omitempty"`
-	CompletedAt    string          `json:"completedAt,omitempty"`
-	Diagnostic     json.RawMessage `json:"-"`
+	TurnID            string          `json:"turnId"`
+	PredecessorTurnID string          `json:"predecessorTurnId,omitempty"`
+	RuntimeTurnRef    string          `json:"-"`
+	State             LifecycleState  `json:"state"`
+	Content           []ContentBlock  `json:"content"`
+	Usage             *Usage          `json:"usage,omitempty"`
+	StartedAt         string          `json:"startedAt,omitempty"`
+	CompletedAt       string          `json:"completedAt,omitempty"`
+	Diagnostic        json.RawMessage `json:"-"`
 }
 
 type History struct {
 	Total int           `json:"total"`
 	Turns []HistoryTurn `json:"turns"`
+}
+
+func (h History) Validate() error {
+	if h.Total < 0 || h.Total < len(h.Turns) {
+		return fmt.Errorf("Runtime history total %d is smaller than returned Turns", h.Total)
+	}
+	for turnIndex, turn := range h.Turns {
+		if turn.TurnID == "" && turn.RuntimeTurnRef == "" {
+			return fmt.Errorf("Runtime history Turn %d has no Turn identity", turnIndex)
+		}
+		switch turn.State {
+		case LifecycleAccepted, LifecycleRejected, LifecycleFailed, LifecycleInterrupted, LifecycleCompleted, LifecycleIndeterminate:
+		default:
+			return fmt.Errorf("Runtime history Turn %q has unknown state %q", turn.TurnID, turn.State)
+		}
+		for contentIndex, content := range turn.Content {
+			if err := content.Validate(); err != nil {
+				return fmt.Errorf("Runtime history Turn %q content %d: %w", turn.TurnID, contentIndex, err)
+			}
+		}
+	}
+	return nil
 }

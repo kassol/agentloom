@@ -101,12 +101,12 @@ func TestPiNeedsYouAnswerSurvivesRestartAndResumesSameThread(t *testing.T) {
 	if sourceErr != "" || source == nil || source.Kind != "needs_you" || source.ID != request.ID {
 		t.Fatalf("resumed Pi Turn source = %#v, err=%q", source, sourceErr)
 	}
-	history, err := h2.History(agent.ID, 10, 0)
+	history, err := h2.CanonicalHistory(agent.ID, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	encodedHistory, _ := json.Marshal(history.Turns)
-	if history.Total != 2 || len(history.Turns) != 2 || history.Turns[0].ID != first.TurnID || history.Turns[1].ID != delivered.ResumedTurnID || !strings.Contains(string(encodedHistory), "hello from Pi") {
+	if history.Total != 2 || len(history.Turns) != 2 || history.Turns[0].TurnID != first.TurnID || history.Turns[1].TurnID != delivered.ResumedTurnID || !strings.Contains(string(encodedHistory), "hello from Pi") {
 		t.Fatalf("resumed Pi history/final response = %s", encodedHistory)
 	}
 	prompts, err := os.ReadFile(os.Getenv("FAKE_PI_PROMPTS_FILE"))

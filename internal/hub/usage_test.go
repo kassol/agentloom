@@ -53,13 +53,22 @@ func writeSameModelProviderUsageRollout(t *testing.T, threadID string) {
 	t.Setenv("CODEX_SESSIONS_DIR", dir)
 }
 
+func readTestRuntimeUsage(t *testing.T, threadID string) *RuntimeUsageReport {
+	t.Helper()
+	report, err := rollout.ReadUsage(threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return codexRuntimeUsageReport(report)
+}
+
 func TestBuildAgentUsageSeparatesTodayPeriodAndLifetime(t *testing.T) {
 	const threadID = "usage-thread"
 	writeUsageRollout(t, threadID)
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	agent := AgentView{Agent: Agent{ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle"}, nativeRuntimeRef: threadID}
 
-	usage := buildAgentUsage(agent, 7, now)
+	usage := buildAgentUsage(agent, 7, now, readTestRuntimeUsage(t, threadID))
 	if !usage.Available {
 		t.Fatal("usage should be available")
 	}
@@ -93,7 +102,7 @@ func TestBuildAgentUsageSeparatesSameThreadByProviderTimeline(t *testing.T) {
 		}},
 	}, nativeRuntimeRef: threadID}
 
-	usage := buildAgentUsage(agent, 7, now)
+	usage := buildAgentUsage(agent, 7, now, readTestRuntimeUsage(t, threadID))
 	if len(usage.Models) != 2 {
 		t.Fatalf("Provider/model groups = %#v", usage.Models)
 	}
@@ -122,7 +131,7 @@ func TestBuildAgentUsageDoesNotMergeSameModelAcrossProviders(t *testing.T) {
 		}},
 	}, nativeRuntimeRef: threadID}
 
-	usage := buildAgentUsage(agent, 7, now)
+	usage := buildAgentUsage(agent, 7, now, readTestRuntimeUsage(t, threadID))
 	groups := map[string]int64{}
 	for _, model := range usage.Models {
 		groups[model.ProviderID+"/"+model.Model] = model.Usage.TotalTokens
@@ -136,7 +145,7 @@ func TestBuildAgentUsageDoesNotMergeSameModelAcrossProviders(t *testing.T) {
 }
 
 func TestBuildAgentUsageWithoutThreadIsUnavailable(t *testing.T) {
-	usage := buildAgentUsage(AgentView{Agent: Agent{ID: "agent-1", Name: "empty"}}, 7, time.Now())
+	usage := buildAgentUsage(AgentView{Agent: Agent{ID: "agent-1", Name: "empty"}}, 7, time.Now(), nil)
 	if usage.Available || len(usage.Daily) != 7 {
 		t.Fatalf("usage = %#v", usage)
 	}
@@ -151,7 +160,7 @@ func TestBuildAgentUsageRangeSelectsHistoricalDayAndPreviousDay(t *testing.T) {
 	now := time.Date(2026, 7, 14, 12, 0, 0, 0, location)
 	agent := AgentView{Agent: Agent{ID: "agent-1", Name: "research", ThreadID: "loom-" + threadID, RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle"}, nativeRuntimeRef: threadID}
 
-	usage := buildAgentUsageRange(agent, start, endExclusive, now)
+	usage := buildAgentUsageRange(agent, start, endExclusive, now, readTestRuntimeUsage(t, threadID))
 	if usage.Period.TotalTokens != 90 {
 		t.Fatalf("period = %#v, want Jul 13 usage", usage.Period)
 	}
@@ -191,9 +200,9 @@ func TestAgentUsageCacheIsBoundedAndDropsStaleReports(t *testing.T) {
 		agentUsageCache.Unlock()
 	}()
 
-	reports := make([]*rollout.UsageReport, maxAgentUsageCacheEntries+1)
+	reports := make([]*RuntimeUsageReport, maxAgentUsageCacheEntries+1)
 	for index := range reports {
-		reports[index] = &rollout.UsageReport{}
+		reports[index] = &RuntimeUsageReport{}
 		cacheAgentUsage(fmt.Sprintf("key-%03d", index), reports[index], AgentUsage{AgentName: fmt.Sprintf("agent-%03d", index)})
 	}
 	agentUsageCache.Lock()
@@ -206,7 +215,7 @@ func TestAgentUsageCacheIsBoundedAndDropsStaleReports(t *testing.T) {
 	}
 
 	key := fmt.Sprintf("key-%03d", maxAgentUsageCacheEntries)
-	if _, ok := cachedAgentUsage(key, &rollout.UsageReport{}); ok {
+	if _, ok := cachedAgentUsage(key, &RuntimeUsageReport{}); ok {
 		t.Fatal("cache accepted a stale UsageReport pointer")
 	}
 	agentUsageCache.Lock()

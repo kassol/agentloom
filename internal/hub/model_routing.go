@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/modelcatalog"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 type providerErrorNotification struct {
@@ -71,7 +73,7 @@ func (h *Hub) interruptTurnIfActive(agentID string, expected *turnState, reason 
 	deadline := time.NewTimer(time.Second)
 	defer deadline.Stop()
 	var rt *runtime
-	var threadID, turnID string
+	var turnID string
 	for turnID == "" {
 		h.mu.Lock()
 		meta := h.agents[agentID]
@@ -80,7 +82,6 @@ func (h *Hub) interruptTurnIfActive(agentID string, expected *turnState, reason 
 			h.mu.Unlock()
 			return false, nil
 		}
-		threadID = meta.RuntimeBinding.NativeRef
 		turnID = expected.nativeTurnID
 		if turnID != "" {
 			h.mu.Unlock()
@@ -101,11 +102,8 @@ func (h *Hub) interruptTurnIfActive(agentID string, expected *turnState, reason 
 			return false, fmt.Errorf("model routing error Turn is still starting")
 		}
 	}
-	_, err := rt.client.Request("turn/interrupt", map[string]any{
-		"threadId": threadID,
-		"turnId":   turnID,
-	}, 10*time.Second)
-	if err != nil {
+	outcome := rt.runtimeContract.InterruptTurn(context.Background(), runtimecontract.TurnTarget{Binding: rt.binding, TurnID: expected.turnID, RuntimeTurnRef: turnID})
+	if err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleInterrupted, false); err != nil {
 		// The target can finish while the turn-scoped request is in flight. That
 		// is already the desired terminal condition; never retry against whatever
 		// Turn is active now.

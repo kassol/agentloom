@@ -15,9 +15,8 @@ import { oldestWaitingMs } from "./product-state";
 const CUSTOM_MODEL_VALUE = "__custom";
 const FALLBACK_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
-function capabilityAvailable(agent: Agent, id: string, v1Fallback: boolean) {
-  const descriptor = agent.capabilitySnapshot?.capabilities.find((capability) => capability.id === id);
-  return descriptor ? descriptor.availability === "available" : v1Fallback;
+function capabilityAvailable(agent: Agent, id: string) {
+  return agent.capabilitySnapshot.capabilities.some((capability) => capability.id === id && capability.availability === "available");
 }
 
 function readableRuntimeError(value: string) {
@@ -102,9 +101,15 @@ export function AgentPane({
   onError: (msg: string) => void;
   onAgentUpdated: (agent: Agent) => void;
 }) {
-  const providerConfigurationAvailable = capabilityAvailable(agent, "provider_configuration", agent.runtimeCapabilities.provider);
-  const sandboxConfigurationAvailable = capabilityAvailable(agent, "sandbox_configuration", agent.runtimeCapabilities.sandbox);
-  const approvalPolicyAvailable = capabilityAvailable(agent, "approval_policy", agent.runtimeCapabilities.approval);
+  const providerConfigurationAvailable = capabilityAvailable(agent, "provider_configuration");
+  const sandboxConfigurationAvailable = capabilityAvailable(agent, "sandbox_configuration");
+  const approvalPolicyAvailable = capabilityAvailable(agent, "approval_policy");
+  const modelConfigurationAvailable = capabilityAvailable(agent, "model_configuration");
+  const goalAvailable = capabilityAvailable(agent, "goal");
+  const remoteAvailable = capabilityAvailable(agent, "remote");
+  const usageAvailable = capabilityAvailable(agent, "usage_reporting");
+  const compactionAvailable = capabilityAvailable(agent, "manual_compaction");
+  const snapshotImageInputAvailable = capabilityAvailable(agent, "image_input");
   const [feed, dispatch] = useReducer(reduceFeed, emptyFeed);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<PendingArtifact[]>([]);
@@ -323,7 +328,7 @@ export function AgentPane({
   }, [configOpen, agent.id]);
 
 	useEffect(() => {
-	  if (!configOpen || configSection !== "runtime" || !agent.runtimeCapabilities.provider) return;
+	  if (!configOpen || configSection !== "runtime" || !modelConfigurationAvailable) return;
 	  let cancelled = false;
 	  api("GET", `/api/agents/${agent.id}/runtime/models`)
 		.then((data) => {
@@ -344,7 +349,7 @@ export function AgentPane({
 		  setRuntimeModelCurrent(null);
 		});
 	  return () => { cancelled = true; };
-	}, [configOpen, configSection, agent.id, agent.runtimeCapabilities.provider]);
+	}, [configOpen, configSection, agent.id, modelConfigurationAvailable]);
 
   const refreshConnections = async () => {
     const [addressData, connectionData, membershipData] = await Promise.all([
@@ -420,16 +425,6 @@ export function AgentPane({
     totalRef.current = 0;
     stickRef.current = true;
     setShowJumpToBottom(false);
-    if (!agent.runtimeCapabilities.history) {
-      api("GET", `/api/agents/${agent.id}/artifacts`)
-        .then((data) => {
-          if (!cancelled) dispatch({ type: "__published_artifacts__", ts: "", data } as any);
-        })
-        .catch(() => {});
-      return () => {
-        cancelled = true;
-      };
-    }
     api("GET", `/api/agents/${agent.id}/thread/history?count=${PAGE}&offset=0`)
       .then((h) => {
         if (cancelled) return;
@@ -452,11 +447,10 @@ export function AgentPane({
     return () => {
       cancelled = true;
     };
-  }, [agent.id, agent.runtimeCapabilities.history]);
+  }, [agent.id]);
 
   // Scroll-up lazy load: fetch the next older page and prepend it.
   const loadOlder = () => {
-    if (!agent.runtimeCapabilities.history) return;
     if (loadingRef.current || loadedRef.current >= totalRef.current) return;
     loadingRef.current = true;
     const el = feedRef.current;
@@ -481,7 +475,6 @@ export function AgentPane({
     let cancelled = false;
     const unsubscribe = subscribeThreadEvents(agent.id, (event) => {
       if (event.type === "loom/reconcile") {
-        if (!agent.runtimeCapabilities.history) return;
         api("GET", `/api/agents/${agent.id}/thread/history?count=${PAGE}&offset=0`)
           .then((history) => {
             if (cancelled) return;
@@ -494,7 +487,6 @@ export function AgentPane({
       }
       dispatch(event);
       if (["loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted"].includes(event.type)) {
-        if (!agent.runtimeCapabilities.history) return;
         window.setTimeout(() => {
           const count = Math.max(PAGE, loadedRef.current);
           api("GET", `/api/agents/${agent.id}/thread/history?count=${count}&offset=0`)
@@ -512,7 +504,7 @@ export function AgentPane({
       cancelled = true;
       unsubscribe();
     };
-  }, [agent.id, agent.runtimeCapabilities.history]);
+  }, [agent.id]);
 
   // After blocks change: if a prepend just happened, preserve the scroll
   // position (keep the same turn under the viewport); otherwise autoscroll to
@@ -644,7 +636,7 @@ export function AgentPane({
     for (const file of files) {
       const id = `${file.name}:${file.size}:${file.lastModified}`;
       if (existing.has(id)) continue;
-      if (file.type.startsWith("image/") && !agent.runtimeCapabilities.imageInput) {
+      if (file.type.startsWith("image/") && !snapshotImageInputAvailable) {
         onError(`${file.name} cannot be attached because the current ${agent.runtimeBinding.kind} model does not support image input`);
         continue;
       }
@@ -686,7 +678,7 @@ export function AgentPane({
       return;
     }
     const isCompact = !request && text === "/compact";
-    if (isCompact && !agent.runtimeCapabilities.compaction) {
+    if (isCompact && !compactionAvailable) {
       onError(`Manual compaction is unavailable for the ${agent.runtimeBinding.kind} Runtime`);
       return;
     }
@@ -997,7 +989,7 @@ export function AgentPane({
 	const selectedRuntimeModel = piModels.find((model) => model.id === modelDraft);
 	const runtimeThinkingOptions = selectedRuntimeModel?.thinkingLevels?.length ? selectedRuntimeModel.thinkingLevels : runtimeThinkingLevels;
 	const runtimeModelIdentityChanged = runtimeModelControl && !!selectedRuntimeModel && (providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id);
-	const imageInputAvailable = selectedRuntimeModel?.imageInput ?? agent.runtimeCapabilities.imageInput;
+	const imageInputAvailable = selectedRuntimeModel?.imageInput ?? selectedModelDetail?.inputModalities?.includes("image") ?? snapshotImageInputAvailable;
 	const runtimeModelChanged = runtimeModelControl
 	  ? providerDraft !== runtimeModelCurrent?.provider || modelDraft !== runtimeModelCurrent?.id || effortDraft !== runtimeThinkingLevel
 	  : providerChanged;
@@ -1093,7 +1085,7 @@ export function AgentPane({
                 <button onClick={() => setConfigSection("external")} className={`h-7 rounded px-3 ${configSection === "external" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>External</button>
                 <button onClick={() => setConfigSection("triggers")} className={`h-7 rounded px-3 ${configSection === "triggers" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Triggers</button>
                 <button onClick={() => setConfigSection("runtime")} className={`h-7 rounded px-3 ${configSection === "runtime" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Runtime</button>
-                <button onClick={() => setConfigSection("usage")} disabled={!agent.runtimeCapabilities.usage} title={!agent.runtimeCapabilities.usage ? `Usage is unavailable for the ${agent.runtimeBinding.kind} Runtime` : undefined} className={`h-7 rounded px-3 disabled:cursor-not-allowed disabled:opacity-40 ${configSection === "usage" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Usage</button>
+                <button onClick={() => setConfigSection("usage")} disabled={!usageAvailable} title={!usageAvailable ? `Usage is unavailable for the ${agent.runtimeBinding.kind} Runtime` : undefined} className={`h-7 rounded px-3 disabled:cursor-not-allowed disabled:opacity-40 ${configSection === "usage" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Usage</button>
               </div>
 
 			  {configSection === "runtime" ? (
@@ -1104,17 +1096,17 @@ export function AgentPane({
 				  </div>
 				  <div className="mb-3 rounded-md border border-border bg-muted/20 p-2">
 					<div className="mb-1.5 text-[10px] font-semibold uppercase text-muted-foreground">Runtime capabilities</div>
-					{agent.capabilitySnapshot?.revision ? <div className="mb-1.5 font-mono text-[9px] text-muted-foreground">snapshot {agent.capabilitySnapshot.revision}</div> : null}
+					{agent.capabilitySnapshot.revision ? <div className="mb-1.5 font-mono text-[9px] text-muted-foreground">snapshot {agent.capabilitySnapshot.revision}</div> : null}
 					<div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10.5px]">
 					  {([
 						["Image input", imageInputAvailable],
-						["History", agent.runtimeCapabilities.history],
-						["Goal support", agent.runtimeCapabilities.goal],
-						["Remote", agent.runtimeCapabilities.remote],
-						["Usage reporting", agent.runtimeCapabilities.usage],
+						["History", true],
+						["Goal support", goalAvailable],
+						["Remote", remoteAvailable],
+						["Usage reporting", usageAvailable],
 						["Provider configuration", providerConfigurationAvailable],
 						["Sandbox configuration", sandboxConfigurationAvailable],
-						["Manual compaction", agent.runtimeCapabilities.compaction],
+						["Manual compaction", compactionAvailable],
 					  ] as Array<[string, boolean]>).map(([label, available]) => (
 						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{label === "Image input" && runtimeModelIdentityChanged ? `${available ? "Available" : "Unavailable"} after Save` : available ? "Available" : label === "Image input" && !agent.processAlive ? "Checked on start" : "Unavailable"}</span></div>
 					  ))}
@@ -1357,7 +1349,6 @@ export function AgentPane({
       <div className="relative min-h-0 flex-1 overflow-hidden">
         <div ref={feedRef} onScroll={onScroll} className="absolute inset-0 overflow-y-auto">
           <div className="mx-auto max-w-[880px] px-3 pb-8 pt-3 md:px-6 md:pt-5">
-            {!agent.runtimeCapabilities.history ? <div className="mb-3 rounded-md border border-border bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground">History is unavailable for the {agent.runtimeBinding.kind} Runtime.</div> : null}
             <div className="relative w-full" style={{ height: `${feedVirtualizer.getTotalSize()}px` }}>
               {active ? feedVirtualizer.getVirtualItems().map((virtualRow) => {
                 const row = feedRows[virtualRow.index];
@@ -1425,7 +1416,7 @@ export function AgentPane({
               <span className="break-words">{readableRuntimeError(agent.lastError)}</span>
             </div>
           ) : null}
-          {agent.runtimeCapabilities.goal ? <GoalBar goal={agent.goal} onUpdate={updateGoal} onClear={clearGoal} onError={onError} /> : <div className="mb-1 rounded-sm bg-muted/35 px-2 py-1.5 text-[10.5px] text-muted-foreground">Goal is unavailable for the {agent.runtimeBinding.kind} Runtime.</div>}
+          {goalAvailable ? <GoalBar goal={agent.goal} onUpdate={updateGoal} onClear={clearGoal} onError={onError} /> : <div className="mb-1 rounded-sm bg-muted/35 px-2 py-1.5 text-[10.5px] text-muted-foreground">Goal is unavailable for the {agent.runtimeBinding.kind} Runtime.</div>}
           <NeedsYouBar entries={humanRequests} onAnswer={(request, value = "") => {
             for (const attachment of attachments) {
               if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);

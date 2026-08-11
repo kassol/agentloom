@@ -137,9 +137,6 @@ func cmdWatch(a args) {
 		str(s, "name"), str(s, "id"), str(s, "status"))))
 
 	eventsPath := "/api/agents/" + url.PathEscape(key) + "/thread/events?tail=" + tail
-	if legacyAgentAPI {
-		eventsPath = legacyAgentPath(eventsPath)
-	}
 	req, _ := http.NewRequest("GET", base+eventsPath, nil)
 	req.Header.Set("Accept", "text/event-stream")
 	httpResp, err := http.DefaultClient.Do(req)

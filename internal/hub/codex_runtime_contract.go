@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,24 +17,37 @@ import (
 )
 
 // codexRuntimeContract translates Runtime Contract v2 values around the
-// existing Codex-native primitive. Provider/model and policy fields remain in
-// the v1 compatibility facade until their capability tickets migrate them.
+// existing Codex-native primitive. Provider/model and policy controls remain
+// adapter-private behind typed optional capability hooks.
 type codexRuntimeContract struct {
 	agentID string
 	native  *codexAgentRuntime
 
-	mu             sync.Mutex
-	bindingRequest RuntimeBindingRequest
-	turnRequest    RuntimeTurnRequest
-	handler        func(runtimecontract.Event)
-	release        func()
-	pendingTurn    runtimeTurnCorrelation
-	turnsByNative  map[string]runtimeTurnCorrelation
+	mu                      sync.Mutex
+	sandbox                 string
+	providerID              string
+	model                   string
+	disabledSkillPaths      []string
+	approvalPolicy          string
+	effort                  string
+	developerContextTimeout time.Duration
+	handler                 func(runtimecontract.Event)
+	approvalHandler         func(runtimecontract.ApprovalProposal)
+	approvalResponses       map[string]codexNativeApprovalResponse
+	bindingRef              string
+	release                 func()
+	pendingTurn             runtimeTurnCorrelation
+	turnsByNative           map[string]runtimeTurnCorrelation
 }
 
 type runtimeTurnCorrelation struct {
 	turnID            string
 	predecessorTurnID string
+}
+
+type codexNativeApprovalResponse struct {
+	client *codex.Client
+	id     json.RawMessage
 }
 
 func (c *codexRuntimeContract) ContractVersion() int { return runtimecontract.Version }
@@ -42,40 +56,96 @@ func (c *codexRuntimeContract) ContextDeliveryMode() runtimecontract.ContextDeli
 	return runtimecontract.ContextDeliveryEpochIncremental
 }
 
-func (c *codexRuntimeContract) setCompatibilityBinding(request RuntimeBindingRequest) {
+func (c *codexRuntimeContract) RuntimeContextEvidence(_ context.Context, binding runtimecontract.Binding, query RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error) {
+	nativeQuery := rollout.ContextHistoryQuery{TurnID: query.TurnID, Deliveries: make([]rollout.ContextDeliveryProbe, 0, len(query.Deliveries))}
+	for _, delivery := range query.Deliveries {
+		nativeQuery.Deliveries = append(nativeQuery.Deliveries, rollout.ContextDeliveryProbe{Role: delivery.Role, Marker: delivery.Marker, Hash: delivery.Hash})
+	}
+	state, err := rollout.ContextHistory(binding.NativeRef, nativeQuery)
+	if err != nil {
+		return RuntimeContextEvidence{}, err
+	}
+	return RuntimeContextEvidence{
+		EpochID: state.EpochID, WindowNumber: state.WindowNumber, CompactedAt: state.CompactedAt,
+		DeliveriesPersisted: state.DeliveriesPersisted, PersistedDeliveryKeys: state.PersistedDeliveryKeys,
+	}, nil
+}
+
+func (c *codexRuntimeContract) SetRuntimeSandbox(value string) {
 	c.mu.Lock()
-	c.bindingRequest = request
+	c.sandbox = value
 	c.mu.Unlock()
 }
 
-func (c *codexRuntimeContract) setCompatibilityTurn(request RuntimeTurnRequest) {
+func (c *codexRuntimeContract) SetRuntimeProvider(providerID, model string) {
 	c.mu.Lock()
-	c.turnRequest = request
+	c.providerID, c.model = providerID, model
 	c.mu.Unlock()
 }
 
-func (c *codexRuntimeContract) bindingControls() RuntimeBindingRequest {
+func (c *codexRuntimeContract) SetRuntimeModel(model string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.bindingRequest
+	c.model = model
+	c.mu.Unlock()
 }
 
-func (c *codexRuntimeContract) turnControls() RuntimeTurnRequest {
+func (c *codexRuntimeContract) SetRuntimeDisabledSkills(paths []string) {
+	c.mu.Lock()
+	c.disabledSkillPaths = append([]string(nil), paths...)
+	c.mu.Unlock()
+}
+
+func (c *codexRuntimeContract) SetRuntimeApprovalPolicy(value string) {
+	c.mu.Lock()
+	c.approvalPolicy = value
+	c.mu.Unlock()
+}
+
+func (c *codexRuntimeContract) SetRuntimeEffort(value string) {
+	c.mu.Lock()
+	c.effort = value
+	c.mu.Unlock()
+}
+
+func (c *codexRuntimeContract) SetRuntimeDeveloperContextTimeout(value time.Duration) {
+	c.mu.Lock()
+	c.developerContextTimeout = value
+	c.mu.Unlock()
+}
+
+func (c *codexRuntimeContract) nativeBindingRequest(name, cwd, nativeRef string) nativeBindingRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.turnRequest
+	return nativeBindingRequest{NativeRef: nativeRef, Name: name, Cwd: cwd, Sandbox: c.sandbox, ProviderID: c.providerID, Model: c.model, DisabledSkillPaths: append([]string(nil), c.disabledSkillPaths...)}
+}
+
+func (c *codexRuntimeContract) nativeTurnRequest(request runtimecontract.TurnRequest) nativeTurnRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return nativeTurnRequest{LoomTurnID: request.TurnID, NativeRef: request.Binding.NativeRef, Input: contractInputToV1(request.Input), ApprovalPolicy: c.approvalPolicy, Sandbox: c.sandbox, Model: c.model, Effort: c.effort}
+}
+
+func (c *codexRuntimeContract) contextDeliveryTimeout() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.developerContextTimeout > 0 {
+		return c.developerContextTimeout
+	}
+	return 30 * time.Second
 }
 
 func (c *codexRuntimeContract) CreateBinding(ctx context.Context, request runtimecontract.BindingRequest) (runtimecontract.Binding, runtimecontract.Outcome) {
 	if failure := contextFailure(ctx, runtimecontract.FailurePhaseBindingCreate); failure != nil {
 		return runtimecontract.Binding{}, *failure
 	}
-	controls := c.bindingControls()
-	controls.Name, controls.Cwd = request.Name, request.Cwd
+	controls := c.nativeBindingRequest(request.Name, request.Cwd, "")
 	nativeRef, err := c.native.Create(controls)
 	if err != nil {
 		return runtimecontract.Binding{}, codexFailureOutcome(err, runtimecontract.FailurePhaseBindingCreate)
 	}
+	c.mu.Lock()
+	c.bindingRef = nativeRef
+	c.mu.Unlock()
 	return runtimecontract.Binding{
 		SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: nativeRef,
 	}, runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}
@@ -85,12 +155,132 @@ func (c *codexRuntimeContract) ResumeBinding(ctx context.Context, binding runtim
 	if failure := contextFailure(ctx, runtimecontract.FailurePhaseBindingResume); failure != nil {
 		return *failure
 	}
-	request := c.bindingControls()
-	request.NativeRef = binding.NativeRef
+	request := c.nativeBindingRequest("", "", binding.NativeRef)
 	if err := c.native.Resume(request, contractTimeout(ctx, 60*time.Second)); err != nil {
+		if errors.Is(err, rollout.ErrRolloutNotFound) {
+			return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: &runtimecontract.Failure{
+				Code: runtimecontract.FailureCodeBindingNotFound, Phase: runtimecontract.FailurePhaseBindingResume,
+				Message: "Runtime binding was not found", Diagnostic: err.Error(), Cause: err,
+			}}
+		}
 		return codexFailureOutcome(err, runtimecontract.FailurePhaseBindingResume)
 	}
+	c.mu.Lock()
+	c.bindingRef = binding.NativeRef
+	c.mu.Unlock()
 	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
+}
+
+func (c *codexRuntimeContract) SetApprovalHandler(handler func(runtimecontract.ApprovalProposal)) {
+	c.mu.Lock()
+	c.approvalHandler = handler
+	c.mu.Unlock()
+}
+
+func (c *codexRuntimeContract) ResolveApproval(_ context.Context, proposalID string, decision runtimecontract.ApprovalDecision) error {
+	c.mu.Lock()
+	response, ok := c.approvalResponses[proposalID]
+	if ok {
+		delete(c.approvalResponses, proposalID)
+	}
+	c.mu.Unlock()
+	if !ok || response.client == nil {
+		return fmt.Errorf("Runtime Approval proposal %s is unavailable", proposalID)
+	}
+	wireDecision := "cancel"
+	if decision == runtimecontract.ApprovalApprove {
+		wireDecision = "accept"
+	}
+	return response.client.Respond(response.id, map[string]any{"decision": wireDecision})
+}
+
+func (c *codexRuntimeContract) handlesNativeThread(threadID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return threadID != "" && c.bindingRef == threadID
+}
+
+func (c *codexRuntimeContract) canHandleApproval() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.approvalHandler != nil
+}
+
+func (c *codexRuntimeContract) handleNativeServerRequest(client *codex.Client, id json.RawMessage, method string, params json.RawMessage) bool {
+	if !strings.Contains(strings.ToLower(method), "approval") {
+		return false
+	}
+	c.mu.Lock()
+	handler := c.approvalHandler
+	if handler == nil {
+		c.mu.Unlock()
+		return false
+	}
+	proposalID := "runtime-approval-" + strings.TrimPrefix(newIntegrationID("proposal"), "proposal_")
+	if c.approvalResponses == nil {
+		c.approvalResponses = map[string]codexNativeApprovalResponse{}
+	}
+	c.approvalResponses[proposalID] = codexNativeApprovalResponse{client: client, id: append(json.RawMessage(nil), id...)}
+	turnID := c.pendingTurn.turnID
+	c.mu.Unlock()
+	toolName, action := codexApprovalTool(method, params)
+	handler(runtimecontract.ApprovalProposal{
+		ID: proposalID, TurnID: turnID, ToolName: toolName,
+		Action: action, Arguments: codexApprovalArguments(params), Timeout: 5 * time.Minute,
+	})
+	return true
+}
+
+func codexApprovalTool(method string, params json.RawMessage) (string, string) {
+	var input map[string]any
+	_ = json.Unmarshal(params, &input)
+	name := ""
+	if input != nil {
+		for _, key := range []string{"toolName", "name", "tool"} {
+			if value, ok := input[key].(string); ok && strings.TrimSpace(value) != "" {
+				name = strings.TrimSpace(value)
+				break
+			}
+		}
+	}
+	lowerMethod := strings.ToLower(method)
+	action := "tool"
+	if _, ok := input["command"]; ok || strings.Contains(lowerMethod, "command") {
+		action = "command"
+		if name == "" {
+			name = "command"
+		}
+	} else if strings.Contains(lowerMethod, "filechange") || strings.Contains(lowerMethod, "edit") || input["path"] != nil || input["filePath"] != nil || input["patch"] != nil || input["diff"] != nil {
+		action = "edit"
+		if name == "" {
+			name = "edit"
+		}
+	}
+	if name == "" {
+		name = "runtime"
+	}
+	name = strings.TrimPrefix(name, "tool/")
+	return "tool/" + name, action
+}
+
+func codexApprovalArguments(params json.RawMessage) []runtimecontract.ApprovalArgument {
+	var input map[string]any
+	if json.Unmarshal(params, &input) != nil {
+		return nil
+	}
+	arguments := make([]runtimecontract.ApprovalArgument, 0, len(input))
+	for key, value := range input {
+		if !approvalActionKey(key) {
+			continue
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			continue
+		}
+		arguments = append(arguments, runtimecontract.ApprovalArgument{Name: key, Value: strings.Trim(string(encoded), `"`)})
+	}
+	sort.Slice(arguments, func(i, j int) bool { return arguments[i].Name < arguments[j].Name })
+	return arguments
 }
 
 func (c *codexRuntimeContract) UpdateBindingName(ctx context.Context, binding runtimecontract.Binding, name string) runtimecontract.Outcome {
@@ -118,15 +308,13 @@ func (c *codexRuntimeContract) StartTurn(ctx context.Context, request runtimecon
 	if failure := contextFailure(ctx, runtimecontract.FailurePhaseTurnStart); failure != nil {
 		return *failure
 	}
-	controls := c.turnControls()
+	controls := c.nativeTurnRequest(request)
 	c.setPendingTurn(request.TurnID, "")
 	if developerContext := contractDeveloperContext(request.Input); developerContext != "" {
-		if err := c.native.InjectDeveloperContext(request.Binding.NativeRef, developerContext, contractTimeout(ctx, 30*time.Second)); err != nil {
+		if err := c.native.InjectDeveloperContext(request.Binding.NativeRef, developerContext, contractTimeout(ctx, c.contextDeliveryTimeout())); err != nil {
 			return codexFailureOutcome(err, runtimecontract.FailurePhaseContextDelivery)
 		}
 	}
-	controls.NativeRef = request.Binding.NativeRef
-	controls.Input = contractInputToV1(request.Input)
 	controls.Timeout = contractTimeout(ctx, 4*time.Hour)
 	nativeTurnID, err := c.native.StartTurn(controls)
 	if err != nil {
@@ -189,17 +377,24 @@ func (c *codexRuntimeContract) SetEventHandler(handler func(runtimecontract.Even
 
 func (c *codexRuntimeContract) handleNativeEvent(method string, params json.RawMessage) int {
 	events := c.native.NormalizeEvent(method, params)
+	emitted := 0
 	for _, event := range events {
 		correlation := c.correlationForEvent(event)
+		if correlation.turnID == "" {
+			// A stale or unrelated native event has no Loom-owned causal target.
+			// Never guess that it belongs to the currently active Turn.
+			continue
+		}
 		canonical := runtimeContractEvent(event, correlation)
 		c.mu.Lock()
 		handler := c.handler
 		c.mu.Unlock()
 		if handler != nil {
 			handler(canonical)
+			emitted++
 		}
 	}
-	return len(events)
+	return emitted
 }
 
 func (c *codexRuntimeContract) setPendingTurn(turnID, predecessorTurnID string) {
@@ -225,7 +420,23 @@ func (c *codexRuntimeContract) bindTurn(turnID, predecessorTurnID, nativeTurnID 
 	c.mu.Unlock()
 }
 
-func (c *codexRuntimeContract) correlationForEvent(event RuntimeEvent) runtimeTurnCorrelation {
+func (c *codexRuntimeContract) turnIDForNative(nativeTurnID string) string {
+	return c.correlationForNative(nativeTurnID).turnID
+}
+
+func (c *codexRuntimeContract) correlationForNative(nativeTurnID string) runtimeTurnCorrelation {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.turnsByNative[nativeTurnID]
+}
+
+func (c *codexRuntimeContract) seedTurnBindings(bindings map[string]string) {
+	for loomTurnID, nativeTurnID := range bindings {
+		c.bindTurn(loomTurnID, "", nativeTurnID)
+	}
+}
+
+func (c *codexRuntimeContract) correlationForEvent(event nativeEvent) runtimeTurnCorrelation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	correlation := c.turnsByNative[event.NativeTurnID]
@@ -256,15 +467,17 @@ func (c *codexRuntimeContract) ReadHistory(ctx context.Context, request runtimec
 	history := runtimecontract.History{Total: native.Total}
 	for _, turn := range native.Turns {
 		diagnostic, _ := json.Marshal(turn)
+		correlation := c.correlationForNative(turn.ID)
 		history.Turns = append(history.Turns, runtimecontract.HistoryTurn{
-			TurnID:         c.turnIDForNative(turn.ID),
-			RuntimeTurnRef: turn.ID,
-			State:          codexHistoryState(turn.Status),
-			Content:        codexHistoryContent(turn.Items),
-			Usage:          codexContractUsage(turn.Usage),
-			StartedAt:      turn.StartedAt,
-			CompletedAt:    turn.CompletedAt,
-			Diagnostic:     diagnostic,
+			TurnID:            correlation.turnID,
+			PredecessorTurnID: correlation.predecessorTurnID,
+			RuntimeTurnRef:    turn.ID,
+			State:             codexHistoryState(turn.Status),
+			Content:           codexHistoryContent(turn.Items),
+			Usage:             codexContractUsage(turn.Usage),
+			StartedAt:         turn.StartedAt,
+			CompletedAt:       turn.CompletedAt,
+			Diagnostic:        diagnostic,
 		})
 	}
 	return history, nil
@@ -282,10 +495,118 @@ func (c *codexRuntimeContract) InspectInterruptedTurn(ctx context.Context, targe
 }
 
 func (c *codexRuntimeContract) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
-	return codexControlPlaneCapabilitySnapshot()
+	c.mu.Lock()
+	imageInput := c.providerID != deepSeekProviderID
+	c.mu.Unlock()
+	return codexControlPlaneCapabilitySnapshot(imageInput)
 }
 
-func (c *codexRuntimeContract) CloseBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {
+func (c *codexRuntimeContract) ValidateRuntimeInput(_ context.Context, _ runtimecontract.Binding, input []runtimecontract.InputBlock) *runtimecontract.Failure {
+	c.mu.Lock()
+	imageInput := c.providerID != deepSeekProviderID
+	c.mu.Unlock()
+	if imageInput {
+		return nil
+	}
+	for _, block := range input {
+		if block.Kind == runtimecontract.InputImage {
+			return &runtimecontract.Failure{Code: "image_input_unavailable", Phase: runtimecontract.FailurePhaseTurnStart, Message: "the active Runtime model does not accept image input"}
+		}
+	}
+	return nil
+}
+
+func (c *codexRuntimeContract) RuntimeGoal(ctx context.Context, binding runtimecontract.Binding) (*ThreadGoal, error) {
+	raw, err := c.native.client.Request("thread/goal/get", map[string]any{"threadId": binding.NativeRef}, contractTimeout(ctx, 15*time.Second))
+	if err != nil {
+		return nil, err
+	}
+	var response threadGoalGetResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, err
+	}
+	return response.Goal, nil
+}
+
+func (c *codexRuntimeContract) UpdateRuntimeGoal(ctx context.Context, binding runtimecontract.Binding, update GoalUpdateParams) (*ThreadGoal, error) {
+	params := goalUpdateRuntimeParams(update)
+	params["threadId"] = binding.NativeRef
+	raw, err := c.native.client.Request("thread/goal/set", params, contractTimeout(ctx, 20*time.Second))
+	if err != nil {
+		return nil, err
+	}
+	var response threadGoalSetResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, err
+	}
+	return &response.Goal, nil
+}
+
+func (c *codexRuntimeContract) ClearRuntimeGoal(ctx context.Context, binding runtimecontract.Binding) (bool, error) {
+	raw, err := c.native.client.Request("thread/goal/clear", map[string]any{"threadId": binding.NativeRef}, contractTimeout(ctx, 20*time.Second))
+	if err != nil {
+		return false, err
+	}
+	var response struct {
+		Cleared bool `json:"cleared"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return false, err
+	}
+	return response.Cleared, nil
+}
+
+func (c *codexRuntimeContract) RuntimeUsage(ctx context.Context, binding runtimecontract.Binding) (*RuntimeUsageReport, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	report, err := rollout.ReadUsage(binding.NativeRef)
+	if err != nil {
+		return nil, err
+	}
+	return codexRuntimeUsageReport(report), nil
+}
+
+func codexRuntimeUsageReport(report *rollout.UsageReport) *RuntimeUsageReport {
+	if report == nil {
+		return nil
+	}
+	tokens := func(value rollout.TokenUsage) RuntimeTokenUsage {
+		return RuntimeTokenUsage{
+			InputTokens: value.InputTokens, CachedInputTokens: value.CachedInputTokens,
+			OutputTokens: value.OutputTokens, ReasoningOutputTokens: value.ReasoningOutputTokens,
+			TotalTokens: value.TotalTokens, Calls: value.Calls,
+		}
+	}
+	result := &RuntimeUsageReport{
+		Lifetime: tokens(report.Lifetime), LatestCall: tokens(report.LatestCall), LatestModel: report.LatestModel,
+		ContextInputTokens: report.ContextInputTokens, ModelContextWindow: report.ModelContextWindow,
+		LastUpdatedAt: report.LastUpdatedAt,
+		Events:        make([]RuntimeUsageEvent, 0, len(report.Events)),
+		Turns:         make([]RuntimeTurnUsage, 0, len(report.Turns)),
+		Activity:      make([]RuntimeTurnActivity, 0, len(report.Activity)),
+	}
+	for _, event := range report.Events {
+		result.Events = append(result.Events, RuntimeUsageEvent{Timestamp: event.Timestamp, TurnID: event.TurnID, Model: event.Model, Usage: tokens(event.Usage)})
+	}
+	for _, turn := range report.Turns {
+		result.Turns = append(result.Turns, RuntimeTurnUsage{TurnID: turn.TurnID, Model: turn.Model, Usage: tokens(turn.Usage), LastUpdatedAt: turn.LastUpdatedAt})
+	}
+	for _, activity := range report.Activity {
+		result.Activity = append(result.Activity, RuntimeTurnActivity{TurnID: activity.TurnID, StartedAt: activity.StartedAt, EndedAt: activity.EndedAt, Status: activity.Status, InferredEnd: activity.InferredEnd})
+	}
+	return result
+}
+
+func (c *codexRuntimeContract) CompactRuntimeBinding(ctx context.Context, binding runtimecontract.Binding) error {
+	_, err := c.native.client.Request("thread/compact/start", map[string]any{"threadId": binding.NativeRef}, contractTimeout(ctx, 60*time.Second))
+	return err
+}
+
+func (c *codexRuntimeContract) CloseBinding(ctx context.Context, _ runtimecontract.Binding) runtimecontract.Outcome {
+	if failure := contextFailure(ctx, runtimecontract.FailurePhaseClose); failure != nil {
+		return *failure
+	}
 	if c.release != nil {
 		c.release()
 	}
@@ -337,17 +658,17 @@ func contractTimeout(ctx context.Context, fallback time.Duration) time.Duration 
 	return fallback
 }
 
-func contractInputToV1(input []runtimecontract.InputBlock) []RuntimeInput {
-	result := make([]RuntimeInput, 0, len(input))
+func contractInputToV1(input []runtimecontract.InputBlock) []nativeInput {
+	result := make([]nativeInput, 0, len(input))
 	for _, block := range input {
 		if block.Role == runtimecontract.InputRoleDeveloper {
 			continue
 		}
 		switch block.Kind {
 		case runtimecontract.InputText:
-			result = append(result, RuntimeInput{Kind: RuntimeInputText, Text: block.Text})
+			result = append(result, nativeInput{Kind: nativeInputText, Text: block.Text})
 		case runtimecontract.InputImage:
-			result = append(result, RuntimeInput{Kind: RuntimeInputLocalImage, Path: block.Ref, MimeType: block.MIMEType})
+			result = append(result, nativeInput{Kind: nativeInputLocalImage, Path: block.Ref, MimeType: block.MIMEType})
 		}
 	}
 	return result
@@ -572,7 +893,7 @@ func codexHistoryText(item map[string]any) string {
 	return strings.Join(text, "")
 }
 
-func codexContractUsage(usage *RuntimeTokenUsage) *runtimecontract.Usage {
+func codexContractUsage(usage *nativeTokenUsage) *runtimecontract.Usage {
 	if usage == nil {
 		return nil
 	}
@@ -587,24 +908,24 @@ func codexContractUsage(usage *RuntimeTokenUsage) *runtimecontract.Usage {
 	}
 }
 
-func runtimeContractEvent(event RuntimeEvent, correlation runtimeTurnCorrelation) runtimecontract.Event {
+func runtimeContractEvent(event nativeEvent, correlation runtimeTurnCorrelation) runtimecontract.Event {
 	canonical := runtimecontract.Event{
 		TurnID: correlation.turnID, PredecessorTurnID: correlation.predecessorTurnID, RuntimeTurnRef: event.NativeTurnID,
 	}
 	switch event.Kind {
-	case RuntimeTurnStarted:
+	case nativeTurnStarted:
 		canonical.Kind = runtimecontract.EventTurnStarted
-	case RuntimeTurnCompleted, RuntimeTurnFailed, RuntimeTurnInterrupted:
+	case nativeTurnCompleted, nativeTurnFailed, nativeTurnInterrupted:
 		canonical.Kind = runtimecontract.EventTerminal
 		state := runtimecontract.LifecycleCompleted
-		if event.Kind == RuntimeTurnFailed {
+		if event.Kind == nativeTurnFailed {
 			state = runtimecontract.LifecycleFailed
 		}
-		if event.Kind == RuntimeTurnInterrupted {
+		if event.Kind == nativeTurnInterrupted {
 			state = runtimecontract.LifecycleInterrupted
 		}
 		canonical.Outcome = &runtimecontract.Outcome{State: state, RuntimeTurnRef: event.NativeTurnID}
-		if event.Kind == RuntimeTurnFailed {
+		if event.Kind == nativeTurnFailed {
 			message := event.Error
 			if message == "" {
 				message = "Runtime Turn failed"
@@ -614,13 +935,13 @@ func runtimeContractEvent(event RuntimeEvent, correlation runtimeTurnCorrelation
 	default:
 		canonical.Kind = runtimecontract.EventContent
 		switch event.Kind {
-		case RuntimeTextDelta, RuntimeReasoningDelta:
+		case nativeTextDelta, nativeReasoningDelta:
 			canonical.ContentPhase = runtimecontract.ContentPhaseDelta
-		case RuntimeToolStarted:
+		case nativeToolStarted:
 			canonical.ContentPhase = runtimecontract.ContentPhaseStarted
-		case RuntimeToolUpdated:
+		case nativeToolUpdated:
 			canonical.ContentPhase = runtimecontract.ContentPhaseUpdated
-		case RuntimeToolCompleted:
+		case nativeToolCompleted:
 			canonical.ContentPhase = runtimecontract.ContentPhaseCompleted
 		default:
 			canonical.ContentPhase = runtimecontract.ContentPhaseCompleted
@@ -632,13 +953,13 @@ func runtimeContractEvent(event RuntimeEvent, correlation runtimeTurnCorrelation
 		content := runtimecontract.ContentBlock{ID: id, Text: event.Text}
 		content.Diagnostic, _ = json.Marshal(event.Item)
 		switch event.Kind {
-		case RuntimeUserInput:
+		case nativeUserInput:
 			content.Kind = runtimecontract.ContentUserText
-		case RuntimeTextDelta, RuntimeTextCompleted:
+		case nativeTextDelta, nativeTextCompleted:
 			content.Kind = runtimecontract.ContentAssistantText
-		case RuntimeReasoningDelta, RuntimeReasoningCompleted:
+		case nativeReasoningDelta, nativeReasoningCompleted:
 			content.Kind = runtimecontract.ContentReasoning
-		case RuntimeToolCompleted:
+		case nativeToolCompleted:
 			content.Kind = runtimecontract.ContentToolResult
 			content.Text = ""
 			content.ToolResult = codexToolResult(id, event.Item)

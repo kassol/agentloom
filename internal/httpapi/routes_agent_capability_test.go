@@ -11,7 +11,7 @@ import (
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
-func TestAgentDetailReportsTruthfulPiRuntimeCapabilities(t *testing.T) {
+func TestAgentDetailUsesCapabilitySnapshotAsOnlyRuntimeCapabilitySurface(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -28,16 +28,12 @@ func TestAgentDetailReportsTruthfulPiRuntimeCapabilities(t *testing.T) {
 
 	response := topicRequest(t, server, http.MethodGet, "/api/agents/agent-pi", nil, http.StatusOK)
 	agent := response["agent"].(map[string]any)
-	capabilities := agent["runtimeCapabilities"].(map[string]any)
-	for _, capability := range []string{"history", "causalSteer", "interrupt", "approval", "provider"} {
-		if capabilities[capability] != true {
-			t.Fatalf("Pi %s capability = %#v", capability, capabilities[capability])
-		}
+	if _, exists := agent["runtimeCapabilities"]; exists {
+		t.Fatalf("Agent detail retained obsolete flat Runtime capabilities: %#v", agent)
 	}
-	for _, capability := range []string{"goal", "remote", "usage", "compaction", "skills", "naming", "archive", "sandbox", "imageInput"} {
-		if value, exists := capabilities[capability]; !exists || value != false {
-			t.Fatalf("Pi %s capability = %#v, exists=%v", capability, value, exists)
-		}
+	snapshot, ok := agent["capabilitySnapshot"].(map[string]any)
+	if !ok || snapshot["revision"] == "" || len(snapshot["capabilities"].([]any)) == 0 {
+		t.Fatalf("Agent detail omitted scoped capability snapshot: %#v", agent)
 	}
 }
 

@@ -306,7 +306,8 @@ func TestResumeTriggerReroutesLegacyGitHubConnectionToExactOwner(t *testing.T) {
 	}
 	select {
 	case connectionID := <-observedWith:
-		trigger, _ = h.GetTrigger(trigger.ID)
+		trigger = waitForTriggerState(t, h, trigger.ID, "armed")
+		h.workers.Wait()
 		if trigger.State != "armed" || trigger.ConnectionID != "conn-parall" || connectionID != "conn-parall" {
 			t.Fatalf("resumed trigger = %#v, observed with = %q", trigger, connectionID)
 		}

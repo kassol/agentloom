@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 const (
@@ -46,6 +49,22 @@ type threadGoalGetResponse struct {
 
 type threadGoalSetResponse struct {
 	Goal ThreadGoal `json:"goal"`
+}
+
+func goalUpdateRuntimeParams(update GoalUpdateParams) map[string]any {
+	params := map[string]any{}
+	if update.Objective != nil {
+		params["objective"] = strings.TrimSpace(*update.Objective)
+	}
+	if update.Status != nil {
+		params["status"] = strings.TrimSpace(*update.Status)
+	}
+	if update.TokenBudget != nil {
+		params["tokenBudget"] = *update.TokenBudget
+	} else if update.ClearTokenBudget {
+		params["tokenBudget"] = nil
+	}
+	return params
 }
 
 func validGoalStatus(status string) bool {
@@ -197,7 +216,7 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 	h.mu.Lock()
 	targets := make([]target, 0, len(h.agents))
 	for _, agent := range h.agents {
-		if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" || !h.runtimeCapabilitiesLocked(agent).Goal {
+		if strings.TrimSpace(agent.RuntimeBinding.NativeRef) == "" || !runtimeCapabilityAvailableLocked(agent, runtimecontract.CapabilityGoal) {
 			continue
 		}
 		providerID, model := effectiveProviderBinding(agent)
@@ -211,25 +230,29 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 
 	active := make([]target, 0)
 	for _, target := range targets {
-		raw, err := host.client.Request("thread/goal/get", map[string]any{"threadId": target.threadID}, 15*time.Second)
+		contract := host.agentContract(target.agentID)
+		configureRuntimeBinding(contract, target.sandbox, target.provider, target.model, target.disabledSkillPaths)
+		capability, ok := contract.(runtimeGoalCapability)
+		if !ok {
+			log.Printf("[codex-loom] hydrate Goal for %s: Runtime Goal capability is unavailable", target.threadID)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		goal, err := capability.RuntimeGoal(ctx, runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: target.threadID})
+		cancel()
 		if err != nil {
 			log.Printf("[codex-loom] hydrate Goal for %s: %v", target.threadID, err)
 			continue
 		}
-		var response threadGoalGetResponse
-		if err := json.Unmarshal(raw, &response); err != nil {
-			log.Printf("[codex-loom] decode Goal for %s: %v", target.threadID, err)
-			continue
-		}
 		h.mu.Lock()
-		h.applyGoalLocked(target.agentID, response.Goal, false)
-		if response.Goal != nil {
+		h.applyGoalLocked(target.agentID, goal, false)
+		if goal != nil {
 			if agent := h.agents[target.agentID]; agent != nil {
 				h.emitStatusLocked(agent, agent.Status)
 			}
 		}
 		h.mu.Unlock()
-		if response.Goal != nil && response.Goal.Status == GoalStatusActive {
+		if goal != nil && goal.Status == GoalStatusActive {
 			active = append(active, target)
 		}
 	}
@@ -237,7 +260,12 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 	// Resuming an active Goal hands continuation back to Codex. Paused,
 	// blocked, limited, and complete Goals remain visible without starting work.
 	for _, target := range active {
-		if err := resumeThread(host.client, target.threadID, target.sandbox, target.cwd, target.provider, target.model, target.disabledSkillPaths); err != nil {
+		contract := host.agentContract(target.agentID)
+		configureRuntimeBinding(contract, target.sandbox, target.provider, target.model, target.disabledSkillPaths)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		outcome := contract.ResumeBinding(ctx, runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: target.threadID})
+		cancel()
+		if err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false); err != nil {
 			log.Printf("[codex-loom] resume active Goal for %s: %v", target.threadID, err)
 		}
 	}
@@ -254,29 +282,31 @@ func (h *Hub) GetGoal(key string) (*ThreadGoal, error) {
 		h.mu.Unlock()
 		return nil, errf(404, "agent not found: %s", key)
 	}
-	if !h.runtimeCapabilitiesLocked(agent).Goal {
+	rt, err := h.getRuntimeLocked(agent)
+	if err != nil {
 		h.mu.Unlock()
-		return nil, unsupportedRuntimeCapability(agent, "Goal")
+		return nil, err
 	}
 	agentID, threadID := agent.ID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	if strings.TrimSpace(threadID) == "" {
 		return nil, errf(409, "agent has no Codex Thread binding")
 	}
-	host, err := h.ensureCodexHost()
-	if err != nil {
-		return nil, err
+	if err := waitReady(rt); err != nil {
+		return nil, errf(500, "Runtime not ready: %s", err)
 	}
-	raw, err := host.client.Request("thread/goal/get", map[string]any{"threadId": threadID}, 15*time.Second)
-	if err != nil {
-		return nil, errf(500, "read Codex Goal: %s", err)
+	capability, ok := rt.runtimeContract.(runtimeGoalCapability)
+	if !ok {
+		return nil, unsupportedRuntimeCapability(agent, "Goal")
 	}
-	var response threadGoalGetResponse
-	if err := json.Unmarshal(raw, &response); err != nil {
-		return nil, errf(500, "decode Codex Goal: %s", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	goalResult, err := capability.RuntimeGoal(ctx, rt.binding)
+	if err != nil {
+		return nil, errf(500, "read Runtime Goal: %s", err)
 	}
 	h.mu.Lock()
-	h.applyGoalLocked(agentID, response.Goal, false)
+	h.applyGoalLocked(agentID, goalResult, false)
 	h.mu.Unlock()
 	h.mu.Lock()
 	goal := cloneGoal(h.goals[agentID])
@@ -325,38 +355,42 @@ func (h *Hub) UpdateGoal(key string, update GoalUpdateParams) (*ThreadGoal, erro
 		h.mu.Unlock()
 		return nil, errf(404, "agent not found: %s", key)
 	}
-	if !h.runtimeCapabilitiesLocked(agent).Goal {
+	rt, err := h.getRuntimeLocked(agent)
+	if err != nil {
 		h.mu.Unlock()
-		return nil, unsupportedRuntimeCapability(agent, "Goal")
+		return nil, err
 	}
 	agentID, threadID := agent.ID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	if strings.TrimSpace(threadID) == "" {
 		return nil, errf(409, "agent has no Codex Thread binding")
 	}
-	params["threadId"] = threadID
-	host, err := h.ensureCodexHost()
-	if err != nil {
-		return nil, err
+	if err := waitReady(rt); err != nil {
+		return nil, errf(500, "Runtime not ready: %s", err)
 	}
-	raw, err := host.client.Request("thread/goal/set", params, 20*time.Second)
-	if err != nil {
-		return nil, errf(500, "update Codex Goal: %s", err)
+	capability, ok := rt.runtimeContract.(runtimeGoalCapability)
+	if !ok {
+		return nil, unsupportedRuntimeCapability(agent, "Goal")
 	}
-	var response threadGoalSetResponse
-	if err := json.Unmarshal(raw, &response); err != nil || strings.TrimSpace(response.Goal.ThreadID) == "" {
-		return nil, errf(500, "decode Codex Goal: %s", decodeError(err))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	goalResult, err := capability.UpdateRuntimeGoal(ctx, rt.binding, update)
+	if err != nil {
+		return nil, errf(500, "update Runtime Goal: %s", err)
+	}
+	if goalResult == nil || strings.TrimSpace(goalResult.ThreadID) == "" {
+		return nil, errf(500, "Runtime Goal update returned no Goal")
 	}
 	h.mu.Lock()
 	wasReserved := h.activeGoalReservesThreadLocked(agentID)
-	h.applyGoalLocked(agentID, &response.Goal, true)
+	h.applyGoalLocked(agentID, goalResult, true)
 	if wasReserved && !h.activeGoalReservesThreadLocked(agentID) {
 		h.startPendingWorkersLocked(agentID)
 	}
 	h.mu.Unlock()
 
-	if response.Goal.Status == GoalStatusActive {
-		h.startWorker(func() { h.resumeGoalThread(agentID, host.generation) })
+	if goalResult.Status == GoalStatusActive {
+		h.startWorker(func() { h.resumeGoalThread(agentID) })
 	}
 	h.mu.Lock()
 	goal := cloneGoal(h.goals[agentID])
@@ -375,43 +409,42 @@ func (h *Hub) ClearGoal(key string) (bool, error) {
 		h.mu.Unlock()
 		return false, errf(404, "agent not found: %s", key)
 	}
-	if !h.runtimeCapabilitiesLocked(agent).Goal {
+	rt, err := h.getRuntimeLocked(agent)
+	if err != nil {
 		h.mu.Unlock()
-		return false, unsupportedRuntimeCapability(agent, "Goal")
+		return false, err
 	}
 	agentID, threadID := agent.ID, agent.RuntimeBinding.NativeRef
 	h.mu.Unlock()
 	if strings.TrimSpace(threadID) == "" {
 		return false, errf(409, "agent has no Codex Thread binding")
 	}
-	host, err := h.ensureCodexHost()
+	if err := waitReady(rt); err != nil {
+		return false, errf(500, "Runtime not ready: %s", err)
+	}
+	capability, ok := rt.runtimeContract.(runtimeGoalCapability)
+	if !ok {
+		return false, unsupportedRuntimeCapability(agent, "Goal")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cleared, err := capability.ClearRuntimeGoal(ctx, rt.binding)
 	if err != nil {
-		return false, err
+		return false, errf(500, "clear Runtime Goal: %s", err)
 	}
-	raw, err := host.client.Request("thread/goal/clear", map[string]any{"threadId": threadID}, 20*time.Second)
-	if err != nil {
-		return false, errf(500, "clear Codex Goal: %s", err)
-	}
-	var response struct {
-		Cleared bool `json:"cleared"`
-	}
-	if err := json.Unmarshal(raw, &response); err != nil {
-		return false, errf(500, "decode clear Goal response: %s", err)
-	}
-	if response.Cleared {
+	if cleared {
 		h.mu.Lock()
 		h.applyGoalLocked(agentID, nil, true)
 		h.startPendingWorkersLocked(agentID)
 		h.mu.Unlock()
 	}
-	return response.Cleared, nil
+	return cleared, nil
 }
 
-func (h *Hub) resumeGoalThread(agentID string, generation uint64) {
+func (h *Hub) resumeGoalThread(agentID string) {
 	h.mu.Lock()
-	host := h.codexHost
 	agent := h.agents[agentID]
-	if h.providerSwitching || host == nil || host.generation != generation || agent == nil || h.goals[agentID] == nil || h.goals[agentID].Status != GoalStatusActive {
+	if h.providerSwitching || agent == nil || h.goals[agentID] == nil || h.goals[agentID].Status != GoalStatusActive {
 		h.mu.Unlock()
 		return
 	}
@@ -419,12 +452,18 @@ func (h *Hub) resumeGoalThread(agentID string, generation uint64) {
 		h.mu.Unlock()
 		return
 	}
-	threadID, sandbox, cwd := agent.RuntimeBinding.NativeRef, agent.Sandbox, agent.Cwd
-	providerID, model := effectiveProviderBinding(agent)
-	disabledSkillPaths := h.disabledSkillPathsLocked(agent.ID)
+	rt, err := h.getRuntimeLocked(agent)
 	h.mu.Unlock()
-	if err := resumeThread(host.client, threadID, sandbox, cwd, providerID, model, disabledSkillPaths); err != nil {
-		log.Printf("[codex-loom] resume Goal for %s: %v", threadID, err)
+	if err != nil {
+		log.Printf("[codex-loom] acquire Runtime for active Goal %s: %v", agentID, err)
+		return
+	}
+	if err := waitReady(rt); err != nil {
+		log.Printf("[codex-loom] wait Runtime for active Goal %s: %v", agentID, err)
+		return
+	}
+	if err := h.resumeAgentThread(agentID, rt); err != nil {
+		log.Printf("[codex-loom] resume Goal for %s: %v", agentID, err)
 	}
 }
 

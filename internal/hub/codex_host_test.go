@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -48,7 +49,7 @@ func TestSharedCodexHostRoutesRemoteTurnIntoAgentEvents(t *testing.T) {
 	host := h.codexHost
 	runtime := h.runtimes["agent-1"]
 	h.mu.Unlock()
-	if host == nil || runtime == nil || runtime.client != host.client {
+	if host == nil || runtime == nil || runtime.hostGeneration != host.generation {
 		t.Fatalf("Agent runtime is not attached to the shared CodexHost")
 	}
 	if agent.Status != "idle" || agent.LastTurn == nil || agent.LastTurn.TurnID == "turn-remote" ||
@@ -62,13 +63,23 @@ func TestSharedCodexHostRoutesRemoteTurnIntoAgentEvents(t *testing.T) {
 	}
 	var sawUser, sawDelta, sawCompleted bool
 	for _, event := range events {
-		switch event.Type {
-		case "item/started":
-			sawUser = strings.Contains(string(event.Data), "hello from phone")
-		case "item/agentMessage/delta":
-			sawDelta = true
-		case "turn/completed":
-			sawCompleted = true
+		if event.Type != "loom/runtime-event" {
+			continue
+		}
+		var typed runtimecontract.Event
+		if err := json.Unmarshal(event.Data, &typed); err != nil {
+			t.Fatal(err)
+		}
+		switch typed.Kind {
+		case runtimecontract.EventContent:
+			if typed.Content != nil && typed.Content.Kind == runtimecontract.ContentUserText {
+				sawUser = strings.Contains(typed.Content.Text, "hello from phone")
+			}
+			if typed.Content != nil && typed.Content.Kind == runtimecontract.ContentAssistantText && typed.ContentPhase == runtimecontract.ContentPhaseDelta {
+				sawDelta = true
+			}
+		case runtimecontract.EventTerminal:
+			sawCompleted = typed.Outcome != nil && typed.Outcome.State == runtimecontract.LifecycleCompleted
 		}
 	}
 	if !sawUser || !sawDelta || !sawCompleted {
@@ -178,7 +189,7 @@ func TestInterruptRetriesWithAuthoritativeActiveTurnID(t *testing.T) {
 		t.Fatal(err)
 	}
 	rt := &runtime{
-		agentID: "agent-race", agentRuntime: handle.facade, agentHost: handle, runtimeContract: handle.contract, client: host.client, hostGeneration: host.generation,
+		agentID: "agent-race", agentHost: handle, runtimeContract: handle.contract, hostGeneration: host.generation,
 		ready: host.ready, approvals: map[string]*approval{}, activeTurn: turn,
 	}
 	h.bindCodexContract(meta, rt, handle.contract)
@@ -256,15 +267,12 @@ func TestTwoAgentsShareOneCodexHost(t *testing.T) {
 	host := h.codexHost
 	h.mu.Unlock()
 	if host == nil || firstRuntime == nil || secondRuntime == nil ||
-		firstRuntime.client != host.client || secondRuntime.client != host.client {
+		firstRuntime.hostGeneration != host.generation || secondRuntime.hostGeneration != host.generation {
 		t.Fatal("Agents do not share the same CodexHost client")
 	}
 	if firstRuntime.agentHost == nil || secondRuntime.agentHost == nil || firstRuntime.agentHost == secondRuntime.agentHost ||
 		firstRuntime.runtimeContract == nil || secondRuntime.runtimeContract == nil || firstRuntime.runtimeContract == secondRuntime.runtimeContract {
 		t.Fatal("Agents did not receive distinct v2 AgentHost and Runtime Contract handles")
-	}
-	if _, ok := firstRuntime.agentRuntime.(*codexRuntimeV1Facade); !ok {
-		t.Fatalf("Codex v1 backend = %T, want thin v2 facade", firstRuntime.agentRuntime)
 	}
 	if got := countRequestMethod(t, logPath, "initialize"); got != 1 {
 		t.Fatalf("initialize requests = %d, want one", got)
@@ -814,6 +822,12 @@ while IFS= read -r line; do
 	  printf '{"id":%s,"result":{"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}}\n' "$id" ;;
 	*'"method":"config/batchWrite"'*)
 	  printf '{"id":%s,"result":{"filePath":"/tmp/config.toml","status":"ok","version":"config-v2"}}\n' "$id" ;;
+	*'"method":"thread/goal/get"'*'"threadId":"thr-stale"'*)
+	  printf '{"id":%s,"result":{"goal":{"threadId":"thr-stale","objective":"initial conformance goal","status":"active"}}}\n' "$id" ;;
+	*'"method":"thread/goal/set"'*'"threadId":"thr-stale"'*)
+	  printf '{"id":%s,"result":{"goal":{"threadId":"thr-stale","objective":"conformance goal","status":"active"}}}\n' "$id" ;;
+	*'"method":"thread/goal/clear"'*'"threadId":"thr-stale"'*)
+	  printf '{"id":%s,"result":{"cleared":true}}\n' "$id" ;;
 	*'"method":"thread/start"'*'codexloom-provider-verify-'*'"modelProvider":"deepseek"'*)
 	  printf '{"id":%s,"result":{"thread":{"id":"thr-provider-verify"}}}\n' "$id" ;;
 	*'"method":"turn/start"'*'"threadId":"thr-provider-verify"'*)
@@ -860,6 +874,12 @@ while IFS= read -r line; do
 	  printf '{"id":%s,"result":{"turn":{"id":"turn-corrected-model"}}}\n' "$id"
 	  printf '{"method":"turn/started","params":{"threadId":"thr-stale","turn":{"id":"turn-corrected-model","status":"inProgress"}}}\n'
 	  printf '{"method":"turn/completed","params":{"threadId":"thr-stale","turn":{"id":"turn-corrected-model","status":"completed"}}}\n' ;;
+	*'"method":"turn/start"'*'causal action after reading the reopened predecessor'*)
+	  printf '{"id":%s,"result":{"turn":{"id":"turn-causal"}}}\n' "$id" ;;
+	*'"method":"turn/steer"'*'continue from the reopened predecessor'*)
+	  printf '{"id":%s,"result":{"turnId":"turn-causal"}}\n' "$id" ;;
+	*'"method":"turn/interrupt"'*'"turnId":"turn-causal"'*)
+	  printf '{"id":%s,"result":{}}\n' "$id" ;;
 	*'"method":"turn/start"'*'"early-event"'*)
 	  printf '{"method":"turn/started","params":{"threadId":"thr-stale","turn":{"id":"turn-native-early","status":"inProgress"}}}\n'
 	  printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr-stale","turnId":"turn-native-early","itemId":"answer-early","delta":"early"}}\n'

@@ -83,7 +83,7 @@ func (h *Hub) codexDriverLocked() *codexRuntimeHostDriver {
 		h.codexHostDriver = newCodexRuntimeHostDriver(h)
 	}
 	if h.runtimeHostDrivers == nil {
-		h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{}
+		h.runtimeHostDrivers = map[string]RuntimeHostDriver{}
 	}
 	h.runtimeHostDrivers["codex"] = h.codexHostDriver
 	return h.codexHostDriver
@@ -137,7 +137,7 @@ func (d *codexRuntimeHostDriver) startLocked() (*codexHostRuntime, error) {
 		h.onHostNotification(host.generation, method, params)
 	}
 	client.OnServerRequest = func(id json.RawMessage, method string, params json.RawMessage) {
-		h.onHostServerRequest(host.generation, id, method, params)
+		d.onNativeServerRequest(host, id, method, params)
 	}
 	client.OnClose = func() { h.onHostClose(host.generation) }
 	h.codexHost = host
@@ -171,7 +171,7 @@ func (h *Hub) markThreadControlIndeterminate(rt *runtime, threadID, method strin
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	host := h.codexHost
-	if host == nil || host.generation != rt.hostGeneration || host.client != rt.client {
+	if host == nil || host.generation != rt.hostGeneration {
 		return
 	}
 	if host.indeterminateThreads == nil {
@@ -198,16 +198,7 @@ func (h *Hub) verifyRuntimeThreadControl(agentID string, rt *runtime) error {
 		}
 		return nil
 	}
-	// Compatibility-only v1 runtimes retain their historical fence until the
-	// v1 removal ticket deletes this projection.
-	if rt != nil && rt.client == nil && runtimeBackend(rt) != nil {
-		return nil
-	}
-	host := h.codexHost
-	if host == nil || rt == nil || host.generation != rt.hostGeneration || host.client != rt.client {
-		return errf(500, "CodexHost changed before Thread control started")
-	}
-	return h.threadControlFailureLocked(meta.RuntimeBinding.NativeRef)
+	return errf(500, "Agent Runtime Contract is unavailable")
 }
 
 func (h *Hub) materializeModelCatalog() (modelcatalog.Snapshot, error) {
@@ -468,9 +459,9 @@ func (h *Hub) runtimeForThreadLocked(threadID string) *runtime {
 				return nil
 			}
 			rt := &runtime{
-				agentID: id, agentRuntime: handle.facade, agentHost: handle, runtimeContract: handle.contract,
-				client: host.client, hostGeneration: host.generation,
-				ready: ready, approvals: map[string]*approval{},
+				agentID: id, agentHost: handle, runtimeContract: handle.contract,
+				hostGeneration: host.generation,
+				ready:          ready, approvals: map[string]*approval{},
 			}
 			handle.SetFailureHandler(func(err error) { h.onCodexHostFailure(rt, err) })
 			h.bindCodexContract(meta, rt, handle.contract)
@@ -574,9 +565,9 @@ func (h *Hub) adoptThreadLocked(threadID, threadName, cwd string) *runtime {
 		return nil
 	}
 	rt := &runtime{
-		agentID: id, agentRuntime: handle.facade, agentHost: handle, runtimeContract: handle.contract,
-		client: host.client, hostGeneration: host.generation,
-		ready: ready, approvals: map[string]*approval{},
+		agentID: id, agentHost: handle, runtimeContract: handle.contract,
+		hostGeneration: host.generation,
+		ready:          ready, approvals: map[string]*approval{},
 	}
 	handle.SetFailureHandler(func(err error) { h.onCodexHostFailure(rt, err) })
 	h.bindCodexContract(meta, rt, handle.contract)
@@ -642,7 +633,7 @@ func (h *Hub) onHostNotification(generation uint64, method string, params json.R
 		if driver != nil {
 			canonical = driver.dispatchNativeEvent(rt.agentID, method, params)
 		}
-		h.onCodexCompatibilityNotification(rt, method, params, canonical)
+		h.onCodexNativeNotification(rt, method, params, canonical)
 	}
 }
 
@@ -656,7 +647,7 @@ func (h *Hub) bindCodexContract(meta *Agent, rt *runtime, contract *codexRuntime
 	contract.SetEventHandler(func(event runtimecontract.Event) { h.onCanonicalRuntimeEvent(rt, event) })
 }
 
-func (h *Hub) onCodexCompatibilityNotification(rt *runtime, method string, params json.RawMessage, canonical bool) {
+func (h *Hub) onCodexNativeNotification(rt *runtime, method string, params json.RawMessage, canonical bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	meta := h.agents[rt.agentID]
@@ -671,8 +662,8 @@ func (h *Hub) onCodexCompatibilityNotification(rt *runtime, method string, param
 			}
 		}
 	}
-	// These native-only notifications remain compatibility side effects until
-	// their dedicated Runtime Capabilities migrate to typed events.
+	// These native-only notifications update Loom-owned controls without
+	// entering the canonical Runtime event stream.
 	if method == "error" && rt.activeTurn != nil && !rt.activeTurn.finished && rt.activeTurn.forcedFailure == "" {
 		if failure, interrupt := customProviderModelRouteFailure(meta.ProviderID, meta.Model, params); failure != "" {
 			rt.activeTurn.forcedFailure = failure
@@ -684,11 +675,6 @@ func (h *Hub) onCodexCompatibilityNotification(rt *runtime, method string, param
 	if method == "thread/goal/updated" || method == "thread/goal/cleared" {
 		h.onGoalNotificationLocked(meta.ID, method, params)
 	}
-	turnID := ""
-	if rt.activeTurn != nil {
-		turnID = rt.activeTurn.turnID
-	}
-	h.emitLocked(meta.ID, method, runtimePublicPayload(params, meta.ThreadID, turnID, true))
 	h.appendRuntimeDiagnosticLocked(meta.ID, method, params)
 }
 
@@ -765,37 +751,6 @@ func (h *Hub) hydrateAdoptedAgent(generation uint64, agentID, threadID string) {
 	}
 }
 
-func (h *Hub) onHostServerRequest(generation uint64, id json.RawMessage, method string, params json.RawMessage) {
-	threadID := notificationThreadID(params)
-	h.mu.Lock()
-	if h.codexHost == nil || h.codexHost.generation != generation {
-		h.mu.Unlock()
-		return
-	}
-	rt := h.runtimeForThreadLocked(threadID)
-	if rt == nil {
-		// Older approval payloads may omit threadId. An app-server only has one
-		// active turn per thread, so route to the sole active Loom thread.
-		for _, candidate := range h.runtimes {
-			if candidate.activeTurn == nil || candidate.activeTurn.finished {
-				continue
-			}
-			if rt != nil {
-				rt = nil
-				break
-			}
-			rt = candidate
-		}
-	}
-	client := h.codexHost.client
-	h.mu.Unlock()
-	if rt != nil {
-		h.onServerRequest(rt, id, method, params)
-		return
-	}
-	_ = client.RespondError(id, -32601, "CodexLoom cannot route "+method+" without a threadId")
-}
-
 func (h *Hub) onHostClose(generation uint64) {
 	h.mu.Lock()
 	driver := h.codexHostDriver
@@ -847,12 +802,14 @@ func (h *Hub) invalidateRuntimeEffectDomain(rt *runtime, cause error) {
 	if rt == nil {
 		return
 	}
-	if rt.client == nil {
+	if rt.hostGeneration == 0 {
 		h.mu.Lock()
 		rt.effectDomainInvalidated = true
 		h.mu.Unlock()
-		if backend := runtimeBackend(rt); backend != nil {
-			backend.Close()
+		if rt.agentHost != nil {
+			rt.agentHost.Close()
+		} else if rt.runtimeContract != nil {
+			_ = runtimeLifecycleOutcomeError(rt.runtimeContract.CloseBinding(context.Background(), rt.binding), runtimecontract.LifecycleCompleted, false)
 		}
 		return
 	}
@@ -863,11 +820,11 @@ func (h *Hub) invalidateRuntimeEffectDomain(rt *runtime, cause error) {
 	rt.effectDomainInvalidated = true
 	host := h.codexHost
 	driver := h.codexHostDriver
-	valid := host != nil && host.generation == rt.hostGeneration && host.client == rt.client
+	valid := host != nil && host.generation == rt.hostGeneration
 	var affected []*runtime
 	if valid {
 		for _, candidate := range h.runtimes {
-			if candidate == nil || candidate.hostGeneration != host.generation || candidate.client != host.client {
+			if candidate == nil || candidate.hostGeneration != host.generation {
 				continue
 			}
 			candidate.effectDomainInvalidated = true

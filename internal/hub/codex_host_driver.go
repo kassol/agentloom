@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
+	"github.com/yan5xu/codex-loom/internal/rollout"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
@@ -23,6 +24,12 @@ type codexRuntimeHostDriver struct {
 
 func newCodexRuntimeHostDriver(h *Hub) *codexRuntimeHostDriver {
 	return &codexRuntimeHostDriver{hub: h, handles: map[string]*codexAgentHost{}, failedHosts: map[uint64]bool{}}
+}
+
+// agentContract keeps the native client inside the Codex Host adapter while
+// startup hydration consumes only Runtime Contract capabilities.
+func (h *codexHostRuntime) agentContract(agentID string) runtimecontract.Contract {
+	return &codexRuntimeContract{agentID: agentID, native: &codexAgentRuntime{client: h.client}}
 }
 
 func (d *codexRuntimeHostDriver) Preflight(context.Context) error {
@@ -47,6 +54,18 @@ func (d *codexRuntimeHostDriver) CapabilitySnapshot(context.Context, runtimecont
 	return codexControlPlaneCapabilitySnapshot()
 }
 
+func (d *codexRuntimeHostDriver) SanitizeProviderHistory(_ context.Context, nativeRef, backupDir string) (RuntimeProviderHistorySanitizeResult, error) {
+	result, err := rollout.SanitizeReasoningContent(nativeRef, backupDir)
+	if err != nil {
+		return RuntimeProviderHistorySanitizeResult{}, err
+	}
+	return RuntimeProviderHistorySanitizeResult{Changed: result.Changed, OriginalPath: result.OriginalPath, BackupPath: result.BackupPath}, nil
+}
+
+func (d *codexRuntimeHostDriver) RestoreProviderHistory(_ context.Context, backupPath, originalPath string) error {
+	return rollout.RestoreRolloutBackup(backupPath, originalPath)
+}
+
 func (d *codexRuntimeHostDriver) HistoryContract(request AgentHostRequest) runtimecontract.Contract {
 	return &codexRuntimeContract{agentID: request.AgentID, native: &codexAgentRuntime{}, turnsByNative: map[string]runtimeTurnCorrelation{}}
 }
@@ -65,11 +84,6 @@ func (d *codexRuntimeHostDriver) Acquire(ctx context.Context, request AgentHostR
 		return nil, err
 	}
 	return handle, nil
-}
-
-func (d *codexRuntimeHostDriver) acquireWhileHubLocked(_ context.Context, request AgentHostRequest) (AgentHost, error) {
-	handle, _, err := d.acquireLocked(request)
-	return handle, err
 }
 
 // acquireLocked binds one Agent handle to the current shared Codex host.
@@ -94,7 +108,6 @@ func (d *codexRuntimeHostDriver) acquireLocked(request AgentHostRequest) (*codex
 	contract := &codexRuntimeContract{agentID: request.AgentID, native: &codexAgentRuntime{client: host.client}}
 	handle := &codexAgentHost{host: host, contract: contract}
 	contract.release = handle.Close
-	handle.facade = &codexRuntimeV1Facade{host: handle, contract: contract, native: contract.native}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.shutdown {
@@ -140,6 +153,41 @@ func (d *codexRuntimeHostDriver) dispatchNativeEvent(agentID, method string, par
 	return false
 }
 
+func (d *codexRuntimeHostDriver) onNativeServerRequest(host *codexHostRuntime, id json.RawMessage, method string, params json.RawMessage) {
+	threadID := notificationThreadID(params)
+	d.mu.Lock()
+	handles := make([]*codexAgentHost, 0, len(d.handles))
+	for _, handle := range d.handles {
+		if handle != nil && handle.Alive() && handle.host == host {
+			handles = append(handles, handle)
+		}
+	}
+	d.mu.Unlock()
+	var target *codexRuntimeContract
+	for _, handle := range handles {
+		if handle.contract.handlesNativeThread(threadID) {
+			target = handle.contract
+			break
+		}
+	}
+	if target == nil && threadID == "" {
+		for _, handle := range handles {
+			if !handle.contract.canHandleApproval() {
+				continue
+			}
+			if target != nil {
+				target = nil
+				break
+			}
+			target = handle.contract
+		}
+	}
+	if target != nil && target.handleNativeServerRequest(host.client, id, method, params) {
+		return
+	}
+	_ = host.client.RespondError(id, -32601, "CodexLoom does not handle "+method)
+}
+
 func (d *codexRuntimeHostDriver) fanoutHostFailure(generation uint64, err error) {
 	if err == nil {
 		return
@@ -175,7 +223,6 @@ type codexAgentHost struct {
 	mu       sync.Mutex
 	host     *codexHostRuntime
 	contract *codexRuntimeContract
-	facade   *codexRuntimeV1Facade
 	failure  func(error)
 	closed   bool
 }
@@ -188,13 +235,11 @@ func (h *codexAgentHost) Alive() bool {
 
 func (h *codexAgentHost) Contract() runtimecontract.Contract { return h.contract }
 
-func (h *codexAgentHost) legacyRuntime() AgentRuntime { return h.facade }
-
-func (h *codexAgentHost) codexCompatibility() (*codex.Client, uint64) {
+func (h *codexAgentHost) RuntimeHostGeneration() uint64 {
 	if h == nil || h.host == nil {
-		return nil, 0
+		return 0
 	}
-	return h.host.client, h.host.generation
+	return h.host.generation
 }
 
 func (h *codexAgentHost) waitRuntimeHostReady(context.Context) error {

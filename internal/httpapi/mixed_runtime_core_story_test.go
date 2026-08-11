@@ -127,12 +127,10 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
 	restarted, err := hub.Open(reopened)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer restarted.Shutdown()
 	restartHandler := New(restarted, reopened, web).Handler()
 	restoredAgent := topicRequest(t, restartHandler, http.MethodGet, "/api/agents/"+piAgentID, nil, http.StatusOK)["agent"].(map[string]any)
 	if restoredAgent["id"] != piAgentID || restoredAgent["threadId"] != loomThreadID || restoredAgent["runtimeBinding"].(map[string]any)["kind"] != "pi" {
@@ -385,6 +383,51 @@ func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *test
 		t.Fatalf("restarted failed canonical Turn detail = %#v", turnDetail)
 	}
 	assertRuntimeNeutralJSON(t, []any{failedHistoryTurn, turnDetail}, "native-codex-mixed", "native-codex-turn", "/private/native/session.jsonl", "sk-mixed-private")
+	assertCanonicalReopenPublicSurface(t, restartHandler, codexID, codexTurnID)
+	restarted.Shutdown()
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	thirdStore, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdHub, err := hub.Open(thirdStore)
+	if err != nil {
+		_ = thirdStore.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		thirdHub.Shutdown()
+		_ = thirdStore.Close()
+	})
+	thirdHandler := New(thirdHub, thirdStore, web).Handler()
+	assertCanonicalReopenPublicSurface(t, thirdHandler, codexID, codexTurnID)
+	assertCanonicalReopenPublicSurface(t, thirdHandler, piID, piTurnID)
+}
+
+func assertCanonicalReopenPublicSurface(t *testing.T, handler http.Handler, agentID, turnID string) {
+	t.Helper()
+	for _, path := range []string{
+		"/api/agents/" + agentID,
+		"/api/agents/" + agentID + "/thread/history?count=10",
+		"/api/turns/" + turnID,
+	} {
+		body := storyJSONRequest(t, handler, http.MethodGet, path, nil, http.StatusOK)
+		assertRuntimeNeutralJSON(t, json.RawMessage(body), "native-codex-mixed", "native-codex-turn", "/private/native/session.jsonl", "sk-mixed-private", `"type":"item/`, `"compatibility":true`)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, path := range []string{"/api/agents/" + agentID + "/thread/events?tail=200", "/api/agents/events?since=0"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"type":"loom/runtime-event"`) {
+			t.Fatalf("canonical reopen SSE %s = %d %s", path, response.Code, response.Body.String())
+		}
+		assertRuntimeNeutralJSON(t, response.Body.String(), "native-codex-mixed", "native-codex-turn", "/private/native/session.jsonl", "sk-mixed-private", `"type":"item/`, `"compatibility":true`)
+	}
 }
 
 func waitForMixedRuntimeTerminal(t *testing.T, handler http.Handler, agentID, turnID, status string) {

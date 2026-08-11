@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -8,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yan5xu/codex-loom/internal/rollout"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -105,9 +106,9 @@ func TestRecoveryCrashWindowsConvergeAcrossTwoStoreReopens(t *testing.T) {
 				}
 				ready := make(chan struct{})
 				close(ready)
-				h.runtimes[agent.ID] = &runtime{agentID: agent.ID, agentRuntime: fake, ready: ready, approvals: map[string]*approval{}}
-				h.contextHistoryProbe = func(threadID string, _ rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
-					return rollout.ContextHistoryState{EpochID: "initial:" + threadID}, nil
+				h.runtimes[agent.ID] = testRuntime(agent.ID, "pi", fake, ready)
+				h.contextHistoryProbe = func(threadID string, _ RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error) {
+					return RuntimeContextEvidence{EpochID: "initial:" + threadID}, nil
 				}
 
 				h.recoverInterruptedTurn(agent.ID, marker.PredecessorTurnID)
@@ -158,7 +159,7 @@ func TestRecoveryCrashWindowsConvergeAcrossTwoStoreReopens(t *testing.T) {
 				if fake.starts > 0 {
 					var prompt strings.Builder
 					for _, input := range fake.lastTurnRequest.Input {
-						if input.Kind == RuntimeInputText {
+						if input.Kind == runtimecontract.InputText {
 							prompt.WriteString(input.Text)
 						}
 					}
@@ -199,9 +200,10 @@ type fakeRecoveryRuntime struct {
 	hostClosed          func() bool
 	hostClosedAtInspect atomic.Bool
 	inspectErr          error
+	lastTurnRequest     runtimecontract.TurnRequest
 }
 
-func (f *fakeRecoveryRuntime) InspectInterruptedTurn(_, _ string) (RuntimeInterruptionEvidence, error) {
+func (f *fakeRecoveryRuntime) InspectInterruptedTurn(_ context.Context, _ runtimecontract.TurnTarget) (RuntimeInterruptionEvidence, error) {
 	f.inspectCount.Add(1)
 	f.aliveAtInspect.Store(f.Alive())
 	if f.hostClosed != nil {
@@ -216,10 +218,10 @@ func (f *fakeRecoveryRuntime) InspectInterruptedTurn(_, _ string) (RuntimeInterr
 	return f.evidence, f.inspectErr
 }
 
-func (f *fakeRecoveryRuntime) StartTurn(request RuntimeTurnRequest) (string, error) {
+func (f *fakeRecoveryRuntime) StartTurn(_ context.Context, request runtimecontract.TurnRequest) runtimecontract.Outcome {
 	f.starts++
 	f.lastTurnRequest = request
-	return "native-recovery-1", nil
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted, RuntimeTurnRef: "native-recovery-1"}
 }
 
 func TestCleanPiCrashCreatesOneReservedRecoveryTurn(t *testing.T) {
@@ -228,8 +230,8 @@ func TestCleanPiCrashCreatesOneReservedRecoveryTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := testHub(st)
-	h.contextHistoryProbe = func(threadID string, _ rollout.ContextHistoryQuery) (rollout.ContextHistoryState, error) {
-		return rollout.ContextHistoryState{EpochID: "initial:" + threadID}, nil
+	h.contextHistoryProbe = func(threadID string, _ RuntimeContextEvidenceQuery) (RuntimeContextEvidence, error) {
+		return RuntimeContextEvidence{EpochID: "initial:" + threadID}, nil
 	}
 	fake := &fakeRecoveryRuntime{
 		fakeAgentRuntime: fakeAgentRuntime{binding: "native-session"},
@@ -243,7 +245,7 @@ func TestCleanPiCrashCreatesOneReservedRecoveryTurn(t *testing.T) {
 		Status: "interrupted", LastTurn: &TurnSummary{TurnID: "turn-before", Task: "publish release", Status: "interrupted", CompletedAt: "2026-08-10T01:00:00Z"},
 		CreatedAt: now(), UpdatedAt: now(),
 	}
-	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", agentRuntime: fake, ready: ready, approvals: map[string]*approval{}}
+	h.runtimes["agent-1"] = testRuntime("agent-1", "pi", fake, ready)
 
 	h.recoverPiInterruptedTurn("agent-1", "turn-before")
 	marker := h.agents["agent-1"].TurnRecoveryMarkers["turn-before"]
@@ -255,7 +257,7 @@ func TestCleanPiCrashCreatesOneReservedRecoveryTurn(t *testing.T) {
 	}
 	var prompt strings.Builder
 	for _, input := range fake.lastTurnRequest.Input {
-		if input.Kind == RuntimeInputText {
+		if input.Kind == runtimecontract.InputText {
 			prompt.WriteString(input.Text)
 		}
 	}
@@ -267,7 +269,7 @@ func TestCleanPiCrashCreatesOneReservedRecoveryTurn(t *testing.T) {
 	if fake.starts != 1 {
 		t.Fatalf("duplicate recovery starts = %d", fake.starts)
 	}
-	h.onRuntimeEvent(h.runtimes["agent-1"], RuntimeEvent{Kind: RuntimeTurnCompleted, NativeTurnID: "native-recovery-1"})
+	deliverTestNativeEvent(h, h.runtimes["agent-1"], nativeEvent{Kind: nativeTurnCompleted, NativeTurnID: "native-recovery-1"})
 	if got := h.agents["agent-1"].TurnRecoveryMarkers["turn-before"].State; got != TurnRecoveryCompleted {
 		t.Fatalf("completed recovery marker state = %q", got)
 	}
@@ -301,7 +303,7 @@ func TestAmbiguousPiCrashCreatesOneReservedNeedsYouAndNoRecoveryTurn(t *testing.
 		Status: "interrupted", LastTurn: &TurnSummary{TurnID: "turn-before", Task: "publish release", Status: "interrupted", CompletedAt: "2026-08-10T01:00:00Z"},
 		CreatedAt: now(), UpdatedAt: now(),
 	}
-	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", agentRuntime: fake, ready: ready, approvals: map[string]*approval{}}
+	h.runtimes["agent-1"] = testRuntime("agent-1", "pi", fake, ready)
 
 	h.recoverPiInterruptedTurn("agent-1", "turn-before")
 	marker := h.agents["agent-1"].TurnRecoveryMarkers["turn-before"]
@@ -482,7 +484,7 @@ func TestAutomaticRecoveryClaimFencesManualActionsBeforeMarkerIsPersisted(t *tes
 		LastTurn:            &TurnSummary{TurnID: "turn-before", Task: "publish release", Status: "interrupted", CompletedAt: now()},
 		CreatedAt:           now(), UpdatedAt: now(),
 	}
-	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", agentRuntime: fake}
+	h.runtimes["agent-1"] = testRuntime("agent-1", "pi", fake, nil)
 
 	h.mu.Lock()
 	if !h.schedulePiRecoveryLocked("agent-1", "turn-before") {
@@ -524,5 +526,5 @@ func TestUnknownPiCrashEvidenceCreatesNeedsYouInsteadOfRecoveryTurn(t *testing.T
 	}
 }
 
-var _ AgentRuntime = (*fakeRecoveryRuntime)(nil)
-var _ RuntimeInterruptedTurnInspector = (*fakeRecoveryRuntime)(nil)
+var _ runtimecontract.Contract = (*fakeRecoveryRuntime)(nil)
+var _ runtimeInterruptedTurnInspector = (*fakeRecoveryRuntime)(nil)
