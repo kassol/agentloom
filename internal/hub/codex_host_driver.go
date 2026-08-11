@@ -84,6 +84,20 @@ func (d *codexRuntimeHostDriver) HistoryContract(request AgentHostRequest) runti
 	return &codexRuntimeContract{agentID: request.AgentID, native: &codexAgentRuntime{}, turnsByNative: map[string]runtimeTurnCorrelation{}}
 }
 
+func (d *codexRuntimeHostDriver) ResourceContract(_ context.Context, request AgentHostRequest) (runtimecontract.Contract, string, error) {
+	host, err := d.hub.ensureCodexHost()
+	if err != nil {
+		return nil, "", err
+	}
+	return d.newContract(request.AgentID, &codexAgentRuntime{client: host.client}), fmt.Sprintf("codex-host:%d", host.generation), nil
+}
+
+func (d *codexRuntimeHostDriver) ResourceContractCurrent(revision string) bool {
+	d.hub.mu.Lock()
+	defer d.hub.mu.Unlock()
+	return d.hub.codexHost != nil && revision == fmt.Sprintf("codex-host:%d", d.hub.codexHost.generation) && !d.hub.codexHost.client.Closed()
+}
+
 func (d *codexRuntimeHostDriver) Acquire(ctx context.Context, request AgentHostRequest) (AgentHost, error) {
 	if err := d.Preflight(ctx); err != nil {
 		return nil, err

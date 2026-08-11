@@ -3,6 +3,7 @@ package hub
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -352,6 +353,69 @@ func TestPiRuntimeExplicitlyLoadsLoomExtensionWithoutDisablingNativeResources(t 
 	}
 	if string(environment) != "agent-pi\nhttp://127.0.0.1:6123" {
 		t.Fatalf("Pi Loom environment = %q", environment)
+	}
+}
+
+func TestPiResourceInventoryUsesNativeCommandsAndFiltersNonResourceCommands(t *testing.T) {
+	configureFakePiHubRPC(t, "happy")
+	native := newPiAgentRuntime("agent-pi", t.TempDir(), "http://127.0.0.1:6123")
+	defer native.Close()
+	contract := newPiRuntimeContract("agent-pi", native)
+	host := &piAgentHost{native: native, contract: contract}
+	contract.host = host
+	binding, outcome := contract.CreateBinding(context.Background(), runtimecontract.BindingRequest{Name: "Pi Worker", Cwd: t.TempDir()})
+	if err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleAccepted, false); err != nil {
+		t.Fatal(err)
+	}
+	inventory, failure := contract.InspectResources(context.Background(), runtimecontract.ResourceInventoryRequest{Binding: binding, Cwd: t.TempDir()})
+	if failure != nil {
+		t.Fatalf("%s: %s", failure.Message, failure.Diagnostic)
+	}
+	if len(inventory.Resources) != 3 {
+		t.Fatalf("Pi resources = %#v", inventory.Resources)
+	}
+	if inventory.Resources[0].Kind != runtimecontract.ResourceExtension || inventory.Resources[1].Kind != runtimecontract.ResourcePrompt || inventory.Resources[2].Kind != runtimecontract.ResourceSkill {
+		t.Fatalf("Pi resource kinds = %#v", inventory.Resources)
+	}
+	if strings.Contains(inventory.Resources[2].Name, "skill:") || inventory.Resources[2].Path != "/tmp/pi/skills/review/SKILL.md" {
+		t.Fatalf("Pi native skill = %#v", inventory.Resources[2])
+	}
+}
+
+func TestPiResourceInventorySurvivesStoreAndDriverRestart(t *testing.T) {
+	configureFakePiHubRPC(t, "happy")
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	agent, err := h.CreateAgent(CreateParams{Name: "pi-resources", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := h.GetRuntimeResources(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Resources) != 3 || first.Policy.Available || first.Policy.Reason == "" || first.Policy.Alternative == "" {
+		t.Fatalf("first Pi Runtime resources = %#v", first)
+	}
+	h.Shutdown()
+
+	restarted := New(st)
+	defer restarted.Shutdown()
+	second, err := restarted.GetRuntimeResources(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Resources) != 3 || second.Resources[2].Path != first.Resources[2].Path || second.Revision == first.Revision {
+		t.Fatalf("restarted Pi Runtime resources = %#v; first=%#v", second, first)
+	}
+	starts, err := os.ReadFile(os.Getenv("FAKE_PI_STARTS_FILE"))
+	if err != nil || strings.Count(string(starts), "start\n") != 2 {
+		t.Fatalf("Pi Driver generations = %q, err=%v", starts, err)
 	}
 }
 
@@ -1363,6 +1427,8 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 			fmt.Printf(`{"id":%q,"type":"response","command":"set_model","success":true,"data":{"provider":%q,"id":%q,"input":["text","image"]}}`+"\n", id, provider, model)
 		case "set_thinking_level":
 			fmt.Printf(`{"id":%q,"type":"response","command":"set_thinking_level","success":true}`+"\n", id)
+		case "get_commands":
+			respondFakePiCommands(id)
 		default:
 			os.Exit(34)
 		}
@@ -1387,6 +1453,9 @@ entriesReady:
 			continue
 		case "set_thinking_level":
 			fmt.Printf(`{"id":%q,"type":"response","command":"set_thinking_level","success":true}`+"\n", id)
+			continue
+		case "get_commands":
+			respondFakePiCommands(id)
 			continue
 		}
 		break
@@ -1606,6 +1675,10 @@ entriesReady:
 	time.Sleep(250 * time.Millisecond)
 	fmt.Print("{\"type\":\"agent_settled\"}\n")
 	serveFakePiHistory(reader, sessionFile)
+}
+
+func respondFakePiCommands(id string) {
+	fmt.Printf(`{"id":%q,"type":"response","command":"get_commands","success":true,"data":{"commands":[{"name":"review","description":"Review changes","source":"extension","sourceInfo":{"path":"/tmp/pi/extensions/review.ts","scope":"user","source":"review-package"}},{"name":"summarize","description":"Summarize work","source":"prompt","sourceInfo":{"path":"/tmp/pi/prompts/summarize.md","scope":"project","source":"top-level"}},{"name":"skill:review","description":"Review skill","source":"skill","sourceInfo":{"path":"/tmp/pi/skills/review/SKILL.md","scope":"user","source":"review-package"}},{"name":"help","description":"TUI built-in","source":"builtin","sourceInfo":{"path":"/tmp/pi/builtin/help","scope":"user"}}]}}`+"\n", id)
 }
 
 func appendFakePiTurn(t *testing.T, sessionFile, prompt, answer, stopReason string) {

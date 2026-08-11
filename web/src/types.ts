@@ -74,6 +74,36 @@ export interface RuntimeModel {
   imageInput: boolean;
 }
 
+export interface RuntimeResourceSnapshot {
+  agentId: string;
+  agentName: string;
+  cwd: string;
+  runtimeKind: string;
+  bindingRevision: string;
+  revision: string;
+  semantics: string;
+  resources: Array<{
+    id: string;
+    name: string;
+    description?: string;
+    kind: "skill" | "prompt" | "extension" | string;
+    path: string;
+    scope?: string;
+    source?: string;
+    enabled: boolean;
+  }>;
+  policy: {
+    available: boolean;
+    mutable: boolean;
+    reason?: string;
+    alternative?: string;
+    revision?: string;
+    disabledPaths?: string[];
+    effective: boolean;
+    evidence?: Array<{ kind: string; summary: string; observedAt?: string }>;
+  };
+}
+
 export interface ModelProvider {
   id: string;
   name: string;

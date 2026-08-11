@@ -26,23 +26,25 @@ type codexRuntimeContract struct {
 	agentID string
 	native  *codexAgentRuntime
 
-	mu                      sync.Mutex
-	sandbox                 string
-	providerID              string
-	model                   string
-	disabledSkillPaths      []string
-	approvalPolicy          string
-	effort                  string
-	developerContextTimeout time.Duration
-	handler                 func(runtimecontract.Event)
-	approvalHandler         func(runtimecontract.ApprovalProposal)
-	approvalResponses       map[string]codexNativeApprovalResponse
-	modelCatalog            func() ([]runtimecontract.Model, error)
-	modelCompensation       *codexModelCompensation
-	bindingRef              string
-	release                 func()
-	pendingTurn             runtimeTurnCorrelation
-	turnsByNative           map[string]runtimeTurnCorrelation
+	mu                        sync.Mutex
+	sandbox                   string
+	providerID                string
+	model                     string
+	disabledSkillPaths        []string
+	resourcePolicyAppliedHash string
+	resourcePolicyEvidence    []runtimecontract.CapabilityEvidence
+	approvalPolicy            string
+	effort                    string
+	developerContextTimeout   time.Duration
+	handler                   func(runtimecontract.Event)
+	approvalHandler           func(runtimecontract.ApprovalProposal)
+	approvalResponses         map[string]codexNativeApprovalResponse
+	modelCatalog              func() ([]runtimecontract.Model, error)
+	modelCompensation         *codexModelCompensation
+	bindingRef                string
+	release                   func()
+	pendingTurn               runtimeTurnCorrelation
+	turnsByNative             map[string]runtimeTurnCorrelation
 }
 
 type codexModelCompensation struct {
@@ -106,6 +108,41 @@ func (c *codexRuntimeContract) SetRuntimeDisabledSkills(paths []string) {
 	c.mu.Unlock()
 }
 
+func (c *codexRuntimeContract) InspectResources(ctx context.Context, request runtimecontract.ResourceInventoryRequest) (runtimecontract.ResourceInventory, *runtimecontract.Failure) {
+	inventory, err := c.native.Resources(ctx, request.Cwd)
+	if err != nil {
+		return runtimecontract.ResourceInventory{}, &runtimecontract.Failure{Code: "resource_inventory_failed", Phase: runtimecontract.FailurePhaseResourceInventory, Message: "Codex could not list its native Skills", Diagnostic: err.Error(), Cause: err}
+	}
+	if err := inventory.Validate(); err != nil {
+		return runtimecontract.ResourceInventory{}, &runtimecontract.Failure{Code: "resource_inventory_invalid", Phase: runtimecontract.FailurePhaseResourceInventory, Message: "Codex returned an invalid native Skill inventory", Diagnostic: err.Error(), Cause: err}
+	}
+	return inventory, nil
+}
+
+func (c *codexRuntimeContract) InspectResourcePolicy(_ context.Context, _ runtimecontract.ResourcePolicyRequest) (runtimecontract.ResourcePolicyState, *runtimecontract.Failure) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return codexResourcePolicyState(c.disabledSkillPaths, c.resourcePolicyAppliedHash, c.resourcePolicyEvidence), nil
+}
+
+func codexResourcePolicyState(paths []string, appliedHash string, evidence []runtimecontract.CapabilityEvidence) runtimecontract.ResourcePolicyState {
+	paths = normalizedDisabledSkillPaths(paths)
+	hash := agentSkillConfigHash(paths)
+	return runtimecontract.ResourcePolicyState{
+		Revision: "codex-policy:" + hash[:16], DisabledPaths: paths,
+		Effective: appliedHash == hash && len(evidence) > 0,
+		Evidence:  append([]runtimecontract.CapabilityEvidence(nil), evidence...),
+	}
+}
+
+func (c *codexRuntimeContract) markResourcePolicyApplied(paths []string) {
+	evidence := []runtimecontract.CapabilityEvidence{{Kind: "native_ack", Summary: "Codex binding lifecycle acknowledged the exact SessionFlags Skill policy", ObservedAt: time.Now().UTC().Format(time.RFC3339Nano)}}
+	c.mu.Lock()
+	c.resourcePolicyAppliedHash = agentSkillConfigHash(paths)
+	c.resourcePolicyEvidence = evidence
+	c.mu.Unlock()
+}
+
 func (c *codexRuntimeContract) SetRuntimeApprovalPolicy(value string) {
 	c.mu.Lock()
 	c.approvalPolicy = value
@@ -160,6 +197,7 @@ func (c *codexRuntimeContract) CreateBinding(ctx context.Context, request runtim
 	c.mu.Lock()
 	c.bindingRef = nativeRef
 	c.mu.Unlock()
+	c.markResourcePolicyApplied(controls.DisabledSkillPaths)
 	return runtimecontract.Binding{
 		SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "codex", NativeRef: nativeRef,
 	}, runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}
@@ -179,6 +217,7 @@ func (c *codexRuntimeContract) ResumeBinding(ctx context.Context, binding runtim
 		}
 		return codexFailureOutcome(err, runtimecontract.FailurePhaseBindingResume)
 	}
+	c.markResourcePolicyApplied(request.DisabledSkillPaths)
 	c.mu.Lock()
 	c.bindingRef = binding.NativeRef
 	c.mu.Unlock()

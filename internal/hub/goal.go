@@ -736,6 +736,10 @@ func (h *Hub) syncNativeGoal(agentID, goalID string, version int64, clear bool) 
 		rt.startMu.Lock()
 		defer rt.startMu.Unlock()
 		h.mu.Lock()
+		if fenceErr := h.runtimeMutationAllowedLocked(agentID); fenceErr != nil {
+			h.mu.Unlock()
+			return
+		}
 		currentAgent, currentGoal := h.agents[agentID], h.goals[agentID]
 		if currentAgent == nil || (!bindingMayInitialize && currentAgent.RuntimeBinding != binding) || currentGoal == nil || currentGoal.ID != goalID || currentGoal.Version != version {
 			h.mu.Unlock()

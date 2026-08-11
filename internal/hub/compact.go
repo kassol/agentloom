@@ -62,6 +62,9 @@ func (h *Hub) CompactAgentThread(key string) (ThreadCompactResult, error) {
 	}
 	rt.startMu.Lock()
 	defer rt.startMu.Unlock()
+	if err := h.verifyRuntimeThreadControl(agentID, rt); err != nil {
+		return ThreadCompactResult{}, err
+	}
 	if err := waitReady(rt); err != nil {
 		return ThreadCompactResult{}, errf(500, "Runtime not ready: %s", err)
 	}

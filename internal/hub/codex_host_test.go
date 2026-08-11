@@ -603,107 +603,6 @@ func TestMissingUserSkillsLetsUserSkillWin(t *testing.T) {
 	}
 }
 
-func TestAgentSkillDisableIsScopedPersistedAndCompiledIntoColdResume(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("PINIX_EDGE_NAMES", filepath.Join(t.TempDir(), "missing.json"))
-	logPath := installFakeSharedCodexHost(t)
-	dataDir := t.TempDir()
-	st, err := store.Open(dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := testHub(st)
-
-	cici, err := h.CreateAgent(CreateParams{Name: "cici-web", Cwd: "/tmp/one", RuntimeKind: "codex"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.RestoreAgent(RestoreAgentParams{
-		ID: "other-agent", Name: "coze-user", Cwd: "/tmp/one", ThreadID: "loom-thr-other", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-other"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	const skillPath = "/tmp/skill/SKILL.md"
-	config, err := h.UpdateAgentSkillConfig(cici.ID, AgentSkillConfigParams{
-		Path: skillPath, Enabled: false,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !config.RestartRequired || config.Applied {
-		t.Fatalf("loaded Thread config = %#v, want restart required", config)
-	}
-
-	inventory, err := h.ReloadSkills()
-	if err != nil {
-		t.Fatal(err)
-	}
-	ciciInventory := findAgentSkillInventory(t, inventory, cici.ID)
-	otherInventory := findAgentSkillInventory(t, inventory, "other-agent")
-	if len(ciciInventory.Skills) != 2 || ciciInventory.Skills[1].Path != skillPath || ciciInventory.Skills[1].Enabled {
-		t.Fatalf("cici-web inventory = %#v, want target Skill disabled", ciciInventory)
-	}
-	if len(otherInventory.Skills) != 2 || !otherInventory.Skills[1].Enabled {
-		t.Fatalf("other Agent inventory = %#v, want shared Skill enabled", otherInventory)
-	}
-
-	var persisted map[string]*AgentSkillConfig
-	if err := st.LoadAgentSkillConfigs(&persisted); err != nil {
-		t.Fatal(err)
-	}
-	if got := persisted[cici.ID]; got == nil || len(got.DisabledPaths) != 1 || got.DisabledPaths[0] != skillPath {
-		t.Fatalf("persisted Agent Skill config = %#v", persisted)
-	}
-
-	h.Shutdown()
-	h = New(st)
-	defer h.Shutdown()
-	h.mu.Lock()
-	rt, err := h.getRuntimeLocked(h.agents[cici.ID])
-	h.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := waitReady(rt); err != nil {
-		t.Fatal(err)
-	}
-
-	resume := lastRequestParams(t, logPath, "thread/resume")
-	skillsConfig, ok := resume["config"].(map[string]any)["skills"].(map[string]any)
-	if !ok {
-		t.Fatalf("thread/resume config = %#v", resume["config"])
-	}
-	entries, ok := skillsConfig["config"].([]any)
-	if !ok || len(entries) != 1 {
-		t.Fatalf("thread/resume skills.config = %#v, want one entry", skillsConfig["config"])
-	}
-	entry, _ := entries[0].(map[string]any)
-	if entry["path"] != skillPath || entry["enabled"] != false {
-		t.Fatalf("thread/resume Skill entry = %#v", entry)
-	}
-
-	applied, err := h.GetAgentSkillConfig(cici.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !applied.Applied || applied.RestartRequired {
-		t.Fatalf("cold-resumed Agent Skill config = %#v, want applied", applied)
-	}
-	inventory, err = h.ReloadSkills()
-	if err != nil {
-		t.Fatal(err)
-	}
-	ciciInventory = findAgentSkillInventory(t, inventory, cici.ID)
-	otherInventory = findAgentSkillInventory(t, inventory, "other-agent")
-	if !ciciInventory.Applied || ciciInventory.RestartRequired || ciciInventory.Skills[1].Enabled {
-		t.Fatalf("cold-resumed cici-web inventory = %#v", ciciInventory)
-	}
-	if !otherInventory.Skills[1].Enabled {
-		t.Fatalf("cold-resumed other Agent inventory = %#v", otherInventory)
-	}
-}
-
 func TestAgentSkillConfigRejectsNonAbsoluteOrNonSkillPath(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -715,52 +614,136 @@ func TestAgentSkillConfigRejectsNonAbsoluteOrNonSkillPath(t *testing.T) {
 		CreatedAt: now(), UpdatedAt: now(),
 	}
 	for _, path := range []string{"relative/SKILL.md", "/tmp/not-a-skill.md"} {
-		if _, err := h.UpdateAgentSkillConfig("agent", AgentSkillConfigParams{Path: path}); err == nil {
+		if _, err := h.UpdateRuntimeResourcePolicy("agent", AgentSkillConfigParams{Path: path, ExpectedRevision: "test"}); err == nil {
 			t.Fatalf("accepted invalid Skill path %q", path)
 		}
 	}
 }
 
-func TestAgentSkillConfigViewDistinguishesUnloadedAndStaleRuntime(t *testing.T) {
-	const (
-		agentID   = "agent-1"
-		skillPath = "/tmp/skill/SKILL.md"
-	)
-	h := &Hub{
-		agents: map[string]*Agent{
-			agentID: {ID: agentID, Name: "agent", Status: "idle"},
-		},
-		agentSkillConfigs: map[string]*AgentSkillConfig{
-			agentID: {AgentID: agentID, DisabledPaths: []string{skillPath}},
-		},
-		runtimes: map[string]*runtime{},
+func TestCodexRuntimeResourceInventoryUsesAdapterNativeList(t *testing.T) {
+	logPath := installFakeSharedCodexHost(t)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
 	}
-	meta := h.agents[agentID]
+	defer st.Close()
+	h := testHub(st)
+	defer h.Shutdown()
+	agent, err := h.CreateAgent(CreateParams{Name: "resource-owner", Cwd: "/tmp/one", RuntimeKind: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := h.GetRuntimeResources(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.RuntimeKind != "codex" || !snapshot.Policy.Available || len(snapshot.Resources) != 2 {
+		t.Fatalf("Codex Runtime resources = %#v", snapshot)
+	}
+	if snapshot.Resources[1].Kind != runtimecontract.ResourceSkill || snapshot.Resources[1].Path != "/tmp/skill/SKILL.md" {
+		t.Fatalf("Codex native Skill = %#v", snapshot.Resources[1])
+	}
+	public, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (agent.RuntimeBinding.NativeRef != "" && strings.Contains(string(public), agent.RuntimeBinding.NativeRef)) || strings.Contains(string(public), "diagnostic") {
+		t.Fatalf("public Runtime resources leaked native binding or diagnostics: %s", public)
+	}
+	params := lastRequestParams(t, logPath, "skills/list")
+	if cwds, ok := params["cwds"].([]any); !ok || len(cwds) != 1 || cwds[0] != "/tmp/one" {
+		t.Fatalf("adapter skills/list params = %#v", params)
+	}
+}
 
-	view := h.agentSkillConfigViewLocked(meta)
-	if view.Applied || view.RestartRequired {
-		t.Fatalf("unloaded config view = %#v, want pending cold load", view)
+func TestCodexResourcePolicyColdAppliesBeforePersistenceAndRejectsStaleOrLoaded(t *testing.T) {
+	logPath := installFakeSharedCodexHost(t)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	defer h.Shutdown()
+	agent, err := h.RestoreAgent(RestoreAgentParams{
+		ID: "resource-cold", Name: "resource-cold", Cwd: "/tmp/one", ThreadID: "loom-resource-cold",
+		RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thr-resource-cold"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.GetRuntimeResources(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.runtimes[agent.ID] != nil {
+		t.Fatal("resource inventory loaded the Codex binding")
+	}
+	h.mu.Lock()
+	h.agents[agent.ID].Cwd = "/tmp/two"
+	h.mu.Unlock()
+	if _, err := h.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{Path: "/tmp/skill/SKILL.md", Enabled: false, ExpectedRevision: before.Revision}); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("CWD race resource policy error = %v", err)
+	}
+	h.mu.Lock()
+	h.agents[agent.ID].Cwd = "/tmp/one"
+	h.agents[agent.ID].RuntimeBinding.NativeRef = "thr-resource-raced"
+	h.mu.Unlock()
+	if _, err := h.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{Path: "/tmp/skill/SKILL.md", Enabled: false, ExpectedRevision: before.Revision}); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("binding race resource policy error = %v", err)
+	}
+	h.mu.Lock()
+	h.agents[agent.ID].RuntimeBinding.NativeRef = "thr-resource-cold"
+	h.mu.Unlock()
+	updated, err := h.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{
+		Path: "/tmp/skill/SKILL.md", Enabled: false, ExpectedRevision: before.Revision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Policy.Effective || len(updated.Policy.Evidence) == 0 || updated.Resources[1].Enabled {
+		t.Fatalf("effective resource policy = %#v", updated)
+	}
+	var persisted map[string]*AgentSkillConfig
+	if err := st.LoadAgentSkillConfigs(&persisted); err != nil || persisted[agent.ID] == nil || len(persisted[agent.ID].DisabledPaths) != 1 {
+		t.Fatalf("persisted resource policy = %#v, err=%v", persisted, err)
+	}
+	resume := lastRequestParams(t, logPath, "thread/resume")
+	entries := resume["config"].(map[string]any)["skills"].(map[string]any)["config"].([]any)
+	if len(entries) != 1 || entries[0].(map[string]any)["path"] != "/tmp/skill/SKILL.md" || entries[0].(map[string]any)["enabled"] != false {
+		t.Fatalf("native resource policy = %#v", resume)
+	}
+	if _, err := h.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{Path: "/tmp/skill/SKILL.md", Enabled: true, ExpectedRevision: before.Revision}); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("stale resource policy error = %v", err)
+	}
+	if _, err := h.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{Path: "/tmp/skill/SKILL.md", Enabled: true, ExpectedRevision: updated.Revision}); err == nil || !strings.Contains(err.Error(), "loaded") {
+		t.Fatalf("loaded resource policy error = %v", err)
 	}
 
-	h.runtimes[agentID] = &runtime{}
-	view = h.agentSkillConfigViewLocked(meta)
-	if view.Applied || view.RestartRequired {
-		t.Fatalf("notification-only runtime view = %#v, want pending cold load", view)
+	// A new Driver generation must not inherit an in-memory claim. It first
+	// reports the durable policy as desired-only, then reapplies and reverifies
+	// it through the native binding lifecycle.
+	h.Shutdown()
+	restarted := New(st)
+	defer restarted.Shutdown()
+	cold, err := restarted.GetRuntimeResources(agent.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	h.runtimes[agentID] = &runtime{
-		skillConfigLoaded: true,
-		skillConfigHash:   agentSkillConfigHash(nil),
+	if cold.Policy.Effective || len(cold.Policy.DisabledPaths) != 1 || cold.Resources[1].Enabled == false {
+		t.Fatalf("cold restarted resource policy = %#v, want desired but not yet proven effective", cold)
 	}
-	view = h.agentSkillConfigViewLocked(meta)
-	if view.Applied || !view.RestartRequired {
-		t.Fatalf("stale loaded runtime view = %#v, want restart required", view)
+	if cold.Revision == updated.Revision {
+		t.Fatalf("new Runtime generation reused stale resource revision %q", cold.Revision)
 	}
-
-	h.runtimes[agentID].skillConfigHash = agentSkillConfigHash([]string{skillPath})
-	view = h.agentSkillConfigViewLocked(meta)
-	if !view.Applied || view.RestartRequired {
-		t.Fatalf("matching loaded runtime view = %#v, want applied", view)
+	reverified, err := restarted.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{
+		Path: "/tmp/skill/SKILL.md", Enabled: false, ExpectedRevision: cold.Revision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reverified.Policy.Effective || len(reverified.Policy.Evidence) == 0 || reverified.Resources[1].Enabled {
+		t.Fatalf("reverified restarted resource policy = %#v", reverified)
 	}
 }
 
@@ -791,17 +774,6 @@ func TestResumeAgentThreadRejectsStaleLoadedSkillPolicy(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "restart CodexLoom") {
 		t.Fatalf("resume stale loaded runtime error = %v, want restart requirement", err)
 	}
-}
-
-func findAgentSkillInventory(t *testing.T, inventory SkillInventory, agentID string) AgentSkillInventoryEntry {
-	t.Helper()
-	for _, entry := range inventory.Agents {
-		if entry.AgentID == agentID {
-			return entry
-		}
-	}
-	t.Fatalf("Agent %s missing from Skill inventory: %#v", agentID, inventory.Agents)
-	return AgentSkillInventoryEntry{}
 }
 
 func installFakeSharedCodexHost(t *testing.T) string {

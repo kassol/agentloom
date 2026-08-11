@@ -59,7 +59,7 @@ compatibility stream.
 ## Optional capabilities
 
 Runtime controls do not expand the mandatory request types. Sandbox, Provider,
-Model, effort, disabled Skills, approval policy, input validation, Goal, Usage,
+Model, effort, Runtime-native resource inventory/policy, approval policy, input validation, Goal, Usage,
 model catalog, compaction, rename/archive, and interruption inspection use
 narrow typed optional hooks. A `CapabilitySnapshot` may say `available` only
 when the corresponding hook is present and passes its capability-specific

@@ -149,6 +149,106 @@ type InputCapability interface {
 	ValidateInput(context.Context, Binding, []InputBlock) *Failure
 }
 
+// ResourceInventoryCapability exposes only resources discovered by the
+// selected Runtime. Paths and source metadata retain Runtime-specific meaning.
+type ResourceInventoryCapability interface {
+	InspectResources(context.Context, ResourceInventoryRequest) (ResourceInventory, *Failure)
+}
+
+// ResourcePolicyCapability is intentionally narrower than inventory. A
+// Runtime may expose native resources while declining Loom policy mutation.
+type ResourcePolicyCapability interface {
+	InspectResourcePolicy(context.Context, ResourcePolicyRequest) (ResourcePolicyState, *Failure)
+}
+
+type ResourceKind string
+
+const (
+	ResourceSkill     ResourceKind = "skill"
+	ResourcePrompt    ResourceKind = "prompt"
+	ResourceExtension ResourceKind = "extension"
+)
+
+type Resource struct {
+	ID          string       `json:"id"`
+	Name        string       `json:"name"`
+	Description string       `json:"description,omitempty"`
+	Kind        ResourceKind `json:"kind"`
+	Path        string       `json:"path"`
+	Scope       string       `json:"scope,omitempty"`
+	Source      string       `json:"source,omitempty"`
+	Enabled     bool         `json:"enabled"`
+}
+
+type ResourceInventoryRequest struct {
+	Binding Binding `json:"binding"`
+	Cwd     string  `json:"cwd"`
+}
+
+type ResourceInventory struct {
+	Revision  string     `json:"revision"`
+	Semantics string     `json:"semantics"`
+	Resources []Resource `json:"resources"`
+}
+
+func (i ResourceInventory) Validate() error {
+	if i.Revision == "" {
+		return fmt.Errorf("Runtime resource inventory revision is required")
+	}
+	if i.Semantics == "" {
+		return fmt.Errorf("Runtime resource semantics are required")
+	}
+	seen := make(map[string]struct{}, len(i.Resources))
+	for _, resource := range i.Resources {
+		if resource.ID == "" || resource.Name == "" || resource.Path == "" {
+			return fmt.Errorf("Runtime resource identity, name, and path are required")
+		}
+		if _, exists := seen[resource.ID]; exists {
+			return fmt.Errorf("duplicate Runtime resource %q", resource.ID)
+		}
+		seen[resource.ID] = struct{}{}
+		switch resource.Kind {
+		case ResourceSkill, ResourcePrompt, ResourceExtension:
+		default:
+			return fmt.Errorf("Runtime resource %q has unknown kind %q", resource.ID, resource.Kind)
+		}
+	}
+	return nil
+}
+
+type ResourcePolicyRequest struct {
+	Binding       Binding  `json:"binding"`
+	Cwd           string   `json:"cwd"`
+	DisabledPaths []string `json:"disabledPaths"`
+}
+
+type ResourcePolicyState struct {
+	Revision      string               `json:"revision"`
+	DisabledPaths []string             `json:"disabledPaths"`
+	Effective     bool                 `json:"effective"`
+	Evidence      []CapabilityEvidence `json:"evidence"`
+}
+
+func (s ResourcePolicyState) Validate() error {
+	if s.Revision == "" {
+		return fmt.Errorf("Runtime resource policy revision is required")
+	}
+	seen := make(map[string]struct{}, len(s.DisabledPaths))
+	for _, path := range s.DisabledPaths {
+		if path == "" {
+			return fmt.Errorf("Runtime resource policy contains an empty path")
+		}
+		if _, exists := seen[path]; exists {
+			return fmt.Errorf("Runtime resource policy contains duplicate path %q", path)
+		}
+		seen[path] = struct{}{}
+	}
+	if s.Effective && len(s.Evidence) == 0 {
+		return fmt.Errorf("effective Runtime resource policy requires native evidence")
+	}
+	return nil
+}
+
 type Model struct {
 	Provider             string   `json:"provider"`
 	ID                   string   `json:"id"`
@@ -304,17 +404,19 @@ func (o Outcome) Validate() error {
 type FailurePhase string
 
 const (
-	FailurePhaseBindingCreate   FailurePhase = "binding_create"
-	FailurePhaseBindingResume   FailurePhase = "binding_resume"
-	FailurePhaseTurnStart       FailurePhase = "turn_start"
-	FailurePhaseTurnContinue    FailurePhase = "turn_continue"
-	FailurePhaseTurnInterrupt   FailurePhase = "turn_interrupt"
-	FailurePhaseHistory         FailurePhase = "history"
-	FailurePhaseClose           FailurePhase = "close"
-	FailurePhaseBindingName     FailurePhase = "binding_name"
-	FailurePhaseBindingArchive  FailurePhase = "binding_archive"
-	FailurePhaseContextDelivery FailurePhase = "context_delivery"
-	FailurePhaseModelControl    FailurePhase = "model_control"
+	FailurePhaseBindingCreate     FailurePhase = "binding_create"
+	FailurePhaseBindingResume     FailurePhase = "binding_resume"
+	FailurePhaseTurnStart         FailurePhase = "turn_start"
+	FailurePhaseTurnContinue      FailurePhase = "turn_continue"
+	FailurePhaseTurnInterrupt     FailurePhase = "turn_interrupt"
+	FailurePhaseHistory           FailurePhase = "history"
+	FailurePhaseClose             FailurePhase = "close"
+	FailurePhaseBindingName       FailurePhase = "binding_name"
+	FailurePhaseBindingArchive    FailurePhase = "binding_archive"
+	FailurePhaseContextDelivery   FailurePhase = "context_delivery"
+	FailurePhaseModelControl      FailurePhase = "model_control"
+	FailurePhaseResourceInventory FailurePhase = "resource_inventory"
+	FailurePhaseResourcePolicy    FailurePhase = "resource_policy"
 )
 
 type Failure struct {
@@ -337,7 +439,8 @@ func (f Failure) Validate() error {
 	case FailurePhaseBindingCreate, FailurePhaseBindingResume, FailurePhaseTurnStart,
 		FailurePhaseTurnContinue, FailurePhaseTurnInterrupt, FailurePhaseHistory,
 		FailurePhaseClose, FailurePhaseBindingName, FailurePhaseBindingArchive,
-		FailurePhaseContextDelivery, FailurePhaseModelControl:
+		FailurePhaseContextDelivery, FailurePhaseModelControl,
+		FailurePhaseResourceInventory, FailurePhaseResourcePolicy:
 		return nil
 	default:
 		return fmt.Errorf("Runtime failure has unknown phase %q", f.Phase)
@@ -413,7 +516,8 @@ func (s CapabilitySnapshot) Validate() error {
 const (
 	CapabilitySandboxConfiguration = "sandbox_configuration"
 	CapabilityApprovalPolicy       = "approval_policy"
-	CapabilitySkillsPolicy         = "skills_policy"
+	CapabilityResourceInventory    = "resource_inventory"
+	CapabilityResourcePolicy       = "resource_policy"
 	CapabilityContextDelivery      = "context_delivery"
 	CapabilityNativeRename         = "native_rename"
 	CapabilityNativeArchive        = "native_archive"

@@ -449,6 +449,55 @@ func TestCmdSkillsHelpReturnsWithoutInspecting(t *testing.T) {
 	}
 }
 
+func TestCmdAgentSkillsUsesOneRuntimeSnapshotAndExpectedRevision(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/agents/codex-worker/skills" && r.URL.Path != "/api/agents/codex-worker/skills/config" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		if r.Method == http.MethodPatch {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["expectedRevision"] != "resources-1" || body["path"] != "/tmp/review/SKILL.md" || body["enabled"] != false {
+				t.Errorf("PATCH body = %#v", body)
+			}
+		}
+		mutable := r.Method != http.MethodPatch
+		_ = json.NewEncoder(w).Encode(map[string]any{"resources": map[string]any{
+			"agentId": "agent-codex", "agentName": "codex-worker", "runtimeKind": "codex", "revision": "resources-1",
+			"semantics": "Codex-native resources; Runtime-specific", "resources": []any{
+				map[string]any{"kind": "skill", "name": "review", "path": "/tmp/review/SKILL.md", "enabled": true},
+			}, "policy": map[string]any{"available": true, "mutable": mutable, "effective": mutable, "reason": "binding is loaded", "alternative": "restart and reopen Resources"},
+		}})
+	}))
+	defer server.Close()
+	previousBase, previousColor := base, useColor
+	base, useColor = server.URL, false
+	defer func() { base, useColor = previousBase, previousColor }()
+	output := captureStdout(t, func() {
+		cmdAgentSkills(args{positional: []string{"agent", "codex-worker", "disable", "/tmp/review/SKILL.md"}, flags: map[string]string{}, flagValues: map[string][]string{}})
+	})
+	if requests != 2 || !strings.Contains(output, "Runtime Resources") || !strings.Contains(output, "Runtime-specific") || !strings.Contains(output, "Policy immutable") || !strings.Contains(output, "restart and reopen Resources") {
+		t.Fatalf("requests=%d output=%q", requests, output)
+	}
+}
+
+func TestRuntimeResourcePolicyMutationErrorUsesTypedAvailabilityAndMutability(t *testing.T) {
+	for _, policy := range []map[string]any{
+		{"available": false, "mutable": false, "reason": "Pi policy unavailable", "alternative": "use Pi settings"},
+		{"available": true, "mutable": false, "reason": "binding loaded", "alternative": "restart Runtime"},
+	} {
+		err := runtimeResourcePolicyMutationError(policy)
+		if err == nil || !strings.Contains(err.Error(), str(policy, "reason")) || !strings.Contains(err.Error(), str(policy, "alternative")) {
+			t.Fatalf("typed policy error = %v for %#v", err, policy)
+		}
+	}
+	if err := runtimeResourcePolicyMutationError(map[string]any{"available": true, "mutable": true}); err != nil {
+		t.Fatalf("mutable policy rejected: %v", err)
+	}
+}
+
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	read, write, err := os.Pipe()

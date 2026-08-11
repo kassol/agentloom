@@ -396,8 +396,21 @@ func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contrac
 			capability.SetApprovalHandler(func(proposal runtimecontract.ApprovalProposal) {
 				_ = capability.ResolveApproval(context.Background(), proposal.ID, runtimecontract.ApprovalApprove)
 			})
-		case runtimecontract.CapabilitySkillsPolicy:
-			contract.(runtimeSkillsConfiguration).SetRuntimeDisabledSkills([]string{"/fixture/disabled-skill"})
+		case runtimecontract.CapabilityResourceInventory:
+			inventory, failure := contract.(runtimecontract.ResourceInventoryCapability).InspectResources(context.Background(), runtimecontract.ResourceInventoryRequest{Binding: binding, Cwd: "/tmp/one"})
+			if failure != nil || inventory.Validate() != nil || len(inventory.Resources) == 0 {
+				t.Fatalf("native resource inventory = %#v, failure=%v", inventory, failure)
+			}
+		case runtimecontract.CapabilityResourcePolicy:
+			paths := []string{"/fixture/disabled-skill"}
+			contract.(runtimeSkillsConfiguration).SetRuntimeDisabledSkills(paths)
+			if outcome := contract.ResumeBinding(context.Background(), binding); runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false) != nil {
+				t.Fatalf("native resource policy resume = %#v", outcome)
+			}
+			state, failure := contract.(runtimecontract.ResourcePolicyCapability).InspectResourcePolicy(context.Background(), runtimecontract.ResourcePolicyRequest{Binding: binding, Cwd: "/tmp/one", DisabledPaths: paths})
+			if failure != nil || state.Validate() != nil || !state.Effective || len(state.DisabledPaths) != 1 || state.DisabledPaths[0] != paths[0] {
+				t.Fatalf("native resource policy = %#v, failure=%v", state, failure)
+			}
 		case runtimecontract.CapabilityContextDelivery:
 			_ = contract.(runtimecontract.ContextDeliveryPolicy).ContextDeliveryMode()
 		case runtimecontract.CapabilityNativeRename:

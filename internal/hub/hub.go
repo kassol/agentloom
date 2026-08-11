@@ -295,17 +295,18 @@ type turnState struct {
 }
 
 type runtime struct {
-	agentID           string
-	agentHost         AgentHost
-	runtimeContract   runtimecontract.Contract
-	hostGeneration    uint64
-	skillConfigHash   string
-	skillConfigLoaded bool
-	binding           runtimecontract.Binding
-	ready             chan struct{}
-	initErr           error
-	acquiring         bool
-	startMu           sync.Mutex
+	agentID            string
+	agentHost          AgentHost
+	runtimeContract    runtimecontract.Contract
+	hostGeneration     uint64
+	resourceGeneration string
+	skillConfigHash    string
+	skillConfigLoaded  bool
+	binding            runtimecontract.Binding
+	ready              chan struct{}
+	initErr            error
+	acquiring          bool
+	startMu            sync.Mutex
 
 	activeTurn *turnState           // guarded by Hub.mu
 	approvals  map[string]*approval // guarded by Hub.mu
@@ -333,8 +334,10 @@ type Hub struct {
 	mu                               sync.Mutex
 	contextCoverageMu                sync.Mutex
 	modelProviderMu                  sync.Mutex
+	resourcePolicyMu                 sync.Mutex
 	agents                           map[string]*Agent
 	agentSkillConfigs                map[string]*AgentSkillConfig
+	resourcePolicyApplying           map[string]bool
 	comms                            map[string]*AgentMessage
 	commOrder                        []string
 	schedules                        map[string]*Schedule
@@ -411,6 +414,8 @@ type Hub struct {
 	larkUpdateConnectionForTest      func(string, string) (PlatformConnection, error)
 	larkMigrationRecordWriteForTest  func() error
 	larkMigrationRecordRemoveForTest func(string) error
+	saveAgentSkillConfigsForTest     func(any) error
+	saveAgentsForTest                func(any) error
 }
 
 // New is retained for in-process callers that cannot recover from an invalid
@@ -470,6 +475,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		writerOwnership:        ownership,
 		agents:                 map[string]*Agent{},
 		agentSkillConfigs:      map[string]*AgentSkillConfig{},
+		resourcePolicyApplying: map[string]bool{},
 		comms:                  map[string]*AgentMessage{},
 		schedules:              map[string]*Schedule{},
 		triggers:               map[string]*Trigger{},
@@ -986,6 +992,9 @@ func (h *Hub) persistAgentsLocked() error {
 		}
 		own[id] = meta
 	}
+	if h.saveAgentsForTest != nil {
+		return h.saveAgentsForTest(own)
+	}
 	return h.st.SaveAgents(own)
 }
 
@@ -1195,6 +1204,13 @@ func (h *Hub) LastSeq(key string) int64 {
 
 // getRuntimeLocked returns an Agent binding to the shared CodexHost.
 func (h *Hub) getRuntimeLocked(meta *Agent) (*runtime, error) {
+	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+		return nil, err
+	}
+	return h.getRuntimeLockedForResourcePolicy(meta)
+}
+
+func (h *Hub) getRuntimeLockedForResourcePolicy(meta *Agent) (*runtime, error) {
 	if rt := h.runtimes[meta.ID]; rt != nil && rt.acquiring {
 		return rt, nil
 	}
@@ -1458,7 +1474,7 @@ func (h *Hub) markRuntimeSkillConfigApplied(agentID string, rt *runtime, skillCo
 	query := h.captureRuntimeCapabilityQueryLocked(meta, rt)
 	h.mu.Unlock()
 	snapshot, err := h.queryRuntimeCapabilities(query)
-	descriptor, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilitySkillsPolicy)
+	descriptor, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilityResourcePolicy)
 	available := err == nil && ok && descriptor.Availability == runtimecontract.CapabilityAvailable
 	h.mu.Lock()
 	if h.runtimeCapabilityQueryCurrentLocked(query) {

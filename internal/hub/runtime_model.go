@@ -172,6 +172,9 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 }
 
 func (h *Hub) runtimeModelSwitchGuardLocked(agentID string, rt *runtime) error {
+	if err := h.runtimeMutationAllowedLocked(agentID); err != nil {
+		return err
+	}
 	if goal := h.goals[agentID]; goal != nil && goal.ClearedAt == 0 && goal.Status == GoalStatusActive {
 		return errf(409, "pause the active Goal before switching the Runtime model")
 	}

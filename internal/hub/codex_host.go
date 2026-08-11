@@ -70,8 +70,7 @@ type SkillInventoryEntry struct {
 }
 
 type SkillInventory struct {
-	Data   []SkillInventoryEntry      `json:"data"`
-	Agents []AgentSkillInventoryEntry `json:"agents"`
+	Data []SkillInventoryEntry `json:"data"`
 }
 
 func (h *Hub) ensureCodexHostLocked() (*codexHostRuntime, error) {
@@ -188,6 +187,9 @@ func (h *Hub) verifyRuntimeThreadControl(agentID string, rt *runtime) error {
 	meta := h.agents[agentID]
 	if meta == nil {
 		return errf(404, "agent vanished")
+	}
+	if err := h.runtimeMutationAllowedLocked(agentID); err != nil {
+		return err
 	}
 	if rt != nil && rt.runtimeContract != nil {
 		if rt.effectDomainInvalidated {
@@ -334,7 +336,6 @@ func (h *Hub) requestSkillInventory(host *codexHostRuntime) (SkillInventory, err
 	if err := json.Unmarshal(raw, &inventory); err != nil {
 		return SkillInventory{}, fmt.Errorf("decode skills/list: %w", err)
 	}
-	h.projectAgentSkillInventory(&inventory)
 	return inventory, nil
 }
 

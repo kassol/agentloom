@@ -200,3 +200,46 @@ func TestCapabilitySnapshotValidateRejectsMalformedDescriptors(t *testing.T) {
 		})
 	}
 }
+
+func TestResourceInventoryValidateRejectsNativeResourceAmbiguity(t *testing.T) {
+	valid := runtimecontract.ResourceInventory{
+		Revision:  "native-1",
+		Semantics: "Runtime-specific resources; no cross-Runtime portability",
+		Resources: []runtimecontract.Resource{{
+			ID: "skill:/tmp/review/SKILL.md", Name: "review", Kind: runtimecontract.ResourceSkill,
+			Path: "/tmp/review/SKILL.md", Scope: "user", Enabled: true,
+		}},
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*runtimecontract.ResourceInventory){
+		"revision":  func(value *runtimecontract.ResourceInventory) { value.Revision = "" },
+		"semantics": func(value *runtimecontract.ResourceInventory) { value.Semantics = "" },
+		"duplicate": func(value *runtimecontract.ResourceInventory) {
+			value.Resources = append(value.Resources, value.Resources[0])
+		},
+		"kind": func(value *runtimecontract.ResourceInventory) { value.Resources[0].Kind = "builtin" },
+		"path": func(value *runtimecontract.ResourceInventory) { value.Resources[0].Path = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := valid
+			value.Resources = append([]runtimecontract.Resource(nil), valid.Resources...)
+			mutate(&value)
+			if err := value.Validate(); err == nil {
+				t.Fatalf("Validate accepted %#v", value)
+			}
+		})
+	}
+}
+
+func TestResourcePolicyStateValidateRequiresEffectiveEvidence(t *testing.T) {
+	state := runtimecontract.ResourcePolicyState{Revision: "policy-1", Effective: true}
+	if err := state.Validate(); err == nil || !strings.Contains(err.Error(), "evidence") {
+		t.Fatalf("effective policy without evidence error = %v", err)
+	}
+	state.Evidence = []runtimecontract.CapabilityEvidence{{Kind: "native_ack", Summary: "native lifecycle acknowledged exact policy"}}
+	if err := state.Validate(); err != nil {
+		t.Fatalf("valid resource policy: %v", err)
+	}
+}

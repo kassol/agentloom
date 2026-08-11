@@ -293,6 +293,67 @@ func (r *piAgentRuntime) models(timeout time.Duration) (RuntimeModelState, error
 	return RuntimeModelState{Current: current, Models: models, ThinkingLevel: thinkingLevel}, nil
 }
 
+func (r *piAgentRuntime) resources(ctx context.Context) (runtimecontract.ResourceInventory, error) {
+	r.mu.Lock()
+	rpc := r.rpc
+	r.mu.Unlock()
+	if rpc == nil {
+		return runtimecontract.ResourceInventory{}, errors.New("Pi Runtime is not running")
+	}
+	response, err := rpc.Request(ctx, "get_commands", nil)
+	if err != nil {
+		return runtimecontract.ResourceInventory{}, err
+	}
+	var data struct {
+		Commands []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Source      string `json:"source"`
+			Path        string `json:"path"`
+			Location    string `json:"location"`
+			SourceInfo  struct {
+				Path   string `json:"path"`
+				Source string `json:"source"`
+				Scope  string `json:"scope"`
+			} `json:"sourceInfo"`
+		} `json:"commands"`
+	}
+	if err := json.Unmarshal(response.Data, &data); err != nil {
+		return runtimecontract.ResourceInventory{}, fmt.Errorf("Pi get_commands returned unsupported data: %w", err)
+	}
+	resources := make([]runtimecontract.Resource, 0, len(data.Commands))
+	for _, command := range data.Commands {
+		kind := runtimecontract.ResourceKind(command.Source)
+		switch kind {
+		case runtimecontract.ResourceSkill, runtimecontract.ResourcePrompt, runtimecontract.ResourceExtension:
+		default:
+			continue
+		}
+		name := strings.TrimPrefix(strings.TrimSpace(command.Name), "skill:")
+		path := strings.TrimSpace(command.SourceInfo.Path)
+		if path == "" {
+			path = strings.TrimSpace(command.Path)
+		}
+		if name == "" || path == "" {
+			continue
+		}
+		scope := command.SourceInfo.Scope
+		if scope == "" {
+			scope = command.Location
+		}
+		resources = append(resources, runtimecontract.Resource{
+			ID: string(kind) + ":" + name + ":" + path, Name: name, Description: command.Description,
+			Kind: kind, Path: path, Scope: scope, Source: command.SourceInfo.Source, Enabled: true,
+		})
+	}
+	encoded, _ := json.Marshal(resources)
+	return runtimecontract.ResourceInventory{
+		Revision:  "pi:" + sha256Hex(encoded)[:16],
+		Semantics: "Pi-native extensions, prompts, and skills; identifiers and paths are Runtime-specific",
+		Resources: resources,
+	}, nil
+}
+
 func (r *piAgentRuntime) switchModel(selection RuntimeModelSelection, timeout time.Duration) (RuntimeModelState, error) {
 	preview, err := r.models(timeout)
 	if err != nil {

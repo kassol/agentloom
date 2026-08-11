@@ -58,8 +58,8 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 | GET | `/api/agents/{key}/runtime/diagnostics` | Explicit native binding diagnostics |
 | GET | `/api/agents/{key}/runtime/diagnostics/events` | Explicit redacted native event diagnostics |
 | PATCH | `/api/agents/{key}/config` | Update Agent config |
-| GET | `/api/agents/{key}/skills` | Get Skill config and inventory |
-| PATCH | `/api/agents/{key}/skills/config` | Update Skill config |
+| GET | `/api/agents/{key}/skills` | Get one Runtime-native resource inventory/policy snapshot |
+| PATCH | `/api/agents/{key}/skills/config` | Update resource policy with the snapshot `expectedRevision` |
 | GET | `/api/agents/{key}/profile` | Get Profile |
 | PUT | `/api/agents/{key}/profile` | Update Profile |
 | GET | `/api/agents/{key}/usage` | Agent token usage |

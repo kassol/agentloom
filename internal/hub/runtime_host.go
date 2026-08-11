@@ -45,6 +45,14 @@ type runtimeHistoryContractProvider interface {
 	HistoryContract(AgentHostRequest) runtimecontract.Contract
 }
 
+// runtimeResourceContractProvider lets a shared Host inspect one Agent's
+// native resources without loading that Agent's binding. Per-Agent Runtimes
+// simply use their acquired Contract.
+type runtimeResourceContractProvider interface {
+	ResourceContract(context.Context, AgentHostRequest) (runtimecontract.Contract, string, error)
+	ResourceContractCurrent(string) bool
+}
+
 type runtimeTurnCorrelationBinder interface {
 	bindTurn(string, string, string)
 }

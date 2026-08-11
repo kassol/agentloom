@@ -45,6 +45,20 @@ func (c *piRuntimeContract) ContextDeliveryMode() runtimecontract.ContextDeliver
 	return runtimecontract.ContextDeliveryFullPerTurn
 }
 
+func (c *piRuntimeContract) InspectResources(ctx context.Context, request runtimecontract.ResourceInventoryRequest) (runtimecontract.ResourceInventory, *runtimecontract.Failure) {
+	if c.native == nil {
+		return runtimecontract.ResourceInventory{}, &runtimecontract.Failure{Code: "resource_inventory_unavailable", Phase: runtimecontract.FailurePhaseResourceInventory, Message: "Pi resource inventory requires a running Runtime"}
+	}
+	inventory, err := c.native.resources(ctx)
+	if err != nil {
+		return runtimecontract.ResourceInventory{}, &runtimecontract.Failure{Code: "resource_inventory_failed", Phase: runtimecontract.FailurePhaseResourceInventory, Message: "Pi could not list its native resources", Diagnostic: err.Error(), Cause: err}
+	}
+	if err := inventory.Validate(); err != nil {
+		return runtimecontract.ResourceInventory{}, &runtimecontract.Failure{Code: "resource_inventory_invalid", Phase: runtimecontract.FailurePhaseResourceInventory, Message: "Pi returned an invalid native resource inventory", Diagnostic: err.Error(), Cause: err}
+	}
+	return inventory, nil
+}
+
 func (c *piRuntimeContract) SetRuntimeSandbox(value string) {
 	c.mu.Lock()
 	c.sandbox = value

@@ -85,6 +85,10 @@ func (h *Hub) GetAgent(key string) (AgentView, error) {
 		h.mu.Unlock()
 		return AgentView{}, errf(404, "agent not found: %s", key)
 	}
+	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+		h.mu.Unlock()
+		return AgentView{}, err
+	}
 	view := h.viewLocked(meta)
 	h.mu.Unlock()
 	if snapshot, ok := h.refreshRuntimeCapabilitySnapshot(view.ID, false); ok {
@@ -369,6 +373,10 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 		h.mu.Unlock()
 		return AgentView{}, errf(404, "agent not found: %s", key)
 	}
+	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+		h.mu.Unlock()
+		return AgentView{}, err
+	}
 	if meta.Status == "running" {
 		h.mu.Unlock()
 		return AgentView{}, errf(409, "agent %q is running; config changes apply between Turns", meta.Name)
@@ -396,6 +404,10 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 		if meta == nil || !h.runtimeCapabilityQueryCurrentLocked(capabilityQuery) {
 			h.mu.Unlock()
 			return AgentView{}, errf(409, "Agent Runtime binding changed while capabilities were checked; retry the config update")
+		}
+		if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+			h.mu.Unlock()
+			return AgentView{}, err
 		}
 		if meta.Status == "running" {
 			h.mu.Unlock()
@@ -447,6 +459,10 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 		nextApprovalPolicy = strings.TrimSpace(*p.ApprovalPolicy)
 	}
 	previous := *meta
+	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+		h.mu.Unlock()
+		return AgentView{}, err
+	}
 	nameChanged := meta.Name != nextName
 	meta.Source = "" // editing config adopts an edge mirror into CodexLoom's registry
 	meta.Name = nextName
@@ -1058,6 +1074,10 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 		h.mu.Unlock()
 		return InterruptResult{}, errf(404, "agent not found: %s", key)
 	}
+	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+		h.mu.Unlock()
+		return InterruptResult{}, err
+	}
 	rt := h.runtimes[meta.ID]
 	if rt == nil || rt.activeTurn == nil || rt.activeTurn.finished {
 		if meta.Status == "running" {
@@ -1143,6 +1163,10 @@ func (h *Hub) ArchiveAgent(key string) (map[string]any, error) {
 		h.mu.Unlock()
 		return nil, errf(404, "agent not found: %s", key)
 	}
+	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+		h.mu.Unlock()
+		return nil, err
+	}
 	agentID := meta.ID
 	h.mu.Unlock()
 	for {
@@ -1151,6 +1175,10 @@ func (h *Hub) ArchiveAgent(key string) (map[string]any, error) {
 		if meta == nil {
 			h.mu.Unlock()
 			return nil, errf(404, "agent not found: %s", key)
+		}
+		if err := h.runtimeMutationAllowedLocked(agentID); err != nil {
+			h.mu.Unlock()
+			return nil, err
 		}
 		rt = h.runtimes[agentID]
 		h.mu.Unlock()

@@ -76,6 +76,10 @@ func (h *Hub) Shutdown() {
 				close(h.stop)
 			}
 		})
+		// Runtime resource policy owns native apply plus its durable commit. Wait
+		// without h.mu so Store retirement and Driver shutdown cannot overtake it.
+		h.resourcePolicyMu.Lock()
+		defer h.resourcePolicyMu.Unlock()
 		h.background.Wait()
 		h.workers.Wait()
 		h.mu.Lock()

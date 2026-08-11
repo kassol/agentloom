@@ -2,7 +2,7 @@ import { ArrowDown, ArrowUpRight, BarChart3, CalendarClock, Check, ChevronRight,
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ConversationMembership, type HumanRequest, type InboxEntry, type PlatformConnection, type RuntimeModel, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
+import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ConversationMembership, type HumanRequest, type InboxEntry, type PlatformConnection, type RuntimeModel, type RuntimeResourceSnapshot, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
 import { emptyFeed, reduceFeed } from "./feed";
 import type { Block } from "./feed";
 import type { LoomEvent } from "./types";
@@ -104,6 +104,7 @@ export function AgentPane({
   const remoteAvailable = capabilityAvailable(agent, "remote");
   const usageAvailable = capabilityAvailable(agent, "usage_reporting");
   const compactionAvailable = capabilityAvailable(agent, "manual_compaction");
+  const resourceInventoryAvailable = capabilityAvailable(agent, "resource_inventory");
   const snapshotImageInputAvailable = capabilityAvailable(agent, "image_input");
   const [feed, dispatch] = useReducer(reduceFeed, emptyFeed);
   const [input, setInput] = useState("");
@@ -117,7 +118,7 @@ export function AgentPane({
   const [sendStatus, setSendStatus] = useState<"idle" | "sending" | "sent" | "failed">("idle");
   const [sendKind, setSendKind] = useState<"task" | "answer" | "compact">("task");
   const [configOpen, setConfigOpen] = useState(false);
-  const [configSection, setConfigSection] = useState<"profile" | "team" | "external" | "triggers" | "runtime" | "usage">("profile");
+  const [configSection, setConfigSection] = useState<"profile" | "team" | "external" | "triggers" | "runtime" | "resources" | "usage">("profile");
   const [nameDraft, setNameDraft] = useState(agent.name);
   const [providerDraft, setProviderDraft] = useState(agent.providerId || "openai");
   const [modelDraft, setModelDraft] = useState(agent.model || "");
@@ -130,6 +131,10 @@ export function AgentPane({
   const [savingConfig, setSavingConfig] = useState(false);
 	const [savingRuntimeModel, setSavingRuntimeModel] = useState(false);
 	const [runtimeModelSaveStatus, setRuntimeModelSaveStatus] = useState<"" | "saved" | "failed">("");
+  const [runtimeResources, setRuntimeResources] = useState<RuntimeResourceSnapshot | null>(null);
+  const [loadingRuntimeResources, setLoadingRuntimeResources] = useState(false);
+  const [savingResourceID, setSavingResourceID] = useState("");
+  const [resourceRefresh, setResourceRefresh] = useState(0);
   const [profile, setProfile] = useState<AgentProfile | null>(null);
   const [identityDraft, setIdentityDraft] = useState("");
   const [domainDraft, setDomainDraft] = useState("");
@@ -343,6 +348,39 @@ export function AgentPane({
 	  return () => { cancelled = true; };
 	}, [configOpen, configSection, agent.id, modelConfigurationAvailable, agent.capabilitySnapshot.revision]);
 
+  useEffect(() => {
+    if (!configOpen || configSection !== "resources" || !resourceInventoryAvailable) return;
+    let cancelled = false;
+    setLoadingRuntimeResources(true);
+    api("GET", `/api/agents/${agent.id}/skills`)
+      .then((data) => {
+        if (!cancelled) setRuntimeResources(data.resources as RuntimeResourceSnapshot);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) onError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingRuntimeResources(false);
+      });
+    return () => { cancelled = true; };
+  }, [configOpen, configSection, agent.id, resourceInventoryAvailable, agent.capabilitySnapshot.revision, resourceRefresh]);
+
+  const setResourceEnabled = async (resource: RuntimeResourceSnapshot["resources"][number], enabled: boolean) => {
+    if (!runtimeResources || savingResourceID) return;
+    setSavingResourceID(resource.id);
+    try {
+      const data = await api("PATCH", `/api/agents/${agent.id}/skills/config`, {
+        path: resource.path, enabled, expectedRevision: runtimeResources.revision,
+      });
+      setRuntimeResources(data.resources as RuntimeResourceSnapshot);
+    } catch (err: any) {
+      onError(err.message);
+      setResourceRefresh((value) => value + 1);
+    } finally {
+      setSavingResourceID("");
+    }
+  };
+
   const refreshConnections = async () => {
     const [addressData, connectionData, membershipData] = await Promise.all([
       api("GET", `/api/agents/${agent.id}/addresses`),
@@ -466,6 +504,9 @@ export function AgentPane({
   useEffect(() => {
     let cancelled = false;
     const unsubscribe = subscribeThreadEvents(agent.id, (event) => {
+	  if (event.type === "loom/runtime-resources-updated") {
+		setResourceRefresh((value) => value + 1);
+	  }
       if (event.type === "loom/reconcile") {
         api("GET", `/api/agents/${agent.id}/thread/history?count=${PAGE}&offset=0`)
           .then((history) => {
@@ -1078,6 +1119,7 @@ export function AgentPane({
                 <button onClick={() => setConfigSection("external")} className={`h-7 rounded px-3 ${configSection === "external" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>External</button>
                 <button onClick={() => setConfigSection("triggers")} className={`h-7 rounded px-3 ${configSection === "triggers" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Triggers</button>
                 <button onClick={() => setConfigSection("runtime")} className={`h-7 rounded px-3 ${configSection === "runtime" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Runtime</button>
+                <button onClick={() => setConfigSection("resources")} disabled={!resourceInventoryAvailable} title={!resourceInventoryAvailable ? `Resources are unavailable for the ${agent.runtimeBinding.kind} Runtime` : undefined} className={`h-7 rounded px-3 disabled:cursor-not-allowed disabled:opacity-40 ${configSection === "resources" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Resources</button>
                 <button onClick={() => setConfigSection("usage")} disabled={!usageAvailable} title={!usageAvailable ? `Usage is unavailable for the ${agent.runtimeBinding.kind} Runtime` : undefined} className={`h-7 rounded px-3 disabled:cursor-not-allowed disabled:opacity-40 ${configSection === "usage" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}>Usage</button>
               </div>
 
@@ -1187,6 +1229,50 @@ export function AgentPane({
 					<button onClick={saveConfig} disabled={running || savingConfig} className="rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-medium text-primary-foreground transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60">{savingConfig ? "Saving Agent Config" : "Save Agent Config"}</button>
                   </div>
                 </>
+              ) : configSection === "resources" ? (
+				loadingRuntimeResources ? (
+				  <div className="py-8 text-center text-[12px] text-muted-foreground">Loading Runtime resources...</div>
+				) : runtimeResources ? (
+				  <>
+					<div className="mb-3 rounded-md border border-border bg-muted/20 p-2">
+					  <div className="flex items-center justify-between gap-2">
+						<span className="text-[10px] font-semibold uppercase text-muted-foreground">Runtime-specific semantics</span>
+						<span className="font-mono text-[9px] text-muted-foreground">{runtimeResources.runtimeKind}</span>
+					  </div>
+					  <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{runtimeResources.semantics}</p>
+					  <div className="mt-1 font-mono text-[9px] text-muted-foreground">snapshot {runtimeResources.revision}</div>
+					</div>
+					{!runtimeResources.policy.available || !runtimeResources.policy.mutable ? (
+					  <div className="mb-3 rounded-md bg-warning/10 px-2.5 py-2 text-[11px] leading-4 text-warning">
+						{runtimeResources.policy.reason}. {runtimeResources.policy.alternative}.
+					  </div>
+					) : runtimeResources.policy.effective ? (
+					  <div className="mb-3 rounded-md bg-success/10 px-2.5 py-2 text-[11px] text-success">The displayed policy is effective and backed by native Runtime evidence.</div>
+					) : null}
+					<div className="divide-y divide-border border-y border-border">
+					  {runtimeResources.resources.map((resource) => (
+						<div key={resource.id} className="flex min-w-0 items-center gap-2 py-2.5">
+						  <span className={`size-2 shrink-0 rounded-full ${resource.enabled ? "bg-success" : "bg-muted-foreground/40"}`} />
+						  <div className="min-w-0 flex-1">
+							<div className="flex items-center gap-2"><span className="truncate text-[12px] font-medium">{resource.name}</span><span className="font-mono text-[9px] uppercase text-muted-foreground">{resource.kind}</span></div>
+							<div className="truncate font-mono text-[9px] text-muted-foreground" title={resource.path}>{resource.path}</div>
+							{resource.description ? <div className="mt-0.5 text-[10.5px] text-muted-foreground">{resource.description}</div> : null}
+						  </div>
+						  <span className={`font-mono text-[9px] ${resource.enabled ? "text-success" : "text-muted-foreground"}`}>{resource.enabled ? "enabled" : "disabled"}</span>
+						  {resource.kind === "skill" ? <button
+							onClick={() => setResourceEnabled(resource, !resource.enabled)}
+							disabled={!runtimeResources.policy.mutable || Boolean(savingResourceID)}
+							aria-label={`${resource.enabled ? "Disable" : "Enable"} ${resource.name}`}
+							className="h-7 rounded-md border border-border px-2 text-[10px] disabled:cursor-not-allowed disabled:opacity-40"
+						  >{savingResourceID === resource.id ? "Applying" : resource.enabled ? "Disable" : "Enable"}</button> : null}
+						</div>
+					  ))}
+					  {runtimeResources.resources.length === 0 ? <div className="py-8 text-center text-[12px] text-muted-foreground">No native Runtime resources discovered.</div> : null}
+					</div>
+				  </>
+				) : (
+				  <div className="py-8 text-center text-[12px] text-muted-foreground">Runtime resources unavailable.</div>
+				)
               ) : configSection === "profile" ? (
                 loadingProfile ? (
                   <div className="py-8 text-center text-[12px] text-muted-foreground">Loading profile...</div>

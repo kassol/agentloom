@@ -1,18 +1,22 @@
 package hub
 
 import (
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
-// AgentSkillConfig stores Agent-scoped exceptions to the shared Codex Skill
-// catalog. V1 intentionally supports only disables: enabling removes the
-// Agent exception and falls back to Codex's user-level policy.
+// AgentSkillConfig stores Agent-scoped Codex Skill exceptions. Runtime
+// inventory and policy evidence are always read through the selected adapter.
 type AgentSkillConfig struct {
 	AgentID       string   `json:"agentId"`
 	DisabledPaths []string `json:"disabledPaths"`
@@ -20,27 +24,197 @@ type AgentSkillConfig struct {
 }
 
 type AgentSkillConfigParams struct {
-	Path    string `json:"path"`
-	Enabled bool   `json:"enabled"`
+	Path             string `json:"path"`
+	Enabled          bool   `json:"enabled"`
+	ExpectedRevision string `json:"expectedRevision"`
 }
 
-type AgentSkillConfigView struct {
-	AgentID         string   `json:"agentId"`
-	AgentName       string   `json:"agentName"`
-	DisabledPaths   []string `json:"disabledPaths"`
-	Applied         bool     `json:"applied"`
-	RestartRequired bool     `json:"restartRequired"`
+type RuntimeResourcePolicyView struct {
+	Available     bool                                 `json:"available"`
+	Mutable       bool                                 `json:"mutable"`
+	Reason        string                               `json:"reason,omitempty"`
+	Alternative   string                               `json:"alternative,omitempty"`
+	Revision      string                               `json:"revision,omitempty"`
+	DisabledPaths []string                             `json:"disabledPaths,omitempty"`
+	Effective     bool                                 `json:"effective"`
+	Evidence      []runtimecontract.CapabilityEvidence `json:"evidence,omitempty"`
 }
 
-type AgentSkillInventoryEntry struct {
-	AgentID         string                `json:"agentId"`
-	AgentName       string                `json:"agentName"`
-	Cwd             string                `json:"cwd"`
-	Skills          []SkillInventorySkill `json:"skills"`
-	Errors          []SkillInventoryError `json:"errors"`
-	DisabledPaths   []string              `json:"disabledPaths"`
-	Applied         bool                  `json:"applied"`
-	RestartRequired bool                  `json:"restartRequired"`
+type RuntimeResourceSnapshot struct {
+	AgentID               string                     `json:"agentId"`
+	AgentName             string                     `json:"agentName"`
+	Cwd                   string                     `json:"cwd"`
+	RuntimeKind           string                     `json:"runtimeKind"`
+	BindingRevision       string                     `json:"bindingRevision"`
+	ConfigurationRevision string                     `json:"configurationRevision"`
+	Revision              string                     `json:"revision"`
+	Semantics             string                     `json:"semantics"`
+	Resources             []runtimecontract.Resource `json:"resources"`
+	Policy                RuntimeResourcePolicyView  `json:"policy"`
+
+	generationRevision string
+}
+
+func (h *Hub) GetRuntimeResources(key string) (RuntimeResourceSnapshot, error) {
+	h.mu.Lock()
+	meta := h.resolveLocked(key)
+	if meta == nil {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(404, "agent not found: %s", key)
+	}
+	if h.resourcePolicyApplying[meta.ID] {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "Runtime resource policy is being applied; retry after it settles")
+	}
+	agentID, name, cwd, binding := meta.ID, meta.Name, meta.Cwd, runtimeContractBinding(meta)
+	providerID, model := effectiveProviderBinding(meta)
+	sandbox, effort := meta.Sandbox, meta.Effort
+	disabled := h.disabledSkillPathsLocked(agentID)
+	rt := h.runtimes[agentID]
+	if !runtimeHandleAlive(rt) {
+		rt = nil
+	}
+	driver, driverErr := h.runtimeHostDriverLocked(binding.RuntimeKind)
+	h.mu.Unlock()
+	if driverErr != nil {
+		return RuntimeResourceSnapshot{}, driverErr
+	}
+	var contract runtimecontract.Contract
+	var provider runtimeResourceContractProvider
+	var hostRevision string
+	if rt == nil {
+		provider, _ = driver.(runtimeResourceContractProvider)
+	}
+	if provider != nil {
+		var err error
+		contract, hostRevision, err = provider.ResourceContract(context.Background(), AgentHostRequest{AgentID: agentID})
+		if err != nil {
+			return RuntimeResourceSnapshot{}, err
+		}
+		configureRuntimeBinding(contract, sandbox, providerID, model, effort, disabled)
+	} else {
+		if rt == nil {
+			h.mu.Lock()
+			meta = h.agents[agentID]
+			if meta == nil || meta.Cwd != cwd || runtimeContractBinding(meta) != binding {
+				h.mu.Unlock()
+				return RuntimeResourceSnapshot{}, errf(409, "Agent binding or CWD changed while resources were opened; retry")
+			}
+			var err error
+			rt, err = h.getRuntimeLocked(meta)
+			h.mu.Unlock()
+			if err != nil {
+				return RuntimeResourceSnapshot{}, err
+			}
+		}
+		rt.startMu.Lock()
+		defer rt.startMu.Unlock()
+		if err := waitReady(rt); err != nil {
+			return RuntimeResourceSnapshot{}, errf(500, "Runtime not ready: %s", err)
+		}
+		contract = rt.runtimeContract
+	}
+	h.mu.Lock()
+	meta = h.agents[agentID]
+	if meta == nil || meta.Cwd != cwd || runtimeContractBinding(meta) != binding || (rt != nil && h.runtimes[agentID] != rt) {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "Agent Runtime binding changed while resources were checked; retry")
+	}
+	query := h.captureRuntimeCapabilityQueryLocked(meta, rt)
+	query.contract = contract
+	h.mu.Unlock()
+	snapshot, err := h.queryRuntimeCapabilities(query)
+	if err != nil {
+		return RuntimeResourceSnapshot{}, err
+	}
+	if err := requireCapability(snapshot, runtimecontract.CapabilityResourceInventory, "Runtime resource inventory"); err != nil {
+		return RuntimeResourceSnapshot{}, err
+	}
+	capability, ok := contract.(runtimecontract.ResourceInventoryCapability)
+	if !ok {
+		return RuntimeResourceSnapshot{}, errf(500, "Runtime resource inventory hook is unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	inventory, failure := capability.InspectResources(ctx, runtimecontract.ResourceInventoryRequest{Binding: binding, Cwd: cwd})
+	if failure != nil {
+		return RuntimeResourceSnapshot{}, errf(500, "inspect Runtime resources: %s", failure.Message)
+	}
+	if err := inventory.Validate(); err != nil {
+		return RuntimeResourceSnapshot{}, errf(500, "invalid Runtime resource inventory: %s", err)
+	}
+	policy := RuntimeResourcePolicyView{}
+	if descriptor, found := capabilityDescriptor(snapshot, runtimecontract.CapabilityResourcePolicy); found {
+		policy.Reason, policy.Alternative = descriptor.Reason, descriptor.Alternative
+		policy.Available = descriptor.Availability == runtimecontract.CapabilityAvailable
+		policy.Mutable = policy.Available
+	}
+	if policy.Available {
+		policyCapability := contract.(runtimecontract.ResourcePolicyCapability)
+		state, policyFailure := policyCapability.InspectResourcePolicy(ctx, runtimecontract.ResourcePolicyRequest{Binding: binding, Cwd: cwd})
+		if policyFailure != nil {
+			return RuntimeResourceSnapshot{}, errf(500, "inspect Runtime resource policy: %s", policyFailure.Message)
+		}
+		if err := state.Validate(); err != nil {
+			return RuntimeResourceSnapshot{}, errf(500, "invalid Runtime resource policy: %s", err)
+		}
+		policy.Revision, policy.DisabledPaths, policy.Effective, policy.Evidence = state.Revision, state.DisabledPaths, state.Effective, state.Evidence
+		if policy.Effective {
+			for i := range inventory.Resources {
+				for _, path := range policy.DisabledPaths {
+					if skillPathMatches(inventory.Resources[i].Path, path) {
+						inventory.Resources[i].Enabled = false
+						break
+					}
+				}
+			}
+		}
+	}
+	if policy.Available && rt != nil {
+		policy.Mutable = false
+		policy.Reason = "This Runtime binding is already loaded and cannot safely hot-apply resource policy."
+		policy.Alternative = "Restart CodexLoom, reopen Resources, and apply the policy before the binding loads."
+	}
+	h.mu.Lock()
+	current := h.agents[agentID]
+	stale := current == nil || current.Cwd != cwd || runtimeContractBinding(current) != binding || (rt != nil && h.runtimes[agentID] != rt)
+	configurationRevision := ""
+	if current != nil {
+		configurationRevision = resourcePolicyConfigurationRevision(current, h.disabledSkillPathsLocked(agentID))
+	}
+	if rt != nil && rt.resourceGeneration == "" {
+		rt.resourceGeneration = newRuntimeResourceGeneration()
+	}
+	runtimeGeneration, nativeGeneration := hostRevision, hostRevision
+	if rt != nil {
+		runtimeGeneration = rt.resourceGeneration
+		if rt.hostGeneration != 0 {
+			nativeGeneration = fmt.Sprintf("codex-host:%d", rt.hostGeneration)
+		} else {
+			nativeGeneration = rt.resourceGeneration
+		}
+	}
+	h.mu.Unlock()
+	if provider != nil && !provider.ResourceContractCurrent(hostRevision) {
+		stale = true
+	}
+	if stale {
+		return RuntimeResourceSnapshot{}, errf(409, "Agent binding or CWD changed while resources were checked; retry")
+	}
+	encoded, _ := json.Marshal([]any{snapshot.Revision, inventory.Revision, policy.Revision, policy.Effective, runtimeGeneration, configurationRevision})
+	return RuntimeResourceSnapshot{
+		AgentID: agentID, AgentName: name, Cwd: cwd, RuntimeKind: binding.RuntimeKind, BindingRevision: query.scope.BindingRevision, ConfigurationRevision: configurationRevision,
+		Revision: "resources:" + sha256Hex(encoded)[:16], Semantics: inventory.Semantics,
+		Resources: inventory.Resources, Policy: policy, generationRevision: nativeGeneration,
+	}, nil
+}
+
+func newRuntimeResourceGeneration() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return "runtime:" + hex.EncodeToString(value[:])
+	}
+	return fmt.Sprintf("runtime:%d", time.Now().UnixNano())
 }
 
 func normalizeAgentSkillPath(path string) (string, error) {
@@ -59,6 +233,242 @@ func normalizeAgentSkillPath(path string) (string, error) {
 		path = filepath.Clean(resolved)
 	}
 	return path, nil
+}
+
+func (h *Hub) UpdateRuntimeResourcePolicy(key string, params AgentSkillConfigParams) (RuntimeResourceSnapshot, error) {
+	path, err := normalizeAgentSkillPath(params.Path)
+	if err != nil {
+		return RuntimeResourceSnapshot{}, err
+	}
+	if strings.TrimSpace(params.ExpectedRevision) == "" {
+		return RuntimeResourceSnapshot{}, errf(400, "expectedRevision is required")
+	}
+	h.resourcePolicyMu.Lock()
+	defer h.resourcePolicyMu.Unlock()
+	h.mu.Lock()
+	if h.stopping {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "CodexLoom is shutting down; Runtime resource policy cannot be changed")
+	}
+	h.mu.Unlock()
+	current, err := h.GetRuntimeResources(key)
+	if err != nil {
+		return RuntimeResourceSnapshot{}, err
+	}
+	if current.Revision != params.ExpectedRevision {
+		return RuntimeResourceSnapshot{}, errf(409, "Runtime resource snapshot is stale; reopen Resources and retry")
+	}
+	if !current.Policy.Available {
+		return RuntimeResourceSnapshot{}, errf(409, "%s; %s", current.Policy.Reason, current.Policy.Alternative)
+	}
+	nextPaths := append([]string(nil), current.Policy.DisabledPaths...)
+	if params.Enabled {
+		kept := nextPaths[:0]
+		for _, existing := range nextPaths {
+			if !skillPathMatches(existing, path) {
+				kept = append(kept, existing)
+			}
+		}
+		nextPaths = kept
+	} else {
+		nextPaths = append(nextPaths, path)
+	}
+	nextPaths = normalizedDisabledSkillPaths(nextPaths)
+	if current.Policy.Effective && strings.Join(nextPaths, "\x00") == strings.Join(normalizedDisabledSkillPaths(current.Policy.DisabledPaths), "\x00") {
+		return current, nil
+	}
+
+	h.mu.Lock()
+	meta := h.resolveLocked(key)
+	if meta == nil {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(404, "agent not found: %s", key)
+	}
+	if meta.ID != current.AgentID || meta.Name != current.AgentName || meta.Cwd != current.Cwd || meta.RuntimeBinding.Kind != current.RuntimeKind || h.runtimeCapabilityScopeLocked(meta).BindingRevision != current.BindingRevision || resourcePolicyConfigurationRevision(meta, h.disabledSkillPathsLocked(meta.ID)) != current.ConfigurationRevision {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "Agent binding or CWD changed after Resources were inspected; retry")
+	}
+	if meta.Status == "running" {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "agent %q is running; change resource policy between Turns", meta.Name)
+	}
+	if h.stopping {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "CodexLoom is shutting down; Runtime resource policy cannot be changed")
+	}
+	if meta.Source == "edge" {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "edge Agent %q must be adopted before configuring resources", meta.Name)
+	}
+	if rt := h.runtimes[meta.ID]; runtimeHandleAlive(rt) {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "the Runtime binding is already loaded and cannot safely hot-apply resource policy; restart CodexLoom, reopen Resources, and retry")
+	}
+	if h.resourcePolicyApplying == nil {
+		h.resourcePolicyApplying = map[string]bool{}
+	}
+	if h.resourcePolicyApplying[meta.ID] {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "Runtime resource policy is already being applied")
+	}
+	h.resourcePolicyApplying[meta.ID] = true
+	previous, hadPrevious := h.agentSkillConfigs[meta.ID]
+	if h.agentSkillConfigs == nil {
+		h.agentSkillConfigs = map[string]*AgentSkillConfig{}
+	}
+	pending := &AgentSkillConfig{AgentID: meta.ID, DisabledPaths: nextPaths, UpdatedAt: now()}
+	h.agentSkillConfigs[meta.ID] = pending
+	expectedConfigurationRevision := resourcePolicyConfigurationRevision(meta, nextPaths)
+	saveAgentSkillConfigs := h.agentSkillConfigSaverLocked()
+	agentID, cwd, binding := meta.ID, meta.Cwd, runtimeContractBinding(meta)
+	rt, acquireErr := h.getRuntimeLockedForResourcePolicy(meta)
+	h.mu.Unlock()
+	restoreLocked := func() {
+		if h.agentSkillConfigs[agentID] != pending && h.agentSkillConfigs[agentID] != nil {
+			return
+		}
+		if hadPrevious {
+			h.agentSkillConfigs[agentID] = previous
+		} else {
+			delete(h.agentSkillConfigs, agentID)
+		}
+	}
+	failApply := func(rt *runtime, cause error) {
+		h.mu.Lock()
+		restoreLocked()
+		h.mu.Unlock()
+		if rt != nil {
+			h.invalidateRuntimeEffectDomain(rt, cause)
+		}
+		h.mu.Lock()
+		delete(h.resourcePolicyApplying, agentID)
+		h.mu.Unlock()
+	}
+	if acquireErr != nil {
+		failApply(nil, acquireErr)
+		return RuntimeResourceSnapshot{}, acquireErr
+	}
+	rt.startMu.Lock()
+	readyErr := waitReady(rt)
+	if readyErr == nil {
+		nativeGeneration := rt.resourceGeneration
+		if rt.hostGeneration != 0 {
+			nativeGeneration = fmt.Sprintf("codex-host:%d", rt.hostGeneration)
+		}
+		if nativeGeneration != current.generationRevision {
+			readyErr = fmt.Errorf("Runtime Host generation changed while resource policy was applied")
+		}
+	}
+	if readyErr == nil {
+		capability, ok := rt.runtimeContract.(runtimecontract.ResourcePolicyCapability)
+		if !ok {
+			readyErr = fmt.Errorf("Runtime resource policy hook is unavailable")
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			state, failure := capability.InspectResourcePolicy(ctx, runtimecontract.ResourcePolicyRequest{Binding: binding, Cwd: cwd, DisabledPaths: nextPaths})
+			cancel()
+			if failure != nil {
+				readyErr = fmt.Errorf("%s", failure.Message)
+			} else if !state.Effective || len(state.Evidence) == 0 || strings.Join(normalizedDisabledSkillPaths(state.DisabledPaths), "\x00") != strings.Join(nextPaths, "\x00") {
+				readyErr = fmt.Errorf("Runtime did not prove the exact resource policy effective")
+			}
+		}
+	}
+	rt.startMu.Unlock()
+	if readyErr != nil {
+		failApply(rt, readyErr)
+		return RuntimeResourceSnapshot{}, errf(409, "apply Runtime resource policy before persistence: %s", readyErr)
+	}
+
+	h.mu.Lock()
+	meta = h.agents[agentID]
+	pendingCurrent := h.agentSkillConfigs[agentID] == pending
+	stale := meta == nil || h.runtimes[agentID] != rt || meta.Cwd != cwd || runtimeContractBinding(meta) != binding || meta.Status == "running" || h.stopping || !pendingCurrent
+	if meta != nil && resourcePolicyConfigurationRevision(meta, h.disabledSkillPathsLocked(agentID)) != expectedConfigurationRevision {
+		stale = true
+	}
+	if stale {
+		restoreLocked()
+		h.mu.Unlock()
+		cause := fmt.Errorf("Agent state changed while resource policy was applied")
+		h.invalidateRuntimeEffectDomain(rt, cause)
+		h.mu.Lock()
+		delete(h.resourcePolicyApplying, agentID)
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(409, "Agent binding, CWD, or policy changed while applying Runtime resources; the Runtime was fenced")
+	}
+	if len(nextPaths) == 0 {
+		delete(h.agentSkillConfigs, agentID)
+	}
+	persisted := cloneAgentSkillConfigs(h.agentSkillConfigs)
+	h.mu.Unlock()
+	saveErr := saveAgentSkillConfigs(persisted)
+	h.mu.Lock()
+	meta = h.agents[agentID]
+	postStale := meta == nil || h.runtimes[agentID] != rt || meta.Cwd != cwd || runtimeContractBinding(meta) != binding || meta.Status == "running" || h.stopping || !h.resourcePolicyApplying[agentID]
+	if meta != nil && resourcePolicyConfigurationRevision(meta, h.disabledSkillPathsLocked(agentID)) != expectedConfigurationRevision {
+		postStale = true
+	}
+	if saveErr != nil || postStale {
+		restoreLocked()
+		compensation := cloneAgentSkillConfigs(h.agentSkillConfigs)
+		h.mu.Unlock()
+		if saveErr == nil {
+			if err := saveAgentSkillConfigs(compensation); err != nil {
+				saveErr = fmt.Errorf("Agent state changed after persistence and compensation failed: %w", err)
+			} else {
+				saveErr = fmt.Errorf("Agent state changed after persistence; previous policy was restored")
+			}
+		}
+		h.invalidateRuntimeEffectDomain(rt, saveErr)
+		h.mu.Lock()
+		delete(h.resourcePolicyApplying, agentID)
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(500, "save Runtime resource policy: %s; the Runtime was fenced", saveErr)
+	}
+	h.emitLocked(agentID, "loom/runtime-resources-updated", map[string]any{"path": path, "enabled": params.Enabled})
+	delete(h.resourcePolicyApplying, agentID)
+	h.mu.Unlock()
+	return h.GetRuntimeResources(agentID)
+}
+
+func (h *Hub) runtimeMutationAllowedLocked(agentID string) error {
+	if h.resourcePolicyApplying[agentID] {
+		return errf(409, "Runtime resource policy is being applied; retry after it settles")
+	}
+	return nil
+}
+
+func (h *Hub) agentSkillConfigSaverLocked() func(any) error {
+	if h.saveAgentSkillConfigsForTest != nil {
+		return h.saveAgentSkillConfigsForTest
+	}
+	st := h.st
+	return st.SaveAgentSkillConfigs
+}
+
+func resourcePolicyConfigurationRevision(meta *Agent, disabledPaths []string) string {
+	if meta == nil {
+		return ""
+	}
+	digest := sha256Hex([]byte(strings.Join([]string{
+		meta.Name, meta.Cwd, meta.ProviderID, meta.Model, meta.Effort, meta.Sandbox, meta.ApprovalPolicy,
+		agentSkillConfigHash(normalizedDisabledSkillPaths(disabledPaths)),
+	}, "\x00")))
+	return "resource-config:" + digest[:16]
+}
+
+func cloneAgentSkillConfigs(configs map[string]*AgentSkillConfig) map[string]*AgentSkillConfig {
+	clone := make(map[string]*AgentSkillConfig, len(configs))
+	for id, config := range configs {
+		if config == nil {
+			continue
+		}
+		copied := *config
+		copied.DisabledPaths = append([]string(nil), config.DisabledPaths...)
+		clone[id] = &copied
+	}
+	return clone
 }
 
 func normalizedDisabledSkillPaths(paths []string) []string {
@@ -116,125 +526,6 @@ func (h *Hub) disabledSkillPathsLocked(agentID string) []string {
 	return append([]string(nil), config.DisabledPaths...)
 }
 
-func (h *Hub) agentSkillConfigViewLocked(meta *Agent) AgentSkillConfigView {
-	paths := normalizedDisabledSkillPaths(h.disabledSkillPathsLocked(meta.ID))
-	desiredHash := agentSkillConfigHash(paths)
-	rt := h.runtimes[meta.ID]
-	applied := rt != nil && rt.skillConfigLoaded && rt.skillConfigHash == desiredHash
-	restartRequired := rt != nil && rt.skillConfigLoaded && rt.skillConfigHash != desiredHash
-	return AgentSkillConfigView{
-		AgentID:         meta.ID,
-		AgentName:       meta.Name,
-		DisabledPaths:   paths,
-		Applied:         applied,
-		RestartRequired: restartRequired,
-	}
-}
-
-func (h *Hub) GetAgentSkillConfig(key string) (AgentSkillConfigView, error) {
-	h.mu.Lock()
-	meta := h.resolveLocked(key)
-	if meta == nil {
-		h.mu.Unlock()
-		return AgentSkillConfigView{}, errf(404, "agent not found: %s", key)
-	}
-	query := h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[meta.ID])
-	h.mu.Unlock()
-	snapshot, queryErr := h.queryRuntimeCapabilities(query)
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	meta = h.agents[query.agentID]
-	if queryErr != nil {
-		return AgentSkillConfigView{}, queryErr
-	}
-	if meta == nil || !h.runtimeCapabilityQueryCurrentLocked(query) {
-		return AgentSkillConfigView{}, errf(409, "Agent Runtime binding changed while capabilities were checked; retry")
-	}
-	if err := requireCapability(snapshot, runtimecontract.CapabilitySkillsPolicy, "Skill policy"); err != nil {
-		return AgentSkillConfigView{}, err
-	}
-	return h.agentSkillConfigViewLocked(meta), nil
-}
-
-func (h *Hub) UpdateAgentSkillConfig(key string, params AgentSkillConfigParams) (AgentSkillConfigView, error) {
-	path, err := normalizeAgentSkillPath(params.Path)
-	if err != nil {
-		return AgentSkillConfigView{}, err
-	}
-
-	h.mu.Lock()
-	meta := h.resolveLocked(key)
-	if meta == nil {
-		h.mu.Unlock()
-		return AgentSkillConfigView{}, errf(404, "agent not found: %s", key)
-	}
-	if meta.Status == "running" {
-		h.mu.Unlock()
-		return AgentSkillConfigView{}, errf(409, "agent %q is running; Skill config changes apply between Turns", meta.Name)
-	}
-	if meta.Source == "edge" {
-		h.mu.Unlock()
-		return AgentSkillConfigView{}, errf(409, "edge Agent %q must be adopted before configuring Skills", meta.Name)
-	}
-	query := h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[meta.ID])
-	h.mu.Unlock()
-	snapshot, queryErr := h.queryRuntimeCapabilities(query)
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	meta = h.agents[query.agentID]
-	if queryErr != nil {
-		return AgentSkillConfigView{}, queryErr
-	}
-	if meta == nil || !h.runtimeCapabilityQueryCurrentLocked(query) {
-		return AgentSkillConfigView{}, errf(409, "Agent Runtime binding changed while capabilities were checked; retry")
-	}
-	if meta.Status == "running" || meta.Source == "edge" {
-		return AgentSkillConfigView{}, errf(409, "Agent changed while capabilities were checked; retry")
-	}
-	if err := requireCapability(snapshot, runtimecontract.CapabilitySkillsPolicy, "Skill policy"); err != nil {
-		return AgentSkillConfigView{}, err
-	}
-	if h.agentSkillConfigs == nil {
-		h.agentSkillConfigs = map[string]*AgentSkillConfig{}
-	}
-
-	previous, hadPrevious := h.agentSkillConfigs[meta.ID]
-	paths := h.disabledSkillPathsLocked(meta.ID)
-	if params.Enabled {
-		filtered := paths[:0]
-		for _, existing := range paths {
-			if filepath.Clean(existing) != path {
-				filtered = append(filtered, existing)
-			}
-		}
-		paths = filtered
-	} else {
-		paths = append(paths, path)
-	}
-	paths = normalizedDisabledSkillPaths(paths)
-	if len(paths) == 0 {
-		delete(h.agentSkillConfigs, meta.ID)
-	} else {
-		h.agentSkillConfigs[meta.ID] = &AgentSkillConfig{
-			AgentID:       meta.ID,
-			DisabledPaths: paths,
-			UpdatedAt:     now(),
-		}
-	}
-	if err := h.st.SaveAgentSkillConfigs(h.agentSkillConfigs); err != nil {
-		if hadPrevious {
-			h.agentSkillConfigs[meta.ID] = previous
-		} else {
-			delete(h.agentSkillConfigs, meta.ID)
-		}
-		return AgentSkillConfigView{}, errf(500, "save Agent Skill config: %s", err)
-	}
-	h.emitLocked(meta.ID, "loom/agent-skill-config-updated", map[string]any{
-		"path": path, "enabled": params.Enabled,
-	})
-	return h.agentSkillConfigViewLocked(meta), nil
-}
-
 func skillPathMatches(left, right string) bool {
 	left = filepath.Clean(left)
 	right = filepath.Clean(right)
@@ -244,118 +535,4 @@ func skillPathMatches(left, right string) bool {
 	leftResolved, leftErr := filepath.EvalSymlinks(left)
 	rightResolved, rightErr := filepath.EvalSymlinks(right)
 	return leftErr == nil && rightErr == nil && filepath.Clean(leftResolved) == filepath.Clean(rightResolved)
-}
-
-func (h *Hub) projectAgentSkillInventory(inventory *SkillInventory) {
-	if inventory == nil {
-		return
-	}
-	byCwd := make(map[string]SkillInventoryEntry, len(inventory.Data))
-	for _, entry := range inventory.Data {
-		byCwd[filepath.Clean(entry.Cwd)] = entry
-	}
-
-	h.mu.Lock()
-	agents := make([]Agent, 0, len(h.agents))
-	configs := make(map[string]AgentSkillConfigView, len(h.agents))
-	queries := make(map[string]runtimeCapabilityQuery, len(h.agents))
-	for _, meta := range h.agents {
-		agents = append(agents, *meta)
-		queries[meta.ID] = h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[meta.ID])
-		configs[meta.ID] = h.agentSkillConfigViewLocked(meta)
-	}
-	h.mu.Unlock()
-	skillsAvailable := make(map[string]bool, len(agents))
-	for _, agent := range agents {
-		snapshot, err := h.queryRuntimeCapabilities(queries[agent.ID])
-		if err != nil {
-			continue
-		}
-		descriptor, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilitySkillsPolicy)
-		skillsAvailable[agent.ID] = ok && descriptor.Availability == runtimecontract.CapabilityAvailable
-	}
-	h.mu.Lock()
-	for agentID, query := range queries {
-		if !h.runtimeCapabilityQueryCurrentLocked(query) {
-			skillsAvailable[agentID] = false
-		}
-	}
-	h.mu.Unlock()
-	sort.SliceStable(agents, func(i, j int) bool {
-		if agents[i].Name != agents[j].Name {
-			return agents[i].Name < agents[j].Name
-		}
-		return agents[i].ID < agents[j].ID
-	})
-
-	inventory.Agents = make([]AgentSkillInventoryEntry, 0, len(agents))
-	for _, agent := range agents {
-		raw := SkillInventoryEntry{Cwd: agent.Cwd}
-		config := configs[agent.ID]
-		if skillsAvailable[agent.ID] {
-			raw = byCwd[filepath.Clean(agent.Cwd)]
-		} else {
-			// Persisted policy belongs to the Runtime that supported it. Keep the
-			// historical record for a possible switch back, but never project it
-			// as active policy or inventory for an unsupported Runtime.
-			config = AgentSkillConfigView{}
-		}
-		skills := append([]SkillInventorySkill(nil), raw.Skills...)
-		for i := range skills {
-			for _, disabledPath := range config.DisabledPaths {
-				if skillPathMatches(skills[i].Path, disabledPath) {
-					skills[i].Enabled = false
-					break
-				}
-			}
-		}
-		inventory.Agents = append(inventory.Agents, AgentSkillInventoryEntry{
-			AgentID:         agent.ID,
-			AgentName:       agent.Name,
-			Cwd:             agent.Cwd,
-			Skills:          skills,
-			Errors:          append([]SkillInventoryError(nil), raw.Errors...),
-			DisabledPaths:   config.DisabledPaths,
-			Applied:         config.Applied,
-			RestartRequired: config.RestartRequired,
-		})
-	}
-}
-
-func (h *Hub) AgentSkillInventory(key string) (AgentSkillInventoryEntry, error) {
-	h.mu.Lock()
-	meta := h.resolveLocked(key)
-	if meta == nil {
-		h.mu.Unlock()
-		return AgentSkillInventoryEntry{}, errf(404, "agent not found: %s", key)
-	}
-	agentID := meta.ID
-	query := h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[meta.ID])
-	h.mu.Unlock()
-	snapshot, queryErr := h.queryRuntimeCapabilities(query)
-	h.mu.Lock()
-	if queryErr != nil {
-		h.mu.Unlock()
-		return AgentSkillInventoryEntry{}, queryErr
-	}
-	if !h.runtimeCapabilityQueryCurrentLocked(query) {
-		h.mu.Unlock()
-		return AgentSkillInventoryEntry{}, errf(409, "Agent Runtime binding changed while capabilities were checked; retry")
-	}
-	if err := requireCapability(snapshot, runtimecontract.CapabilitySkillsPolicy, "Skill inventory"); err != nil {
-		h.mu.Unlock()
-		return AgentSkillInventoryEntry{}, err
-	}
-	h.mu.Unlock()
-
-	inventory, err := h.ReloadSkills()
-	if err != nil {
-		return AgentSkillInventoryEntry{}, err
-	}
-	for _, entry := range inventory.Agents {
-		if entry.AgentID == agentID {
-			return entry, nil
-		}
-	}
-	return AgentSkillInventoryEntry{}, errf(500, "Agent Skill inventory missing after reload")
 }

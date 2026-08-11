@@ -1,14 +1,17 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
 	"github.com/yan5xu/codex-loom/internal/rollout"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 type codexAgentRuntime struct {
@@ -38,6 +41,47 @@ func (r *codexAgentRuntime) Resume(request nativeBindingRequest, timeout time.Du
 	params["threadId"] = request.NativeRef
 	_, err := r.client.Request("thread/resume", params, timeout)
 	return err
+}
+
+func (r *codexAgentRuntime) Resources(ctx context.Context, cwd string) (runtimecontract.ResourceInventory, error) {
+	if r == nil || r.client == nil {
+		return runtimecontract.ResourceInventory{}, errors.New("Codex Runtime is not running")
+	}
+	params := map[string]any{"forceReload": true}
+	if cwd = strings.TrimSpace(cwd); cwd != "" {
+		params["cwds"] = []string{cwd}
+	}
+	raw, err := r.client.Request("skills/list", params, contractTimeout(ctx, 30*time.Second))
+	if err != nil {
+		return runtimecontract.ResourceInventory{}, err
+	}
+	var native struct {
+		Data []SkillInventoryEntry `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &native); err != nil {
+		return runtimecontract.ResourceInventory{}, fmt.Errorf("decode Codex skills/list: %w", err)
+	}
+	resources := make([]runtimecontract.Resource, 0)
+	for _, entry := range native.Data {
+		if cwd != "" && filepath.Clean(entry.Cwd) != filepath.Clean(cwd) {
+			continue
+		}
+		for _, skill := range entry.Skills {
+			if strings.TrimSpace(skill.Name) == "" || strings.TrimSpace(skill.Path) == "" {
+				continue
+			}
+			resources = append(resources, runtimecontract.Resource{
+				ID: "skill:" + skill.Path, Name: skill.Name, Description: skill.Description,
+				Kind: runtimecontract.ResourceSkill, Path: skill.Path, Scope: skill.Scope, Source: "codex", Enabled: skill.Enabled,
+			})
+		}
+	}
+	encoded, _ := json.Marshal(resources)
+	return runtimecontract.ResourceInventory{
+		Revision:  "codex:" + sha256Hex(encoded)[:16],
+		Semantics: "Codex-native Skills; paths and enablement follow Codex discovery and SessionFlags policy",
+		Resources: resources,
+	}, nil
 }
 
 func (r *codexAgentRuntime) InjectDeveloperContext(nativeRef, content string, timeout time.Duration) error {

@@ -108,41 +108,46 @@ func cmdAgentSkills(a args) {
 		usage("skills agent <agent> [disable|enable <absolute SKILL.md path>]")
 	}
 	agent := a.positional[1]
-	method := "GET"
 	path := "/api/agents/" + url.PathEscape(agent) + "/skills"
-	var body any
+	resp, err := api("GET", path, nil)
+	if err != nil {
+		fail(err)
+	}
+	resources, _ := resp["resources"].(map[string]any)
 	if len(a.positional) > 2 {
 		if len(a.positional) != 4 || (a.positional[2] != "disable" && a.positional[2] != "enable") {
 			usage("skills agent <agent> [disable|enable <absolute SKILL.md path>]")
 		}
-		method = "PATCH"
-		path += "/config"
-		body = map[string]any{
-			"path":    a.positional[3],
-			"enabled": a.positional[2] == "enable",
+		policy, _ := resources["policy"].(map[string]any)
+		if err := runtimeResourcePolicyMutationError(policy); err != nil {
+			fail(err)
 		}
+		resp, err = api("PATCH", path+"/config", map[string]any{
+			"path": a.positional[3], "enabled": a.positional[2] == "enable",
+			"expectedRevision": str(resources, "revision"),
+		})
+		if err != nil {
+			fail(err)
+		}
+		resources, _ = resp["resources"].(map[string]any)
 	}
-	resp, err := api(method, path, body)
-	if err != nil {
-		fail(err)
-	}
-	config, _ := resp["config"].(map[string]any)
-	inventory, _ := resp["inventory"].(map[string]any)
-	fmt.Printf("%s %s (%s)\n", bold("Agent Skills"), str(inventory, "agentName"), str(inventory, "agentId"))
-	for _, value := range anySlice(inventory["skills"]) {
-		skill, _ := value.(map[string]any)
+	fmt.Printf("%s %s (%s) · %s\n", bold("Runtime Resources"), str(resources, "agentName"), str(resources, "agentId"), str(resources, "runtimeKind"))
+	fmt.Printf("  %s\n", dim(str(resources, "semantics")))
+	for _, value := range anySlice(resources["resources"]) {
+		resource, _ := value.(map[string]any)
 		state := green("enabled")
-		if !boolean(skill, "enabled") {
+		if !boolean(resource, "enabled") {
 			state = yellow("disabled")
 		}
-		fmt.Printf("  %-10s  %-28s  %s\n", state, str(skill, "name"), dim(str(skill, "path")))
+		fmt.Printf("  %-10s  %-10s  %-24s  %s\n", state, str(resource, "kind"), str(resource, "name"), dim(str(resource, "path")))
 	}
-	for _, value := range anySlice(config["disabledPaths"]) {
+	policy, _ := resources["policy"].(map[string]any)
+	for _, value := range anySlice(policy["disabledPaths"]) {
 		disabledPath, _ := value.(string)
 		found := false
-		for _, skillValue := range anySlice(inventory["skills"]) {
-			skill, _ := skillValue.(map[string]any)
-			if str(skill, "path") == disabledPath {
+		for _, resourceValue := range anySlice(resources["resources"]) {
+			resource, _ := resourceValue.(map[string]any)
+			if str(resource, "path") == disabledPath {
 				found = true
 				break
 			}
@@ -151,13 +156,29 @@ func cmdAgentSkills(a args) {
 			fmt.Printf("  %-10s  %-28s  %s\n", yellow("disabled"), "(not discovered)", dim(disabledPath))
 		}
 	}
-	if boolean(config, "restartRequired") {
-		fmt.Println(yellow("Restart required: the loaded Codex Thread still has the previous Skill policy."))
-	} else if boolean(config, "applied") {
-		fmt.Println(green("Agent Skill policy is active for the next Turn."))
+	if !boolean(policy, "available") {
+		fmt.Printf("%s %s; %s\n", yellow("Policy unavailable:"), str(policy, "reason"), str(policy, "alternative"))
+	} else if !boolean(policy, "mutable") {
+		fmt.Printf("%s %s; %s\n", yellow("Policy immutable:"), str(policy, "reason"), str(policy, "alternative"))
+	} else if boolean(policy, "effective") {
+		fmt.Println(green("Runtime resource policy is active and backed by native evidence."))
 	} else {
-		fmt.Println(dim("Agent Skill policy will apply when the Codex Thread is next loaded."))
+		fmt.Println(dim("Runtime resource policy is inspectable but not proven effective."))
 	}
+}
+
+func runtimeResourcePolicyMutationError(policy map[string]any) error {
+	if boolean(policy, "available") && boolean(policy, "mutable") {
+		return nil
+	}
+	reason, alternative := str(policy, "reason"), str(policy, "alternative")
+	if reason == "" {
+		reason = "Runtime resource policy cannot be changed"
+	}
+	if alternative == "" {
+		alternative = "inspect the Runtime-specific policy and retry"
+	}
+	return fmt.Errorf("%s; %s", reason, alternative)
 }
 
 func printSkillStatus(name, state, hash, path string, changed bool) {

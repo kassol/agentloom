@@ -812,6 +812,12 @@ func (h *Hub) tryDeliverReplyToActiveTurn(target string, timeout time.Duration) 
 }
 
 func (h *Hub) requestTurnSteer(rt *runtime, threadID, expectedTurnID, input string, timeout time.Duration) (string, error) {
+	h.mu.Lock()
+	if err := h.runtimeMutationAllowedLocked(rt.agentID); err != nil {
+		h.mu.Unlock()
+		return "", err
+	}
+	h.mu.Unlock()
 	if h.steerTurn != nil {
 		return h.steerTurn(threadID, expectedTurnID, input, timeout)
 	}

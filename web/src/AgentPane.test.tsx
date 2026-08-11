@@ -326,6 +326,57 @@ describe("AgentPane scroll restoration", () => {
 	expect(view.getByRole("button", { name: "Save Runtime Model" })).toBeDisabled();
   });
 
+  it("shows Runtime-specific resources and patches policy with the inspected revision", async () => {
+	const resourceAgent: Agent = {
+	  ...testAgent,
+	  processAlive: true,
+	  capabilitySnapshot: capabilitySnapshot("resource_inventory", "resource_policy"),
+	};
+	const snapshot = {
+	  agentId: resourceAgent.id, agentName: resourceAgent.name, runtimeKind: "codex", revision: "resources-1",
+	  semantics: "Codex-native Skills; Runtime-specific paths and policy",
+	  resources: [{ id: "skill:/tmp/review/SKILL.md", name: "review", kind: "skill", path: "/tmp/review/SKILL.md", enabled: true }],
+	  policy: { available: true, mutable: true, effective: true, disabledPaths: [], evidence: [{ kind: "native_ack", summary: "exact policy acknowledged" }] },
+	};
+	vi.mocked(fetch).mockImplementation(async (input, init) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  if (url.endsWith("/skills") || url.endsWith("/skills/config")) {
+		if (init?.method === "PATCH") {
+		  expect(JSON.parse(String(init.body))).toEqual({ path: "/tmp/review/SKILL.md", enabled: false, expectedRevision: "resources-1" });
+		  return new Response(JSON.stringify({ resources: { ...snapshot, revision: "resources-2", resources: [{ ...snapshot.resources[0], enabled: false }], policy: { ...snapshot.policy, mutable: false, reason: "binding is loaded", alternative: "restart and reopen Resources" } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+		}
+		return new Response(JSON.stringify({ resources: snapshot }), { status: 200, headers: { "Content-Type": "application/json" } });
+	  }
+	  const body = url.includes("/thread/history") ? { total: 0, turns: [] } : { artifacts: [] };
+	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+	const view = render(<AgentPane {...props} agent={resourceAgent} active configRequestNonce={1} />);
+	fireEvent.click(view.getByRole("button", { name: "Resources" }));
+	expect(await view.findByText("Codex-native Skills; Runtime-specific paths and policy")).toBeInTheDocument();
+	expect(view.getByText("Runtime-specific semantics")).toBeInTheDocument();
+	fireEvent.click(view.getByRole("button", { name: "Disable review" }));
+	await waitFor(() => expect(view.getByText("disabled")).toBeInTheDocument());
+	expect(view.getByText(/binding is loaded.*restart and reopen Resources/)).toBeInTheDocument();
+	expect(view.getByRole("button", { name: "Enable review" })).toBeDisabled();
+  });
+
+  it("shows Pi unavailable policy reason from the typed snapshot", async () => {
+	const resourceAgent: Agent = { ...testAgent, runtimeBinding: { kind: "pi" }, processAlive: false, capabilitySnapshot: capabilitySnapshot("resource_inventory") };
+	vi.mocked(fetch).mockImplementation(async (input) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  if (url.endsWith("/skills")) return new Response(JSON.stringify({ resources: {
+		agentId: resourceAgent.id, agentName: resourceAgent.name, runtimeKind: "pi", revision: "pi-resources-1", semantics: "Pi-native Runtime-specific resources",
+		resources: [{ id: "skill:review", name: "review", kind: "skill", path: "/tmp/pi/review/SKILL.md", enabled: true }],
+		policy: { available: false, mutable: false, effective: false, reason: "Pi policy unavailable", alternative: "use Pi settings" },
+	  } }), { status: 200, headers: { "Content-Type": "application/json" } });
+	  return new Response(JSON.stringify(url.includes("/thread/history") ? { total: 0, turns: [] } : { artifacts: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+	const view = render(<AgentPane {...props} agent={resourceAgent} active configRequestNonce={1} />);
+	fireEvent.click(view.getByRole("button", { name: "Resources" }));
+	expect(await view.findByText(/Pi policy unavailable.*use Pi settings/)).toBeInTheDocument();
+	expect(view.getByRole("button", { name: "Disable review" })).toBeDisabled();
+  });
+
   it("keeps Runtime model and Agent config saves independent on failure", async () => {
 	const onError = vi.fn();
 	vi.mocked(fetch).mockImplementation(async (input, init) => {

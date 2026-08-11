@@ -50,6 +50,7 @@ type controlPlaneContract struct {
 	history          runtimecontract.History
 	historyFailure   *runtimecontract.Failure
 	eventHandler     func(runtimecontract.Event)
+	resourcePaths    []string
 }
 
 func (c *controlPlaneContract) SetApprovalHandler(func(runtimecontract.ApprovalProposal)) {}
@@ -58,14 +59,42 @@ func (c *controlPlaneContract) ResolveApproval(context.Context, string, runtimec
 }
 
 type controlPlaneHost struct {
-	contract *controlPlaneContract
-	alive    bool
+	contract   *controlPlaneContract
+	alive      bool
+	generation uint64
 }
 
 func (h *controlPlaneHost) Alive() bool                        { return h.alive }
 func (h *controlPlaneHost) Contract() runtimecontract.Contract { return h.contract }
 func (h *controlPlaneHost) SetFailureHandler(func(error))      {}
 func (h *controlPlaneHost) Close()                             { h.alive = false }
+func (h *controlPlaneHost) RuntimeHostGeneration() uint64      { return h.generation }
+
+type blockingResourcePolicyDriver struct {
+	contract *controlPlaneContract
+	started  chan struct{}
+	release  chan struct{}
+	start    sync.Once
+	calls    atomic.Int32
+}
+
+func (d *blockingResourcePolicyDriver) Preflight(context.Context) error { return nil }
+func (d *blockingResourcePolicyDriver) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
+	return codexControlPlaneCapabilitySnapshot()
+}
+func (d *blockingResourcePolicyDriver) ResourceContract(context.Context, AgentHostRequest) (runtimecontract.Contract, string, error) {
+	return d.contract, "codex-host:7", nil
+}
+func (d *blockingResourcePolicyDriver) ResourceContractCurrent(revision string) bool {
+	return revision == "codex-host:7"
+}
+func (d *blockingResourcePolicyDriver) Acquire(context.Context, AgentHostRequest) (AgentHost, error) {
+	d.calls.Add(1)
+	d.start.Do(func() { close(d.started) })
+	<-d.release
+	return &controlPlaneHost{contract: d.contract, alive: true, generation: 7}, nil
+}
+func (d *blockingResourcePolicyDriver) Shutdown(context.Context) error { return nil }
 
 type controlPlaneDriver struct {
 	hosts                []*controlPlaneHost
@@ -341,9 +370,23 @@ func (c *controlPlaneContract) ContextDeliveryMode() runtimecontract.ContextDeli
 func (c *controlPlaneContract) SetRuntimeSandbox(string)          {}
 func (c *controlPlaneContract) SetRuntimeProvider(string, string) {}
 func (c *controlPlaneContract) SetRuntimeModel(string)            {}
-func (c *controlPlaneContract) SetRuntimeDisabledSkills([]string) {}
-func (c *controlPlaneContract) SetRuntimeApprovalPolicy(string)   {}
-func (c *controlPlaneContract) SetRuntimeEffort(string)           {}
+func (c *controlPlaneContract) SetRuntimeDisabledSkills(paths []string) {
+	c.resourcePaths = append([]string(nil), paths...)
+}
+func (c *controlPlaneContract) InspectResources(context.Context, runtimecontract.ResourceInventoryRequest) (runtimecontract.ResourceInventory, *runtimecontract.Failure) {
+	return runtimecontract.ResourceInventory{
+		Revision: "control-plane-resources-1", Semantics: "Runtime-specific semantics fixture",
+		Resources: []runtimecontract.Resource{{ID: "fixture-skill", Name: "fixture", Kind: runtimecontract.ResourceSkill, Path: "/fixture/SKILL.md", Enabled: true}},
+	}, nil
+}
+func (c *controlPlaneContract) InspectResourcePolicy(context.Context, runtimecontract.ResourcePolicyRequest) (runtimecontract.ResourcePolicyState, *runtimecontract.Failure) {
+	return runtimecontract.ResourcePolicyState{
+		Revision: "control-plane-policy-1", DisabledPaths: append([]string(nil), c.resourcePaths...), Effective: true,
+		Evidence: []runtimecontract.CapabilityEvidence{{Kind: "native_ack", Summary: "fixture acknowledged exact policy"}},
+	}, nil
+}
+func (c *controlPlaneContract) SetRuntimeApprovalPolicy(string) {}
+func (c *controlPlaneContract) SetRuntimeEffort(string)         {}
 func (c *controlPlaneContract) ValidateInput(context.Context, runtimecontract.Binding, []runtimecontract.InputBlock) *runtimecontract.Failure {
 	return nil
 }
@@ -737,106 +780,275 @@ func TestPiSkillPolicyIsRejectedBeforePersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	configureFakePiHubRPC(t, "happy")
 	h := testHub(st)
-	meta := &Agent{
-		ID: "pi-agent", Name: "pi-worker", Cwd: t.TempDir(), ThreadID: "thread-loom",
-		RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "pi", NativeRef: "native-session"},
-		Status:         "idle", CreatedAt: now(), UpdatedAt: now(),
+	defer h.Shutdown()
+	meta, err := h.CreateAgent(CreateParams{Name: "pi-worker", Cwd: t.TempDir(), RuntimeKind: "pi"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	h.agents[meta.ID] = meta
-
-	_, err = h.UpdateAgentSkillConfig(meta.ID, AgentSkillConfigParams{Path: "/tmp/codex-skill/SKILL.md", Enabled: false})
-	if err == nil || !strings.Contains(err.Error(), "does not apply Loom Skill policy") || !strings.Contains(err.Error(), "native Runtime settings") {
+	resources, err := h.GetRuntimeResources(meta.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq := h.seqs[meta.ID]
+	_, err = h.UpdateRuntimeResourcePolicy(meta.ID, AgentSkillConfigParams{Path: "/tmp/codex-skill/SKILL.md", Enabled: false, ExpectedRevision: resources.Revision})
+	if err == nil || !strings.Contains(err.Error(), "does not apply Loom resource policy") || !strings.Contains(err.Error(), "native Runtime settings") {
 		t.Fatalf("Pi Skill policy error=%v", err)
 	}
-	if len(h.agentSkillConfigs) != 0 || h.seqs[meta.ID] != 0 {
+	if len(h.agentSkillConfigs) != 0 || h.seqs[meta.ID] != seq {
 		t.Fatalf("Pi Skill policy persisted or published: configs=%#v seq=%d", h.agentSkillConfigs, h.seqs[meta.ID])
 	}
 }
 
-func TestPiSkillInventoryDoesNotProjectCodexCatalog(t *testing.T) {
-	h := testHub(nil)
-	cwd := t.TempDir()
-	h.agents["codex-agent"] = &Agent{ID: "codex-agent", Name: "codex", Cwd: cwd, RuntimeBinding: RuntimeBinding{Kind: "codex"}}
-	h.agents["pi-agent"] = &Agent{ID: "pi-agent", Name: "pi", Cwd: cwd, RuntimeBinding: RuntimeBinding{Kind: "pi"}}
-	inventory := SkillInventory{Data: []SkillInventoryEntry{{
-		Cwd: cwd, Skills: []SkillInventorySkill{{Name: "codex-only", Path: "/tmp/codex-only/SKILL.md", Enabled: true}},
-	}}}
-
-	h.projectAgentSkillInventory(&inventory)
-	var codexSkills, piSkills []SkillInventorySkill
-	for _, entry := range inventory.Agents {
-		switch entry.AgentID {
-		case "codex-agent":
-			codexSkills = entry.Skills
-		case "pi-agent":
-			piSkills = entry.Skills
-		}
-	}
-	if len(codexSkills) != 1 || len(piSkills) != 0 {
-		t.Fatalf("projected Codex/Pi Skills = %#v / %#v", codexSkills, piSkills)
-	}
-}
-
-func TestReloadSkillsSuppressesPersistedCodexPolicyForPiAgentsAfterReopen(t *testing.T) {
-	installFakeSharedCodexHost(t)
+func TestResourcePolicyFenceBlocksAcquireAndOtherNativeControls(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	seed := testHub(st)
-	const disabledPath = "/tmp/skill/SKILL.md"
-	for _, id := range []string{"pi-applied", "pi-restart"} {
-		seed.agents[id] = &Agent{
-			ID: id, Name: id, Cwd: "/tmp/one", ThreadID: "loom-" + id,
-			RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "pi", NativeRef: "native-" + id},
-			Status:         "idle", CreatedAt: now(), UpdatedAt: now(),
-		}
-	}
-	if err := seed.persistAgentsLocked(); err != nil {
-		t.Fatal(err)
-	}
-	persisted := map[string]*AgentSkillConfig{
-		"pi-applied": {AgentID: "pi-applied", DisabledPaths: []string{disabledPath}, UpdatedAt: now()},
-		"pi-restart": {AgentID: "pi-restart", DisabledPaths: []string{disabledPath}, UpdatedAt: now()},
-	}
-	if err := st.SaveAgentSkillConfigs(persisted); err != nil {
-		t.Fatal(err)
-	}
-
-	h := New(st)
-	defer h.Shutdown()
-	h.mu.Lock()
-	for _, id := range []string{"pi-applied", "pi-restart"} {
-		meta := h.agents[id]
-		h.runtimes[id] = &runtime{
-			agentID: id, runtimeContract: &controlPlaneContract{snapshot: piControlPlaneCapabilitySnapshot()},
-			binding: runtimeContractBinding(meta), skillConfigLoaded: true, approvals: map[string]*approval{},
-		}
-	}
-	h.runtimes["pi-applied"].skillConfigHash = agentSkillConfigHash([]string{disabledPath})
-	h.runtimes["pi-restart"].skillConfigHash = agentSkillConfigHash(nil)
-	h.mu.Unlock()
-
-	inventory, err := h.ReloadSkills()
+	h := testHub(st)
+	contract := &controlPlaneContract{snapshot: codexControlPlaneCapabilitySnapshot()}
+	driver := &blockingResourcePolicyDriver{contract: contract, started: make(chan struct{}), release: make(chan struct{})}
+	h.runtimeHostDrivers["codex"] = driver
+	agent, err := h.RestoreAgent(RestoreAgentParams{
+		ID: "policy-acquire", Name: "policy-acquire", Cwd: t.TempDir(), ThreadID: "loom-policy-acquire",
+		RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "native-policy-acquire"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"pi-applied", "pi-restart"} {
-		entry := findAgentSkillInventory(t, inventory, id)
-		if len(entry.Skills) != 0 || len(entry.Errors) != 0 || len(entry.DisabledPaths) != 0 || entry.Applied || entry.RestartRequired {
-			t.Fatalf("Pi %s leaked stale Codex Skill projection after reopen: %#v", id, entry)
-		}
-	}
-	var retained map[string]*AgentSkillConfig
-	if err := st.LoadAgentSkillConfigs(&retained); err != nil {
+	before, err := h.GetRuntimeResources(agent.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"pi-applied", "pi-restart"} {
-		if config := retained[id]; config == nil || len(config.DisabledPaths) != 1 || config.DisabledPaths[0] != disabledPath {
-			t.Fatalf("historical persisted config for %s was mutated: %#v", id, config)
+	var configSaves atomic.Int32
+	h.saveAgentsForTest = func(any) error {
+		configSaves.Add(1)
+		return nil
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := h.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{Path: "/fixture/SKILL.md", Enabled: false, ExpectedRevision: before.Revision})
+		result <- err
+	}()
+	<-driver.started
+	rename := "renamed-during-acquire"
+	if _, err := h.UpdateAgentConfig(agent.ID, ConfigParams{Name: &rename}); err == nil || !strings.Contains(err.Error(), "resource policy") {
+		t.Fatalf("UpdateAgentConfig during policy Acquire = %v", err)
+	}
+	if _, err := h.SendTask(agent.ID, "must not start", time.Second); err == nil || !strings.Contains(err.Error(), "resource policy") {
+		t.Fatalf("SendTask during policy Acquire = %v", err)
+	}
+	if _, err := h.ArchiveAgent(agent.ID); err == nil || !strings.Contains(err.Error(), "resource policy") {
+		t.Fatalf("ArchiveAgent during policy Acquire = %v", err)
+	}
+	if contract.startCalls != 0 || contract.archiveCalls != 0 || contract.nameCalls != 0 || configSaves.Load() != 0 || driver.calls.Load() != 1 {
+		t.Fatalf("calls during policy Acquire: start=%d archive=%d rename=%d save=%d acquire=%d", contract.startCalls, contract.archiveCalls, contract.nameCalls, configSaves.Load(), driver.calls.Load())
+	}
+	close(driver.release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	applying := h.resourcePolicyApplying[agent.ID]
+	h.mu.Unlock()
+	if applying {
+		t.Fatal("resource policy fence remained after success")
+	}
+}
+
+func TestResourcePolicyFenceBlocksNativeControlsDuringStoreFailure(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	contract := &controlPlaneContract{snapshot: codexControlPlaneCapabilitySnapshot()}
+	releaseAcquire := make(chan struct{})
+	close(releaseAcquire)
+	driver := &blockingResourcePolicyDriver{contract: contract, started: make(chan struct{}), release: releaseAcquire}
+	h.runtimeHostDrivers["codex"] = driver
+	agent, err := h.RestoreAgent(RestoreAgentParams{
+		ID: "policy-store", Name: "policy-store", Cwd: t.TempDir(), ThreadID: "loom-policy-store",
+		RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "native-policy-store"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.GetRuntimeResources(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var configSaves atomic.Int32
+	h.saveAgentsForTest = func(any) error {
+		configSaves.Add(1)
+		return nil
+	}
+	saveStarted, saveRelease := make(chan struct{}), make(chan struct{})
+	h.saveAgentSkillConfigsForTest = func(any) error {
+		close(saveStarted)
+		<-saveRelease
+		return errors.New("blocked save failed")
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := h.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{Path: "/fixture/SKILL.md", Enabled: false, ExpectedRevision: before.Revision})
+		result <- err
+	}()
+	<-saveStarted
+	contract.nameCalls = 0 // Runtime initialization completed before the config race.
+	rename := "renamed-during-store"
+	if _, err := h.UpdateAgentConfig(agent.ID, ConfigParams{Name: &rename}); err == nil || !strings.Contains(err.Error(), "resource policy") {
+		t.Fatalf("UpdateAgentConfig during policy Store = %v", err)
+	}
+	if _, err := h.SendTask(agent.ID, "must not start", time.Second); err == nil || !strings.Contains(err.Error(), "resource policy") {
+		t.Fatalf("SendTask during policy Store = %v", err)
+	}
+	if _, err := h.ArchiveAgent(agent.ID); err == nil || !strings.Contains(err.Error(), "resource policy") {
+		t.Fatalf("ArchiveAgent during policy Store = %v", err)
+	}
+	if contract.startCalls != 0 || contract.archiveCalls != 0 || contract.nameCalls != 0 || configSaves.Load() != 0 {
+		t.Fatalf("calls during policy Store: start=%d archive=%d rename=%d save=%d", contract.startCalls, contract.archiveCalls, contract.nameCalls, configSaves.Load())
+	}
+	close(saveRelease)
+	if err := <-result; err == nil || !strings.Contains(err.Error(), "blocked save failed") {
+		t.Fatalf("policy Store failure = %v", err)
+	}
+	h.mu.Lock()
+	applying := h.resourcePolicyApplying[agent.ID]
+	h.mu.Unlock()
+	if applying {
+		t.Fatal("resource policy fence remained after failure")
+	}
+	if contract.startCalls != 0 || contract.archiveCalls != 0 {
+		t.Fatalf("native calls after failed policy Store: start=%d archive=%d", contract.startCalls, contract.archiveCalls)
+	}
+}
+
+func waitForHubStopping(t *testing.T, h *Hub) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		stopping := h.stopping
+		h.mu.Unlock()
+		if stopping {
+			return
 		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("Hub did not enter stopping state")
+}
+
+func TestShutdownWaitsForResourcePolicyBlockedAcquire(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	contract := &controlPlaneContract{snapshot: codexControlPlaneCapabilitySnapshot()}
+	driver := &blockingResourcePolicyDriver{contract: contract, started: make(chan struct{}), release: make(chan struct{})}
+	h.runtimeHostDrivers["codex"] = driver
+	agent, err := h.RestoreAgent(RestoreAgentParams{ID: "policy-shutdown-acquire", Name: "policy-shutdown-acquire", Cwd: t.TempDir(), ThreadID: "loom-policy-shutdown-acquire", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "native-policy-shutdown-acquire"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.GetRuntimeResources(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policySaves atomic.Int32
+	h.saveAgentSkillConfigsForTest = func(any) error {
+		policySaves.Add(1)
+		return nil
+	}
+	updateDone := make(chan error, 1)
+	go func() {
+		_, err := h.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{Path: "/fixture/SKILL.md", Enabled: false, ExpectedRevision: before.Revision})
+		updateDone <- err
+	}()
+	<-driver.started
+	shutdownDone := make(chan struct{})
+	go func() { h.Shutdown(); close(shutdownDone) }()
+	waitForHubStopping(t, h)
+	select {
+	case <-shutdownDone:
+		close(driver.release)
+		t.Fatal("Shutdown retired Runtime ownership while policy Acquire was blocked")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(driver.release)
+	if err := <-updateDone; err == nil || (!strings.Contains(err.Error(), "state changed") && !strings.Contains(err.Error(), "shutting down")) {
+		t.Fatalf("policy update racing Shutdown = %v", err)
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not finish after policy transaction exited")
+	}
+	if policySaves.Load() != 0 {
+		t.Fatalf("policy saves during blocked Acquire shutdown = %d", policySaves.Load())
+	}
+}
+
+func TestShutdownWaitsForResourcePolicyBlockedSave(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	contract := &controlPlaneContract{snapshot: codexControlPlaneCapabilitySnapshot()}
+	releaseAcquire := make(chan struct{})
+	close(releaseAcquire)
+	driver := &blockingResourcePolicyDriver{contract: contract, started: make(chan struct{}), release: releaseAcquire}
+	h.runtimeHostDrivers["codex"] = driver
+	agent, err := h.RestoreAgent(RestoreAgentParams{ID: "policy-shutdown-save", Name: "policy-shutdown-save", Cwd: t.TempDir(), ThreadID: "loom-policy-shutdown-save", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "native-policy-shutdown-save"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.GetRuntimeResources(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveStarted, saveRelease := make(chan struct{}), make(chan struct{})
+	var policySaves atomic.Int32
+	var saveStartedOnce sync.Once
+	h.saveAgentSkillConfigsForTest = func(any) error {
+		policySaves.Add(1)
+		saveStartedOnce.Do(func() { close(saveStarted) })
+		<-saveRelease
+		return nil
+	}
+	updateDone := make(chan error, 1)
+	go func() {
+		_, err := h.UpdateRuntimeResourcePolicy(agent.ID, AgentSkillConfigParams{Path: "/fixture/SKILL.md", Enabled: false, ExpectedRevision: before.Revision})
+		updateDone <- err
+	}()
+	<-saveStarted
+	shutdownDone := make(chan struct{})
+	go func() { h.Shutdown(); close(shutdownDone) }()
+	waitForHubStopping(t, h)
+	select {
+	case <-shutdownDone:
+		close(saveRelease)
+		t.Fatal("Shutdown retired Store while policy save was blocked")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(saveRelease)
+	if err := <-updateDone; err == nil || (!strings.Contains(err.Error(), "state changed") && !strings.Contains(err.Error(), "shutting down")) {
+		t.Fatalf("policy save racing Shutdown = %v", err)
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not finish after policy save and compensation")
+	}
+	if policySaves.Load() != 2 {
+		t.Fatalf("policy commit+compensation saves = %d, want 2 before Store retirement", policySaves.Load())
 	}
 }
 
@@ -870,14 +1082,8 @@ func TestPiResumeAndTurnDoNotClaimCodexSkillPolicyApplied(t *testing.T) {
 	if _, err := h.SendTask(meta.ID, "verify Pi", time.Second); err != nil {
 		t.Fatal(err)
 	}
-	h.mu.Lock()
-	view := h.agentSkillConfigViewLocked(meta)
-	h.mu.Unlock()
-	if view.Applied || view.RestartRequired || rt.skillConfigLoaded || rt.skillConfigHash != "" {
-		t.Fatalf("Pi Skill projection after resume/Turn = %#v loaded=%v hash=%q", view, rt.skillConfigLoaded, rt.skillConfigHash)
-	}
-	if _, err := h.GetAgentSkillConfig(meta.ID); err == nil || !strings.Contains(err.Error(), "does not apply Loom Skill policy") {
-		t.Fatalf("Pi Skill capability error = %v", err)
+	if rt.skillConfigLoaded || rt.skillConfigHash != "" {
+		t.Fatalf("Pi Runtime claimed Codex resource policy after resume/Turn: loaded=%v hash=%q", rt.skillConfigLoaded, rt.skillConfigHash)
 	}
 }
 func (c *controlPlaneContract) CloseBinding(_ context.Context, binding runtimecontract.Binding) runtimecontract.Outcome {
