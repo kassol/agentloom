@@ -93,7 +93,7 @@ export interface RuntimeResourceSnapshot {
     enabled: boolean;
   }>;
   policy: {
-    available: boolean;
+    available?: boolean;
     mutable: boolean;
     reason?: string;
     alternative?: string;
@@ -635,6 +635,12 @@ export interface TokenUsage {
   reasoningOutputTokens: number;
   totalTokens: number;
   calls: number;
+  costMicros?: number;
+  metrics?: Record<string, {
+    available?: boolean;
+    complete?: boolean;
+    sources: string[];
+  }>;
 }
 
 export interface UsageDay {
@@ -666,6 +672,8 @@ export interface AgentTokenUsage {
     inputTokens: number;
     windowTokens: number;
     usedPercent: number;
+    available?: boolean;
+    source?: string;
   };
   daily: UsageDay[];
   models: UsageModel[];

@@ -11,6 +11,7 @@ import { UsageBarTooltip, usageDayLabel } from "./components/UsageBarTooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "./components/ui/popover";
 import { subscribeThreadEvents } from "./thread-events";
 import { oldestWaitingMs } from "./product-state";
+import { formatOptionalUsageMetric, usageMetricAvailable } from "./usage";
 
 
 function capabilityAvailable(agent: Agent, id: string) {
@@ -2113,23 +2114,23 @@ function AgentUsagePanel({ usage, loading, onRefresh, onOpenOverview }: { usage:
       </div>
 
       <div className="grid grid-cols-3 divide-x divide-border border-y border-border">
-        <AgentUsageMetric label="7 day" value={compactTokens(usage.period.totalTokens)} detail={`${compactTokens(usage.period.calls)} calls`} />
+        <AgentUsageMetric label="7 day" value={compactTokens(usage.period.totalTokens)} detail={`${formatOptionalUsageMetric(usage.period, "calls", compactTokens)} calls`} />
         <AgentUsageMetric label="Today" value={compactTokens(usage.today.totalTokens)} detail={`${compactTokens(usage.today.outputTokens)} output`} />
-        <AgentUsageMetric label="Lifetime" value={compactTokens(usage.lifetime.totalTokens)} detail={`${compactTokens(usage.lifetime.calls)} calls`} />
+        <AgentUsageMetric label="Lifetime" value={compactTokens(usage.lifetime.totalTokens)} detail={`${formatOptionalUsageMetric(usage.lifetime, "calls", compactTokens)} calls`} />
       </div>
 
       <section className="border-b border-border py-4">
         <div className="flex items-end justify-between gap-3">
           <div>
             <div className="text-[10px] font-semibold uppercase text-muted-foreground">Current context</div>
-            <div className="mt-1 font-mono text-[13px] font-semibold">{compactTokens(usage.context.inputTokens)} <span className="text-[9px] font-normal text-muted-foreground">/ {compactTokens(usage.context.windowTokens)}</span></div>
+            <div className="mt-1 font-mono text-[13px] font-semibold">{usage.context.available === false ? "—" : compactTokens(usage.context.inputTokens)} {usage.context.available === false ? null : <span className="text-[9px] font-normal text-muted-foreground">/ {compactTokens(usage.context.windowTokens)}</span>}</div>
           </div>
-          <div className="text-right font-mono text-[10px] text-muted-foreground">{usage.context.usedPercent.toFixed(0)}% used</div>
+          <div className="text-right font-mono text-[10px] text-muted-foreground">{usage.context.available === false ? "unavailable" : `${usage.context.usedPercent.toFixed(0)}% used`}</div>
         </div>
         <div className="mt-2 h-1.5 bg-muted"><div className="h-full bg-[var(--loom-blue)]/70" style={{ width: `${usage.context.usedPercent}%` }} /></div>
         <div className="mt-2 flex justify-between font-mono text-[9px] text-muted-foreground">
-          <span>{usage.cacheHitPercent.toFixed(0)}% cache hit</span>
-          <span>{compactTokens(usage.period.cachedInputTokens)} cached input</span>
+          <span>{usageMetricAvailable(usage.period, "cachedInputTokens") ? `${usage.cacheHitPercent.toFixed(0)}% cache hit` : "cache unavailable"}</span>
+          <span>{usageMetricAvailable(usage.period, "cachedInputTokens") ? `${compactTokens(usage.period.cachedInputTokens)} cached input` : "—"}</span>
         </div>
       </section>
 
@@ -2140,7 +2141,7 @@ function AgentUsagePanel({ usage, loading, onRefresh, onOpenOverview }: { usage:
             <div key={day.date} data-usage-date={day.date} className="group relative flex h-full min-w-0 flex-1 items-end outline-none" tabIndex={-1} aria-label={usageDayLabel(day)}>
               <UsageBarTooltip day={day} align={index === 0 ? "start" : index === usage.daily.length - 1 ? "end" : "center"} />
               <div className="relative w-full bg-muted" style={{ height: `${day.usage.totalTokens ? Math.max(4, (day.usage.totalTokens / maxDaily) * 100) : 2}%` }}>
-                <div className="absolute inset-x-0 bottom-0 bg-[var(--loom-teal)]/65" style={{ height: `${day.usage.inputTokens ? (day.usage.cachedInputTokens / day.usage.inputTokens) * 100 : 0}%` }} />
+                {usageMetricAvailable(day.usage, "cachedInputTokens") ? <div className="absolute inset-x-0 bottom-0 bg-[var(--loom-teal)]/65" style={{ height: `${day.usage.inputTokens ? (day.usage.cachedInputTokens / day.usage.inputTokens) * 100 : 0}%` }} /> : null}
               </div>
             </div>
           ))}

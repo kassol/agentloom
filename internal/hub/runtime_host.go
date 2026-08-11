@@ -75,10 +75,6 @@ type runtimeGoalCapability interface {
 	ClearRuntimeGoal(context.Context, runtimecontract.Binding) (bool, error)
 }
 
-type runtimeUsageCapability interface {
-	RuntimeUsage(context.Context, runtimecontract.Binding) (*RuntimeUsageReport, error)
-}
-
 type runtimeCompactionCapability interface {
 	CompactRuntimeBinding(context.Context, runtimecontract.Binding) error
 }

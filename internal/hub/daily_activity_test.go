@@ -3,6 +3,8 @@ package hub
 import (
 	"testing"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 func TestBuildDailyActivitySplitsExecutionAndTokensIntoAlignedBuckets(t *testing.T) {
@@ -18,16 +20,16 @@ func TestBuildDailyActivitySplitsExecutionAndTokensIntoAlignedBuckets(t *testing
 	reports := map[string]*RuntimeUsageReport{
 		"agent-a": {
 			Activity: []RuntimeTurnActivity{
-				{TurnID: "turn-a1", StartedAt: start.Add(20 * time.Minute).UTC().Format(time.RFC3339Nano), EndedAt: start.Add(40 * time.Minute).UTC().Format(time.RFC3339Nano)},
-				{TurnID: "turn-a2", StartedAt: start.Add(50 * time.Minute).UTC().Format(time.RFC3339Nano)},
+				{TurnID: testUsageText("turn-a1"), StartedAt: testUsageText(start.Add(20 * time.Minute).UTC().Format(time.RFC3339Nano)), EndedAt: testUsageText(start.Add(40 * time.Minute).UTC().Format(time.RFC3339Nano))},
+				{TurnID: testUsageText("turn-a2"), StartedAt: testUsageText(start.Add(50 * time.Minute).UTC().Format(time.RFC3339Nano))},
 			},
 			Events: []RuntimeUsageEvent{
-				{Timestamp: start.Add(25 * time.Minute).UTC().Format(time.RFC3339Nano), Usage: RuntimeTokenUsage{TotalTokens: 100, Calls: 1}},
-				{Timestamp: start.Add(65 * time.Minute).UTC().Format(time.RFC3339Nano), Usage: RuntimeTokenUsage{TotalTokens: 250, Calls: 1}},
+				{Timestamp: testUsageText(start.Add(25 * time.Minute).UTC().Format(time.RFC3339Nano)), Usage: testContractUsage(100)},
+				{Timestamp: testUsageText(start.Add(65 * time.Minute).UTC().Format(time.RFC3339Nano)), Usage: testContractUsage(250)},
 			},
 		},
 		"agent-b": {
-			Activity: []RuntimeTurnActivity{{TurnID: "turn-b1", StartedAt: start.Add(10 * time.Minute).UTC().Format(time.RFC3339Nano), EndedAt: start.Add(70 * time.Minute).UTC().Format(time.RFC3339Nano)}},
+			Activity: []RuntimeTurnActivity{{TurnID: testUsageText("turn-b1"), StartedAt: testUsageText(start.Add(10 * time.Minute).UTC().Format(time.RFC3339Nano)), EndedAt: testUsageText(start.Add(70 * time.Minute).UTC().Format(time.RFC3339Nano))}},
 		},
 		"agent-c": {},
 	}
@@ -60,6 +62,17 @@ func TestBuildDailyActivitySplitsExecutionAndTokensIntoAlignedBuckets(t *testing
 	alpha := activity.Agents[1]
 	if alpha.Buckets[0].ExecutingSeconds != 10*60 || alpha.Buckets[1].ExecutingSeconds != 20*60 || alpha.Buckets[2].ExecutingSeconds != 15*60 {
 		t.Fatalf("alpha execution buckets = %#v", alpha.Buckets[:3])
+	}
+}
+
+func testUsageText(value string) runtimecontract.UsageText {
+	return runtimecontract.UsageText{Available: true, Value: value, Source: "test"}
+}
+
+func testContractUsage(total int64) runtimecontract.Usage {
+	return runtimecontract.Usage{
+		TotalTokens: runtimecontract.UsageMetric{Available: true, Value: total, Source: "test"},
+		Calls:       runtimecontract.UsageMetric{Available: true, Value: 1, Source: "test"},
 	}
 }
 

@@ -27,6 +27,8 @@ type ContextUsage struct {
 	InputTokens  int64   `json:"inputTokens"`
 	WindowTokens int64   `json:"windowTokens"`
 	UsedPercent  float64 `json:"usedPercent"`
+	Available    bool    `json:"available"`
+	Source       string  `json:"source,omitempty"`
 }
 
 type AgentUsage struct {
@@ -145,13 +147,9 @@ func (h *Hub) AgentTokenUsageRange(key string, start, endExclusive time.Time) (A
 		h.mu.Unlock()
 		return AgentUsage{}, errf(404, "agent not found: %s", key)
 	}
-	if !runtimeCapabilityAvailableLocked(meta, runtimecontract.CapabilityUsageReporting) {
-		h.mu.Unlock()
-		return AgentUsage{}, unsupportedRuntimeCapability(meta, "usage")
-	}
 	agent := h.viewLocked(meta)
 	h.mu.Unlock()
-	report, _ := h.runtimeUsageReport(agent.ID, runtimeContractBinding(&agent.Agent))
+	report, _ := h.runtimeUsageReport(agent.ID, runtimeUsageBinding(agent))
 	return buildAgentUsageRange(agent, start, endExclusive, time.Now().In(start.Location()), report), nil
 }
 
@@ -179,7 +177,7 @@ func (h *Hub) TokenUsageOverviewRange(start, endExclusive time.Time) UsageOvervi
 	}
 	h.mu.Unlock()
 	for _, agent := range agents {
-		report, _ := h.runtimeUsageReport(agent.ID, runtimeContractBinding(&agent.Agent))
+		report, _ := h.runtimeUsageReport(agent.ID, runtimeUsageBinding(agent))
 		usage := buildAgentUsageRange(agent, start, endExclusive, now, report)
 		overview.Agents = append(overview.Agents, usage)
 		if usage.Available {
@@ -206,7 +204,13 @@ func (h *Hub) TokenUsageOverviewRange(start, endExclusive time.Time) UsageOvervi
 		overview.Models = append(overview.Models, UsageModel{ProviderID: parts[0], Model: parts[1], Usage: usage})
 	}
 	sort.SliceStable(overview.Models, func(i, j int) bool {
-		return overview.Models[i].Usage.TotalTokens > overview.Models[j].Usage.TotalTokens
+		if overview.Models[i].Usage.TotalTokens != overview.Models[j].Usage.TotalTokens {
+			return overview.Models[i].Usage.TotalTokens > overview.Models[j].Usage.TotalTokens
+		}
+		if overview.Models[i].ProviderID != overview.Models[j].ProviderID {
+			return overview.Models[i].ProviderID < overview.Models[j].ProviderID
+		}
+		return overview.Models[i].Model < overview.Models[j].Model
 	})
 	sort.SliceStable(overview.Agents, func(i, j int) bool {
 		if overview.Agents[i].Period.TotalTokens != overview.Agents[j].Period.TotalTokens {
@@ -218,6 +222,10 @@ func (h *Hub) TokenUsageOverviewRange(start, endExclusive time.Time) UsageOvervi
 		return overview.Agents[i].AgentName < overview.Agents[j].AgentName
 	})
 	return overview
+}
+
+func runtimeUsageBinding(agent AgentView) runtimecontract.Binding {
+	return runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: agent.RuntimeBinding.Kind, NativeRef: agent.nativeRuntimeRef}
 }
 
 func buildAgentUsage(agent AgentView, days int, now time.Time, report *RuntimeUsageReport) AgentUsage {
@@ -237,7 +245,7 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time, r
 	todayStart, _ := usageRange(now, 1)
 	result := AgentUsage{
 		AgentID: agent.ID, AgentName: agent.Name, ThreadID: agent.ThreadID, Status: agent.Status,
-		LatestProviderID: publicProviderID(agent.ProviderID), Daily: emptyUsageDays(start, days), Models: []UsageModel{},
+		Daily: emptyUsageDays(start, days), Models: []UsageModel{},
 	}
 	if report == nil {
 		return result
@@ -256,18 +264,26 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time, r
 		return result
 	}
 	result.Available = true
-	result.Lifetime = report.Lifetime
-	result.LatestCall = report.LatestCall
-	result.LatestModel = report.LatestModel
-	result.LastUpdatedAt = report.LastUpdatedAt
-	result.LatestProviderID = publicProviderID(agent.ProviderID)
-	if latestAt, parseErr := time.Parse(time.RFC3339Nano, report.LastUpdatedAt); parseErr == nil {
-		result.LatestProviderID = providerAt(agent.Agent, latestAt)
+	result.Lifetime = projectRuntimeTokenUsage(report.Lifetime)
+	result.Period = emptyRuntimeTokenUsage(report.Lifetime)
+	result.Previous = emptyRuntimeTokenUsage(report.Lifetime)
+	result.Today = emptyRuntimeTokenUsage(report.Lifetime)
+	for index := range result.Daily {
+		result.Daily[index].Usage = emptyRuntimeTokenUsage(report.Lifetime)
+	}
+	result.LatestCall = projectRuntimeTokenUsage(report.LatestCall)
+	result.LatestModel = report.LatestModel.Value
+	result.LastUpdatedAt = report.LastUpdatedAt.Value
+	result.LatestProviderID = usageProviderAt(agent, time.Time{}, report.LatestProvider)
+	if latestAt, parseErr := time.Parse(time.RFC3339Nano, report.LastUpdatedAt.Value); parseErr == nil {
+		result.LatestProviderID = usageProviderAt(agent, latestAt, report.LatestProvider)
 	}
 	result.Context = ContextUsage{
-		InputTokens:  report.ContextInputTokens,
-		WindowTokens: report.ModelContextWindow,
-		UsedPercent:  percent(report.ContextInputTokens, report.ModelContextWindow),
+		InputTokens:  report.ContextInputTokens.Value,
+		WindowTokens: report.ModelContextWindow.Value,
+		UsedPercent:  percent(report.ContextInputTokens.Value, report.ModelContextWindow.Value),
+		Available:    report.ContextInputTokens.Available && report.ModelContextWindow.Available,
+		Source:       report.ContextInputTokens.Source,
 	}
 
 	dailyIndex := map[string]int{}
@@ -276,31 +292,32 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time, r
 	}
 	models := map[string]RuntimeTokenUsage{}
 	for _, event := range report.Events {
-		timestamp, err := time.Parse(time.RFC3339Nano, event.Timestamp)
+		timestamp, err := time.Parse(time.RFC3339Nano, event.Timestamp.Value)
 		if err != nil {
 			continue
 		}
 		local := timestamp.In(now.Location())
 		if !local.Before(start) && local.Before(endLimit) {
-			result.Period.Add(event.Usage)
+			projected := projectRuntimeTokenUsage(event.Usage)
+			result.Period.Add(projected)
 			if index, ok := dailyIndex[local.Format("2006-01-02")]; ok {
-				result.Daily[index].Usage.Add(event.Usage)
+				result.Daily[index].Usage.Add(projected)
 			}
-			model := event.Model
+			model := event.Model.Value
 			if model == "" {
 				model = "unknown"
 			}
-			providerID := providerAt(agent.Agent, timestamp)
+			providerID := usageProviderAt(agent, timestamp, event.Provider)
 			key := providerID + "\x00" + model
 			usage := models[key]
-			usage.Add(event.Usage)
+			usage.Add(projected)
 			models[key] = usage
 		}
 		if !local.Before(previousStart) && local.Before(previousEnd) {
-			result.Previous.Add(event.Usage)
+			result.Previous.Add(projectRuntimeTokenUsage(event.Usage))
 		}
 		if !local.Before(todayStart) && !local.After(now) {
-			result.Today.Add(event.Usage)
+			result.Today.Add(projectRuntimeTokenUsage(event.Usage))
 		}
 	}
 	result.CacheHitPercent = percent(result.Period.CachedInputTokens, result.Period.InputTokens)
@@ -309,10 +326,29 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time, r
 		result.Models = append(result.Models, UsageModel{ProviderID: parts[0], Model: parts[1], Usage: usage})
 	}
 	sort.SliceStable(result.Models, func(i, j int) bool {
-		return result.Models[i].Usage.TotalTokens > result.Models[j].Usage.TotalTokens
+		if result.Models[i].Usage.TotalTokens != result.Models[j].Usage.TotalTokens {
+			return result.Models[i].Usage.TotalTokens > result.Models[j].Usage.TotalTokens
+		}
+		if result.Models[i].ProviderID != result.Models[j].ProviderID {
+			return result.Models[i].ProviderID < result.Models[j].ProviderID
+		}
+		return result.Models[i].Model < result.Models[j].Model
 	})
 	cacheAgentUsage(cacheKey, report, result)
 	return result
+}
+
+func usageProviderAt(agent AgentView, timestamp time.Time, reported runtimecontract.UsageText) string {
+	if reported.Available {
+		return reported.Value
+	}
+	if agent.RuntimeBinding.Kind == "codex" {
+		if timestamp.IsZero() {
+			return publicProviderID(agent.ProviderID)
+		}
+		return providerAt(agent.Agent, timestamp)
+	}
+	return ""
 }
 
 func (h *Hub) runtimeUsageReport(agentID string, binding runtimecontract.Binding) (*RuntimeUsageReport, error) {
@@ -330,13 +366,20 @@ func (h *Hub) runtimeUsageReport(agentID string, binding runtimecontract.Binding
 	if contract == nil || contract.ContractVersion() != runtimecontract.Version {
 		return nil, errf(500, "Runtime %s passive Contract is incompatible", binding.RuntimeKind)
 	}
-	capability, ok := contract.(runtimeUsageCapability)
+	capability, ok := contract.(runtimecontract.UsageInspectionCapability)
 	if !ok {
 		return nil, errf(501, "Runtime %s does not provide usage reporting", binding.RuntimeKind)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return capability.RuntimeUsage(ctx, binding)
+	report, failure := capability.InspectUsage(ctx, binding)
+	if failure != nil {
+		return nil, fmt.Errorf("%s", failure.Message)
+	}
+	if err := report.Validate(); err != nil {
+		return nil, fmt.Errorf("Runtime %s returned invalid usage: %w", binding.RuntimeKind, err)
+	}
+	return &report, nil
 }
 
 func providerAt(agent Agent, timestamp time.Time) string {

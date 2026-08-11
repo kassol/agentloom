@@ -149,6 +149,12 @@ type InputCapability interface {
 	ValidateInput(context.Context, Binding, []InputBlock) *Failure
 }
 
+// UsageInspectionCapability exposes passive, Runtime-neutral accounting for a
+// binding. Inspection must not start or acquire a Runtime host.
+type UsageInspectionCapability interface {
+	InspectUsage(context.Context, Binding) (UsageReport, *Failure)
+}
+
 // ResourceInventoryCapability exposes only resources discovered by the
 // selected Runtime. Paths and source metadata retain Runtime-specific meaning.
 type ResourceInventoryCapability interface {
@@ -417,6 +423,7 @@ const (
 	FailurePhaseModelControl      FailurePhase = "model_control"
 	FailurePhaseResourceInventory FailurePhase = "resource_inventory"
 	FailurePhaseResourcePolicy    FailurePhase = "resource_policy"
+	FailurePhaseUsageInspection   FailurePhase = "usage_inspection"
 )
 
 type Failure struct {
@@ -440,7 +447,7 @@ func (f Failure) Validate() error {
 		FailurePhaseTurnContinue, FailurePhaseTurnInterrupt, FailurePhaseHistory,
 		FailurePhaseClose, FailurePhaseBindingName, FailurePhaseBindingArchive,
 		FailurePhaseContextDelivery, FailurePhaseModelControl,
-		FailurePhaseResourceInventory, FailurePhaseResourcePolicy:
+		FailurePhaseResourceInventory, FailurePhaseResourcePolicy, FailurePhaseUsageInspection:
 		return nil
 	default:
 		return fmt.Errorf("Runtime failure has unknown phase %q", f.Phase)
@@ -716,6 +723,186 @@ type Usage struct {
 	TotalTokens           UsageMetric `json:"totalTokens"`
 	Calls                 UsageMetric `json:"calls"`
 	CostMicros            UsageMetric `json:"costMicros"`
+}
+
+// Add combines only observed values. A field remains unavailable until at
+// least one source reports it; missing Runtime metrics are never turned into
+// zeroes by aggregation.
+func (u *Usage) Add(other Usage) {
+	addUsageMetric := func(target *UsageMetric, value UsageMetric) {
+		if !value.Available {
+			if target.Source == "" {
+				target.Source = value.Source
+			}
+			return
+		}
+		wasAvailable := target.Available
+		target.Available = true
+		target.Value += value.Value
+		if !wasAvailable || target.Source == "" {
+			target.Source = value.Source
+		} else if value.Source != "" && target.Source != value.Source {
+			target.Source = "aggregate"
+		}
+	}
+	addUsageMetric(&u.InputTokens, other.InputTokens)
+	addUsageMetric(&u.CachedInputTokens, other.CachedInputTokens)
+	addUsageMetric(&u.OutputTokens, other.OutputTokens)
+	addUsageMetric(&u.ReasoningOutputTokens, other.ReasoningOutputTokens)
+	addUsageMetric(&u.TotalTokens, other.TotalTokens)
+	addUsageMetric(&u.Calls, other.Calls)
+	addUsageMetric(&u.CostMicros, other.CostMicros)
+}
+
+type UsageText struct {
+	Available bool   `json:"available"`
+	Value     string `json:"value,omitempty"`
+	Source    string `json:"source"`
+}
+
+type UsageBool struct {
+	Available bool   `json:"available"`
+	Value     bool   `json:"value,omitempty"`
+	Source    string `json:"source"`
+}
+
+type UsageEvent struct {
+	Timestamp UsageText `json:"timestamp"`
+	TurnID    UsageText `json:"turnId"`
+	Provider  UsageText `json:"provider"`
+	Model     UsageText `json:"model"`
+	Usage     Usage     `json:"usage"`
+}
+
+type TurnUsage struct {
+	TurnID        UsageText `json:"turnId"`
+	Provider      UsageText `json:"provider"`
+	Model         UsageText `json:"model"`
+	Usage         Usage     `json:"usage"`
+	LastUpdatedAt UsageText `json:"lastUpdatedAt"`
+}
+
+type TurnActivity struct {
+	TurnID      UsageText `json:"turnId"`
+	StartedAt   UsageText `json:"startedAt"`
+	EndedAt     UsageText `json:"endedAt"`
+	Status      UsageText `json:"status"`
+	InferredEnd UsageBool `json:"inferredEnd"`
+}
+
+type UsageReport struct {
+	Lifetime           Usage          `json:"lifetime"`
+	Events             []UsageEvent   `json:"events"`
+	Turns              []TurnUsage    `json:"turns"`
+	Activity           []TurnActivity `json:"activity"`
+	LatestCall         Usage          `json:"latestCall"`
+	LatestProvider     UsageText      `json:"latestProvider"`
+	LatestModel        UsageText      `json:"latestModel"`
+	ContextInputTokens UsageMetric    `json:"contextInputTokens"`
+	ModelContextWindow UsageMetric    `json:"modelContextWindow"`
+	LastUpdatedAt      UsageText      `json:"lastUpdatedAt"`
+}
+
+func (r UsageReport) Validate() error {
+	if err := r.Lifetime.validate("lifetime"); err != nil {
+		return err
+	}
+	for index, event := range r.Events {
+		if err := event.Timestamp.validate(fmt.Sprintf("event %d timestamp", index)); err != nil {
+			return err
+		}
+		if err := event.TurnID.validate(fmt.Sprintf("event %d Turn ID", index)); err != nil {
+			return err
+		}
+		if err := event.Provider.validate(fmt.Sprintf("event %d provider", index)); err != nil {
+			return err
+		}
+		if err := event.Model.validate(fmt.Sprintf("event %d model", index)); err != nil {
+			return err
+		}
+		if err := event.Usage.validate(fmt.Sprintf("event %d usage", index)); err != nil {
+			return err
+		}
+	}
+	for index, turn := range r.Turns {
+		for name, value := range map[string]UsageText{"Turn ID": turn.TurnID, "provider": turn.Provider, "model": turn.Model, "last updated": turn.LastUpdatedAt} {
+			if err := value.validate(fmt.Sprintf("Turn %d %s", index, name)); err != nil {
+				return err
+			}
+		}
+		if err := turn.Usage.validate(fmt.Sprintf("Turn %d usage", index)); err != nil {
+			return err
+		}
+	}
+	for index, activity := range r.Activity {
+		for name, value := range map[string]UsageText{"Turn ID": activity.TurnID, "started at": activity.StartedAt, "ended at": activity.EndedAt, "status": activity.Status} {
+			if err := value.validate(fmt.Sprintf("activity %d %s", index, name)); err != nil {
+				return err
+			}
+		}
+		if err := activity.InferredEnd.validate(fmt.Sprintf("activity %d inferred end", index)); err != nil {
+			return err
+		}
+	}
+	for name, value := range map[string]UsageText{"latest provider": r.LatestProvider, "latest model": r.LatestModel, "last updated": r.LastUpdatedAt} {
+		if err := value.validate(name); err != nil {
+			return err
+		}
+	}
+	if err := r.LatestCall.validate("latest call"); err != nil {
+		return err
+	}
+	for name, metric := range map[string]UsageMetric{"context input tokens": r.ContextInputTokens, "model context window": r.ModelContextWindow} {
+		if err := metric.validate(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (u Usage) validate(prefix string) error {
+	for name, metric := range map[string]UsageMetric{
+		"input tokens": u.InputTokens, "cached input tokens": u.CachedInputTokens, "output tokens": u.OutputTokens,
+		"reasoning output tokens": u.ReasoningOutputTokens, "total tokens": u.TotalTokens, "calls": u.Calls, "cost micros": u.CostMicros,
+	} {
+		if err := metric.validate(prefix + " " + name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m UsageMetric) validate(name string) error {
+	if m.Source == "" {
+		return fmt.Errorf("%s has no source", name)
+	}
+	if !m.Available && m.Value != 0 {
+		return fmt.Errorf("unavailable %s has value %d", name, m.Value)
+	}
+	return nil
+}
+
+func (m UsageText) validate(name string) error {
+	if m.Source == "" {
+		return fmt.Errorf("%s has no source", name)
+	}
+	if m.Available && m.Value == "" {
+		return fmt.Errorf("available %s has no value", name)
+	}
+	if !m.Available && m.Value != "" {
+		return fmt.Errorf("unavailable %s has value", name)
+	}
+	return nil
+}
+
+func (m UsageBool) validate(name string) error {
+	if m.Source == "" {
+		return fmt.Errorf("%s has no source", name)
+	}
+	if !m.Available && m.Value {
+		return fmt.Errorf("unavailable %s has value", name)
+	}
+	return nil
 }
 
 type HistoryRequest struct {

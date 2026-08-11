@@ -57,6 +57,10 @@ func TestPiRuntimeHostDriverRealRestartSafeStory(t *testing.T) {
 	if len(history.Turns) == 0 {
 		t.Fatal("real Pi history is empty")
 	}
+	usage, err := h.AgentTokenUsage(agent.ID, 7)
+	if err != nil || !usage.Available || usage.Lifetime.TotalTokens <= 0 || usage.Lifetime.Metrics["calls"].Available {
+		t.Fatalf("real Pi passive usage = %#v, err=%v", usage, err)
+	}
 	interruptedTurnID := exerciseRealRuntimeSteerInterrupt(t, h, agent.ID)
 	loomThreadID := agent.ThreadID
 	h.Shutdown()
@@ -92,6 +96,9 @@ func TestPiRuntimeHostDriverRealRestartSafeStory(t *testing.T) {
 	reopenedHistory, err := h.CanonicalHistory(agent.ID, 10, 0)
 	if err != nil || !canonicalHistoryHasTurn(reopenedHistory, dispatched.TurnID, "completed") || !canonicalHistoryHasTurn(reopenedHistory, interruptedTurnID, "interrupted") {
 		t.Fatalf("reopened Pi history = %#v, err=%v", reopenedHistory, err)
+	}
+	if usage, err := h.AgentTokenUsage(agent.ID, 7); err != nil || usage.Lifetime.TotalTokens <= 0 {
+		t.Fatalf("reopened real Pi passive usage = %#v, err=%v", usage, err)
 	}
 	handle := rt.agentHost
 	if _, err := h.ArchiveAgent(agent.ID); err != nil {

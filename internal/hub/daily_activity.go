@@ -68,7 +68,7 @@ func (h *Hub) DailyActivity(start, endExclusive time.Time, bucketMinutes int) Da
 
 	reports := make(map[string]*RuntimeUsageReport, len(agents))
 	for _, agent := range agents {
-		if report, err := h.runtimeUsageReport(agent.ID, runtimeContractBinding(&agent.Agent)); err == nil {
+		if report, err := h.runtimeUsageReport(agent.ID, runtimeUsageBinding(agent)); err == nil {
 			reports[agent.ID] = report
 		}
 	}
@@ -93,12 +93,12 @@ func buildDailyActivity(agents []AgentView, reports map[string]*RuntimeUsageRepo
 		GeneratedAt: now.UTC().Format(time.RFC3339Nano), Live: live, BucketMinutes: bucketMinutes,
 		TotalAgents: len(agents), Buckets: make([]DailyActivityBucket, bucketCount), Agents: []DailyAgentActivity{},
 		DataQuality: DailyActivityDataQuality{
-			ActivityBasis: "codex_rollout_turn_intervals", TokenBasis: "codex_rollout_token_deltas",
+			ActivityBasis: "runtime_contract_turn_intervals", TokenBasis: "runtime_contract_consumed_usage",
 			Limitations: []string{
 				"Execution includes model, tool, network, and approval waiting inside a Turn.",
 				"Team execution is summed Agent time, so parallel Agents can exceed wall-clock duration.",
-				"Agents without a readable Codex rollout are not included in activity rows.",
-				"Token events are assigned to the bucket in which Codex recorded each usage delta.",
+				"Agents without Runtime usage inspection are not included in activity rows.",
+				"Token events are assigned to the bucket in which the Runtime recorded consumed work.",
 			},
 		},
 	}
@@ -129,7 +129,10 @@ func buildDailyActivity(agents []AgentView, reports map[string]*RuntimeUsageRepo
 		result.TrackedAgents++
 		row := DailyAgentActivity{
 			AgentID: agent.ID, AgentName: agent.Name, Status: agent.Status,
-			Buckets: make([]DailyActivityAgentBucket, bucketCount),
+			Usage: emptyRuntimeTokenUsage(report.Lifetime), Buckets: make([]DailyActivityAgentBucket, bucketCount),
+		}
+		for index := range row.Buckets {
+			row.Buckets[index].Usage = emptyRuntimeTokenUsage(report.Lifetime)
 		}
 		intervals := workloadIntervals(report.Activity, start, windowEnd)
 		row.ExecutingSeconds = intervalDurationSeconds(intervals)
@@ -167,7 +170,7 @@ func buildDailyActivity(agents []AgentView, reports map[string]*RuntimeUsageRepo
 			row.Buckets[index].ExecutingSeconds = intervalDurationSeconds(clipWorkloadIntervals(intervals, bucketStart, bucketEnd))
 		}
 		for _, activity := range report.Activity {
-			started, ok := workloadTime(activity.StartedAt)
+			started, ok := workloadTime(activity.StartedAt.Value)
 			if !ok || started.Before(start) || !started.Before(windowEnd) {
 				continue
 			}
@@ -180,7 +183,7 @@ func buildDailyActivity(agents []AgentView, reports map[string]*RuntimeUsageRepo
 			markActive(started, started)
 		}
 		for _, event := range report.Events {
-			timestamp, err := time.Parse(time.RFC3339Nano, event.Timestamp)
+			timestamp, err := time.Parse(time.RFC3339Nano, event.Timestamp.Value)
 			if err != nil || timestamp.Before(start) || !timestamp.Before(windowEnd) {
 				continue
 			}
@@ -188,11 +191,16 @@ func buildDailyActivity(agents []AgentView, reports map[string]*RuntimeUsageRepo
 			if index < 0 || index >= len(row.Buckets) {
 				continue
 			}
-			row.Usage.Add(event.Usage)
-			row.Buckets[index].Usage.Add(event.Usage)
+			projected := projectRuntimeTokenUsage(event.Usage)
+			row.Usage.Add(projected)
+			row.Buckets[index].Usage.Add(projected)
 			markActive(timestamp, timestamp)
 		}
 		if row.ExecutingSeconds == 0 && row.TurnCount == 0 && row.Usage.Calls == 0 && row.Usage.TotalTokens == 0 {
+			result.Usage.Add(row.Usage)
+			for index := range row.Buckets {
+				result.Buckets[index].Usage.Add(row.Buckets[index].Usage)
+			}
 			continue
 		}
 		if !firstActive.IsZero() {

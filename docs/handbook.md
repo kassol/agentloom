@@ -616,27 +616,30 @@ make build
 
 ### Token Usage 口径
 
-- 用量读取 Codex rollout 的 `event_msg/token_count`，不依赖浏览器在线，也不从 Loom live event 日志反推。
-- `total_token_usage` 是 Thread 累计快照，`last_token_usage` 是最近一次模型调用。聚合必须对各 token 维度维护累计高水位，只记录超过历史最大值的增量；app-server 重连和多端交错写入可能产生重复或较旧快照，直接累加 `last`、相邻差值或把回退视为新分段都会重复计数。
-- `cachedInputTokens` 已包含在 `inputTokens` 中，`reasoningOutputTokens` 已包含在 `outputTokens` 中；总量只计算 input + output。
+- 用量只通过 Runtime Contract 的 passive Usage inspection 读取，不依赖浏览器在线、不启动 Runtime，也不从 Loom live event 或可见 transcript 反推。
+- Codex adapter 读取 rollout 的 `event_msg/token_count`。`total_token_usage` 是 Thread 累计快照，`last_token_usage` 是最近一次模型调用；聚合必须维护累计高水位，只记录超过历史最大值的增量，避免 app-server 重连和旧快照重复计数。
+- Pi adapter 按 entry ID 去重读取 append-only session 的全部已消费 usage，包括 active branch、abandoned branch、compaction、branch summary 和 tool result；可见 history 仍只投影 active branch。末尾未写完的 JSONL 记录本次忽略，补齐后只计一次。Pi 的公共 input 是 `input + cacheRead + cacheWrite`，cached input 是 `cacheRead`，total 优先使用原生 `totalTokens`，旧记录缺失该字段时回退为四个 token bucket 之和。原生 `provider`、`reasoning` 和 `cost.total` 存在时直接投影，缺失时保持 unavailable。
+- `cachedInputTokens` 已包含在 `inputTokens` 中，`reasoningOutputTokens` 已包含在 `outputTokens` 中；`totalTokens` 保留 Runtime 报告的总量语义，不从公共 input/output 再次推算。
+- 每个 Runtime usage 字段都携带 availability 与 source。Provider、model、cost、cache、reasoning 或 calls 缺失时保持 unavailable；团队聚合披露完整或部分 coverage，HTTP/Web 用 `—` 显示缺失值，绝不把缺失解释为零，也不估算调用次数、价格或账单。
 - Usage 的主查询使用包含首尾日期的日历窗口 `from/to`，并显式携带 IANA 时区。`Day` 可以选择任意历史日期；7/30/90 日只是以选定结束日期回溯的快捷方式，`Custom` 可以选择最多 366 天的任意范围。包含今天的窗口截止当前时刻并标记 `live`，而不是假装今天已经结束。旧的 `days=N` 查询继续兼容现有调用方。
 - 每个窗口同时计算紧邻的等长前一周期。Live 窗口的前一周期只计算到最后一天的相同时刻，避免用未结束的今天与完整历史日直接比较。
 - WebUI `#usage` 用 KPI 表达总量，用逐日柱状图表达时间分布，用 Treemap 的矩形面积表达 Agent 占比，用堆叠条表达 token composition，并用表格提供精确比较。Treemap 可以按显式 Organization root 分组；没有 Organization Relationship 的 Agent 归入 Independent。
 - Agent 当前 Context 是实时 Thread 快照，不属于历史查询窗口，只能显示在选中 Agent Inspector 中，不能与周期统计列混排。
 - 全局 Usage 只聚合当前 Agent registry 中的 Agent。
-- Token usage 是模型调用量，不等于货币成本或订阅额度。模型价格、Codex 计划和缓存计费没有可靠映射时，不展示推测成本。
+- Token usage 是模型调用量，不等于订阅额度。只展示 Runtime 原生报告的成本；模型价格、Codex 计划和缓存计费没有可靠映射时，不推测成本。
 - `/api/usage` 返回全局聚合，`/api/agents/{key}/usage` 返回单 Agent 聚合；history Turn 同时携带该 Turn 的 `model` 与 `usage`。
 
 ### Agent 负载与容量信号
 
 Organization → Usage 的 **Capacity signals** 是组织诊断入口，不是自动拆分、合并或绩效判断。它把两类
-事实放在一起：Codex Thread 实际执行了多久，以及进入 Loom durable queue 的工作等待了多久。
+事实放在一起：Agent Runtime Thread 实际执行了多久，以及进入 Loom durable queue 的工作等待了多久。
 
-- **Executing** 来自 Codex rollout 的 `task_started` 到 `task_complete` / `turn_aborted` 区间，因此
-  WebUI、CLI、Codex Desktop 和 Mobile 在同一 Thread 上发起的 Turn 都进入统计。相邻或重叠区间会合并，
-  新 Turn 出现但上一 Turn 没有终止事件时，上一段以新 Turn 的开始时间作为推断终点并计入数据质量。
+- **Executing** 来自 Runtime Contract usage activity 的 Turn 区间，因此各 Runtime 原生入口与 Loom 发起的
+  Turn 都能在有证据时进入统计。相邻或重叠区间会合并。Codex rollout 只有在明确记录其推断规则时才以后一
+  Turn 的开始补齐旧区间；Pi 从每条 user entry 开始 Activity，只有 `stop`、`length`、`error` 或 `aborted`
+  终态证据才能结束，`toolUse`、`pending`、`deferred` 以及 user-only Turn 在重开后仍保持 open。
 - **Idle proxy** 是所选日历窗口减去 executing 的剩余比例。Loom 尚未持久化机器、Hub、Codex Host 的
-  历史在线区间，所以它包含离线、睡眠和服务停机，不能解释成“Agent 在线但无事可做”。没有可读 rollout
+  历史在线区间，所以它包含离线、睡眠和服务停机，不能解释成“Agent 在线但无事可做”。没有可读 Runtime usage
   的 Agent 不进入全局 observed 分母，UI 用 coverage 明确显示可观测 Agent 数量。
 - **New-work wait** 只计算工作进入 durable queue 到首次开始处理之间的时间，不包含 Turn 处理时长。MVP
   覆盖 root internal message、external Inbox、Schedule 和已回答的 Needs You；进入正在运行 Turn 的因果

@@ -105,6 +105,37 @@ func TestContractV2RepresentsTypedCapabilityLifecycleContentUsageAndFailure(t *t
 	}
 }
 
+func TestUsageReportRejectsUnsourcedOrFabricatedUnavailableMetrics(t *testing.T) {
+	unavailable := runtimecontract.UsageMetric{Source: "runtime_unavailable"}
+	usage := runtimecontract.Usage{
+		InputTokens: unavailable, CachedInputTokens: unavailable, OutputTokens: unavailable,
+		ReasoningOutputTokens: unavailable, TotalTokens: unavailable, Calls: unavailable, CostMicros: unavailable,
+	}
+	report := runtimecontract.UsageReport{
+		Lifetime: usage, LatestCall: usage,
+		LatestProvider:     runtimecontract.UsageText{Source: "runtime_unavailable"},
+		LatestModel:        runtimecontract.UsageText{Source: "runtime_unavailable"},
+		ContextInputTokens: unavailable, ModelContextWindow: unavailable,
+		LastUpdatedAt: runtimecontract.UsageText{Source: "runtime_unavailable"},
+	}
+	if err := report.Validate(); err != nil {
+		t.Fatalf("truthful unavailable report: %v", err)
+	}
+	report.Lifetime.Calls.Value = 1
+	if err := report.Validate(); err == nil {
+		t.Fatal("unavailable calls accepted a fabricated value")
+	}
+	report.Lifetime.Calls.Value = 0
+	report.Activity = []runtimecontract.TurnActivity{{
+		TurnID: runtimecontract.UsageText{Source: "runtime_unavailable"}, StartedAt: runtimecontract.UsageText{Source: "runtime_unavailable"},
+		EndedAt: runtimecontract.UsageText{Source: "runtime_unavailable"}, Status: runtimecontract.UsageText{Source: "runtime_unavailable"},
+		InferredEnd: runtimecontract.UsageBool{Value: true, Source: "runtime_unavailable"},
+	}}
+	if err := report.Validate(); err == nil {
+		t.Fatal("unavailable inferred end accepted a fabricated value")
+	}
+}
+
 func TestContractV2RejectsContradictoryContentAndLifecycleStates(t *testing.T) {
 	valid := runtimecontract.ContentBlock{ID: "tool-1", Kind: runtimecontract.ContentToolCall, ToolCall: &runtimecontract.ToolCall{Name: "read"}}
 	if err := valid.Validate(); err != nil {

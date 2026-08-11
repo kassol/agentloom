@@ -399,8 +399,8 @@ func (c *controlPlaneContract) UpdateRuntimeGoal(context.Context, runtimecontrac
 func (c *controlPlaneContract) ClearRuntimeGoal(context.Context, runtimecontract.Binding) (bool, error) {
 	return false, nil
 }
-func (c *controlPlaneContract) RuntimeUsage(context.Context, runtimecontract.Binding) (*RuntimeUsageReport, error) {
-	return &RuntimeUsageReport{}, nil
+func (c *controlPlaneContract) InspectUsage(context.Context, runtimecontract.Binding) (runtimecontract.UsageReport, *runtimecontract.Failure) {
+	return runtimecontract.UsageReport{}, nil
 }
 func (c *controlPlaneContract) InspectModelControl(context.Context, runtimecontract.Binding) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
 	return runtimecontract.ModelControlState{}, nil

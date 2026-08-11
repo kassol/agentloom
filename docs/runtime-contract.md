@@ -76,6 +76,17 @@ Turn start. Inspector previews may therefore show a pending model while the
 composer continues to follow the active Capability Snapshot until Save
 succeeds.
 
+`UsageInspectionCapability` is passive: it reads one binding without acquiring
+or starting its Host. Every scalar in the report carries availability and a
+source. Aggregates may sum only observed values and must retain partial metric
+coverage; unavailable Provider, cost, cache, reasoning, or call counts are not
+zero and must not be inferred. Native usage may count consumed work outside the
+visible branch, while `ReadHistory` keeps its own active-history semantics.
+Pi preserves its persisted per-event Provider and native `totalTokens`; older
+records without that total fall back to input + output + cache read + cache
+write. Every user entry starts Activity, and only a terminal native stop reason
+ends it, so tool-use and interrupted append tails remain open across restart.
+
 Codex Provider definitions, credentials, verification, and shared Host restart
 remain a Codex Host integration. They are not part of
 `ModelControlCapability`, and Pi does not implement that administration

@@ -5,7 +5,7 @@ import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { activityIntensity, shiftCalendarDate, type DailyActivityOverview, type DailyAgentActivity } from "./daily-activity";
 import { api } from "./types";
-import { browserTimezone, todayDate } from "./usage";
+import { browserTimezone, formatOptionalUsageMetric, todayDate } from "./usage";
 
 const AGENT_COLUMN = 176;
 const SUMMARY_COLUMN = 136;
@@ -102,7 +102,7 @@ export function DailyActivityTimeline({ onSelectAgent }: { onSelectAgent: (id: s
                   type="button"
                   className={`relative flex h-full min-w-0 items-end justify-center border-l outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/40 ${index % labelEvery === 0 ? "border-border/60" : "border-border/20"}`}
                   onPointerEnter={(event) => showHover(event, `${formatBucketRange(bucket.startedAt, bucket.endedAt, timezone)} · team`, [
-                    `${formatTokens(bucket.usage.totalTokens)} tokens · ${formatTokens(bucket.usage.calls)} calls`,
+                    `${formatTokens(bucket.usage.totalTokens)} tokens · ${formatOptionalUsageMetric(bucket.usage, "calls", formatTokens)} calls`,
                     `${bucket.activeAgents} active Agents · ${formatDuration(bucket.executingSeconds)} execution`,
                   ])}
                   onPointerLeave={() => setHover(null)}
@@ -134,7 +134,7 @@ export function DailyActivityTimeline({ onSelectAgent }: { onSelectAgent: (id: s
                     onClick={() => active && setSelection({ agent, bucketIndex: index })}
                     onPointerEnter={(event) => showHover(event, `${agent.agentName} · ${formatBucketRange(timelineBucket.startedAt, timelineBucket.endedAt, timezone)}`, [
                       `${formatDuration(bucket.executingSeconds)} execution · ${formatTurnCount(bucket.turnCount)}`,
-                      `${formatTokens(bucket.usage.totalTokens)} tokens · ${formatTokens(bucket.usage.calls)} calls`,
+                      `${formatTokens(bucket.usage.totalTokens)} tokens · ${formatOptionalUsageMetric(bucket.usage, "calls", formatTokens)} calls`,
                     ])}
                     onPointerLeave={() => setHover(null)}
                     aria-label={`${agent.agentName}, ${formatBucketRange(timelineBucket.startedAt, timelineBucket.endedAt, timezone)}: ${formatDuration(bucket.executingSeconds)} execution, ${formatTokens(bucket.usage.totalTokens)} tokens`}
@@ -180,7 +180,7 @@ function SelectedBucket({ selection, activity, timezone, onOpenAgent }: { select
       <MiniMetric label="Execution" value={formatDuration(bucket.executingSeconds)} />
       <MiniMetric label="Turns" value={String(bucket.turnCount)} />
       <MiniMetric label="Tokens" value={formatTokens(bucket.usage.totalTokens)} />
-      <MiniMetric label="Calls" value={formatTokens(bucket.usage.calls)} />
+      <MiniMetric label="Calls" value={formatOptionalUsageMetric(bucket.usage, "calls", formatTokens)} />
       <Button type="button" variant="outline" size="sm" onClick={onOpenAgent} className="h-7 text-[9.5px]">Open Agent</Button>
     </div>
   );

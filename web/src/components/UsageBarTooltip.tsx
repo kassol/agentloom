@@ -1,4 +1,5 @@
 import type { UsageDay } from "../types";
+import { formatOptionalUsageMetric } from "../usage";
 
 export function UsageBarTooltip({ day, align = "center" }: { day: UsageDay; align?: "start" | "center" | "end" }) {
   const position = align === "start" ? "left-0" : align === "end" ? "right-0" : "left-1/2 -translate-x-1/2";
@@ -15,16 +16,16 @@ export function UsageBarTooltip({ day, align = "center" }: { day: UsageDay; alig
       </div>
       <dl className="mt-1 grid grid-cols-[1fr_auto] gap-x-3 gap-y-0.5 font-mono text-[9px]">
         <dt className="text-muted-foreground">Input</dt><dd>{exactNumber(day.usage.inputTokens)}</dd>
-        <dt className="text-muted-foreground">Cached</dt><dd>{exactNumber(day.usage.cachedInputTokens)}</dd>
+        <dt className="text-muted-foreground">Cached</dt><dd>{formatOptionalUsageMetric(day.usage, "cachedInputTokens", exactNumber)}</dd>
         <dt className="text-muted-foreground">Output</dt><dd>{exactNumber(day.usage.outputTokens)}</dd>
-        <dt className="text-muted-foreground">Calls</dt><dd>{exactNumber(day.usage.calls)}</dd>
+        <dt className="text-muted-foreground">Calls</dt><dd>{formatOptionalUsageMetric(day.usage, "calls", exactNumber)}</dd>
       </dl>
     </div>
   );
 }
 
 export function usageDayLabel(day: UsageDay) {
-  return `${day.date}: ${exactNumber(day.usage.totalTokens)} total tokens, ${exactNumber(day.usage.inputTokens)} input, ${exactNumber(day.usage.cachedInputTokens)} cached, ${exactNumber(day.usage.outputTokens)} output, ${exactNumber(day.usage.calls)} calls`;
+  return `${day.date}: ${exactNumber(day.usage.totalTokens)} total tokens, ${exactNumber(day.usage.inputTokens)} input, ${formatOptionalUsageMetric(day.usage, "cachedInputTokens", exactNumber)} cached, ${exactNumber(day.usage.outputTokens)} output, ${formatOptionalUsageMetric(day.usage, "calls", exactNumber)} calls`;
 }
 
 function exactNumber(value: number) {

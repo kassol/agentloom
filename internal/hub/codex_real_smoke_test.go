@@ -60,6 +60,9 @@ func TestCodexRuntimeHostDriverRealRestartSafeStory(t *testing.T) {
 	if len(history.Turns) == 0 || history.Turns[len(history.Turns)-1].TurnID != dispatched.TurnID {
 		t.Fatalf("real canonical history = %#v", history)
 	}
+	if usage, err := h.AgentTokenUsage(agent.ID, 7); err != nil || !usage.Available || usage.Lifetime.TotalTokens <= 0 {
+		t.Fatalf("real Codex passive usage = %#v, err=%v", usage, err)
+	}
 	interruptedTurnID := exerciseRealRuntimeSteerInterrupt(t, h, agent.ID)
 	loomThreadID := agent.ThreadID
 	h.Shutdown()
@@ -98,6 +101,9 @@ func TestCodexRuntimeHostDriverRealRestartSafeStory(t *testing.T) {
 	reopenedHistory, err := h.CanonicalHistory(agent.ID, 10, 0)
 	if err != nil || !canonicalHistoryHasTurn(reopenedHistory, dispatched.TurnID, "completed") || !canonicalHistoryHasTurn(reopenedHistory, interruptedTurnID, "interrupted") {
 		t.Fatalf("reopened canonical history = %#v, err=%v", reopenedHistory, err)
+	}
+	if usage, err := h.AgentTokenUsage(agent.ID, 7); err != nil || usage.Lifetime.TotalTokens <= 0 {
+		t.Fatalf("reopened real Codex passive usage = %#v, err=%v", usage, err)
 	}
 	handle := rt.agentHost
 	if _, err := h.ArchiveAgent(agent.ID); err != nil {

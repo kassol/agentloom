@@ -7,7 +7,10 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +23,21 @@ type piSessionEntry struct {
 	ParentID  string          `json:"parentId"`
 	Timestamp string          `json:"timestamp"`
 	Message   json.RawMessage `json:"message"`
+	Usage     *piNativeUsage  `json:"usage"`
+}
+
+type piNativeUsageCost struct {
+	Total *float64 `json:"total"`
+}
+
+type piNativeUsage struct {
+	Input       int64              `json:"input"`
+	Output      int64              `json:"output"`
+	CacheRead   int64              `json:"cacheRead"`
+	CacheWrite  int64              `json:"cacheWrite"`
+	TotalTokens *int64             `json:"totalTokens"`
+	Reasoning   *int64             `json:"reasoning"`
+	Cost        *piNativeUsageCost `json:"cost"`
 }
 
 type piSessionMessage struct {
@@ -31,13 +49,8 @@ type piSessionMessage struct {
 	ToolCallID   string          `json:"toolCallId"`
 	ToolName     string          `json:"toolName"`
 	IsError      bool            `json:"isError"`
-	Usage        struct {
-		Input       int64 `json:"input"`
-		Output      int64 `json:"output"`
-		CacheRead   int64 `json:"cacheRead"`
-		CacheWrite  int64 `json:"cacheWrite"`
-		TotalTokens int64 `json:"totalTokens"`
-	} `json:"usage"`
+	Provider     string          `json:"provider"`
+	Usage        piNativeUsage   `json:"usage"`
 }
 
 type piContentBlock struct {
@@ -85,35 +98,270 @@ func readPiSessionEntries(path string) ([]piSessionEntry, string, error) {
 	defer file.Close()
 
 	entries := []piSessionEntry{}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 1<<20), 1<<26)
+	reader := bufio.NewReader(file)
 	line := 0
-	for scanner.Scan() {
+	for {
+		lineRaw, readErr := reader.ReadString('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, "", fmt.Errorf("read Pi session %s: %w", path, readErr)
+		}
+		if lineRaw == "" && errors.Is(readErr, io.EOF) {
+			break
+		}
 		line++
-		raw := strings.TrimSpace(scanner.Text())
+		raw := strings.TrimSpace(lineRaw)
 		if raw == "" {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
 			continue
 		}
 		var entry piSessionEntry
 		if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+			if errors.Is(readErr, io.EOF) {
+				break // an append interrupted mid-record is not consumed work yet
+			}
 			return nil, "", fmt.Errorf("parse Pi session %s line %d: %w", path, line, err)
 		}
 		if entry.Type == "session" {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
 			continue
 		}
 		if entry.ID == "" {
 			return nil, "", fmt.Errorf("parse Pi session %s line %d: entry has no id", path, line)
 		}
 		entries = append(entries, entry)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, "", fmt.Errorf("read Pi session %s: %w", path, err)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
 	}
 	leafID := ""
 	if len(entries) > 0 {
 		leafID = entries[len(entries)-1].ID
 	}
 	return entries, leafID, nil
+}
+
+type piUsageEnvelope struct {
+	Role       string         `json:"role"`
+	Provider   string         `json:"provider"`
+	Model      string         `json:"model"`
+	StopReason string         `json:"stopReason"`
+	Usage      *piNativeUsage `json:"usage"`
+}
+
+func (c *piRuntimeContract) InspectUsage(ctx context.Context, binding runtimecontract.Binding) (runtimecontract.UsageReport, *runtimecontract.Failure) {
+	if err := ctx.Err(); err != nil {
+		return runtimecontract.UsageReport{}, piUsageFailure(err)
+	}
+	entries, _, err := readPiSessionEntries(binding.NativeRef)
+	if err != nil {
+		return runtimecontract.UsageReport{}, piUsageFailure(err)
+	}
+	return projectPiUsage(entries), nil
+}
+
+func piUsageFailure(err error) *runtimecontract.Failure {
+	return &runtimecontract.Failure{Code: "usage_inspection_failed", Phase: runtimecontract.FailurePhaseUsageInspection, Message: "Pi usage could not be inspected", Diagnostic: err.Error(), Cause: err}
+}
+
+func projectPiUsage(entries []piSessionEntry) runtimecontract.UsageReport {
+	const source = "pi_session"
+	unavailableText := runtimecontract.UsageText{Source: "runtime_unavailable"}
+	unavailableMetric := runtimecontract.UsageMetric{Source: "runtime_unavailable"}
+	unavailableUsage := runtimecontract.Usage{
+		InputTokens: unavailableMetric, CachedInputTokens: unavailableMetric, OutputTokens: unavailableMetric,
+		ReasoningOutputTokens: unavailableMetric, TotalTokens: unavailableMetric, Calls: unavailableMetric, CostMicros: unavailableMetric,
+	}
+	report := runtimecontract.UsageReport{
+		Events: []runtimecontract.UsageEvent{}, Turns: []runtimecontract.TurnUsage{}, Activity: []runtimecontract.TurnActivity{},
+		LatestProvider: unavailableText, LatestModel: unavailableText,
+		ContextInputTokens: unavailableMetric, ModelContextWindow: unavailableMetric,
+		Lifetime: unavailableUsage, LatestCall: unavailableUsage, LastUpdatedAt: unavailableText,
+	}
+	byID := make(map[string]piSessionEntry, len(entries))
+	envelopes := make(map[string]piUsageEnvelope, len(entries))
+	roles := make(map[string]string, len(entries))
+	activities := make(map[string]*runtimecontract.TurnActivity, len(entries))
+	activityOrder := []string{}
+	for _, entry := range entries {
+		if _, exists := byID[entry.ID]; exists {
+			continue
+		}
+		byID[entry.ID] = entry
+		var envelope piUsageEnvelope
+		if len(entry.Message) > 0 && json.Unmarshal(entry.Message, &envelope) != nil {
+			continue
+		}
+		if envelope.Usage == nil {
+			envelope.Usage = entry.Usage
+		}
+		envelopes[entry.ID] = envelope
+		roles[entry.ID] = envelope.Role
+		if envelope.Role == "user" {
+			activities[entry.ID] = &runtimecontract.TurnActivity{
+				TurnID: observedUsageText(entry.ID, source), StartedAt: observedUsageText(entry.Timestamp, source),
+				EndedAt: unavailableText, Status: observedUsageText("running", source),
+				InferredEnd: runtimecontract.UsageBool{Available: true, Source: source},
+			}
+			activityOrder = append(activityOrder, entry.ID)
+		}
+	}
+	seen := map[string]bool{}
+	turnStatuses := map[string]struct {
+		status string
+		ended  runtimecontract.UsageText
+	}{}
+	for _, entry := range entries {
+		if seen[entry.ID] {
+			continue
+		}
+		seen[entry.ID] = true
+		envelope := envelopes[entry.ID]
+		turnID := piUsageTurnID(entry, byID, roles)
+		if status := piUsageStatus(envelope.StopReason); status != "" {
+			current := turnStatuses[turnID]
+			if piUsageStatusRank(status) >= piUsageStatusRank(current.status) {
+				turnStatuses[turnID] = struct {
+					status string
+					ended  runtimecontract.UsageText
+				}{status: status, ended: observedUsageText(entry.Timestamp, source)}
+			}
+		}
+		if envelope.Usage == nil {
+			continue
+		}
+		usage := piRuntimeUsage(*envelope.Usage)
+		report.Lifetime.Add(usage)
+		report.Events = append(report.Events, runtimecontract.UsageEvent{
+			Timestamp: observedUsageText(entry.Timestamp, source), TurnID: observedUsageText(turnID, source),
+			Provider: observedUsageText(envelope.Provider, source), Model: observedUsageText(envelope.Model, source), Usage: usage,
+		})
+	}
+	sort.SliceStable(report.Events, func(i, j int) bool {
+		return report.Events[i].Timestamp.Value < report.Events[j].Timestamp.Value
+	})
+	turns := map[string]*runtimecontract.TurnUsage{}
+	turnOrder := []string{}
+	for _, event := range report.Events {
+		id := event.TurnID.Value
+		turn := turns[id]
+		if turn == nil {
+			turn = &runtimecontract.TurnUsage{TurnID: event.TurnID, Provider: unavailableText}
+			turns[id] = turn
+			turnOrder = append(turnOrder, id)
+			if activities[id] == nil {
+				entry := byID[id]
+				activities[id] = &runtimecontract.TurnActivity{
+					TurnID: event.TurnID, StartedAt: observedUsageText(entry.Timestamp, source), EndedAt: unavailableText,
+					Status: observedUsageText("running", source), InferredEnd: runtimecontract.UsageBool{Available: true, Source: source},
+				}
+				activityOrder = append(activityOrder, id)
+			}
+		}
+		turn.Usage.Add(event.Usage)
+		if event.Provider.Available {
+			turn.Provider = event.Provider
+		}
+		if event.Model.Available {
+			turn.Model = event.Model
+		}
+		turn.LastUpdatedAt = event.Timestamp
+	}
+	for _, id := range turnOrder {
+		report.Turns = append(report.Turns, *turns[id])
+	}
+	for _, id := range activityOrder {
+		if terminal := turnStatuses[id]; terminal.status != "" {
+			activities[id].Status = observedUsageText(terminal.status, source)
+			activities[id].EndedAt = terminal.ended
+		}
+		report.Activity = append(report.Activity, *activities[id])
+	}
+	if len(report.Events) > 0 {
+		latest := report.Events[len(report.Events)-1]
+		report.LatestCall, report.LatestProvider, report.LatestModel, report.LastUpdatedAt = latest.Usage, latest.Provider, latest.Model, latest.Timestamp
+	}
+	return report
+}
+
+func piUsageStatus(stopReason string) string {
+	switch stopReason {
+	case "stop", "length":
+		return "completed"
+	case "aborted":
+		return "interrupted"
+	case "error":
+		return "failed"
+	default:
+		return ""
+	}
+}
+
+func piUsageStatusRank(status string) int {
+	switch status {
+	case "completed":
+		return 3
+	case "failed":
+		return 2
+	case "interrupted":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func piUsageTurnID(entry piSessionEntry, byID map[string]piSessionEntry, roles map[string]string) string {
+	seen := map[string]bool{}
+	for current := entry; current.ID != "" && !seen[current.ID]; current = byID[current.ParentID] {
+		seen[current.ID] = true
+		if roles[current.ID] == "user" {
+			return current.ID
+		}
+		if current.ParentID == "" {
+			break
+		}
+	}
+	return entry.ID
+}
+
+func piRuntimeUsage(value piNativeUsage) runtimecontract.Usage {
+	observed := func(amount int64) runtimecontract.UsageMetric {
+		return runtimecontract.UsageMetric{Available: true, Value: amount, Source: "pi_session_usage"}
+	}
+	unavailable := runtimecontract.UsageMetric{Source: "runtime_unavailable"}
+	result := runtimecontract.Usage{
+		InputTokens: observed(value.Input + value.CacheRead + value.CacheWrite), CachedInputTokens: observed(value.CacheRead),
+		OutputTokens: observed(value.Output), TotalTokens: observed(piNativeTotalTokens(value)),
+		ReasoningOutputTokens: unavailable, Calls: unavailable, CostMicros: unavailable,
+	}
+	if value.Reasoning != nil {
+		result.ReasoningOutputTokens = observed(*value.Reasoning)
+	}
+	if value.Cost != nil && value.Cost.Total != nil {
+		result.CostMicros = observed(piNativeCostMicros(*value.Cost.Total))
+	}
+	return result
+}
+
+func piNativeTotalTokens(value piNativeUsage) int64 {
+	if value.TotalTokens != nil {
+		return *value.TotalTokens
+	}
+	return value.Input + value.Output + value.CacheRead + value.CacheWrite
+}
+
+func piNativeCostMicros(value float64) int64 {
+	return int64(math.Round(value * 1_000_000))
+}
+
+func observedUsageText(value, source string) runtimecontract.UsageText {
+	if value == "" {
+		return runtimecontract.UsageText{Source: "runtime_unavailable"}
+	}
+	return runtimecontract.UsageText{Available: true, Value: value, Source: source}
 }
 
 func piActiveBranch(entries []piSessionEntry, leafID string) ([]piSessionEntry, error) {
@@ -470,7 +718,7 @@ func piUserCanonicalAttachments(text string) []runtimecontract.Attachment {
 
 func addPiContractUsage(current *runtimecontract.Usage, message piSessionMessage) *runtimecontract.Usage {
 	usage := message.Usage
-	if usage.Input == 0 && usage.Output == 0 && usage.CacheRead == 0 && usage.TotalTokens == 0 {
+	if !piNativeUsagePresent(usage) {
 		return current
 	}
 	if current == nil {
@@ -479,14 +727,27 @@ func addPiContractUsage(current *runtimecontract.Usage, message piSessionMessage
 	add := func(metric *runtimecontract.UsageMetric, value int64) {
 		metric.Available, metric.Value, metric.Source = true, metric.Value+value, "native"
 	}
-	add(&current.InputTokens, usage.Input)
+	add(&current.InputTokens, usage.Input+usage.CacheRead+usage.CacheWrite)
 	add(&current.CachedInputTokens, usage.CacheRead)
 	add(&current.OutputTokens, usage.Output)
-	add(&current.TotalTokens, usage.TotalTokens)
-	add(&current.Calls, 1)
-	current.ReasoningOutputTokens.Source = "runtime_unavailable"
-	current.CostMicros.Source = "runtime_unavailable"
+	add(&current.TotalTokens, piNativeTotalTokens(usage))
+	if usage.Reasoning != nil {
+		add(&current.ReasoningOutputTokens, *usage.Reasoning)
+	} else if current.ReasoningOutputTokens.Source == "" {
+		current.ReasoningOutputTokens.Source = "runtime_unavailable"
+	}
+	if usage.Cost != nil && usage.Cost.Total != nil {
+		add(&current.CostMicros, piNativeCostMicros(*usage.Cost.Total))
+	} else if current.CostMicros.Source == "" {
+		current.CostMicros.Source = "runtime_unavailable"
+	}
+	current.Calls.Source = "runtime_unavailable"
 	return current
+}
+
+func piNativeUsagePresent(usage piNativeUsage) bool {
+	return usage.Input != 0 || usage.Output != 0 || usage.CacheRead != 0 || usage.CacheWrite != 0 ||
+		usage.TotalTokens != nil || usage.Reasoning != nil || usage.Cost != nil
 }
 
 func piCausalAgentMessage(text string) bool {
@@ -579,16 +840,19 @@ func piUserAttachments(text string) []map[string]any {
 
 func addPiUsage(current *nativeTokenUsage, message piSessionMessage) *nativeTokenUsage {
 	usage := message.Usage
-	if usage.Input == 0 && usage.Output == 0 && usage.CacheRead == 0 && usage.TotalTokens == 0 {
+	if !piNativeUsagePresent(usage) {
 		return current
 	}
 	if current == nil {
 		current = &nativeTokenUsage{}
 	}
-	current.InputTokens += usage.Input
+	current.InputTokens += usage.Input + usage.CacheRead + usage.CacheWrite
 	current.CachedInputTokens += usage.CacheRead
 	current.OutputTokens += usage.Output
-	current.TotalTokens += usage.TotalTokens
+	if usage.Reasoning != nil {
+		current.ReasoningOutputTokens += *usage.Reasoning
+	}
+	current.TotalTokens += piNativeTotalTokens(usage)
 	current.Calls++
 	return current
 }

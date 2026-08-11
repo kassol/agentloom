@@ -85,7 +85,7 @@ func validateRuntimeCapabilityHooks(contract runtimecontract.Contract, snapshot 
 			// synchronization projection and is not required for product CRUD.
 			implemented = true
 		case runtimecontract.CapabilityUsageReporting:
-			_, implemented = contract.(runtimeUsageCapability)
+			_, implemented = contract.(runtimecontract.UsageInspectionCapability)
 		case runtimecontract.CapabilityModelConfiguration:
 			_, implemented = contract.(runtimecontract.ModelControlCapability)
 		case runtimecontract.CapabilityManualCompaction:
@@ -335,7 +335,7 @@ func piControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Capabi
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityNativeArchive, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityGoal, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityRemote, false),
-		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityUsageReporting, false),
+		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityUsageReporting, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityModelConfiguration, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityManualCompaction, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityImageInput, imageAvailable),

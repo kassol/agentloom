@@ -22,4 +22,23 @@ describe("UsageBarTooltip", () => {
     expect(screen.getByText("2,345")).toBeInTheDocument();
     expect(screen.getByText("3")).toBeInTheDocument();
   });
+
+	 it("shows unavailable Runtime metrics as a dash instead of zero", () => {
+	   render(<UsageBarTooltip day={{
+	     date: "2026-08-11",
+	     usage: {
+	       inputTokens: 12,
+	       cachedInputTokens: 2,
+	       outputTokens: 3,
+	       reasoningOutputTokens: 0,
+	       totalTokens: 15,
+	       calls: 0,
+	       metrics: {
+	         cachedInputTokens: { available: true, complete: true, sources: ["pi_session_usage"] },
+	         calls: { available: false, complete: false, sources: ["runtime_unavailable"] },
+	       },
+	     },
+	   }} />);
+	   expect(screen.getAllByText("Calls").at(-1)?.nextSibling).toHaveTextContent("—");
+	 });
 });

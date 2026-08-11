@@ -140,7 +140,7 @@ func buildWorkloadOverviewRange(snapshot workloadSnapshot, start, endExclusive, 
 		Timezone: usageTimezoneLabel(now), GeneratedAt: now.UTC().Format(time.RFC3339Nano), Live: usageRangeIsLive(endExclusive, now),
 		Daily: emptyWorkloadDays(start, days), Sources: []WorkloadSource{}, Agents: []AgentWorkload{}, Evidence: []WorkloadEvidence{},
 		DataQuality: WorkloadDataQuality{
-			ActivityBasis: "codex_rollout_turn_intervals", IdleBasis: "calendar_non_executing_proxy",
+			ActivityBasis: "runtime_contract_turn_intervals", IdleBasis: "calendar_non_executing_proxy",
 			HistoricalWaitReasons: "unrecorded", TotalAgents: len(snapshot.agents),
 			Limitations: []string{
 				"Idle proxy includes machine and service downtime because historical online intervals are not persisted.",
@@ -311,11 +311,11 @@ func buildAgentWorkload(agent Agent, samples []workloadQueueSample, start time.T
 		intervals := workloadIntervals(report.Activity, observedStart, rangeEnd)
 		workload.ExecutingSeconds = intervalDurationSeconds(intervals)
 		for _, activity := range report.Activity {
-			started, ok := workloadTime(activity.StartedAt)
+			started, ok := workloadTime(activity.StartedAt.Value)
 			if !ok || !started.Before(rangeEnd) {
 				continue
 			}
-			ended, hasEnd := workloadTime(activity.EndedAt)
+			ended, hasEnd := workloadTime(activity.EndedAt.Value)
 			overlapsWindow := started.Before(rangeEnd) && (!hasEnd || ended.After(observedStart))
 			if !started.Before(observedStart) {
 				workload.TurnCount++
@@ -323,7 +323,7 @@ func buildAgentWorkload(agent Agent, samples []workloadQueueSample, start time.T
 			if !hasEnd && overlapsWindow {
 				workload.OpenTurns++
 			}
-			if activity.InferredEnd && overlapsWindow {
+			if activity.InferredEnd.Value && overlapsWindow {
 				workload.InferredTurns++
 			}
 		}
@@ -343,7 +343,7 @@ func buildAgentWorkload(agent Agent, samples []workloadQueueSample, start time.T
 			}
 			workload.Daily[index].ExecutingSeconds = intervalDurationSeconds(clipWorkloadIntervals(intervals, dayStart, dayWindowEnd))
 			for _, activity := range report.Activity {
-				started, ok := workloadTime(activity.StartedAt)
+				started, ok := workloadTime(activity.StartedAt.Value)
 				if ok && !started.Before(dayStart) && started.Before(dayWindowEnd) {
 					workload.Daily[index].TurnCount++
 				}
@@ -595,12 +595,12 @@ type workloadInterval struct {
 func workloadIntervals(activity []RuntimeTurnActivity, start, now time.Time) []workloadInterval {
 	intervals := []workloadInterval{}
 	for _, turn := range activity {
-		turnStart, ok := workloadTime(turn.StartedAt)
+		turnStart, ok := workloadTime(turn.StartedAt.Value)
 		if !ok {
 			continue
 		}
 		turnEnd := now
-		if parsed, ok := workloadTime(turn.EndedAt); ok {
+		if parsed, ok := workloadTime(turn.EndedAt.Value); ok {
 			turnEnd = parsed
 		}
 		if turnStart.Before(start) {

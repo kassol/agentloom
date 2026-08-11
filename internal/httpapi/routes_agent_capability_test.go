@@ -62,7 +62,6 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 	tests := []struct {
 		name, method, path, body, capability string
 	}{
-		{name: "usage", method: http.MethodGet, path: "/api/agents/agent-pi/usage?days=7", capability: "usage"},
 		{name: "manual compaction", method: http.MethodPost, path: "/api/agents/agent-pi/compact", capability: "compaction"},
 		{name: "sandbox config", method: http.MethodPatch, path: "/api/agents/agent-pi/config", body: `{"sandbox":"read-only"}`, capability: "sandbox"},
 	}

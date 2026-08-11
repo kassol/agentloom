@@ -770,44 +770,55 @@ func (c *codexRuntimeContract) ClearRuntimeGoal(ctx context.Context, binding run
 	return response.Cleared, nil
 }
 
-func (c *codexRuntimeContract) RuntimeUsage(ctx context.Context, binding runtimecontract.Binding) (*RuntimeUsageReport, error) {
+func (c *codexRuntimeContract) InspectUsage(ctx context.Context, binding runtimecontract.Binding) (runtimecontract.UsageReport, *runtimecontract.Failure) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return runtimecontract.UsageReport{}, codexUsageFailure(err)
 	}
 	report, err := rollout.ReadUsage(binding.NativeRef)
 	if err != nil {
-		return nil, err
+		return runtimecontract.UsageReport{}, codexUsageFailure(err)
 	}
-	return codexRuntimeUsageReport(report), nil
+	result := codexRuntimeUsageReport(report)
+	return result, nil
 }
 
-func codexRuntimeUsageReport(report *rollout.UsageReport) *RuntimeUsageReport {
+func codexUsageFailure(err error) *runtimecontract.Failure {
+	return &runtimecontract.Failure{Code: "usage_inspection_failed", Phase: runtimecontract.FailurePhaseUsageInspection, Message: "Codex usage could not be inspected", Diagnostic: err.Error(), Cause: err}
+}
+
+func codexRuntimeUsageReport(report *rollout.UsageReport) runtimecontract.UsageReport {
 	if report == nil {
-		return nil
+		return runtimecontract.UsageReport{}
 	}
-	tokens := func(value rollout.TokenUsage) RuntimeTokenUsage {
-		return RuntimeTokenUsage{
-			InputTokens: value.InputTokens, CachedInputTokens: value.CachedInputTokens,
-			OutputTokens: value.OutputTokens, ReasoningOutputTokens: value.ReasoningOutputTokens,
-			TotalTokens: value.TotalTokens, Calls: value.Calls,
+	const source = "codex_rollout"
+	text := func(value string) runtimecontract.UsageText { return observedUsageText(value, source) }
+	tokens := func(value rollout.TokenUsage) runtimecontract.Usage {
+		metric := func(amount int64) runtimecontract.UsageMetric {
+			return runtimecontract.UsageMetric{Available: true, Value: amount, Source: source}
+		}
+		return runtimecontract.Usage{
+			InputTokens: metric(value.InputTokens), CachedInputTokens: metric(value.CachedInputTokens),
+			OutputTokens: metric(value.OutputTokens), ReasoningOutputTokens: metric(value.ReasoningOutputTokens),
+			TotalTokens: metric(value.TotalTokens), Calls: metric(value.Calls),
+			CostMicros: runtimecontract.UsageMetric{Source: "runtime_unavailable"},
 		}
 	}
-	result := &RuntimeUsageReport{
-		Lifetime: tokens(report.Lifetime), LatestCall: tokens(report.LatestCall), LatestModel: report.LatestModel,
-		ContextInputTokens: report.ContextInputTokens, ModelContextWindow: report.ModelContextWindow,
-		LastUpdatedAt: report.LastUpdatedAt,
-		Events:        make([]RuntimeUsageEvent, 0, len(report.Events)),
-		Turns:         make([]RuntimeTurnUsage, 0, len(report.Turns)),
-		Activity:      make([]RuntimeTurnActivity, 0, len(report.Activity)),
+	result := runtimecontract.UsageReport{
+		Lifetime: tokens(report.Lifetime), LatestCall: tokens(report.LatestCall),
+		LatestProvider: runtimecontract.UsageText{Source: "runtime_unavailable"}, LatestModel: text(report.LatestModel),
+		ContextInputTokens: runtimecontract.UsageMetric{Available: true, Value: report.ContextInputTokens, Source: source},
+		ModelContextWindow: runtimecontract.UsageMetric{Available: true, Value: report.ModelContextWindow, Source: source},
+		LastUpdatedAt:      text(report.LastUpdatedAt), Events: make([]runtimecontract.UsageEvent, 0, len(report.Events)),
+		Turns: make([]runtimecontract.TurnUsage, 0, len(report.Turns)), Activity: make([]runtimecontract.TurnActivity, 0, len(report.Activity)),
 	}
 	for _, event := range report.Events {
-		result.Events = append(result.Events, RuntimeUsageEvent{Timestamp: event.Timestamp, TurnID: event.TurnID, Model: event.Model, Usage: tokens(event.Usage)})
+		result.Events = append(result.Events, runtimecontract.UsageEvent{Timestamp: text(event.Timestamp), TurnID: text(event.TurnID), Provider: runtimecontract.UsageText{Source: "runtime_unavailable"}, Model: text(event.Model), Usage: tokens(event.Usage)})
 	}
 	for _, turn := range report.Turns {
-		result.Turns = append(result.Turns, RuntimeTurnUsage{TurnID: turn.TurnID, Model: turn.Model, Usage: tokens(turn.Usage), LastUpdatedAt: turn.LastUpdatedAt})
+		result.Turns = append(result.Turns, runtimecontract.TurnUsage{TurnID: text(turn.TurnID), Provider: runtimecontract.UsageText{Source: "runtime_unavailable"}, Model: text(turn.Model), Usage: tokens(turn.Usage), LastUpdatedAt: text(turn.LastUpdatedAt)})
 	}
 	for _, activity := range report.Activity {
-		result.Activity = append(result.Activity, RuntimeTurnActivity{TurnID: activity.TurnID, StartedAt: activity.StartedAt, EndedAt: activity.EndedAt, Status: activity.Status, InferredEnd: activity.InferredEnd})
+		result.Activity = append(result.Activity, runtimecontract.TurnActivity{TurnID: text(activity.TurnID), StartedAt: text(activity.StartedAt), EndedAt: text(activity.EndedAt), Status: text(activity.Status), InferredEnd: runtimecontract.UsageBool{Available: true, Value: activity.InferredEnd, Source: source}})
 	}
 	return result
 }

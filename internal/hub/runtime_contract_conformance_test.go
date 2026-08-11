@@ -180,6 +180,12 @@ historyReady:
 	if fixture.expectedUsageTotal > 0 && conformanceUsageTotal(observed.Usage) != fixture.expectedUsageTotal {
 		t.Fatalf("history usage did not remain correlated with the streamed Turn: got %#v, want total=%d", observed.Usage, fixture.expectedUsageTotal)
 	}
+	if descriptor, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilityUsageReporting); ok && descriptor.Availability == runtimecontract.CapabilityAvailable {
+		report, usageFailure := contract.(runtimecontract.UsageInspectionCapability).InspectUsage(ctx, binding)
+		if usageFailure != nil || report.Validate() != nil || report.Lifetime.TotalTokens.Value < fixture.expectedUsageTotal {
+			t.Fatalf("usage inspection after consumed Turn = %#v, failure=%v", report, usageFailure)
+		}
+	}
 	if fixture.verifyEffects != nil {
 		fixture.verifyEffects(binding, started)
 	}
@@ -195,6 +201,12 @@ historyReady:
 	reopenedHistory, failure := contract.ReadHistory(ctx, runtimecontract.HistoryRequest{Binding: binding, Count: 10})
 	if failure != nil || reopenedHistory.Validate() != nil || !conformanceHistoryHasTurn(reopenedHistory, "turn-conformance", started.RuntimeTurnRef) {
 		t.Fatalf("history after true reopen = %#v, failure=%#v", reopenedHistory, failure)
+	}
+	if descriptor, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilityUsageReporting); ok && descriptor.Availability == runtimecontract.CapabilityAvailable {
+		reopenedUsage, usageFailure := contract.(runtimecontract.UsageInspectionCapability).InspectUsage(ctx, binding)
+		if usageFailure != nil || reopenedUsage.Validate() != nil || reopenedUsage.Lifetime.TotalTokens.Value < fixture.expectedUsageTotal {
+			t.Fatalf("usage after Driver/Store reopen = %#v, failure=%v", reopenedUsage, usageFailure)
+		}
 	}
 	causalEvents := make(chan runtimecontract.Event, 64)
 	contract.SetEventHandler(func(event runtimecontract.Event) { causalEvents <- event })
@@ -439,8 +451,8 @@ func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contrac
 				t.Fatalf("goal clear = %v, err=%v", cleared, err)
 			}
 		case runtimecontract.CapabilityUsageReporting:
-			if report, err := contract.(runtimeUsageCapability).RuntimeUsage(context.Background(), binding); err != nil || report == nil || report.Lifetime.TotalTokens != 17 {
-				t.Fatalf("usage report = %#v, err=%v", report, err)
+			if report, failure := contract.(runtimecontract.UsageInspectionCapability).InspectUsage(context.Background(), binding); failure != nil || report.Validate() != nil {
+				t.Fatalf("usage report = %#v, failure=%v", report, failure)
 			}
 		case runtimecontract.CapabilityModelConfiguration:
 			capability := contract.(runtimecontract.ModelControlCapability)

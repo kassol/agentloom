@@ -1,4 +1,4 @@
-import type { TokenUsageOverview } from "./types";
+import type { TokenUsage, TokenUsageOverview } from "./types";
 
 export const USAGE_RANGE_MODES = ["day", "7d", "30d", "90d", "custom"] as const;
 
@@ -107,6 +107,15 @@ export function resolveUsageScope(usage: TokenUsageOverview, agentId: string | n
     previous: agent?.previous || usage.previous,
     today: agent?.today || usage.today,
   };
+}
+
+export function usageMetricAvailable(usage: TokenUsage, metric: keyof TokenUsage) {
+  const coverage = usage.metrics?.[metric];
+  return coverage ? coverage.available === true && coverage.complete !== false : true;
+}
+
+export function formatOptionalUsageMetric(usage: TokenUsage, metric: keyof TokenUsage, format: (value: number) => string) {
+  return usageMetricAvailable(usage, metric) ? format(usage[metric] as number) : "—";
 }
 
 function legacyUsageMode(value: string | null): UsageRangeMode {

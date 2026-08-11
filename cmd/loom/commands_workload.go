@@ -125,7 +125,7 @@ func formatWorkloadFacts(b *strings.Builder, report map[string]any, agent bool) 
 		}
 		fmt.Fprintf(b, "calendar non-executing proxy: %.1f%%\n", num(report, "idleProxyPercent"))
 	} else {
-		b.WriteString("executing: unavailable · no readable rollout activity\n")
+		b.WriteString("executing: unavailable · no Runtime usage activity\n")
 		b.WriteString("calendar non-executing proxy: unavailable\n")
 	}
 	wait, _ := report["wait"].(map[string]any)
@@ -235,7 +235,7 @@ func workloadEvidenceTotal(report map[string]any) int {
 func formatWorkloadDataQuality(b *strings.Builder, overview map[string]any) {
 	quality, _ := overview["dataQuality"].(map[string]any)
 	b.WriteString("Data quality\n")
-	fmt.Fprintf(b, "  coverage: %.0f/%.0f Agents with readable rollout activity\n",
+	fmt.Fprintf(b, "  coverage: %.0f/%.0f Agents with Runtime usage activity\n",
 		num(quality, "trackedActivityAgents"), num(quality, "totalAgents"))
 	fmt.Fprintf(b, "  activity basis: %s\n", value(quality, "activityBasis", "unknown"))
 	fmt.Fprintf(b, "  non-executing basis: %s\n", value(quality, "idleBasis", "unknown"))
