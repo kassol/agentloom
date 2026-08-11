@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 func (h *Hub) ListComms(agent, status string) []AgentMessage {
@@ -812,32 +815,46 @@ func (h *Hub) requestTurnSteer(rt *runtime, threadID, expectedTurnID, input stri
 	if h.steerTurn != nil {
 		return h.steerTurn(threadID, expectedTurnID, input, timeout)
 	}
-	backend := runtimeBackend(rt)
-	if backend == nil {
-		return "", errors.New("Agent Runtime is unavailable")
-	}
 	h.mu.Lock()
 	if rt.activeTurn == nil || rt.activeTurn.finished || rt.activeTurn.turnID != expectedTurnID {
 		h.mu.Unlock()
 		return "", errors.New("active Loom Turn changed before causal steer")
 	}
 	expectedNativeTurnID := rt.activeTurn.nativeTurnID
-	h.mu.Unlock()
-	if expectedNativeTurnID == "" {
-		return "", errors.New("active Turn has no native Runtime binding for causal steer")
+	binding := rt.binding
+	if binding.RuntimeKind == "" {
+		if meta := h.agents[rt.agentID]; meta != nil {
+			binding = runtimeContractBinding(meta)
+		}
 	}
-	acceptedNativeTurnID, err := backend.Steer(threadID, expectedNativeTurnID, input, timeout)
+	h.mu.Unlock()
+
+	var err error
+	if rt.runtimeContract != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		outcome := rt.runtimeContract.ContinueTurn(ctx, runtimecontract.CausalInput{
+			Binding: binding, TurnID: expectedTurnID, RuntimeTurnRef: expectedNativeTurnID,
+			Input: []runtimecontract.InputBlock{{Kind: runtimecontract.InputText, Text: input}},
+		})
+		err = compatibilityLifecycleOutcomeError(outcome)
+	} else {
+		// Compatibility-only path for injected v1 test doubles while their
+		// dedicated migration ticket remains open.
+		backend := runtimeBackend(rt)
+		if backend == nil {
+			return "", errors.New("Agent Runtime is unavailable")
+		}
+		if expectedNativeTurnID == "" {
+			return "", errors.New("active Turn has no native Runtime binding for causal steer")
+		}
+		_, err = backend.Steer(threadID, expectedNativeTurnID, input, timeout)
+	}
 	if err != nil {
 		if isRuntimeIndeterminate(err) {
-			if rt.client != nil {
-				h.markThreadControlIndeterminate(rt, threadID, "turn/steer")
-			}
 			h.onRuntimeIndeterminate(rt, err)
 		}
 		return "", err
-	}
-	if acceptedNativeTurnID != expectedNativeTurnID {
-		return "", fmt.Errorf("Agent Runtime steered native Turn %s, expected %s", acceptedNativeTurnID, expectedNativeTurnID)
 	}
 	return expectedTurnID, nil
 }

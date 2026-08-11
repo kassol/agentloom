@@ -36,6 +36,10 @@ type runtimeTurnCorrelation struct {
 
 func (c *codexRuntimeContract) ContractVersion() int { return runtimecontract.Version }
 
+func (c *codexRuntimeContract) ContextDeliveryMode() runtimecontract.ContextDeliveryMode {
+	return runtimecontract.ContextDeliveryEpochIncremental
+}
+
 func (c *codexRuntimeContract) setCompatibilityBinding(request RuntimeBindingRequest) {
 	c.mu.Lock()
 	c.bindingRequest = request
@@ -87,12 +91,38 @@ func (c *codexRuntimeContract) ResumeBinding(ctx context.Context, binding runtim
 	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
 }
 
+func (c *codexRuntimeContract) UpdateBindingName(ctx context.Context, binding runtimecontract.Binding, name string) runtimecontract.Outcome {
+	if failure := contextFailure(ctx, runtimecontract.FailurePhaseBindingName); failure != nil {
+		return *failure
+	}
+	if err := setThreadName(c.native.client, binding.NativeRef, name); err != nil {
+		return codexFailureOutcome(err, runtimecontract.FailurePhaseBindingName)
+	}
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
+}
+
+func (c *codexRuntimeContract) ArchiveBinding(ctx context.Context, binding runtimecontract.Binding) runtimecontract.Outcome {
+	if failure := contextFailure(ctx, runtimecontract.FailurePhaseBindingArchive); failure != nil {
+		return *failure
+	}
+	_, err := c.native.client.Request("thread/archive", map[string]any{"threadId": binding.NativeRef}, contractTimeout(ctx, 10*time.Second))
+	if err != nil {
+		return codexFailureOutcome(err, runtimecontract.FailurePhaseBindingArchive)
+	}
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
+}
+
 func (c *codexRuntimeContract) StartTurn(ctx context.Context, request runtimecontract.TurnRequest) runtimecontract.Outcome {
 	if failure := contextFailure(ctx, runtimecontract.FailurePhaseTurnStart); failure != nil {
 		return *failure
 	}
 	controls := c.turnControls()
 	c.setPendingTurn(request.TurnID, "")
+	if developerContext := contractDeveloperContext(request.Input); developerContext != "" {
+		if err := c.native.InjectDeveloperContext(request.Binding.NativeRef, developerContext, contractTimeout(ctx, 30*time.Second)); err != nil {
+			return codexFailureOutcome(err, runtimecontract.FailurePhaseContextDelivery)
+		}
+	}
 	controls.NativeRef = request.Binding.NativeRef
 	controls.Input = contractInputToV1(request.Input)
 	controls.Timeout = contractTimeout(ctx, 4*time.Hour)
@@ -132,10 +162,21 @@ func (c *codexRuntimeContract) InterruptTurn(ctx context.Context, request runtim
 			Code: "missing_turn_id", Phase: runtimecontract.FailurePhaseTurnInterrupt, Message: "canonical Loom Turn ID is required",
 		}}
 	}
-	if err := c.native.Interrupt(request.Binding.NativeRef, request.RuntimeTurnRef, contractTimeout(ctx, 10*time.Second)); err != nil {
+	timeout := contractTimeout(ctx, 10*time.Second)
+	target := request.RuntimeTurnRef
+	err := c.native.Interrupt(request.Binding.NativeRef, target, timeout)
+	if actual, mismatch := activeTurnInterruptMismatch(err); mismatch && actual != target {
+		// The adapter, not Loom's control plane, owns native correlation repair.
+		// Bind the authoritative native Turn to the same Loom Turn and retry the
+		// interrupt once; native identities remain private to this boundary.
+		c.bindTurn(request.TurnID, "", actual)
+		target = actual
+		err = c.native.Interrupt(request.Binding.NativeRef, target, timeout)
+	}
+	if err != nil {
 		return codexFailureOutcome(err, runtimecontract.FailurePhaseTurnInterrupt)
 	}
-	return runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted, RuntimeTurnRef: request.RuntimeTurnRef}
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted, RuntimeTurnRef: target}
 }
 
 func (c *codexRuntimeContract) SetEventHandler(handler func(runtimecontract.Event)) {
@@ -224,8 +265,19 @@ func (c *codexRuntimeContract) ReadHistory(ctx context.Context, request runtimec
 	return history, nil
 }
 
+func (c *codexRuntimeContract) InspectInterruptedTurn(ctx context.Context, target runtimecontract.TurnTarget) (RuntimeInterruptionEvidence, error) {
+	if err := ctx.Err(); err != nil {
+		return RuntimeInterruptionEvidence{}, err
+	}
+	turn, err := c.native.ReadTurn(target.Binding.NativeRef, target.RuntimeTurnRef)
+	if err != nil {
+		return RuntimeInterruptionEvidence{}, err
+	}
+	return inspectCodexInterruptedTurn(turn), nil
+}
+
 func (c *codexRuntimeContract) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
-	return runtimecontract.CapabilitySnapshot{}
+	return codexControlPlaneCapabilitySnapshot()
 }
 
 func (c *codexRuntimeContract) CloseBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {
@@ -247,7 +299,7 @@ func contextFailure(ctx context.Context, phase runtimecontract.FailurePhase) *ru
 
 func codexFailureOutcome(err error, phase runtimecontract.FailurePhase) runtimecontract.Outcome {
 	state, code := runtimecontract.LifecycleFailed, "runtime_error"
-	if phase == runtimecontract.FailurePhaseTurnStart || phase == runtimecontract.FailurePhaseTurnContinue || phase == runtimecontract.FailurePhaseTurnInterrupt {
+	if codexMutatingFailurePhase(phase) {
 		switch {
 		case codex.IsRequestTimeout(err):
 			state, code = runtimecontract.LifecycleIndeterminate, "transport_timeout"
@@ -258,6 +310,17 @@ func codexFailureOutcome(err error, phase runtimecontract.FailurePhase) runtimec
 	return runtimecontract.Outcome{State: state, Failure: &runtimecontract.Failure{
 		Code: code, Phase: phase, Message: err.Error(), Diagnostic: err.Error(), Cause: err,
 	}}
+}
+
+func codexMutatingFailurePhase(phase runtimecontract.FailurePhase) bool {
+	switch phase {
+	case runtimecontract.FailurePhaseBindingCreate, runtimecontract.FailurePhaseBindingResume,
+		runtimecontract.FailurePhaseContextDelivery, runtimecontract.FailurePhaseTurnStart,
+		runtimecontract.FailurePhaseTurnContinue, runtimecontract.FailurePhaseTurnInterrupt:
+		return true
+	default:
+		return false
+	}
 }
 
 func contractTimeout(ctx context.Context, fallback time.Duration) time.Duration {
@@ -272,6 +335,9 @@ func contractTimeout(ctx context.Context, fallback time.Duration) time.Duration 
 func contractInputToV1(input []runtimecontract.InputBlock) []RuntimeInput {
 	result := make([]RuntimeInput, 0, len(input))
 	for _, block := range input {
+		if block.Role == runtimecontract.InputRoleDeveloper {
+			continue
+		}
 		switch block.Kind {
 		case runtimecontract.InputText:
 			result = append(result, RuntimeInput{Kind: RuntimeInputText, Text: block.Text})
@@ -280,6 +346,16 @@ func contractInputToV1(input []runtimecontract.InputBlock) []RuntimeInput {
 		}
 	}
 	return result
+}
+
+func contractDeveloperContext(input []runtimecontract.InputBlock) string {
+	parts := make([]string, 0, 1)
+	for _, block := range input {
+		if block.Kind == runtimecontract.InputText && block.Role == runtimecontract.InputRoleDeveloper && strings.TrimSpace(block.Text) != "" {
+			parts = append(parts, block.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func codexHistoryState(status string) runtimecontract.LifecycleState {

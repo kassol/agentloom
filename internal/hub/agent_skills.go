@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 // AgentSkillConfig stores Agent-scoped exceptions to the shared Codex Skill
@@ -131,10 +133,25 @@ func (h *Hub) agentSkillConfigViewLocked(meta *Agent) AgentSkillConfigView {
 
 func (h *Hub) GetAgentSkillConfig(key string) (AgentSkillConfigView, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	meta := h.resolveLocked(key)
 	if meta == nil {
+		h.mu.Unlock()
 		return AgentSkillConfigView{}, errf(404, "agent not found: %s", key)
+	}
+	query := h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[meta.ID])
+	h.mu.Unlock()
+	snapshot, queryErr := h.queryRuntimeCapabilities(query)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta = h.agents[query.agentID]
+	if queryErr != nil {
+		return AgentSkillConfigView{}, queryErr
+	}
+	if meta == nil || !h.runtimeCapabilityQueryCurrentLocked(query) {
+		return AgentSkillConfigView{}, errf(409, "Agent Runtime binding changed while capabilities were checked; retry")
+	}
+	if err := requireCapability(snapshot, runtimecontract.CapabilitySkillsPolicy, "Skill policy"); err != nil {
+		return AgentSkillConfigView{}, err
 	}
 	return h.agentSkillConfigViewLocked(meta), nil
 }
@@ -146,16 +163,36 @@ func (h *Hub) UpdateAgentSkillConfig(key string, params AgentSkillConfigParams) 
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	meta := h.resolveLocked(key)
 	if meta == nil {
+		h.mu.Unlock()
 		return AgentSkillConfigView{}, errf(404, "agent not found: %s", key)
 	}
 	if meta.Status == "running" {
+		h.mu.Unlock()
 		return AgentSkillConfigView{}, errf(409, "agent %q is running; Skill config changes apply between Turns", meta.Name)
 	}
 	if meta.Source == "edge" {
+		h.mu.Unlock()
 		return AgentSkillConfigView{}, errf(409, "edge Agent %q must be adopted before configuring Skills", meta.Name)
+	}
+	query := h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[meta.ID])
+	h.mu.Unlock()
+	snapshot, queryErr := h.queryRuntimeCapabilities(query)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta = h.agents[query.agentID]
+	if queryErr != nil {
+		return AgentSkillConfigView{}, queryErr
+	}
+	if meta == nil || !h.runtimeCapabilityQueryCurrentLocked(query) {
+		return AgentSkillConfigView{}, errf(409, "Agent Runtime binding changed while capabilities were checked; retry")
+	}
+	if meta.Status == "running" || meta.Source == "edge" {
+		return AgentSkillConfigView{}, errf(409, "Agent changed while capabilities were checked; retry")
+	}
+	if err := requireCapability(snapshot, runtimecontract.CapabilitySkillsPolicy, "Skill policy"); err != nil {
+		return AgentSkillConfigView{}, err
 	}
 	if h.agentSkillConfigs == nil {
 		h.agentSkillConfigs = map[string]*AgentSkillConfig{}
@@ -221,9 +258,27 @@ func (h *Hub) projectAgentSkillInventory(inventory *SkillInventory) {
 	h.mu.Lock()
 	agents := make([]Agent, 0, len(h.agents))
 	configs := make(map[string]AgentSkillConfigView, len(h.agents))
+	queries := make(map[string]runtimeCapabilityQuery, len(h.agents))
 	for _, meta := range h.agents {
 		agents = append(agents, *meta)
+		queries[meta.ID] = h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[meta.ID])
 		configs[meta.ID] = h.agentSkillConfigViewLocked(meta)
+	}
+	h.mu.Unlock()
+	skillsAvailable := make(map[string]bool, len(agents))
+	for _, agent := range agents {
+		snapshot, err := h.queryRuntimeCapabilities(queries[agent.ID])
+		if err != nil {
+			continue
+		}
+		descriptor, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilitySkillsPolicy)
+		skillsAvailable[agent.ID] = ok && descriptor.Availability == runtimecontract.CapabilityAvailable
+	}
+	h.mu.Lock()
+	for agentID, query := range queries {
+		if !h.runtimeCapabilityQueryCurrentLocked(query) {
+			skillsAvailable[agentID] = false
+		}
 	}
 	h.mu.Unlock()
 	sort.SliceStable(agents, func(i, j int) bool {
@@ -235,8 +290,16 @@ func (h *Hub) projectAgentSkillInventory(inventory *SkillInventory) {
 
 	inventory.Agents = make([]AgentSkillInventoryEntry, 0, len(agents))
 	for _, agent := range agents {
-		raw := byCwd[filepath.Clean(agent.Cwd)]
+		raw := SkillInventoryEntry{Cwd: agent.Cwd}
 		config := configs[agent.ID]
+		if skillsAvailable[agent.ID] {
+			raw = byCwd[filepath.Clean(agent.Cwd)]
+		} else {
+			// Persisted policy belongs to the Runtime that supported it. Keep the
+			// historical record for a possible switch back, but never project it
+			// as active policy or inventory for an unsupported Runtime.
+			config = AgentSkillConfigView{}
+		}
 		skills := append([]SkillInventorySkill(nil), raw.Skills...)
 		for i := range skills {
 			for _, disabledPath := range config.DisabledPaths {
@@ -267,6 +330,22 @@ func (h *Hub) AgentSkillInventory(key string) (AgentSkillInventoryEntry, error) 
 		return AgentSkillInventoryEntry{}, errf(404, "agent not found: %s", key)
 	}
 	agentID := meta.ID
+	query := h.captureRuntimeCapabilityQueryLocked(meta, h.runtimes[meta.ID])
+	h.mu.Unlock()
+	snapshot, queryErr := h.queryRuntimeCapabilities(query)
+	h.mu.Lock()
+	if queryErr != nil {
+		h.mu.Unlock()
+		return AgentSkillInventoryEntry{}, queryErr
+	}
+	if !h.runtimeCapabilityQueryCurrentLocked(query) {
+		h.mu.Unlock()
+		return AgentSkillInventoryEntry{}, errf(409, "Agent Runtime binding changed while capabilities were checked; retry")
+	}
+	if err := requireCapability(snapshot, runtimecontract.CapabilitySkillsPolicy, "Skill inventory"); err != nil {
+		h.mu.Unlock()
+		return AgentSkillInventoryEntry{}, err
+	}
 	h.mu.Unlock()
 
 	inventory, err := h.ReloadSkills()

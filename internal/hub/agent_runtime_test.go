@@ -178,6 +178,47 @@ func TestSendTaskRejectsImageWhenRuntimeDoesNotAdvertiseImageInput(t *testing.T)
 	}
 }
 
+func TestArchivePersistenceFailureLeavesActiveRuntimeUntouched(t *testing.T) {
+	dir := t.TempDir()
+	writable, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err := store.OpenWithOptions(dir, store.OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	h := testHub(readOnly)
+	fake := &fakeAgentRuntime{binding: "native-binding"}
+	turn := &turnState{
+		turnID: "turn-active", nativeTurnID: "native-turn", task: "keep working",
+		startedAt: time.Now(), lastActivity: time.Now(), stopWatchdog: make(chan struct{}),
+	}
+	meta := &Agent{
+		ID: "agent-1", Name: "worker", ThreadID: "thread-loom", RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: "native-binding"},
+		Status: "running", CurrentTask: turn.task, CurrentTurnID: turn.turnID, CreatedAt: now(), UpdatedAt: now(),
+	}
+	rt := &runtime{agentID: meta.ID, agentRuntime: fake, activeTurn: turn, approvals: map[string]*approval{}}
+	h.agents[meta.ID] = meta
+	h.runtimes[meta.ID] = rt
+
+	if _, err := h.ArchiveAgent(meta.ID); err == nil {
+		t.Fatal("Archive succeeded despite registry persistence failure")
+	}
+	if fake.interrupted || fake.closed.Load() || rt.activeTurn != turn || turn.finished {
+		t.Fatalf("failed Loom archive changed Runtime: interrupted=%v closed=%v active=%#v finished=%v", fake.interrupted, fake.closed.Load(), rt.activeTurn, turn.finished)
+	}
+	if _, err := h.GetAgent(meta.ID); err != nil {
+		t.Fatalf("failed Loom archive removed Agent: %v", err)
+	}
+	turn.finished = true
+	close(turn.stopWatchdog)
+}
+
 func TestSendTaskBuildsRuntimeImageInputAndFilePathGuidance(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -325,4 +366,64 @@ func TestHubPublishesNormalizedCoreEventBeforeRawCompatibilityEvent(t *testing.T
 	if raw["threadId"] != "thr-loom" || thread["id"] != "thr-loom" || raw["turnId"] == "turn-1" || strings.Contains(string(events[0].Data), "nativeTurnId") {
 		t.Fatalf("public Runtime events leaked native identity: normalized=%s compatibility=%s", events[0].Data, events[1].Data)
 	}
+}
+
+func TestRuntimePublicEventsDeeplyRedactNativeIdentityAcrossReopen(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	meta := &Agent{
+		ID: "agent-1", Name: "worker", ThreadID: "loom-thread",
+		RuntimeBinding:      RuntimeBinding{Kind: "codex", NativeRef: "native-thread-secret"},
+		RuntimeTurnBindings: map[string]string{"turn-loom": "native-turn-secret"}, Status: "running", CurrentTurnID: "turn-loom",
+	}
+	rt := &runtime{
+		agentID: meta.ID, approvals: map[string]*approval{},
+		activeTurn: &turnState{turnID: "turn-loom", nativeTurnID: "native-turn-secret", startedConfirmed: true, startedAt: time.Now(), stopWatchdog: make(chan struct{})},
+	}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	h.onNotification(rt, "item/completed", json.RawMessage(`{
+		"threadId":"native-thread-secret","turnId":"native-turn-secret","itemId":"native-item-secret",
+		"sessionId":"native-session-secret","sessionPath":"/private/native-session-secret.jsonl",
+		"item":{"id":"native-item-secret","type":"commandExecution","command":"printf safe","status":"completed","output":"safe output",
+			"toolCallId":"native-tool-secret","callId":"native-call-secret","diagnostic":{"nativeThreadId":"native-thread-secret","nativeTurnId":"native-turn-secret","sessionFile":"/private/native-session-secret.jsonl"}}
+	}`))
+
+	assertPublicRuntimeEvents := func(events []store.Event) {
+		t.Helper()
+		encoded, _ := json.Marshal(events)
+		for _, secret := range []string{"native-thread-secret", "native-turn-secret", "native-item-secret", "native-session-secret", "native-tool-secret", "native-call-secret", "/private/native-session-secret.jsonl"} {
+			if strings.Contains(string(encoded), secret) {
+				t.Fatalf("public Runtime event leaked %q: %s", secret, encoded)
+			}
+		}
+		for _, actionable := range []string{"printf safe", "completed", "safe output", "loom-thread", "turn-loom"} {
+			if !strings.Contains(string(encoded), actionable) {
+				t.Fatalf("public Runtime event omitted %q: %s", actionable, encoded)
+			}
+		}
+	}
+	events, err := st.ReadEvents(meta.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPublicRuntimeEvents(events)
+	h.stopping = true
+	h.Shutdown()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	events, err = reopened.ReadEvents(meta.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPublicRuntimeEvents(events)
 }

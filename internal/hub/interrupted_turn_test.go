@@ -26,7 +26,7 @@ func TestReconcileInterruptedPiTurnKeepsCanonicalLoomTurnIdentity(t *testing.T) 
 	}
 
 	summary, missingTerminal := reconcileInterruptedTurn(meta)
-	if missingTerminal || summary.TurnID != "turn-loom-1" || summary.Status != "completed" {
+	if !missingTerminal || summary.TurnID != "turn-loom-1" || summary.Status != "interrupted" {
 		t.Fatalf("reconciled Pi Turn = %#v, missingTerminal=%v", summary, missingTerminal)
 	}
 }

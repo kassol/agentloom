@@ -37,6 +37,10 @@ func newPiRuntimeContract(agentID string, native *piAgentRuntime) *piRuntimeCont
 
 func (c *piRuntimeContract) ContractVersion() int { return runtimecontract.Version }
 
+func (c *piRuntimeContract) ContextDeliveryMode() runtimecontract.ContextDeliveryMode {
+	return runtimecontract.ContextDeliveryFullPerTurn
+}
+
 func (c *piRuntimeContract) setCompatibilityBinding(request RuntimeBindingRequest) {
 	c.mu.Lock()
 	c.bindingRequest = request
@@ -86,6 +90,11 @@ func (c *piRuntimeContract) StartTurn(ctx context.Context, request runtimecontra
 	controls := c.turnRequest
 	c.pendingTurn = runtimeTurnCorrelation{turnID: request.TurnID}
 	c.mu.Unlock()
+	if developerContext := contractDeveloperContext(request.Input); developerContext != "" {
+		if err := c.native.InjectDeveloperContext(request.Binding.NativeRef, developerContext, contractTimeout(ctx, 30*time.Second)); err != nil {
+			return piFailureOutcome(err, runtimecontract.FailurePhaseContextDelivery)
+		}
+	}
 	controls.LoomTurnID = request.TurnID
 	controls.NativeRef = request.Binding.NativeRef
 	controls.Input = contractInputToV1(request.Input)
@@ -206,8 +215,21 @@ func (c *piRuntimeContract) ReadHistory(ctx context.Context, request runtimecont
 	return history, nil
 }
 
+func (c *piRuntimeContract) InspectInterruptedTurn(ctx context.Context, target runtimecontract.TurnTarget) (RuntimeInterruptionEvidence, error) {
+	if err := ctx.Err(); err != nil {
+		return RuntimeInterruptionEvidence{}, err
+	}
+	// Recovery evidence is durable session history; reading it must not share
+	// the live Pi RPC command stream with a concurrently resumed Turn.
+	entries, leafID, err := readPiSessionEntries(target.Binding.NativeRef)
+	if err != nil {
+		return RuntimeInterruptionEvidence{}, err
+	}
+	return inspectPiInterruptedTurn(entries, leafID, target.RuntimeTurnRef)
+}
+
 func (c *piRuntimeContract) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
-	return runtimecontract.CapabilitySnapshot{}
+	return piControlPlaneCapabilitySnapshot()
 }
 
 func (c *piRuntimeContract) CloseBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {

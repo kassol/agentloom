@@ -349,7 +349,7 @@ func TestPiCreatePersistenceFailureClosesStartedProcessWithoutDeletingSessionEvi
 	defer h.Shutdown()
 
 	_, err = h.CreateAgent(CreateParams{Name: "pi-rollback", Cwd: t.TempDir(), RuntimeKind: "pi"})
-	if err == nil || !strings.Contains(err.Error(), "persist started Thread binding") {
+	if err == nil || !strings.Contains(err.Error(), "persist started Runtime binding") {
 		t.Fatalf("CreateAgent error = %v, want binding persistence failure", err)
 	}
 	h.mu.Lock()

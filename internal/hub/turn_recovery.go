@@ -1,10 +1,13 @@
 package hub
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 const (
@@ -121,13 +124,32 @@ func (h *Hub) recoverInterruptedTurnClaimed(agentID, predecessorTurnID string) {
 	}
 	predecessor := *meta.LastTurn
 	nativeTurnID := meta.RuntimeTurnBindings[predecessorTurnID]
-	nativeRef := meta.RuntimeBinding.NativeRef
-	backend := runtimeForKind(meta.RuntimeBinding.Kind)
-	if rt := h.runtimes[agentID]; rt != nil && runtimeBackend(rt) != nil {
-		backend = runtimeBackend(rt)
+	binding := runtimeContractBinding(meta)
+	runtimeKind := meta.RuntimeBinding.Kind
+	rt := h.runtimes[agentID]
+	if rt == nil {
+		var acquireErr error
+		rt, acquireErr = h.getRuntimeLocked(meta)
+		if acquireErr != nil {
+			log.Printf("[codex-loom] acquire Runtime for interrupted Turn inspection on Agent %s: %v", agentID, acquireErr)
+		}
 	}
-	inspector, canInspect := backend.(RuntimeInterruptedTurnInspector)
+	var inspect func(context.Context, runtimecontract.TurnTarget) (RuntimeInterruptionEvidence, error)
+	if rt != nil {
+		if inspector, ok := rt.runtimeContract.(runtimeInterruptedTurnInspector); ok {
+			inspect = inspector.InspectInterruptedTurn
+		} else if legacy, ok := runtimeBackend(rt).(RuntimeInterruptedTurnInspector); ok {
+			// Compatibility only for injected v1 test doubles.
+			inspect = func(_ context.Context, target runtimecontract.TurnTarget) (RuntimeInterruptionEvidence, error) {
+				return legacy.InspectInterruptedTurn(target.Binding.NativeRef, target.RuntimeTurnRef)
+			}
+		}
+	}
 	h.mu.Unlock()
+	var runtimeReadyErr error
+	if rt != nil && rt.ready != nil {
+		runtimeReadyErr = waitReady(rt)
+	}
 	// A Pi process can close immediately after replying to get_entries. The
 	// failure callback then races the serialized StartTurn caller that records
 	// the returned native user-entry ID. Give that already-accepted response a
@@ -143,12 +165,16 @@ func (h *Hub) recoverInterruptedTurnClaimed(agentID, predecessorTurnID string) {
 
 	var evidence RuntimeInterruptionEvidence
 	var inspectErr error
-	if nativeTurnID == "" {
+	if runtimeReadyErr != nil {
+		inspectErr = fmt.Errorf("Runtime is not ready for interruption inspection: %w", runtimeReadyErr)
+	} else if nativeTurnID == "" {
 		inspectErr = fmt.Errorf("no native Turn binding is available for interrupted Loom Turn %s", predecessorTurnID)
-	} else if !canInspect {
-		inspectErr = fmt.Errorf("%s Runtime does not expose durable interruption evidence", meta.RuntimeBinding.Kind)
+	} else if inspect == nil {
+		inspectErr = fmt.Errorf("%s Runtime does not expose durable interruption evidence", runtimeKind)
 	} else {
-		evidence, inspectErr = inspector.InspectInterruptedTurn(nativeRef, nativeTurnID)
+		evidence, inspectErr = inspect(context.Background(), runtimecontract.TurnTarget{
+			Binding: binding, TurnID: predecessorTurnID, RuntimeTurnRef: nativeTurnID,
+		})
 	}
 	if inspectErr != nil {
 		log.Printf("[codex-loom] inspect interrupted Runtime Turn for Agent %s predecessor %s: %v", agentID, predecessorTurnID, inspectErr)
@@ -268,6 +294,7 @@ func (h *Hub) recoverInterruptedTurnClaimed(agentID, predecessorTurnID string) {
 	}
 	_, err := h.sendTaskWithContextReserved(agentName, prompt, nil, defaultInactivity, "", "", "", marker.TopicID, displayTask, contextSource, marker.RecoveryTurnID)
 	if err != nil {
+		log.Printf("[codex-loom] dispatch recovery Turn for Agent %s predecessor %s: %v", agentID, predecessorTurnID, err)
 		return
 	}
 	h.markRecoveryDispatched(agentID, predecessorTurnID, marker, false)

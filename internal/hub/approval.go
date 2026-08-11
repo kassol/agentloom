@@ -63,9 +63,10 @@ func (h *Hub) requestRuntimeApprovalLocked(request runtimeApprovalRequest, respo
 		return ApprovalView{}, fmt.Errorf("Agent Runtime is unavailable")
 	}
 	requestedAt := now()
+	publicParams := canonicalApprovalParams(meta, request.TurnID, request.Params)
 	next := ApprovalView{
 		ApprovalID: newApprovalID(request.AgentID), AgentID: request.AgentID, TurnID: request.TurnID,
-		RuntimeKind: request.RuntimeKind, Method: request.Method, Params: append(json.RawMessage(nil), request.Params...),
+		RuntimeKind: request.RuntimeKind, Method: request.Method, Params: publicParams,
 		Status: "pending", RequestedAt: requestedAt, TS: requestedAt,
 	}
 	if err := h.commitApprovalLocked(next); err != nil {
@@ -83,6 +84,64 @@ func (h *Hub) requestRuntimeApprovalLocked(request runtimeApprovalRequest, respo
 	}
 	h.emitLocked(meta.ID, "loom/approval-requested", approvalEventPayload(next))
 	return next, nil
+}
+
+func canonicalApprovalParams(meta *Agent, turnID string, raw json.RawMessage) json.RawMessage {
+	public := map[string]any{}
+	if meta != nil && meta.ThreadID != "" {
+		public["threadId"] = meta.ThreadID
+	}
+	if turnID != "" {
+		public["turnId"] = turnID
+	}
+	var input map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &input) != nil {
+		public["redacted"] = true
+	} else {
+		for key, value := range input {
+			if approvalActionKey(key) {
+				public[key] = projectApprovalAction(value)
+			}
+		}
+	}
+	encoded, err := json.Marshal(public)
+	if err != nil {
+		return json.RawMessage(`{"redacted":true}`)
+	}
+	return encoded
+}
+
+func projectApprovalAction(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		projected := map[string]any{}
+		for key, nested := range typed {
+			if approvalActionKey(key) {
+				projected[key] = projectApprovalAction(nested)
+			}
+		}
+		return projected
+	case []any:
+		projected := make([]any, len(typed))
+		for index, nested := range typed {
+			projected[index] = projectApprovalAction(nested)
+		}
+		return projected
+	default:
+		return value
+	}
+}
+
+func approvalActionKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "toolname", "command", "cwd", "path", "filepath", "source", "destination", "target",
+		"url", "host", "port", "method", "reason", "justification", "description", "query",
+		"pattern", "prompt", "content", "oldtext", "newtext", "patch", "input", "args",
+		"arguments", "changes", "edits", "permissions":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Hub) commitApprovalLocked(approval ApprovalView) error {

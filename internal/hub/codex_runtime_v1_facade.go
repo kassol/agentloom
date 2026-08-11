@@ -68,6 +68,12 @@ func (c *codexRuntimeContract) turnIDForNative(nativeTurnID string) string {
 	return c.turnsByNative[nativeTurnID].turnID
 }
 
+func (c *codexRuntimeContract) seedTurnBindings(bindings map[string]string) {
+	for loomTurnID, nativeTurnID := range bindings {
+		c.bindTurn(loomTurnID, "", nativeTurnID)
+	}
+}
+
 func (f *codexRuntimeV1Facade) Interrupt(nativeRef, nativeTurnID string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

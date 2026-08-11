@@ -55,6 +55,105 @@ func TestRuntimeApprovalRequestIsDurableAndVisibleInAgentSnapshot(t *testing.T) 
 	}
 }
 
+func TestApprovalIngressPersistsOnlyCanonicalLoomIdentity(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "worker", ThreadID: "loom-thread-1",
+		RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "native-thread-secret"}, Status: "running",
+	}
+	rt := &runtime{
+		agentID: "agent-1", agentRuntime: &fakeAgentRuntime{}, approvals: map[string]*approval{},
+		activeTurn: &turnState{turnID: "turn-loom-1", nativeTurnID: "native-turn-secret", startedAt: time.Now(), stopWatchdog: make(chan struct{})},
+	}
+	h.runtimes["agent-1"] = rt
+	h.onServerRequest(rt, json.RawMessage(`{"rpc":"native-rpc-secret"}`), "item/commandExecution/requestApproval", json.RawMessage(`{
+		"threadId":"native-thread-secret","turnId":"native-turn-secret",
+		"sessionFile":"/private/native-session-secret.jsonl","sessionId":"native-session-id-secret",
+		"toolCallId":"native-tool-call-secret","itemId":"native-item-secret","callId":"native-call-secret","rpcId":"native-rpc-param-secret",
+		"nested":{"threadId":"native-thread-secret","turnId":"native-turn-secret","command":"printf nested"},
+		"command":"printf safe","justification":"verify the release"
+	}`))
+
+	view, err := h.GetAgent("agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(view)
+	events, err := h.ReadEvents("agent-1", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventJSON, _ := json.Marshal(events)
+	for _, raw := range [][]byte{encoded, eventJSON} {
+		for _, secret := range []string{"native-thread-secret", "native-turn-secret", "native-session-secret", "native-session-id-secret", "native-tool-call-secret", "native-item-secret", "native-call-secret", "native-rpc-param-secret", "native-rpc-secret"} {
+			if strings.Contains(string(raw), secret) {
+				t.Fatalf("public Approval projection leaked %q: %s", secret, raw)
+			}
+		}
+		for _, forbiddenKey := range []string{"toolCallId", "itemId", "callId", "sessionFile", "sessionId", "rpcId", "nested"} {
+			if strings.Contains(string(raw), `"`+forbiddenKey+`"`) {
+				t.Fatalf("public Approval projection retained non-actionable key %q: %s", forbiddenKey, raw)
+			}
+		}
+		if !strings.Contains(string(raw), "loom-thread-1") || !strings.Contains(string(raw), "turn-loom-1") {
+			t.Fatalf("public Approval projection omitted Loom identity: %s", raw)
+		}
+		if !strings.Contains(string(raw), "printf safe") || !strings.Contains(string(raw), "verify the release") {
+			t.Fatalf("public Approval projection omitted actionable fields: %s", raw)
+		}
+	}
+	if len(view.PendingApprovals) != 1 || !strings.Contains(string(rt.approvals[view.PendingApprovals[0].ApprovalID].rpcID), "native-rpc-secret") {
+		t.Fatalf("private Runtime Approval correlation was not retained: %#v", rt.approvals)
+	}
+	h.Shutdown()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := Open(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedView, err := h2.GetAgent("agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedJSON, _ := json.Marshal(reopenedView)
+	if strings.Contains(string(reopenedJSON), "native-") || strings.Contains(string(reopenedJSON), "native-session-secret") {
+		t.Fatalf("reopened Approval leaked native identity: %s", reopenedJSON)
+	}
+	var reopenedApprovals []json.RawMessage
+	if err := reopened.ReadApprovals(func(raw json.RawMessage) {
+		reopenedApprovals = append(reopenedApprovals, append(json.RawMessage(nil), raw...))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reopenedEvents, err := h2.ReadEvents("agent-1", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableJSON, _ := json.Marshal(struct {
+		Approvals []json.RawMessage `json:"approvals"`
+		Events    []store.Event     `json:"events"`
+	}{reopenedApprovals, reopenedEvents})
+	for _, secret := range []string{"native-thread-secret", "native-turn-secret", "native-session-secret", "native-session-id-secret", "native-tool-call-secret", "native-item-secret", "native-call-secret", "native-rpc-param-secret", "native-rpc-secret"} {
+		if strings.Contains(string(durableJSON), secret) {
+			t.Fatalf("reopened Approval Store/SSE projection leaked %q: %s", secret, durableJSON)
+		}
+	}
+	h2.Shutdown()
+	reopened.Close()
+}
+
 func TestApprovePersistsTerminalRecordAndUsesCodexDecisionAdapter(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

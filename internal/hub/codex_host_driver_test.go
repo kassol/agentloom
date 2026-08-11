@@ -396,6 +396,29 @@ func TestCodexV1FacadePreservesTypedIndeterminateTimeout(t *testing.T) {
 	}
 }
 
+func TestCodexV2MutatingBindingAndContextTransportLossIsIndeterminate(t *testing.T) {
+	for _, phase := range []runtimecontract.FailurePhase{
+		runtimecontract.FailurePhaseBindingCreate,
+		runtimecontract.FailurePhaseBindingResume,
+		runtimecontract.FailurePhaseContextDelivery,
+	} {
+		for name, transportErr := range map[string]error{
+			"timeout": &codex.RequestTimeoutError{Method: string(phase), Timeout: time.Millisecond},
+			"closed":  codex.ErrClosed,
+		} {
+			t.Run(string(phase)+"/"+name, func(t *testing.T) {
+				outcome := codexFailureOutcome(transportErr, phase)
+				if outcome.State != runtimecontract.LifecycleIndeterminate || outcome.Failure == nil || outcome.Failure.Phase != phase {
+					t.Fatalf("outcome = %#v", outcome)
+				}
+				if err := outcome.Validate(); err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestCodexLiveFacadeTreatsMissingRolloutAsEmptyHistory(t *testing.T) {
 	installFakeSharedCodexHost(t)
 	t.Setenv("CODEX_SESSIONS_DIR", t.TempDir())

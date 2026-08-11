@@ -11,27 +11,22 @@ import (
 )
 
 func TestSyncThreadNamesSendsPersistedNames(t *testing.T) {
-	logPath := installFakeCodexNameServer(t)
-	h := &Hub{
-		agents: map[string]*Agent{
-			"a": {ID: "a", Name: "agent-a", ThreadID: "loom-thread-b", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-b"}},
-			"b": {ID: "b", Name: "agent-b", ThreadID: "loom-thread-a", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-a"}},
-			"c": {ID: "c", Name: "no-thread"},
-		},
-	}
+	h := testHub(nil)
+	fakeContract, codexContract := &controlPlaneContract{}, &controlPlaneContract{}
+	h.agents["a"] = &Agent{ID: "a", Name: "agent-a", ThreadID: "loom-thread-b", RuntimeBinding: RuntimeBinding{Kind: "fake", NativeRef: "thread-b"}}
+	h.agents["b"] = &Agent{ID: "b", Name: "agent-b", ThreadID: "loom-thread-a", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-a"}}
+	h.agents["c"] = &Agent{ID: "c", Name: "pi-without-live-contract", RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: "session-c"}}
+	h.runtimes["a"] = &runtime{agentID: "a", runtimeContract: fakeContract, binding: runtimeContractBinding(h.agents["a"])}
+	h.runtimes["b"] = &runtime{agentID: "b", runtimeContract: codexContract, binding: runtimeContractBinding(h.agents["b"])}
 
 	if err := h.SyncThreadNames(); err != nil {
 		t.Fatal(err)
 	}
-	requests := readThreadNameRequests(t, logPath)
-	if len(requests) != 2 {
-		t.Fatalf("thread/name/set requests = %d, want 2: %#v", len(requests), requests)
+	if fakeContract.nameCalls != 1 || fakeContract.nameBinding.RuntimeKind != "fake" || fakeContract.name != "agent-a" {
+		t.Fatalf("non-Codex v2 name backfill = calls %d binding %#v name %q", fakeContract.nameCalls, fakeContract.nameBinding, fakeContract.name)
 	}
-	if requests[0].ThreadID != "thread-a" || requests[0].Name != "agent-b" {
-		t.Fatalf("first request = %#v", requests[0])
-	}
-	if requests[1].ThreadID != "thread-b" || requests[1].Name != "agent-a" {
-		t.Fatalf("second request = %#v", requests[1])
+	if codexContract.nameCalls != 1 || codexContract.nameBinding.RuntimeKind != "codex" || codexContract.name != "agent-b" {
+		t.Fatalf("Codex v2 name backfill = calls %d binding %#v name %q", codexContract.nameCalls, codexContract.nameBinding, codexContract.name)
 	}
 }
 
@@ -43,6 +38,14 @@ func TestUpdateConfigSyncsRenamedThread(t *testing.T) {
 	}
 	h := testHub(st)
 	h.agents["sess"] = &Agent{ID: "sess", Name: "old-name", ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: "thread-1"}, Status: "idle"}
+	host, err := h.ensureCodexHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.runtimes["sess"] = &runtime{
+		agentID: "sess", runtimeContract: &codexRuntimeContract{native: &codexAgentRuntime{client: host.client}},
+	}
+	defer host.close()
 	name := "new-name"
 
 	view, err := h.UpdateConfig("sess", ConfigParams{Name: &name})
@@ -55,6 +58,36 @@ func TestUpdateConfigSyncsRenamedThread(t *testing.T) {
 	requests := readThreadNameRequests(t, logPath)
 	if len(requests) != 1 || requests[0].ThreadID != "thread-1" || requests[0].Name != name {
 		t.Fatalf("thread/name/set requests = %#v", requests)
+	}
+}
+
+func TestRenamePiAgentCommitsLoomNameWithoutInvokingCodex(t *testing.T) {
+	logPath := installFakeCodexNameServer(t)
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	h.agents["pi-agent"] = &Agent{
+		ID: "pi-agent", Name: "old-name", ThreadID: "loom-thread-1",
+		RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "pi", NativeRef: "/private/pi/session.jsonl"},
+		Status:         "idle", CreatedAt: now(), UpdatedAt: now(),
+	}
+	name := "new-name"
+
+	view, err := h.UpdateAgentConfig("pi-agent", ConfigParams{Name: &name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Name != name {
+		t.Fatalf("Agent name = %q, want %q", view.Name, name)
+	}
+	if requests := readThreadNameRequests(t, logPath); len(requests) != 0 {
+		t.Fatalf("Pi rename invoked Codex native naming: %#v", requests)
 	}
 }
 

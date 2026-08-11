@@ -3,6 +3,8 @@ package hub
 import (
 	"context"
 	"log"
+
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 func (h *Hub) Shutdown() {
@@ -78,15 +80,33 @@ func (h *Hub) Shutdown() {
 		h.workers.Wait()
 		h.mu.Lock()
 		host := h.codexHost
-		driver := h.codexHostDriver
-		piDriver := h.piHostDriver
+		type bindingClose struct {
+			contract runtimecontract.Contract
+			binding  runtimecontract.Binding
+		}
+		bindings := make([]bindingClose, 0, len(h.runtimes))
 		backends := make([]AgentRuntime, 0, len(h.runtimes))
 		for _, rt := range h.runtimes {
-			if backend := runtimeBackend(rt); backend != nil && rt.agentHost == nil {
+			if rt.runtimeContract != nil {
+				bindings = append(bindings, bindingClose{contract: rt.runtimeContract, binding: rt.binding})
+			} else if backend := runtimeBackend(rt); backend != nil && rt.agentHost == nil {
 				backends = append(backends, backend)
 			}
 		}
-		if driver == nil {
+		drivers := make([]RuntimeHostDriver, 0, len(h.runtimeHostDrivers)+2)
+		seenDrivers := map[RuntimeHostDriver]bool{}
+		addDriver := func(driver RuntimeHostDriver) {
+			if driver != nil && !seenDrivers[driver] {
+				seenDrivers[driver] = true
+				drivers = append(drivers, driver)
+			}
+		}
+		for _, driver := range h.runtimeHostDrivers {
+			addDriver(driver)
+		}
+		addDriver(h.codexHostDriver)
+		addDriver(h.piHostDriver)
+		if h.codexHostDriver == nil {
 			h.codexHost = nil
 		}
 		h.remoteRuntime = nil
@@ -96,17 +116,18 @@ func (h *Hub) Shutdown() {
 			h.st = ownedStore.RetiredReadOnlyView()
 		}
 		h.mu.Unlock()
-		if driver != nil {
-			if err := driver.Shutdown(context.Background()); err != nil {
-				log.Printf("[codex-loom] shut down Codex Runtime Host Driver: %v", err)
+		for _, item := range bindings {
+			if err := compatibilityLifecycleOutcomeError(item.contract.CloseBinding(context.Background(), item.binding)); err != nil {
+				log.Printf("[codex-loom] close Runtime binding during shutdown: %v", err)
 			}
-		} else if host != nil {
-			host.close()
 		}
-		if piDriver != nil {
-			if err := piDriver.Shutdown(context.Background()); err != nil {
-				log.Printf("[codex-loom] shut down Pi Runtime Host Driver: %v", err)
+		for _, driver := range drivers {
+			if err := driver.Shutdown(context.Background()); err != nil {
+				log.Printf("[codex-loom] shut down Runtime Host Driver: %v", err)
 			}
+		}
+		if len(drivers) == 0 && host != nil {
+			host.close()
 		}
 		for _, backend := range backends {
 			backend.Close()

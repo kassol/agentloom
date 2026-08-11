@@ -30,6 +30,10 @@ func (d *piRuntimeHostDriver) Preflight(context.Context) error {
 	return pi.Check("")
 }
 
+func (d *piRuntimeHostDriver) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
+	return piControlPlaneCapabilitySnapshot()
+}
+
 // PreflightPiRuntime exposes the Driver-owned startup prerequisite without
 // opening the Store or creating any per-Agent session directory.
 func PreflightPiRuntime(ctx context.Context) error {
@@ -37,6 +41,10 @@ func PreflightPiRuntime(ctx context.Context) error {
 }
 
 func (d *piRuntimeHostDriver) Acquire(ctx context.Context, request AgentHostRequest) (AgentHost, error) {
+	return d.acquireWhileHubLocked(ctx, request)
+}
+
+func (d *piRuntimeHostDriver) acquireWhileHubLocked(ctx context.Context, request AgentHostRequest) (AgentHost, error) {
 	if err := d.Preflight(ctx); err != nil {
 		return nil, err
 	}
@@ -131,6 +139,10 @@ func (h *piAgentHost) started() bool {
 }
 
 func (h *piAgentHost) Contract() runtimecontract.Contract { return h.contract }
+
+func (h *piAgentHost) legacyRuntime() AgentRuntime { return h.facade }
+
+func (h *piAgentHost) waitRuntimeHostReady(context.Context) error { return nil }
 
 func (h *piAgentHost) createBinding(request RuntimeBindingRequest) (string, error) {
 	h.mu.Lock()

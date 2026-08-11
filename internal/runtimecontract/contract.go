@@ -31,6 +31,20 @@ type Contract interface {
 	CloseBinding(context.Context, Binding) Outcome
 }
 
+// BindingNameCapability is an optional native convenience. Loom Agent names
+// remain authoritative, so callers invoke this only after committing the Loom
+// rename and never use its outcome to roll product state back.
+type BindingNameCapability interface {
+	UpdateBindingName(context.Context, Binding, string) Outcome
+}
+
+// BindingArchiveCapability is an optional native consequence of a committed
+// Loom archive. Failure cannot resurrect or invalidate the Loom-owned Agent
+// archive; CloseBinding remains the mandatory resource-release operation.
+type BindingArchiveCapability interface {
+	ArchiveBinding(context.Context, Binding) Outcome
+}
+
 type Binding struct {
 	SchemaVersion int    `json:"schemaVersion"`
 	RuntimeKind   string `json:"runtimeKind"`
@@ -45,16 +59,34 @@ type BindingRequest struct {
 
 type InputKind string
 
+type InputRole string
+
 const (
-	InputText  InputKind = "text"
-	InputImage InputKind = "image"
+	InputText          InputKind = "text"
+	InputImage         InputKind = "image"
+	InputRoleUser      InputRole = "user"
+	InputRoleDeveloper InputRole = "developer"
 )
 
 type InputBlock struct {
 	Kind     InputKind `json:"kind"`
+	Role     InputRole `json:"role,omitempty"`
 	Text     string    `json:"text,omitempty"`
 	Ref      string    `json:"ref,omitempty"`
 	MIMEType string    `json:"mimeType,omitempty"`
+}
+
+type ContextDeliveryMode string
+
+const (
+	ContextDeliveryEpochIncremental ContextDeliveryMode = "epoch_incremental"
+	ContextDeliveryFullPerTurn      ContextDeliveryMode = "full_per_turn"
+)
+
+// ContextDeliveryPolicy selects Loom's existing delivery strategy without
+// teaching control-plane consumers about a concrete Runtime kind.
+type ContextDeliveryPolicy interface {
+	ContextDeliveryMode() ContextDeliveryMode
 }
 
 type TurnRequest struct {
@@ -96,7 +128,7 @@ type Outcome struct {
 
 func (o Outcome) Validate() error {
 	switch o.State {
-	case LifecycleAccepted, LifecycleCompleted:
+	case LifecycleAccepted, LifecycleInterrupted, LifecycleCompleted:
 		if o.Failure != nil {
 			return fmt.Errorf("%s outcome cannot carry a failure", o.State)
 		}
@@ -104,12 +136,16 @@ func (o Outcome) Validate() error {
 		if o.Failure == nil {
 			return fmt.Errorf("%s outcome requires a failure", o.State)
 		}
-	case LifecycleInterrupted:
 	default:
 		return fmt.Errorf("unknown lifecycle state %q", o.State)
 	}
-	if o.State == LifecycleIndeterminate && o.Failure.Retryable {
-		return fmt.Errorf("indeterminate outcome cannot be marked retryable")
+	if o.State == LifecycleIndeterminate {
+		if o.Failure == nil {
+			return fmt.Errorf("indeterminate outcome requires a failure")
+		}
+		if o.Failure.Retryable {
+			return fmt.Errorf("indeterminate outcome cannot be marked retryable")
+		}
 	}
 	return nil
 }
@@ -117,13 +153,16 @@ func (o Outcome) Validate() error {
 type FailurePhase string
 
 const (
-	FailurePhaseBindingCreate FailurePhase = "binding_create"
-	FailurePhaseBindingResume FailurePhase = "binding_resume"
-	FailurePhaseTurnStart     FailurePhase = "turn_start"
-	FailurePhaseTurnContinue  FailurePhase = "turn_continue"
-	FailurePhaseTurnInterrupt FailurePhase = "turn_interrupt"
-	FailurePhaseHistory       FailurePhase = "history"
-	FailurePhaseClose         FailurePhase = "close"
+	FailurePhaseBindingCreate   FailurePhase = "binding_create"
+	FailurePhaseBindingResume   FailurePhase = "binding_resume"
+	FailurePhaseTurnStart       FailurePhase = "turn_start"
+	FailurePhaseTurnContinue    FailurePhase = "turn_continue"
+	FailurePhaseTurnInterrupt   FailurePhase = "turn_interrupt"
+	FailurePhaseHistory         FailurePhase = "history"
+	FailurePhaseClose           FailurePhase = "close"
+	FailurePhaseBindingName     FailurePhase = "binding_name"
+	FailurePhaseBindingArchive  FailurePhase = "binding_archive"
+	FailurePhaseContextDelivery FailurePhase = "context_delivery"
 )
 
 type Failure struct {
@@ -169,6 +208,16 @@ type CapabilitySnapshot struct {
 	Revision     string                 `json:"revision"`
 	Capabilities []CapabilityDescriptor `json:"capabilities"`
 }
+
+const (
+	CapabilitySandboxConfiguration  = "sandbox_configuration"
+	CapabilityProviderConfiguration = "provider_configuration"
+	CapabilityApprovalPolicy        = "approval_policy"
+	CapabilitySkillsPolicy          = "skills_policy"
+	CapabilityContextDelivery       = "context_delivery"
+	CapabilityNativeRename          = "native_rename"
+	CapabilityNativeArchive         = "native_archive"
+)
 
 type ContentKind string
 

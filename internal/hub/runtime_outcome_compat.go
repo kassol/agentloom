@@ -2,6 +2,7 @@ package hub
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
@@ -34,6 +35,9 @@ func (e *runtimeIndeterminateError) RuntimeFailure() *runtimecontract.Failure {
 }
 
 func compatibilityLifecycleOutcomeError(outcome runtimecontract.Outcome) error {
+	if err := outcome.Validate(); err != nil {
+		return fmt.Errorf("invalid Runtime lifecycle outcome: %w", err)
+	}
 	if outcome.State == runtimecontract.LifecycleIndeterminate && outcome.Failure != nil {
 		return &runtimeIndeterminateError{failure: outcome.Failure}
 	}

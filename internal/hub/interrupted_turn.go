@@ -27,44 +27,10 @@ func reconcileInterruptedTurn(meta *Agent) (*TurnSummary, bool) {
 		TurnID: meta.CurrentTurnID, Task: displayRolloutTask(meta.CurrentTask),
 		Status: "interrupted", CompletedAt: now(),
 	}
-	kind := meta.RuntimeBinding.Kind
-	if kind == "" {
-		kind = "codex"
-	}
-	backend := runtimeForKind(kind)
-	if backend == nil || !backend.Capabilities().History {
-		return summary, true
-	}
-	latest, err := backend.LatestTurn(meta.RuntimeBinding.NativeRef)
-	if err != nil || latest == nil || latest.ID == "" {
-		return summary, true
-	}
-	nativeTurnID := summary.TurnID
-	if bound := meta.RuntimeTurnBindings[summary.TurnID]; bound != "" {
-		nativeTurnID = bound
-	}
-	if nativeTurnID != "" && latest.ID != nativeTurnID {
-		return summary, true
-	}
-	if summary.TurnID == "" {
-		summary.TurnID = latest.ID
-		for loomTurnID, candidate := range meta.RuntimeTurnBindings {
-			if candidate == latest.ID {
-				summary.TurnID = loomTurnID
-				break
-			}
-		}
-	}
-	if task := displayRolloutTask(latest.Task); task != "" {
-		summary.Task = task
-	}
-	if latest.UpdatedAt != "" {
-		summary.CompletedAt = latest.UpdatedAt
-	}
-	if latest.Status == "completed" || latest.Status == "failed" || latest.Status == "interrupted" {
-		summary.Status = latest.Status
-		return summary, false
-	}
+	// Startup records only Loom's durable observation. The recovery worker
+	// acquires the per-Agent v2 Contract and inspects optional native evidence
+	// after this checkpoint, so registry restoration never routes by Runtime
+	// kind or consults a process-global v1 backend.
 	return summary, true
 }
 

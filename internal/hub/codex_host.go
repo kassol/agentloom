@@ -82,6 +82,10 @@ func (h *Hub) codexDriverLocked() *codexRuntimeHostDriver {
 	if h.codexHostDriver == nil {
 		h.codexHostDriver = newCodexRuntimeHostDriver(h)
 	}
+	if h.runtimeHostDrivers == nil {
+		h.runtimeHostDrivers = map[string]hubLockedRuntimeHostDriver{}
+	}
+	h.runtimeHostDrivers["codex"] = h.codexHostDriver
 	return h.codexHostDriver
 }
 
@@ -188,8 +192,14 @@ func (h *Hub) verifyRuntimeThreadControl(agentID string, rt *runtime) error {
 	if meta == nil {
 		return errf(404, "agent vanished")
 	}
-	// The indeterminate-RPC fence belongs to the shared Codex host. Other
-	// Runtime implementations provide their own control guarantees.
+	if rt != nil && rt.runtimeContract != nil {
+		if rt.effectDomainInvalidated {
+			return errf(409, "Runtime binding is fenced after an indeterminate control outcome; restart the Runtime before continuing")
+		}
+		return nil
+	}
+	// Compatibility-only v1 runtimes retain their historical fence until the
+	// v1 removal ticket deletes this projection.
 	if rt != nil && rt.client == nil && runtimeBackend(rt) != nil {
 		return nil
 	}

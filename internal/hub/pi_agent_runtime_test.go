@@ -96,8 +96,13 @@ func TestPiAgentCompletesLiveLoomTurnOnlyAfterAgentSettled(t *testing.T) {
 		"loom/reasoning-delta", "loom/reasoning-completed", "loom/tool-started", "loom/tool-updated",
 		"loom/tool-completed", "loom/text-delta", "loom/text-completed", "loom/turn-completed",
 	}
-	if strings.Join(normalized, ",") != strings.Join(wantNormalized, ",") || len(toolIDs) != 1 || !toolIDs["call-1"] {
+	if strings.Join(normalized, ",") != strings.Join(wantNormalized, ",") || len(toolIDs) != 1 {
 		t.Fatalf("streamed normalized order=%v toolIDs=%v", normalized, toolIDs)
+	}
+	for itemID := range toolIDs {
+		if !strings.HasPrefix(itemID, "item_") || strings.Contains(itemID, "call-1") {
+			t.Fatalf("public tool item ID = %q", itemID)
+		}
 	}
 	prompt, err := os.ReadFile(os.Getenv("FAKE_PI_PROMPT_FILE"))
 	if err != nil || !strings.Contains(string(prompt), "hello Pi") || !strings.Contains(string(prompt), "loom_agent_profile") {
@@ -149,7 +154,8 @@ func TestPiApprovalUsesCanonicalLoomTurnAndExecutesToolOnlyAfterApprove(t *testi
 		t.Fatal("Pi tool did not produce a pending Loom Approval")
 	}
 	if approval.TurnID != result.TurnID || approval.RuntimeKind != "pi" || approval.Method != "tool/bash" ||
-		!strings.Contains(string(approval.Params), `"toolCallId":"call-approval-1"`) ||
+		strings.Contains(string(approval.Params), `"toolCallId"`) ||
+		!strings.Contains(string(approval.Params), `"toolName":"bash"`) ||
 		!strings.Contains(string(approval.Params), `"command":"touch approval-effect"`) {
 		t.Fatalf("Pi Approval = %#v, canonical Turn = %q", approval, result.TurnID)
 	}

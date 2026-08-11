@@ -220,6 +220,7 @@ func testHub(st *store.Store) *Hub {
 		goals:               map[string]*ThreadGoal{},
 		seqs:                map[string]int64{},
 		runtimes:            map[string]*runtime{},
+		runtimeHostDrivers:  map[string]hubLockedRuntimeHostDriver{},
 		subs:                map[string]map[*subscriber]struct{}{},
 		globalSubs:          map[*subscriber]struct{}{},
 	}

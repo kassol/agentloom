@@ -43,6 +43,10 @@ func (d *codexRuntimeHostDriver) Preflight(context.Context) error {
 	return nil
 }
 
+func (d *codexRuntimeHostDriver) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
+	return codexControlPlaneCapabilitySnapshot()
+}
+
 func (d *codexRuntimeHostDriver) Acquire(ctx context.Context, request AgentHostRequest) (AgentHost, error) {
 	if err := d.Preflight(ctx); err != nil {
 		return nil, err
@@ -57,6 +61,11 @@ func (d *codexRuntimeHostDriver) Acquire(ctx context.Context, request AgentHostR
 		return nil, err
 	}
 	return handle, nil
+}
+
+func (d *codexRuntimeHostDriver) acquireWhileHubLocked(_ context.Context, request AgentHostRequest) (AgentHost, error) {
+	handle, _, err := d.acquireLocked(request)
+	return handle, err
 }
 
 // acquireLocked binds one Agent handle to the current shared Codex host.
@@ -174,6 +183,22 @@ func (h *codexAgentHost) Alive() bool {
 }
 
 func (h *codexAgentHost) Contract() runtimecontract.Contract { return h.contract }
+
+func (h *codexAgentHost) legacyRuntime() AgentRuntime { return h.facade }
+
+func (h *codexAgentHost) codexCompatibility() (*codex.Client, uint64) {
+	if h == nil || h.host == nil {
+		return nil, 0
+	}
+	return h.host.client, h.host.generation
+}
+
+func (h *codexAgentHost) waitRuntimeHostReady(context.Context) error {
+	if h == nil {
+		return fmt.Errorf("Codex Agent Host is unavailable")
+	}
+	return waitCodexHost(h.host)
+}
 
 func (h *codexAgentHost) SetFailureHandler(handler func(error)) {
 	h.mu.Lock()

@@ -116,7 +116,9 @@ func TestContractV2RejectsContradictoryContentAndLifecycleStates(t *testing.T) {
 	}
 	for _, outcome := range []runtimecontract.Outcome{
 		{State: runtimecontract.LifecycleCompleted, Failure: &runtimecontract.Failure{Code: "unexpected"}},
+		{State: runtimecontract.LifecycleInterrupted, Failure: &runtimecontract.Failure{Code: "unexpected"}},
 		{State: runtimecontract.LifecycleFailed},
+		{State: runtimecontract.LifecycleIndeterminate},
 		{State: runtimecontract.LifecycleIndeterminate, Failure: &runtimecontract.Failure{Code: "timeout", Retryable: true}},
 	} {
 		if err := outcome.Validate(); err == nil {

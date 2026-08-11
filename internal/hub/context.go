@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/rollout"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 )
 
 const (
@@ -384,12 +385,14 @@ func (h *Hub) prepareTurnContext(agentID string, source turnContextSource, artif
 		return TurnContextPlan{}, err
 	}
 	h.mu.Lock()
-	runtimeKind := ""
-	if agent := h.agents[agentID]; agent != nil {
-		runtimeKind = agent.RuntimeBinding.Kind
+	mode := runtimecontract.ContextDeliveryEpochIncremental
+	if rt := h.runtimes[agentID]; rt != nil {
+		if policy, ok := rt.runtimeContract.(runtimecontract.ContextDeliveryPolicy); ok {
+			mode = policy.ContextDeliveryMode()
+		}
 	}
 	h.mu.Unlock()
-	if runtimeKind == "pi" {
+	if mode == runtimecontract.ContextDeliveryFullPerTurn {
 		developerContext := renderPiDeveloperContext(compiledAt, developerPayload)
 		if len(developerContext) > maxDeveloperContextBytes {
 			return TurnContextPlan{}, errf(409, "compiled Loom Developer context is %d bytes; maximum is %d bytes and it will not be truncated", len(developerContext), maxDeveloperContextBytes)
