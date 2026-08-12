@@ -68,7 +68,7 @@ func (h *Hub) GetRuntimeResources(key string) (RuntimeResourceSnapshot, error) {
 	}
 	agentID, name, cwd, binding := meta.ID, meta.Name, meta.Cwd, runtimeContractBinding(meta)
 	providerID, model := effectiveProviderBinding(meta)
-	sandbox, effort := meta.Sandbox, meta.Effort
+	sandbox, effort, imageEvidence := meta.Sandbox, meta.Effort, agentModelImageEvidence(meta)
 	disabled := h.disabledSkillPathsLocked(agentID)
 	rt := h.runtimes[agentID]
 	if !runtimeHandleAlive(rt) {
@@ -91,7 +91,7 @@ func (h *Hub) GetRuntimeResources(key string) (RuntimeResourceSnapshot, error) {
 		if err != nil {
 			return RuntimeResourceSnapshot{}, err
 		}
-		configureRuntimeBinding(contract, sandbox, providerID, model, effort, disabled)
+		configureRuntimeBinding(contract, sandbox, providerID, model, effort, imageEvidence, disabled)
 	} else {
 		if rt == nil {
 			h.mu.Lock()

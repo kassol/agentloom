@@ -104,6 +104,17 @@ Turn start. Inspector previews may therefore show a pending model while the
 composer continues to follow the active Capability Snapshot until Save
 succeeds.
 
+Claude derives its catalog and effort choices from the installed generation's
+public Agent SDK `supportedModels` result. `default` means the SDK default and
+is applied as a cleared effort value, never guessed as a named level. Image
+input is available only when the generation recognizes the model's exact
+resolved ID; PNG, JPEG, GIF, and WebP files are read by the private bridge and
+sent as base64 SDK image blocks, while paths and bytes stay out of public
+model, event, and diagnostic data. Model and effort controls are revalidated
+before the next prompt is yielded to the SDK. Durable image capability evidence
+is scoped to the exact installed generation and selected model; a generation or
+model mismatch fails closed, and Restore input cannot manufacture that evidence.
+
 `UsageInspectionCapability` is passive: it reads one binding without acquiring
 or starting its Host. Every scalar in the report carries availability and a
 source. Aggregates may sum only observed values and must retain partial metric

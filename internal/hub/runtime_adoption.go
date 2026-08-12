@@ -268,7 +268,7 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 	if contract == nil || contract.ContractVersion() != runtimecontract.Version {
 		return AgentView{}, errf(500, "Runtime Contract is unavailable for adoption")
 	}
-	configureRuntimeBinding(contract, p.Sandbox, p.ProviderID, p.Model, p.Effort, nil)
+	configureRuntimeBinding(contract, p.Sandbox, p.ProviderID, p.Model, p.Effort, runtimeModelImageEvidence{}, nil)
 	binding := runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: kind, NativeRef: candidate.nativeRef}
 	ctx, cancel = context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 	outcome := contract.ResumeBinding(ctx, binding)

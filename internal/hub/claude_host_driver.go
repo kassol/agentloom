@@ -20,9 +20,10 @@ import (
 )
 
 type claudeRuntimeHostDriver struct {
-	st        *store.Store
-	bridge    *claudebridge.Driver
-	preflight func(context.Context) error
+	st               *store.Store
+	bridge           *claudebridge.Driver
+	preflight        func(context.Context) error
+	activeGeneration func() (string, error)
 
 	mu        sync.Mutex
 	handles   map[string]*claudeAgentHost
@@ -68,6 +69,7 @@ func newDefaultClaudeRuntimeHostDriver(st *store.Store, manager *claudegen.Manag
 		return claudebridge.LaunchSpec{NodePath: spec.NodePath, BridgePath: spec.BridgePath, Manifest: spec.Manifest}, nil
 	}})
 	driver.preflight = manager.Preflight
+	driver.activeGeneration = manager.ReadActiveGenerationID
 	return driver
 }
 
@@ -124,6 +126,16 @@ func (d *claudeRuntimeHostDriver) HistoryContract(request AgentHostRequest) runt
 
 func (d *claudeRuntimeHostDriver) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
 	return claudeControlPlaneCapabilitySnapshot()
+}
+
+func (d *claudeRuntimeHostDriver) CapabilitySnapshotWithModelImageEvidence(ctx context.Context, evidence runtimeModelImageEvidence) runtimecontract.CapabilitySnapshot {
+	available := false
+	if d != nil && d.activeGeneration != nil && evidence.Available && evidence.GenerationID != "" && evidence.ModelID != "" {
+		if generationID, err := d.activeGeneration(); err == nil {
+			available = generationID == evidence.GenerationID
+		}
+	}
+	return claudeControlPlaneCapabilitySnapshot(available)
 }
 
 func (d *claudeRuntimeHostDriver) Shutdown(ctx context.Context) error {
@@ -239,6 +251,13 @@ type claudeRuntimeContract struct {
 	observed                  bool
 	ledgerErr                 error
 	cwd                       string
+	provider                  string
+	model                     string
+	effort                    string
+	modelState                *runtimecontract.ModelControlState
+	imageInput                bool
+	generationID              string
+	modelRevision             uint64
 	release                   func()
 	ops                       atomic.Uint64
 	opPhases                  map[string]runtimecontract.FailurePhase
@@ -260,6 +279,9 @@ func newClaudeRuntimeContract(agentID string, st *store.Store, bridge *claudebri
 	c := &claudeRuntimeContract{
 		agentID: agentID, st: st, bridge: bridge, terminal: map[string]bool{}, waiting: map[string]bool{}, fenced: map[string]bool{}, pendingOps: map[string]bool{}, terminalOps: map[string]string{},
 		opPhases: map[string]runtimecontract.FailurePhase{}, opTurns: map[string]string{}, callbacks: map[string]claudeCallback{}, callbackProposals: map[string]string{}, pendingContext: map[string]*runtimecontract.ContextEvidence{},
+	}
+	if bridge != nil {
+		c.generationID = bridge.GenerationID()
 	}
 	if st != nil {
 		if history, err := st.LoadCanonicalTurnLedger(agentID, int(^uint(0)>>1), 0); err == nil {
@@ -286,6 +308,53 @@ func (c *claudeRuntimeContract) SetRuntimeApprovalPolicy(policy string) {
 	c.mu.Lock()
 	c.approvalPolicy = policy
 	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) SetRuntimeProvider(provider, model string) {
+	c.mu.Lock()
+	provider, model = strings.TrimSpace(provider), strings.TrimSpace(model)
+	if provider == "" && model == "" {
+		provider, model = "anthropic", "default"
+	}
+	if c.provider != provider || c.model != model {
+		c.provider, c.model, c.modelState, c.imageInput = provider, model, nil, false
+		c.modelRevision++
+	}
+	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) SetRuntimeModel(model string) {
+	c.mu.Lock()
+	if model = strings.TrimSpace(model); c.model != model {
+		c.model, c.modelState, c.imageInput = model, nil, false
+		c.modelRevision++
+	}
+	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) SetRuntimeEffort(effort string) {
+	c.mu.Lock()
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		effort = runtimecontract.ThinkingLevelDefault
+	}
+	if c.effort != effort {
+		c.effort, c.modelState = effort, nil
+		c.modelRevision++
+	}
+	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) SetRuntimeModelImageEvidence(evidence runtimeModelImageEvidence) {
+	c.mu.Lock()
+	c.imageInput = evidence.Available && evidence.GenerationID != "" && evidence.GenerationID == c.generationID && evidence.ModelID == c.model
+	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) RuntimeModelImageEvidence() runtimeModelImageEvidence {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return runtimeModelImageEvidence{Available: c.imageInput, GenerationID: c.generationID, ModelID: c.model}
 }
 
 func (c *claudeRuntimeContract) ResolveApproval(ctx context.Context, proposalID string, decision runtimecontract.ApprovalDecision) error {
@@ -373,6 +442,137 @@ func (c *claudeRuntimeContract) InspectUsage(ctx context.Context, _ runtimecontr
 	return projectClaudeUsage(history.Turns), nil
 }
 
+func (c *claudeRuntimeContract) InspectModelControl(ctx context.Context, binding runtimecontract.Binding) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
+	c.mu.Lock()
+	provider, model, effort, cached, revision := c.provider, c.model, c.effort, c.modelState, c.modelRevision
+	c.mu.Unlock()
+	if cached != nil {
+		return cloneClaudeModelState(*cached), nil
+	}
+	response, outcome := c.command(ctx, "inspect_model_control", "", runtimecontract.FailurePhaseModelControl, map[string]any{"provider": provider, "model": model, "thinkingLevel": effort})
+	if outcome.State != runtimecontract.LifecycleAccepted {
+		return runtimecontract.ModelControlState{}, outcome.Failure
+	}
+	var state runtimecontract.ModelControlState
+	if err := json.Unmarshal(response.Data, &state); err != nil {
+		return runtimecontract.ModelControlState{}, modelControlFailure(errors.New("Claude bridge returned malformed model control evidence"))
+	}
+	if err := state.Validate(); err != nil {
+		return runtimecontract.ModelControlState{}, modelControlFailure(fmt.Errorf("invalid Claude model control evidence: %w", err))
+	}
+	c.mu.Lock()
+	if c.modelRevision != revision || c.provider != provider || c.model != model || c.effort != effort {
+		current := c.modelState
+		c.mu.Unlock()
+		if current != nil {
+			return cloneClaudeModelState(*current), nil
+		}
+		return runtimecontract.ModelControlState{}, modelControlFailure(errors.New("Claude model configuration changed during inspection; retry"))
+	}
+	copy := cloneClaudeModelState(state)
+	c.imageInput = state.Current.ImageInput
+	c.modelState = &copy
+	c.mu.Unlock()
+	return state, nil
+}
+
+func (c *claudeRuntimeContract) SelectModel(ctx context.Context, binding runtimecontract.Binding, selection runtimecontract.ModelSelection) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
+	preview, failure := c.InspectModelControl(ctx, binding)
+	if failure != nil {
+		return runtimecontract.ModelControlState{}, failure
+	}
+	if err := preview.ValidateSelection(selection); err != nil {
+		return runtimecontract.ModelControlState{}, modelControlFailure(err)
+	}
+	c.mu.Lock()
+	cwd := c.cwd
+	resume := len(c.turns) > 0 || c.observed
+	c.mu.Unlock()
+	response, outcome := c.command(ctx, "select_model", "", runtimecontract.FailurePhaseModelControl, map[string]any{
+		"sessionRef": binding.NativeRef,
+		"cwd":        cwd,
+		"resume":     resume,
+		"current":    runtimecontract.ModelSelection{Provider: preview.Current.Provider, Model: preview.Current.ID, ThinkingLevel: preview.ThinkingLevel},
+		"selection":  selection,
+	})
+	if outcome.State != runtimecontract.LifecycleAccepted {
+		if outcome.State == runtimecontract.LifecycleIndeterminate && outcome.Failure != nil {
+			failure := *outcome.Failure
+			failure.Code = "model_selection_indeterminate"
+			return runtimecontract.ModelControlState{}, &failure
+		}
+		return runtimecontract.ModelControlState{}, outcome.Failure
+	}
+	var state runtimecontract.ModelControlState
+	if err := json.Unmarshal(response.Data, &state); err != nil {
+		return runtimecontract.ModelControlState{}, claudeModelSelectionIndeterminate(errors.New("Claude bridge returned malformed effective model evidence"))
+	}
+	if err := state.Validate(); err != nil {
+		return runtimecontract.ModelControlState{}, claudeModelSelectionIndeterminate(fmt.Errorf("invalid Claude effective model evidence: %w", err))
+	}
+	c.mu.Lock()
+	c.provider, c.model, c.effort = state.Current.Provider, state.Current.ID, state.ThinkingLevel
+	c.imageInput = state.Current.ImageInput
+	c.modelRevision++
+	copy := cloneClaudeModelState(state)
+	c.modelState = &copy
+	c.mu.Unlock()
+	return state, nil
+}
+
+func (c *claudeRuntimeContract) ValidateInput(ctx context.Context, binding runtimecontract.Binding, input []runtimecontract.InputBlock) *runtimecontract.Failure {
+	hasImage := false
+	for _, block := range input {
+		switch block.Kind {
+		case runtimecontract.InputText:
+		case runtimecontract.InputImage:
+			hasImage = true
+			if block.MIMEType != "" && !supportedClaudeImageMIME(block.MIMEType) {
+				return claudeInputFailure("Claude Runtime supports PNG, JPEG, GIF, and WebP image input")
+			}
+		default:
+			return claudeInputFailure("Claude Runtime does not support this input modality")
+		}
+	}
+	if !hasImage {
+		return nil
+	}
+	state, failure := c.InspectModelControl(ctx, binding)
+	if failure != nil {
+		return failure
+	}
+	if !state.Current.ImageInput {
+		return claudeInputFailure("the active Claude model does not accept image input")
+	}
+	return nil
+}
+
+func supportedClaudeImageMIME(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "image/png", "image/jpeg", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
+
+func claudeInputFailure(message string) *runtimecontract.Failure {
+	return &runtimecontract.Failure{Code: "input_unavailable", Phase: runtimecontract.FailurePhaseTurnStart, Message: message}
+}
+
+func claudeModelSelectionIndeterminate(err error) *runtimecontract.Failure {
+	return &runtimecontract.Failure{Code: "model_selection_indeterminate", Phase: runtimecontract.FailurePhaseModelControl, Message: "Claude model selection effect is indeterminate", Diagnostic: err.Error(), Cause: err}
+}
+
+func cloneClaudeModelState(state runtimecontract.ModelControlState) runtimecontract.ModelControlState {
+	state.Current.ThinkingLevels = append([]string(nil), state.Current.ThinkingLevels...)
+	state.Models = append([]runtimecontract.Model(nil), state.Models...)
+	for index := range state.Models {
+		state.Models[index].ThinkingLevels = append([]string(nil), state.Models[index].ThinkingLevels...)
+	}
+	return state
+}
+
 func (c *claudeRuntimeContract) CreateBinding(ctx context.Context, request runtimecontract.BindingRequest) (runtimecontract.Binding, runtimecontract.Outcome) {
 	c.cwd = request.Cwd
 	if err := ctx.Err(); err != nil {
@@ -412,6 +612,9 @@ func (c *claudeRuntimeContract) seedTurnBindings(bindings map[string]string) {
 }
 
 func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimecontract.TurnRequest) runtimecontract.Outcome {
+	if failure := c.ValidateInput(ctx, request.Binding, request.Input); failure != nil {
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: failure}
+	}
 	if err := c.persistLedgerFence(); err != nil {
 		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseTurnStart, "ledger_unavailable", err)
 	}
@@ -421,8 +624,9 @@ func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimeco
 		c.pendingContext[request.TurnID] = evidence
 	}
 	resume := len(c.turns) > 0 || c.observed
+	model, effort := c.model, c.effort
 	c.mu.Unlock()
-	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input})
+	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input, "model": model, "thinkingLevel": effort})
 	if outcome.State != runtimecontract.LifecycleAccepted {
 		c.mu.Lock()
 		delete(c.pendingContext, request.TurnID)
@@ -443,6 +647,9 @@ func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimeco
 }
 
 func (c *claudeRuntimeContract) ContinueTurn(ctx context.Context, request runtimecontract.CausalInput) runtimecontract.Outcome {
+	if failure := c.ValidateInput(ctx, request.Binding, request.Input); failure != nil {
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: failure}
+	}
 	if err := c.persistLedgerFence(); err != nil {
 		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseTurnContinue, "ledger_unavailable", err)
 	}
@@ -588,7 +795,10 @@ func (c *claudeRuntimeContract) ReadHistory(ctx context.Context, request runtime
 }
 
 func (c *claudeRuntimeContract) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
-	return claudeControlPlaneCapabilitySnapshot()
+	c.mu.Lock()
+	imageInput := c.imageInput
+	c.mu.Unlock()
+	return claudeControlPlaneCapabilitySnapshot(imageInput)
 }
 
 func (c *claudeRuntimeContract) CloseBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {

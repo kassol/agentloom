@@ -217,6 +217,7 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 	if err := validateModelEffort(p.ProviderID, p.Model, p.Effort); err != nil {
 		return AgentView{}, err
 	}
+	defaultClaudeModelConfiguration(p.RuntimeKind, &p.ProviderID, &p.Model, &p.Effort)
 	idBytes := make([]byte, 4)
 	_, _ = rand.Read(idBytes)
 	id := hex.EncodeToString(idBytes)
@@ -309,6 +310,7 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	p.Effort = normalizeEffort(strings.TrimSpace(p.Effort))
 	p.ProviderID = normalizeProviderID(p.ProviderID)
 	p.Model = strings.TrimSpace(p.Model)
+	defaultClaudeModelConfiguration(p.RuntimeBinding.Kind, &p.ProviderID, &p.Model, &p.Effort)
 	if p.ProviderID != "" && !nameRe.MatchString(p.ProviderID) {
 		return AgentView{}, errf(400, "providerId must match [a-zA-Z0-9_-]+")
 	}
@@ -589,11 +591,19 @@ func normalizeEffort(effort string) string {
 
 func validEffort(effort string) bool {
 	switch effort {
-	case "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+	case runtimecontract.ThinkingLevelDefault, "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
 		return true
 	default:
 		return false
 	}
+}
+
+func defaultClaudeModelConfiguration(kind string, provider, model, effort *string) bool {
+	if kind != "claude" || strings.TrimSpace(*model) != "" {
+		return false
+	}
+	*provider, *model, *effort = "anthropic", "default", runtimecontract.ThinkingLevelDefault
+	return true
 }
 
 func validateModelEffort(providerID, model, effort string) error {

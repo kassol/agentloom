@@ -76,6 +76,17 @@ type runtimeModelConfiguration interface{ SetRuntimeModel(string) }
 type runtimeSkillsConfiguration interface{ SetRuntimeDisabledSkills([]string) }
 type runtimeApprovalConfiguration interface{ SetRuntimeApprovalPolicy(string) }
 type runtimeEffortConfiguration interface{ SetRuntimeEffort(string) }
+type runtimeModelImageEvidence struct {
+	Available    bool
+	GenerationID string
+	ModelID      string
+}
+type runtimeModelImageEvidenceConfiguration interface {
+	SetRuntimeModelImageEvidence(runtimeModelImageEvidence)
+}
+type runtimeModelImageEvidenceProvider interface {
+	RuntimeModelImageEvidence() runtimeModelImageEvidence
+}
 type runtimeContextTimeoutConfiguration interface{ SetRuntimeDeveloperContextTimeout(time.Duration) }
 
 type runtimeGoalCapability interface {
@@ -87,7 +98,7 @@ type runtimeGoalCapability interface {
 type RuntimeContextEvidenceQuery = runtimecontract.ContextEvidenceQuery
 type RuntimeContextEvidence = runtimecontract.ContextEvidence
 
-func configureRuntimeBinding(contract runtimecontract.Contract, sandbox, providerID, model, effort string, disabledSkillPaths []string) {
+func configureRuntimeBinding(contract runtimecontract.Contract, sandbox, providerID, model, effort string, imageEvidence runtimeModelImageEvidence, disabledSkillPaths []string) {
 	if capability, ok := contract.(runtimeSandboxConfiguration); ok {
 		capability.SetRuntimeSandbox(sandbox)
 	}
@@ -97,8 +108,21 @@ func configureRuntimeBinding(contract runtimecontract.Contract, sandbox, provide
 	if capability, ok := contract.(runtimeEffortConfiguration); ok {
 		capability.SetRuntimeEffort(effort)
 	}
+	if capability, ok := contract.(runtimeModelImageEvidenceConfiguration); ok {
+		capability.SetRuntimeModelImageEvidence(imageEvidence)
+	}
 	if capability, ok := contract.(runtimeSkillsConfiguration); ok {
 		capability.SetRuntimeDisabledSkills(disabledSkillPaths)
+	}
+}
+
+func agentModelImageEvidence(agent *Agent) runtimeModelImageEvidence {
+	if agent == nil {
+		return runtimeModelImageEvidence{}
+	}
+	return runtimeModelImageEvidence{
+		Available:    agent.ModelImageInput && agent.ModelImageModel == agent.Model,
+		GenerationID: agent.ModelImageGeneration, ModelID: agent.ModelImageModel,
 	}
 }
 

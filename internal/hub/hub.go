@@ -89,6 +89,9 @@ type Agent struct {
 	ProviderID            string                        `json:"providerId,omitempty"`
 	Model                 string                        `json:"model,omitempty"`
 	Effort                string                        `json:"effort,omitempty"`
+	ModelImageInput       bool                          `json:"modelImageInput,omitempty"`
+	ModelImageGeneration  string                        `json:"modelImageGeneration,omitempty"`
+	ModelImageModel       string                        `json:"modelImageModel,omitempty"`
 	Status                string                        `json:"status"`
 	CurrentTask           string                        `json:"currentTask"`
 	CurrentTurnID         string                        `json:"currentTurnId"`
@@ -572,6 +575,10 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 			}
 		default:
 			return nil, fmt.Errorf("load agents: Agent %s uses unsupported Runtime Binding schema version %d", id, meta.RuntimeBinding.SchemaVersion)
+		}
+		if defaultClaudeModelConfiguration(meta.RuntimeBinding.Kind, &meta.ProviderID, &meta.Model, &meta.Effort) {
+			meta.UpdatedAt = now()
+			agentRegistryRecovered = true
 		}
 		if meta.ContextMaintenance != nil {
 			if err := meta.ContextMaintenance.Validate(meta); err != nil {
@@ -1614,13 +1621,13 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 		rt.initErr = errf(404, "agent vanished")
 		return
 	}
-	threadID, threadName, sandbox, cwd, effort := meta.RuntimeBinding.NativeRef, meta.Name, meta.Sandbox, meta.Cwd, meta.Effort
+	threadID, threadName, sandbox, cwd, effort, imageEvidence := meta.RuntimeBinding.NativeRef, meta.Name, meta.Sandbox, meta.Cwd, meta.Effort, agentModelImageEvidence(meta)
 	providerID, model := effectiveProviderBinding(meta)
 	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
 	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
 	persistedBinding := runtimeContractBinding(meta)
 	h.mu.Unlock()
-	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, effort, disabledSkillPaths)
+	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, effort, imageEvidence, disabledSkillPaths)
 	startBinding := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 		defer cancel()
@@ -1768,7 +1775,7 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 		h.mu.Unlock()
 		return errf(404, "agent vanished")
 	}
-	threadID, sandbox, effort := meta.RuntimeBinding.NativeRef, meta.Sandbox, meta.Effort
+	threadID, sandbox, effort, imageEvidence := meta.RuntimeBinding.NativeRef, meta.Sandbox, meta.Effort, agentModelImageEvidence(meta)
 	providerID, model := effectiveProviderBinding(meta)
 	disabledSkillPaths := h.disabledSkillPathsLocked(meta.ID)
 	skillConfigHash := agentSkillConfigHash(disabledSkillPaths)
@@ -1784,7 +1791,7 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 		return errf(500, "Agent Runtime Contract is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
-	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, effort, disabledSkillPaths)
+	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, effort, imageEvidence, disabledSkillPaths)
 	outcome := rt.runtimeContract.ResumeBinding(ctx, rt.binding)
 	cancel()
 	err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false)

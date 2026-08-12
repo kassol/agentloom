@@ -45,6 +45,7 @@ func (h *Hub) GetRuntimeModels(key string) (RuntimeModelState, error) {
 	if err := state.Validate(); err != nil {
 		return RuntimeModelState{}, errf(500, "invalid Runtime model state: %s", err)
 	}
+	h.refreshRuntimeCapabilitySnapshot(agent.ID, true)
 	return state, nil
 }
 
@@ -123,6 +124,9 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 	}
 	state, failure := capability.SelectModel(ctx, rt.binding, selection)
 	if failure != nil {
+		if failure.Code != "model_selection_indeterminate" {
+			return RuntimeModelState{}, errf(409, "switch Runtime model: %s", failure.Message)
+		}
 		typed := &runtimeIndeterminateError{failure: failure}
 		h.invalidateRuntimeEffectDomain(rt, typed)
 		return RuntimeModelState{}, &HubError{Status: 500, Message: "switch Runtime model is indeterminate; the Runtime was fenced and closed", Cause: typed}
@@ -132,6 +136,10 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 	}
 	if state.Current.Provider != selection.Provider || state.Current.ID != selection.Model || (selection.ThinkingLevel != "" && state.ThinkingLevel != selection.ThinkingLevel) {
 		return RuntimeModelState{}, h.runtimeModelPostSelectionFailure(rt, capability, rollback, 500, fmt.Errorf("Runtime did not activate the selected model and thinking level"))
+	}
+	imageEvidence := runtimeModelImageEvidence{Available: state.Current.ImageInput}
+	if provider, ok := rt.runtimeContract.(runtimeModelImageEvidenceProvider); ok {
+		imageEvidence = provider.RuntimeModelImageEvidence()
 	}
 	h.mu.Lock()
 	agent = h.agents[agentID]
@@ -144,7 +152,7 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 		h.mu.Unlock()
 		return RuntimeModelState{}, h.runtimeModelPostSelectionFailure(rt, capability, rollback, 409, fmt.Errorf("Agent binding or model configuration changed while applying the Runtime selection"))
 	}
-	previousProvider, previousModel, previousEffort, previousUpdatedAt := agent.ProviderID, agent.Model, agent.Effort, agent.UpdatedAt
+	previousProvider, previousModel, previousEffort, previousImageEvidence, previousUpdatedAt := agent.ProviderID, agent.Model, agent.Effort, agentModelImageEvidence(agent), agent.UpdatedAt
 	previousHistoryLen := len(agent.ProviderHistory)
 	providerChanged := publicProviderID(previousProvider) != publicProviderID(state.Current.Provider)
 	if providerChanged {
@@ -154,8 +162,10 @@ func (h *Hub) SwitchRuntimeModel(key string, selection RuntimeModelSelection) (R
 		})
 	}
 	agent.ProviderID, agent.Model, agent.Effort, agent.UpdatedAt = state.Current.Provider, state.Current.ID, state.ThinkingLevel, now()
+	agent.ModelImageInput, agent.ModelImageGeneration, agent.ModelImageModel = imageEvidence.Available, imageEvidence.GenerationID, imageEvidence.ModelID
 	if err := h.persistAgentsLocked(); err != nil {
 		agent.ProviderID, agent.Model, agent.Effort, agent.UpdatedAt = previousProvider, previousModel, previousEffort, previousUpdatedAt
+		agent.ModelImageInput, agent.ModelImageGeneration, agent.ModelImageModel = previousImageEvidence.Available, previousImageEvidence.GenerationID, previousImageEvidence.ModelID
 		agent.ProviderHistory = agent.ProviderHistory[:previousHistoryLen]
 		h.mu.Unlock()
 		return RuntimeModelState{}, h.runtimeModelPostSelectionFailure(rt, capability, rollback, 500, fmt.Errorf("save Runtime model selection: %w", err))

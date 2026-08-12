@@ -112,10 +112,11 @@ type eventDelivery struct {
 }
 
 type Bridge struct {
-	agentID string
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	reader  *bufio.Reader
+	agentID      string
+	generationID string
+	cmd          *exec.Cmd
+	stdin        io.WriteCloser
+	reader       *bufio.Reader
 
 	onEvent      func(Event)
 	onDiagnostic func(string)
@@ -231,7 +232,7 @@ func start(ctx context.Context, agentID string, spec LaunchSpec, nextID func() s
 		return nil, fmt.Errorf("open Claude bridge stderr: %w", err)
 	}
 	bridge := &Bridge{
-		agentID: agentID, cmd: cmd, stdin: stdin, reader: bufio.NewReaderSize(stdout, 64<<10),
+		agentID: agentID, generationID: spec.Manifest.ID, cmd: cmd, stdin: stdin, reader: bufio.NewReaderSize(stdout, 64<<10),
 		onEvent: onEvent, onDiagnostic: onDiagnostic, onFailure: onFailure, nextID: nextID,
 		pending: map[string]pendingRequest{}, operations: map[string]operationState{}, done: make(chan struct{}), readerDone: make(chan struct{}), stop: make(chan struct{}), stderr: &boundedStderr{},
 	}
@@ -257,6 +258,15 @@ func start(ctx context.Context, agentID string, spec LaunchSpec, nextID func() s
 		close(bridge.done)
 	}()
 	return bridge, nil
+}
+
+// GenerationID identifies the exact installed Claude generation backing this
+// bridge. Capability evidence must not outlive this scope.
+func (b *Bridge) GenerationID() string {
+	if b == nil {
+		return ""
+	}
+	return b.generationID
 }
 
 func (b *Bridge) handshake(ctx context.Context, manifest claudegen.Manifest) error {

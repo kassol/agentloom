@@ -34,6 +34,40 @@ func TestEmbeddedBridgeHasValidJavaScriptSyntax(t *testing.T) {
 	}
 }
 
+func TestReadActiveGenerationIDDoesNotRequireInstalledRuntime(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "state.json"), []byte(`{"version":1,"active":"generation-static"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(Options{Root: root, Manifest: Manifest{ID: "generation-static"}, Platform: Platform{Supported: true}})
+	got, err := manager.ReadActiveGenerationID()
+	if err != nil || got != "generation-static" {
+		t.Fatalf("ReadActiveGenerationID() = %q, %v", got, err)
+	}
+}
+
+func TestReadActiveGenerationIDRejectsAnotherBuildGeneration(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "state.json"), []byte(`{"version":1,"active":"generation-old"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(Options{Root: root, Manifest: Manifest{ID: "generation-current"}, Platform: Platform{Supported: true}})
+	if got, err := manager.ReadActiveGenerationID(); err == nil || got != "" {
+		t.Fatalf("ReadActiveGenerationID() = %q, %v; want fail closed", got, err)
+	}
+}
+
+func TestReadActiveGenerationIDRejectsUnsupportedPlatform(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "state.json"), []byte(`{"version":1,"active":"generation-current"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(Options{Root: root, Manifest: Manifest{ID: "generation-current"}, Platform: Platform{Supported: false}})
+	if got, err := manager.ReadActiveGenerationID(); err == nil || got != "" {
+		t.Fatalf("ReadActiveGenerationID() = %q, %v; want unsupported", got, err)
+	}
+}
+
 func TestEmbeddedBridgeWaitsForAcceptedCausalInputBeforeTerminal(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -56,19 +90,25 @@ export async function getSessionInfo() { return undefined; }
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export function query({prompt, options}) {
   const queued = [];
+	let selectedModel = "", selectedEffort;
   return {
+	async supportedModels() { return [{value:"sonnet",resolvedModel:"claude-sonnet-4-6",displayName:"Sonnet",supportsEffort:true,supportedEffortLevels:["low","high"],supportsAdaptiveThinking:true},{value:"legacy",resolvedModel:"claude-3-7-sonnet-20250219",displayName:"Legacy"},{value:"unknown",displayName:"Unknown"}]; },
+	async setModel(model) { selectedModel = model; },
+	async applyFlagSettings(settings) { selectedEffort = settings.effortLevel; },
     async streamInput(stream) { for await (const message of stream) queued.push(message); },
     async interrupt() {}, close() {},
     async *[Symbol.asyncIterator]() {
       const first = await prompt[Symbol.asyncIterator]().next();
-      yield {type:"system", subtype:"init", session_id:options.sessionId};
+	  const firstContent = first.value.message.content;
+	  const configured = selectedModel === "sonnet" && selectedEffort === "high" && firstContent.some((part) => part.type === "image" && part.source.media_type === "image/png" && part.source.data === "aW1hZ2U=");
+	  yield {type:"system", subtype:"init", session_id:options.sessionId, model:"claude-sonnet-4-6"};
       await delay(80);
-      yield {type:"assistant", uuid:"first", session_id:options.sessionId, message:{content:[{type:"text",text:"first"}]}};
+	  yield {type:"assistant", uuid:"first", session_id:options.sessionId, message:{model:"claude-sonnet-4-6",content:[{type:"text",text:configured?"configured-image-observed":"missing-configuration"}]}};
       yield {type:"result", subtype:"success", session_id:options.sessionId, usage:{input_tokens:1,output_tokens:1},num_turns:1,total_cost_usd:0,modelUsage:{"claude-main":{inputTokens:1,outputTokens:0,cacheReadInputTokens:0,costUSD:0,contextWindow:200000,provider:"firstParty"}}};
       while (!queued.length) await delay(5);
       const causal = queued.shift();
-      const sawDeveloper = String(causal.message.content).includes("loom_developer_context");
-      yield {type:"assistant", uuid:"causal", session_id:options.sessionId, message:{content:[{type:"text",text:sawDeveloper?"causal-developer-observed":"missing-developer"}]}};
+	  const sawDeveloper = JSON.stringify(causal.message.content).includes("loom_developer_context");
+	  yield {type:"assistant", uuid:"causal", session_id:options.sessionId, message:{model:"claude-sonnet-4-6",content:[{type:"text",text:sawDeveloper?"causal-developer-observed":"missing-developer"}]}};
       yield {type:"result", subtype:"success", session_id:options.sessionId, usage:{input_tokens:2,output_tokens:2},num_turns:1,total_cost_usd:0,modelUsage:{"claude-main":{inputTokens:3,outputTokens:2,cacheReadInputTokens:0,cacheCreationInputTokens:1,costUSD:0.000006,contextWindow:200000,provider:"firstParty"},"claude-side":{inputTokens:4,outputTokens:1,cacheReadInputTokens:2,cacheCreationInputTokens:0,costUSD:0.000007,contextWindow:100000,provider:"gateway"}}};
     }
   };
@@ -114,8 +154,24 @@ export function query({prompt, options}) {
 	_ = read()
 	write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
 	_ = read()
+	write(map[string]any{"kind": "command", "command": "inspect_model_control", "requestId": "inspect", "operation": "op-inspect", "payload": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "default"}})
+	inspected := read()
+	state := inspected["data"].(map[string]any)
+	catalogModels := state["models"].([]any)
+	if state["thinkingLevel"] != "default" || catalogModels[0].(map[string]any)["id"] != "default" || catalogModels[0].(map[string]any)["imageInput"] != false || catalogModels[1].(map[string]any)["imageInput"] != true || catalogModels[2].(map[string]any)["imageInput"] != true || catalogModels[3].(map[string]any)["imageInput"] != false {
+		t.Fatalf("generation model evidence = %#v", state)
+	}
+	write(map[string]any{"kind": "command", "command": "select_model", "requestId": "select", "operation": "op-select", "payload": map[string]any{"sessionRef": "11111111-1111-4111-8111-111111111111", "cwd": app, "current": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "default"}, "selection": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "high"}}})
+	selected := read()
+	if selected["accepted"] != true || selected["data"].(map[string]any)["thinkingLevel"] != "high" {
+		t.Fatalf("selected model evidence = %#v", selected)
+	}
 	session := "11111111-1111-4111-8111-111111111111"
-	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "input": []any{map[string]any{"kind": "text", "role": "developer", "text": "first-dev"}, map[string]any{"kind": "text", "role": "user", "text": "first-user"}}}})
+	imagePath := filepath.Join(app, "screen.png")
+	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "model": "sonnet", "thinkingLevel": "high", "input": []any{map[string]any{"kind": "text", "role": "developer", "text": "first-dev"}, map[string]any{"kind": "text", "role": "user", "text": "first-user"}, map[string]any{"kind": "image", "role": "user", "ref": imagePath, "mimeType": "image/png"}}}})
 	sentContinue := false
 	terminalCount := 0
 	texts := []string{}
@@ -150,7 +206,7 @@ export function query({prompt, options}) {
 			terminalCount++
 		}
 	}
-	if terminalCount != 1 || !slices.Contains(texts, "causal-developer-observed") {
+	if terminalCount != 1 || !slices.Contains(texts, "configured-image-observed") || !slices.Contains(texts, "causal-developer-observed") {
 		t.Fatalf("terminalCount=%d texts=%#v", terminalCount, texts)
 	}
 	if len(usageFrames) != 2 {

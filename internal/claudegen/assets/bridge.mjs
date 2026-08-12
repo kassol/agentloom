@@ -77,15 +77,49 @@ function developerInput(input) {
     .map((block) => block.text).filter(Boolean).join("\n\n");
 }
 
-function sdkUserMessage(input, sessionRef, includeDeveloper = false) {
+const generationImageModels = new Set([
+	"claude-3-haiku-20240307", "claude-3-opus-20240229", "claude-3-5-haiku-20241022", "claude-3-5-sonnet-20240620", "claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219",
+  "claude-opus-4-20250514", "claude-opus-4-1-20250805", "claude-opus-4-5-20251101", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+  "claude-sonnet-4-20250514", "claude-sonnet-4-5-20250929", "claude-sonnet-4-6", "claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-fable-5", "claude-mythos-5"
+]);
+
+function modelDescriptor(raw) {
+  const levels = ["default", ...(raw?.supportsEffort && Array.isArray(raw.supportedEffortLevels) ? raw.supportedEffortLevels : [])];
+  return {
+    provider: "anthropic", id: String(raw?.value || ""), displayName: String(raw?.displayName || raw?.value || ""),
+    reasoning: Boolean(raw?.supportsAdaptiveThinking || raw?.supportsEffort), thinkingLevels: [...new Set(levels)],
+    defaultThinkingLevel: "default", imageInput: typeof raw?.resolvedModel === "string" && generationImageModels.has(raw.resolvedModel)
+  };
+}
+
+const modelCatalog = (raw) => [{provider: "anthropic", id: "default", displayName: "SDK default", reasoning: true, thinkingLevels: ["default"], defaultThinkingLevel: "default", imageInput: false}, ...(Array.isArray(raw) ? raw : []).map(modelDescriptor).filter((model) => model.id)];
+
+function modelState(models, requested) {
+  const current = models.find((model) => model.provider === requested.provider && model.id === requested.model);
+  if (!current) throw new Error("Claude model is absent from public generation evidence");
+  const thinkingLevel = requested.thinkingLevel || "default";
+  if (!current.thinkingLevels.includes(thinkingLevel)) throw new Error("Claude thinking level is unavailable for this model");
+  return {current, models, thinkingLevel};
+}
+
+function imageBlock(block) {
+  if (!block?.ref || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(block.mimeType)) {
+    throw new Error("Claude image input is invalid");
+  }
+  return readFile(block.ref).then((data) => ({type: "image", source: {type: "base64", media_type: block.mimeType, data: data.toString("base64")}}));
+}
+
+async function sdkUserMessage(input, sessionRef, includeDeveloper = false) {
 	const developer = includeDeveloper ? developerInput(input) : "";
 	const user = textInput(input);
-	const content = developer ? `<loom_developer_context>\n${developer}\n</loom_developer_context>\n\n${user}` : user;
+	const text = developer ? `<loom_developer_context>\n${developer}\n</loom_developer_context>\n\n${user}` : user;
+	const content = [{type: "text", text}, ...await Promise.all((Array.isArray(input) ? input : []).filter((block) => block?.kind === "image").map(imageBlock))];
 	return {type: "user", message: {role: "user", content}, parent_tool_use_id: null, origin: {kind: "human"}, session_id: sessionRef};
 }
 
-async function* initialInput(input, sessionRef) {
-	yield sdkUserMessage(input, sessionRef);
+async function* initialInput(input, sessionRef, ready = Promise.resolve()) {
+	await ready;
+	yield await sdkUserMessage(input, sessionRef);
 	await new Promise(() => {});
 }
 
@@ -155,15 +189,30 @@ async function runTurn(frame) {
       ...(developer ? {systemPrompt: {type: "preset", preset: "claude_code", append: developer}} : {}),
       canUseTool: (toolName, input, callbackOptions) => requestPermission(turn, toolName, input, callbackOptions)
     };
-    sdkQuery = query({prompt: initialInput(payload.input, sessionRef), options});
-	turn = {frame, operations: [frame], query: sdkQuery, runtimeTurnRef, callbacks: new Map(), accepted: false, terminal: false, expectedResults: 1, observedResults: 0};
+	let releaseInput;
+	const inputReady = new Promise((resolve) => { releaseInput = resolve; });
+    sdkQuery = query({prompt: initialInput(payload.input, sessionRef, inputReady), options});
+	let expectedModel = "";
+	if (payload.model) {
+	  const available = await sdkQuery.supportedModels();
+	  const rawCurrent = available.find((model) => model?.value === payload.model);
+	  const state = modelState(modelCatalog(available), {provider: "anthropic", model: payload.model, thinkingLevel: payload.thinkingLevel || "default"});
+	  expectedModel = rawCurrent?.resolvedModel || rawCurrent?.value || "";
+	  await sdkQuery.setModel(state.current.id === "default" ? undefined : state.current.id);
+	  await sdkQuery.applyFlagSettings({effortLevel: state.thinkingLevel === "default" ? null : state.thinkingLevel});
+	  if ((Array.isArray(payload.input) ? payload.input : []).some((block) => block?.kind === "image") && !state.current.imageInput) {
+		throw new Error("Claude model has no generation-proven image input");
+	  }
+	}
+	releaseInput();
+	turn = {frame, operations: [frame], query: sdkQuery, runtimeTurnRef, expectedModel, callbacks: new Map(), accepted: false, terminal: false, expectedResults: 1, observedResults: 0};
 	active = turn;
     for await (const message of sdkQuery) {
       if (message?.session_id && message.session_id !== sessionRef) {
         throw new Error("Claude SDK initialized a different session");
       }
 	  if (!turn.accepted) {
-        if (message?.type !== "system" || message.subtype !== "init" || message.session_id !== sessionRef) {
+		if (message?.type !== "system" || message.subtype !== "init" || message.session_id !== sessionRef) {
           throw new Error("Claude SDK did not initialize the reserved session");
         }
 		turn.accepted = true;
@@ -174,6 +223,9 @@ async function runTurn(frame) {
         respond(frame, true, {runtimeTurnRef});
         continue;
       }
+	  if (message?.type === "assistant" && !message.parent_tool_use_id && turn.expectedModel && message.message?.model !== turn.expectedModel) {
+		throw new Error("Claude SDK used a different model than the committed selection");
+	  }
       const content = message?.type === "assistant" ? assistantContent(message) : message?.type === "user" ? toolResultContent(message) : [];
       for (const block of content) {
         emit(frame, "content", {runtimeTurnRef, phase: "completed", content: block});
@@ -208,6 +260,44 @@ async function runTurn(frame) {
 async function handleCommand(frame) {
   const payload = frame.payload || {};
   switch (frame.command) {
+	case "inspect_model_control": {
+	  const requested = {provider: payload.provider || "anthropic", model: payload.model, thinkingLevel: payload.thinkingLevel || "default"};
+	  if (!requested.model) {
+		respond(frame, false, {}, "Claude model selection is not committed");
+		return;
+	  }
+	  const control = query({prompt: (async function* () { await new Promise(() => {}); })(), options: {persistSession: false, settingSources: []}});
+	  try {
+		const models = modelCatalog(await control.supportedModels());
+		respond(frame, true, modelState(models, requested));
+	  } finally { control.close(); }
+	  return;
+	}
+	case "select_model": {
+	  if (typeof payload.sessionRef !== "string" || typeof payload.cwd !== "string") {
+		respond(frame, false, {}, "Claude Runtime model selection has no exact binding");
+		return;
+	  }
+	  const control = query({prompt: (async function* () { await new Promise(() => {}); })(), options: {cwd: payload.cwd, persistSession: false, settingSources: [], ...(payload.resume ? {resume: payload.sessionRef} : {sessionId: payload.sessionRef})}});
+	  try {
+		const models = modelCatalog(await control.supportedModels());
+		const previous = modelState(models, payload.current || {});
+		const selected = modelState(models, payload.selection || {});
+		try {
+		  await control.setModel(selected.current.id === "default" ? undefined : selected.current.id);
+		  await control.applyFlagSettings({effortLevel: selected.thinkingLevel === "default" ? null : selected.thinkingLevel});
+		} catch (error) {
+		  try {
+			await control.setModel(previous.current.id === "default" ? undefined : previous.current.id);
+			await control.applyFlagSettings({effortLevel: previous.thinkingLevel === "default" ? null : previous.thinkingLevel});
+		  } catch { process.exit(70); }
+		  respond(frame, false, {}, "Claude Runtime rejected the model selection");
+		  return;
+		}
+		respond(frame, true, {...selected, effectEvidence: {binding: "exact", model: "sdk_ack", thinking: "sdk_ack"}});
+	  } finally { control.close(); }
+	  return;
+	}
   case "resume_binding": {
 	const info = await getSessionInfo(payload.sessionRef, {dir: payload.cwd});
 	if (!info || info.sessionId !== payload.sessionRef || info.cwd !== payload.cwd) {
@@ -236,7 +326,7 @@ async function handleCommand(frame) {
 	  turn.expectedResults++;
     try {
       await turn.query.streamInput((async function* () {
-		yield sdkUserMessage(payload.input, payload.sessionRef, true);
+		yield await sdkUserMessage(payload.input, payload.sessionRef, true);
 		for (const [index, block] of (Array.isArray(payload.input) ? payload.input : []).filter((block) => block?.kind === "text" && block.role !== "developer").entries()) {
 		  emit(frame, "content", {runtimeTurnRef: turn.runtimeTurnRef, phase: "completed", content: {id: `continue-user-${index}`, kind: "user_text", text: block.text || ""}});
 		}

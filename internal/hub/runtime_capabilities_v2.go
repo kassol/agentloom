@@ -11,11 +11,12 @@ import (
 )
 
 type runtimeCapabilityQuery struct {
-	agentID  string
-	binding  runtimecontract.Binding
-	rt       *runtime
-	contract runtimecontract.Contract
-	scope    runtimecontract.CapabilityScope
+	agentID       string
+	binding       runtimecontract.Binding
+	rt            *runtime
+	contract      runtimecontract.Contract
+	scope         runtimecontract.CapabilityScope
+	imageEvidence runtimeModelImageEvidence
 }
 
 func (h *Hub) captureRuntimeCapabilityQueryLocked(meta *Agent, rt *runtime) runtimeCapabilityQuery {
@@ -23,6 +24,7 @@ func (h *Hub) captureRuntimeCapabilityQueryLocked(meta *Agent, rt *runtime) runt
 	if meta != nil {
 		query.agentID = meta.ID
 		query.scope = h.runtimeCapabilityScopeLocked(meta)
+		query.imageEvidence = agentModelImageEvidence(meta)
 	}
 	if rt != nil {
 		query.contract = rt.runtimeContract
@@ -38,7 +40,7 @@ func (h *Hub) queryRuntimeCapabilities(query runtimeCapabilityQuery) (runtimecon
 		snapshot = query.contract.CapabilitySnapshot(ctx, query.binding)
 	} else {
 		var err error
-		snapshot, err = h.coldRuntimeCapabilitySnapshot(query.binding.RuntimeKind)
+		snapshot, err = h.coldRuntimeCapabilitySnapshot(query.binding.RuntimeKind, query.imageEvidence)
 		if err != nil {
 			return runtimecontract.CapabilitySnapshot{}, err
 		}
@@ -141,7 +143,7 @@ func (h *Hub) runtimeCapabilityScopeLocked(meta *Agent) runtimecontract.Capabili
 	binding := runtimeContractBinding(meta)
 	bindingDigest := sha256Hex([]byte(strconv.Itoa(binding.SchemaVersion) + "\x00" + binding.RuntimeKind + "\x00" + binding.NativeRef))
 	configDigest := sha256Hex([]byte(strings.Join([]string{
-		meta.Cwd, meta.ProviderID, meta.Model, meta.Effort, meta.Sandbox, meta.ApprovalPolicy,
+		meta.Cwd, meta.ProviderID, meta.Model, meta.Effort, strconv.FormatBool(meta.ModelImageInput), meta.ModelImageGeneration, meta.ModelImageModel, meta.Sandbox, meta.ApprovalPolicy,
 		agentSkillConfigHash(h.disabledSkillPathsLocked(meta.ID)),
 	}, "\x00")))
 	return runtimecontract.CapabilityScope{
@@ -200,12 +202,21 @@ type runtimeCapabilitySnapshotProvider interface {
 	CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot
 }
 
-func (h *Hub) coldRuntimeCapabilitySnapshot(runtimeKind string) (runtimecontract.CapabilitySnapshot, error) {
+type runtimeModelImageEvidenceSnapshotProvider interface {
+	CapabilitySnapshotWithModelImageEvidence(context.Context, runtimeModelImageEvidence) runtimecontract.CapabilitySnapshot
+}
+
+func (h *Hub) coldRuntimeCapabilitySnapshot(runtimeKind string, imageEvidence ...runtimeModelImageEvidence) (runtimecontract.CapabilitySnapshot, error) {
 	h.mu.Lock()
 	driver, err := h.runtimeHostDriverLocked(runtimeKind)
 	h.mu.Unlock()
 	if err != nil {
 		return runtimecontract.CapabilitySnapshot{}, err
+	}
+	if provider, ok := driver.(runtimeModelImageEvidenceSnapshotProvider); ok && len(imageEvidence) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return provider.CapabilitySnapshotWithModelImageEvidence(ctx, imageEvidence[0]), nil
 	}
 	provider, ok := driver.(runtimeCapabilitySnapshotProvider)
 	if !ok {
@@ -342,11 +353,12 @@ func piControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Capabi
 	}}
 }
 
-func claudeControlPlaneCapabilitySnapshot() runtimecontract.CapabilitySnapshot {
+func claudeControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.CapabilitySnapshot {
 	snapshot := controlPlaneCapabilitySnapshot("claude")
 	for index := range snapshot.Capabilities {
 		id := snapshot.Capabilities[index].ID
-		if id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy || id == runtimecontract.CapabilityUsageReporting {
+		available := id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy || id == runtimecontract.CapabilityUsageReporting || id == runtimecontract.CapabilityModelConfiguration || id == runtimecontract.CapabilityImageInput && len(imageInput) > 0 && imageInput[0]
+		if available {
 			snapshot.Capabilities[index] = runtimeCapabilityDescriptor("claude", id, true)
 		}
 	}

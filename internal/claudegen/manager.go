@@ -431,6 +431,24 @@ func (m *Manager) InspectPreflight(ctx context.Context) PreflightReport {
 	return report
 }
 
+// ReadActiveGenerationID reads only the activation pointer. It deliberately
+// performs no integrity verification or bridge self-test, so callers can scope
+// cached capability evidence without starting Node. Acquire and Preflight must
+// still use ResolveActive for full verification.
+func (m *Manager) ReadActiveGenerationID() (string, error) {
+	if !m.platform.Supported {
+		return "", errors.New("Claude Runtime generation is unsupported")
+	}
+	state, err := m.loadState()
+	if err != nil {
+		return "", errors.New("Claude Runtime generation state is unreadable")
+	}
+	if state.Active != m.manifest.ID {
+		return "", errors.New("the exact Claude Runtime generation required by this Loom build is not active")
+	}
+	return state.Active, nil
+}
+
 // ResolveActive verifies and resolves the exact active generation without
 // consulting PATH or the system Node installation.
 func (m *Manager) ResolveActive(ctx context.Context) (ActiveLaunchSpec, error) {

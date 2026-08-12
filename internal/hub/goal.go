@@ -316,7 +316,7 @@ func (h *Hub) hydrateGoals(host *codexHostRuntime) {
 
 	for _, target := range targets {
 		contract := host.agentContract(target.agentID)
-		configureRuntimeBinding(contract, target.sandbox, target.provider, target.model, target.effort, target.disabledSkillPaths)
+		configureRuntimeBinding(contract, target.sandbox, target.provider, target.model, target.effort, runtimeModelImageEvidence{}, target.disabledSkillPaths)
 		capability, ok := contract.(runtimeGoalCapability)
 		if !ok {
 			log.Printf("[codex-loom] hydrate Goal for %s: Runtime Goal capability is unavailable", target.threadID)

@@ -336,6 +336,20 @@ func TestRuntimeModelSelectionFailureFencesRuntimeBeforePersist(t *testing.T) {
 	}
 }
 
+func TestRuntimeModelSelectionExplicitRejectionKeepsRuntimeUsable(t *testing.T) {
+	h, agent, contract := modelControlTestHub(t)
+	contract.selectHook = func(runtimecontract.ModelSelection) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
+		return runtimecontract.ModelControlState{}, &runtimecontract.Failure{Code: "model_control_failed", Phase: runtimecontract.FailurePhaseModelControl, Message: "native rejected before effect"}
+	}
+	_, err := h.SwitchRuntimeModel(agent.ID, runtimecontract.ModelSelection{Provider: "fixture", Model: "text", ThinkingLevel: "off"})
+	if err == nil || !strings.Contains(err.Error(), "native rejected") {
+		t.Fatalf("explicit native rejection = %v", err)
+	}
+	if h.runtimes[agent.ID].effectDomainInvalidated || contract.closeCalls != 0 || agent.Model != "vision" || agent.Effort != "low" {
+		t.Fatalf("explicit rejection fenced or mutated Runtime: fenced=%v close=%d Agent=%#v", h.runtimes[agent.ID].effectDomainInvalidated, contract.closeCalls, agent)
+	}
+}
+
 func TestRuntimeModelProviderChangeAppendsHistoryAndClearsUsageCache(t *testing.T) {
 	h, agent, contract := modelControlTestHub(t)
 	contract.state.Models = append(contract.state.Models, runtimecontract.Model{Provider: "other", ID: "vision-2", ThinkingLevels: []string{"low"}, DefaultThinkingLevel: "low", ImageInput: true})

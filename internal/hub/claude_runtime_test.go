@@ -35,14 +35,31 @@ while IFS= read -r line; do
   turn_id=$(printf '%s' "$line" | sed -n 's/.*"turnId":"\([^"]*\)".*/\1/p')
   command=$(printf '%s' "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')
   case "$command" in
+	inspect_model_control|select_model)
+	  if printf '%s' "$line" | grep -q '"selection":{"provider":"anthropic","model":"opus"'; then
+		current='{"provider":"anthropic","id":"opus","thinkingLevels":["default","high"],"defaultThinkingLevel":"default","imageInput":false}'
+		thinking=high
+	  elif printf '%s' "$line" | grep -q '"selection":{"provider":"anthropic","model":"sonnet"'; then
+		current='{"provider":"anthropic","id":"sonnet","thinkingLevels":["default","high"],"defaultThinkingLevel":"default","imageInput":true}'
+		thinking=high
+	  elif printf '%s' "$line" | grep -q '"model":"default"'; then
+		current='{"provider":"anthropic","id":"default","thinkingLevels":["default"],"defaultThinkingLevel":"default","imageInput":false}'
+		thinking=default
+	  else
+		current='{"provider":"anthropic","id":"sonnet","thinkingLevels":["default","high"],"defaultThinkingLevel":"default","imageInput":true}'
+		thinking=default
+	  fi
+	  data="{\"current\":$current,\"models\":[{\"provider\":\"anthropic\",\"id\":\"default\",\"thinkingLevels\":[\"default\"],\"defaultThinkingLevel\":\"default\",\"imageInput\":false},{\"provider\":\"anthropic\",\"id\":\"sonnet\",\"thinkingLevels\":[\"default\",\"high\"],\"defaultThinkingLevel\":\"default\",\"imageInput\":true},{\"provider\":\"anthropic\",\"id\":\"opus\",\"thinkingLevels\":[\"default\",\"high\"],\"defaultThinkingLevel\":\"default\",\"imageInput\":false}],\"thinkingLevel\":\"$thinking\"}"
+	  ;;
     resume_binding)
 	  data='{}'
 	  printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":%s}\n' "$request_id" "$turn_id" "$operation" "$data"
 	  printf '{"kind":"event","class":"control","event":"binding_resumed","turnId":"%s","operation":"%s","data":{}}\n' "$turn_id" "$operation"
 	  continue ;;
-    start_turn)
+	start_turn)
 	  session_ref=$(printf '%s' "$line" | sed -n 's/.*"sessionRef":"\([^"]*\)".*/\1/p')
 	  [ "${#session_ref}" -eq 36 ] || { printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":false,"error":"bad reserved session"}\n' "$request_id" "$turn_id" "$operation"; continue; }
+	  printf '%s' "$line" | grep -Eq '"model":"(default|sonnet|opus)"' || { printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":false,"error":"missing model"}\n' "$request_id" "$turn_id" "$operation"; continue; }
       data='{"runtimeTurnRef":"native-turn"}'
       printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":%s}\n' "$request_id" "$turn_id" "$operation" "$data"
       printf '{"kind":"event","class":"control","event":"turn_started","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-turn"}}\n' "$turn_id" "$operation"
@@ -62,9 +79,11 @@ done
 		t.Fatal(err)
 	}
 	manifest := claudegen.CurrentManifest()
-	return newClaudeRuntimeHostDriver(st, claudebridge.DriverOptions{ResolveActive: func(context.Context) (claudebridge.LaunchSpec, error) {
+	driver := newClaudeRuntimeHostDriver(st, claudebridge.DriverOptions{ResolveActive: func(context.Context) (claudebridge.LaunchSpec, error) {
 		return claudebridge.LaunchSpec{NodePath: "/bin/sh", BridgePath: path, Manifest: manifest}, nil
 	}})
+	driver.activeGeneration = func() (string, error) { return manifest.ID, nil }
+	return driver
 }
 
 func TestClaudeCanonicalHistoryIsColdAndLedgerOnly(t *testing.T) {
@@ -182,6 +201,155 @@ func TestClaudeRuntimeRunsAndReopensFromCanonicalTurnLedger(t *testing.T) {
 	after, _ := reopened.GetRuntimeDiagnostics(agent.ID)
 	if before.NativeRef != after.NativeRef || after.NativeRef == "" || cold.Total != 2 {
 		t.Fatalf("reopen replaced session or replayed History: before=%#v after=%#v history=%#v", before, after, cold)
+	}
+}
+
+func TestClaudeNonDefaultModelReopensAndDrivesNextTurn(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(st)
+	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-model", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := h.SwitchRuntimeModel(agent.ID, RuntimeModelSelection{Provider: "anthropic", Model: "opus", ThinkingLevel: "high"})
+	if err != nil || state.Current.ID != "opus" || state.ThinkingLevel != "high" || state.Current.ImageInput {
+		t.Fatalf("select non-default Claude model = %#v, %v", state, err)
+	}
+	h.Shutdown()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopenedStore, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(reopenedStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, reopenedStore)
+	t.Cleanup(func() { reopened.Shutdown(); _ = reopenedStore.Close() })
+	view, err := reopened.GetAgent(agent.ID)
+	if err != nil || view.Model != "opus" || view.Effort != "high" || view.ProviderID != "anthropic" {
+		t.Fatalf("reopened Claude selection = %#v, %v", view.Agent, err)
+	}
+	image, ok := capabilityDescriptor(view.CapabilitySnapshot, runtimecontract.CapabilityImageInput)
+	if !ok || image.Availability != runtimecontract.CapabilityUnavailable {
+		t.Fatalf("reopened Claude image capability = %#v", image)
+	}
+	if _, err := reopened.SendTask(agent.ID, "verify committed selection", time.Minute); err != nil {
+		t.Fatalf("next Claude Turn did not use committed model/thinking: %v", err)
+	}
+	view, err = reopened.GetAgent(agent.ID)
+	image, ok = capabilityDescriptor(view.CapabilitySnapshot, runtimecontract.CapabilityImageInput)
+	if err != nil || !ok || image.Availability != runtimecontract.CapabilityUnavailable {
+		t.Fatalf("Claude Turn changed reopened image truth: view=%#v image=%#v err=%v", view.Agent, image, err)
+	}
+}
+
+func TestClaudeImageCapableSelectionReopensAndAcceptsPNG(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(st)
+	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-image-model", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := h.SwitchRuntimeModel(agent.ID, RuntimeModelSelection{Provider: "anthropic", Model: "sonnet", ThinkingLevel: "high"})
+	if err != nil || state.Current.ID != "sonnet" || state.ThinkingLevel != "high" || !state.Current.ImageInput {
+		t.Fatalf("select image-capable Claude model = %#v, %v", state, err)
+	}
+	h.Shutdown()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopenedStore, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(reopenedStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, reopenedStore)
+	t.Cleanup(func() { reopened.Shutdown(); _ = reopenedStore.Close() })
+	view, err := reopened.GetAgent(agent.ID)
+	image, ok := capabilityDescriptor(view.CapabilitySnapshot, runtimecontract.CapabilityImageInput)
+	if err != nil || view.Model != "sonnet" || view.Effort != "high" || !ok || image.Availability != runtimecontract.CapabilityAvailable {
+		t.Fatalf("reopened image-capable Claude selection: view=%#v image=%#v err=%v", view.Agent, image, err)
+	}
+	artifact, err := reopened.StageThreadArtifact(agent.ID, "model-control.png", "image/png", strings.NewReader("\x89PNG\r\n\x1a\nfixture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.SendTaskWithArtifacts(agent.ID, "inspect the restored image", []string{artifact.ID}, time.Minute); err != nil {
+		t.Fatalf("reopened Claude image Turn: %v", err)
+	}
+}
+
+func TestClaudeImageCapabilityEvidenceIsScopedToGenerationAndModel(t *testing.T) {
+	contract := newClaudeRuntimeContract("agent-evidence", nil, nil)
+	contract.generationID = "generation-current"
+	contract.SetRuntimeProvider("anthropic", "sonnet")
+
+	for name, evidence := range map[string]runtimeModelImageEvidence{
+		"old generation": {Available: true, GenerationID: "generation-old", ModelID: "sonnet"},
+		"other model":    {Available: true, GenerationID: "generation-current", ModelID: "opus"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			contract.SetRuntimeModelImageEvidence(evidence)
+			image, ok := capabilityDescriptor(contract.CapabilitySnapshot(context.Background(), runtimecontract.Binding{}), runtimecontract.CapabilityImageInput)
+			if !ok || image.Availability != runtimecontract.CapabilityUnavailable {
+				t.Fatalf("image capability for stale evidence = %#v", image)
+			}
+		})
+	}
+
+	contract.SetRuntimeModelImageEvidence(runtimeModelImageEvidence{Available: true, GenerationID: "generation-current", ModelID: "sonnet"})
+	image, ok := capabilityDescriptor(contract.CapabilitySnapshot(context.Background(), runtimecontract.Binding{}), runtimecontract.CapabilityImageInput)
+	if !ok || image.Availability != runtimecontract.CapabilityAvailable {
+		t.Fatalf("image capability for exact evidence = %#v", image)
+	}
+	contract.SetRuntimeModel("opus")
+	image, _ = capabilityDescriptor(contract.CapabilitySnapshot(context.Background(), runtimecontract.Binding{}), runtimecontract.CapabilityImageInput)
+	if image.Availability != runtimecontract.CapabilityUnavailable {
+		t.Fatalf("model change retained stale image evidence = %#v", image)
+	}
+}
+
+func TestClaudeRestoreCannotSupplyImageCapabilityEvidence(t *testing.T) {
+	var params RestoreAgentParams
+	if err := json.Unmarshal([]byte(`{
+		"id":"restored", "name":"restored", "cwd":"/tmp", "threadId":"loom-thread",
+		"runtimeBinding":{"schemaVersion":2,"kind":"claude","nativeRef":"11111111-1111-4111-8111-111111111111"},
+		"providerId":"anthropic", "model":"sonnet", "effort":"default",
+		"modelImageInput":true, "modelImageGeneration":"forged", "modelImageModel":"sonnet"
+	}`), &params); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	view, err := h.RestoreAgent(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ModelImageInput || view.ModelImageGeneration != "" || view.ModelImageModel != "" {
+		t.Fatalf("restore accepted unverified image evidence: %#v", view.Agent)
 	}
 }
 
@@ -373,6 +541,62 @@ func TestClaudeConversationCatalogIsTruthful(t *testing.T) {
 		return
 	}
 	t.Fatal("Claude Runtime missing from catalog")
+}
+
+func TestClaudeInputValidationUsesCommittedModelAndExactImageTypes(t *testing.T) {
+	contract := newClaudeRuntimeContract("agent-input", nil, nil)
+	contract.modelState = &runtimecontract.ModelControlState{
+		Current:       runtimecontract.Model{Provider: "anthropic", ID: "sonnet", ThinkingLevels: []string{"default"}, DefaultThinkingLevel: "default", ImageInput: true},
+		Models:        []runtimecontract.Model{{Provider: "anthropic", ID: "sonnet", ThinkingLevels: []string{"default"}, DefaultThinkingLevel: "default", ImageInput: true}},
+		ThinkingLevel: "default",
+	}
+	binding := runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: "claude", NativeRef: "private"}
+	if failure := contract.ValidateInput(context.Background(), binding, []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage, MIMEType: "image/png"}}); failure != nil {
+		t.Fatalf("supported image = %#v", failure)
+	}
+	for _, input := range []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage, MIMEType: "image/svg+xml"}, {Kind: runtimecontract.InputKind("video")}} {
+		if failure := contract.ValidateInput(context.Background(), binding, []runtimecontract.InputBlock{input}); failure == nil {
+			t.Fatalf("unsupported input accepted: %#v", input)
+		}
+	}
+	contract.modelState.Current.ImageInput = false
+	contract.modelState.Models[0].ImageInput = false
+	if failure := contract.ValidateInput(context.Background(), binding, []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage, MIMEType: "image/png"}}); failure == nil {
+		t.Fatal("text-only committed model accepted image")
+	}
+}
+
+func TestClaudeLegacyEmptyModelUsesSDKDefault(t *testing.T) {
+	contract := newClaudeRuntimeContract("agent-legacy", nil, nil)
+	contract.SetRuntimeProvider("", "")
+	contract.SetRuntimeEffort("")
+	if contract.provider != "anthropic" || contract.model != "default" || contract.effort != runtimecontract.ThinkingLevelDefault {
+		t.Fatalf("legacy Claude defaults = provider %q model %q effort %q", contract.provider, contract.model, contract.effort)
+	}
+}
+
+func TestOpenMigratesLegacyClaudeModelToSDKDefault(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &Agent{ID: "agent-legacy-open", Name: "legacy", Cwd: t.TempDir(), ThreadID: "thread-legacy", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	if err := st.SaveAgents(map[string]*Agent{agent.ID: agent}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Open(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.Shutdown)
+	persisted := map[string]*Agent{}
+	if err := st.LoadAgents(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	got := persisted[agent.ID]
+	if got.ProviderID != "anthropic" || got.Model != "default" || got.Effort != runtimecontract.ThinkingLevelDefault {
+		t.Fatalf("migrated Claude selection = %#v", got)
+	}
 }
 
 func TestClaudeArchiveRestorePreservesLedgerAndAgentIdentity(t *testing.T) {
