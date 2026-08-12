@@ -53,6 +53,13 @@ func TestOwnerStagesActivatesAndRollsBackVerifiedGenerations(t *testing.T) {
 	if err := manager.Preflight(context.Background()); err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
+	launch, err := manager.ResolveActive(context.Background())
+	if err != nil {
+		t.Fatalf("ResolveActive: %v", err)
+	}
+	if launch.Manifest.ID != first.ID || filepath.Base(launch.NodePath) != "node" || filepath.Base(launch.BridgePath) != "bridge.mjs" || strings.Contains(launch.NodePath, "/usr/") {
+		t.Fatalf("active launch spec = %#v", launch)
+	}
 
 	second := testManifest("claude-test-b", server.URL, archive)
 	manager = New(Options{Root: root, Manifest: second, Platform: testPlatform()})

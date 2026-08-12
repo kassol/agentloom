@@ -108,6 +108,14 @@ type PreflightReport struct {
 	Alternative  string      `json:"alternative,omitempty"`
 }
 
+// ActiveLaunchSpec is the verified, fixed executable pair for the active
+// generation. It deliberately contains no environment or arbitrary command.
+type ActiveLaunchSpec struct {
+	NodePath   string
+	BridgePath string
+	Manifest   Manifest
+}
+
 type Assets struct {
 	PackageJSON []byte
 	PackageLock []byte
@@ -421,6 +429,33 @@ func (m *Manager) InspectPreflight(ctx context.Context) PreflightReport {
 	}
 	report.Availability, report.Active, report.Reason, report.Alternative = "available", m.readGeneration(state.Active), "", ""
 	return report
+}
+
+// ResolveActive verifies and resolves the exact active generation without
+// consulting PATH or the system Node installation.
+func (m *Manager) ResolveActive(ctx context.Context) (ActiveLaunchSpec, error) {
+	if !m.platform.Supported {
+		return ActiveLaunchSpec{}, fmt.Errorf("Claude Runtime generation is unsupported: %s", m.platform.Reason)
+	}
+	state, err := m.loadState()
+	if err != nil {
+		return ActiveLaunchSpec{}, errors.New("Claude Runtime generation state is unreadable")
+	}
+	if state.Active != m.manifest.ID {
+		return ActiveLaunchSpec{}, errors.New("the exact Claude Runtime generation required by this Loom build is not active")
+	}
+	if _, err := m.verifyGeneration(ctx, state.Active); err != nil {
+		return ActiveLaunchSpec{}, err
+	}
+	node, _, err := findNode(m.generationDir(state.Active))
+	if err != nil {
+		return ActiveLaunchSpec{}, errors.New("Claude Runtime Node executable is missing")
+	}
+	return ActiveLaunchSpec{
+		NodePath:   node,
+		BridgePath: filepath.Join(m.generationDir(state.Active), "app", "bridge.mjs"),
+		Manifest:   m.manifest,
+	}, nil
 }
 
 func (m *Manager) artifact() (PlatformArtifact, error) {
