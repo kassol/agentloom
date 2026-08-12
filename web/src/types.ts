@@ -75,6 +75,23 @@ export interface CapabilitySnapshot {
   }>;
 }
 
+export interface RuntimeConversationCapabilities {
+  runtimeKind: string;
+  revision: string;
+  capabilities: Array<{ id: string; available: boolean; reason?: string }>;
+}
+
+export interface RuntimeConversationCandidate {
+  id: string;
+  revision: string;
+  runtimeKind: string;
+  name?: string;
+  cwd: string;
+  updatedAt: string;
+  compatible: boolean;
+  compatibility?: string;
+}
+
 export interface RuntimeModel {
   provider: string;
   id: string;

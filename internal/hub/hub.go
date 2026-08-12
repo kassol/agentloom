@@ -332,7 +332,9 @@ type Hub struct {
 	runtimeAPIURL   string
 	writerOwnership *store.WritableOwnership
 
-	mu                               sync.Mutex
+	mu sync.Mutex
+	// ponytail: adoption is rare; shard by Runtime candidate only if this lock becomes contended.
+	conversationAdoptionMu           sync.Mutex
 	contextCoverageMu                sync.Mutex
 	modelProviderMu                  sync.Mutex
 	resourcePolicyMu                 sync.Mutex

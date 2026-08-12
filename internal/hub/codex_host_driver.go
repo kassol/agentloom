@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/yan5xu/codex-loom/internal/codex"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
@@ -78,6 +80,91 @@ func (d *codexRuntimeHostDriver) Preflight(context.Context) error {
 
 func (d *codexRuntimeHostDriver) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
 	return codexControlPlaneCapabilitySnapshot()
+}
+
+type codexConversationThread struct {
+	ID        string `json:"id"`
+	Preview   string `json:"preview"`
+	Name      string `json:"name"`
+	Cwd       string `json:"cwd"`
+	CreatedAt int64  `json:"createdAt"`
+	UpdatedAt int64  `json:"updatedAt"`
+	RecencyAt *int64 `json:"recencyAt"`
+	Ephemeral bool   `json:"ephemeral"`
+}
+
+func (d *codexRuntimeHostDriver) DiscoverConversations(ctx context.Context) ([]nativeConversationCandidate, error) {
+	host, err := d.hub.ensureCodexHost()
+	if err != nil {
+		return nil, err
+	}
+	result := []nativeConversationCandidate{}
+	cursor := ""
+	for {
+		params := map[string]any{"limit": 100, "sortKey": "recency_at", "sortDirection": "desc"}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		raw, err := host.client.Request("thread/list", params, contractTimeout(ctx, 15*time.Second))
+		if err != nil {
+			return nil, err
+		}
+		var page struct {
+			Data       []codexConversationThread `json:"data"`
+			NextCursor string                    `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, fmt.Errorf("decode Codex thread/list: %w", err)
+		}
+		for _, thread := range page.Data {
+			result = append(result, codexConversationCandidate(thread))
+		}
+		if page.NextCursor == "" {
+			return result, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func (d *codexRuntimeHostDriver) InspectConversation(ctx context.Context, nativeRef string) (nativeConversationCandidate, error) {
+	host, err := d.hub.ensureCodexHost()
+	if err != nil {
+		return nativeConversationCandidate{}, err
+	}
+	raw, err := host.client.Request("thread/read", map[string]any{"threadId": nativeRef, "includeTurns": true}, contractTimeout(ctx, 15*time.Second))
+	if err != nil {
+		return nativeConversationCandidate{}, err
+	}
+	var response struct {
+		Thread codexConversationThread `json:"thread"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil || response.Thread.ID != nativeRef {
+		return nativeConversationCandidate{}, fmt.Errorf("Codex thread/read returned an invalid conversation")
+	}
+	return codexConversationCandidate(response.Thread), nil
+}
+
+func codexConversationCandidate(thread codexConversationThread) nativeConversationCandidate {
+	updatedAt := thread.UpdatedAt
+	if thread.RecencyAt != nil {
+		updatedAt = *thread.RecencyAt
+	}
+	name := strings.TrimSpace(thread.Name)
+	if name == "" {
+		name = strings.TrimSpace(thread.Preview)
+	}
+	if len([]rune(name)) > 80 {
+		name = string([]rune(name)[:80]) + "…"
+	}
+	compatible, reason := !thread.Ephemeral && thread.ID != "" && strings.TrimSpace(thread.Cwd) != "", ""
+	if !compatible {
+		reason = "ephemeral or incomplete Codex Thread"
+	}
+	updated := time.Unix(updatedAt, 0).UTC().Format(time.RFC3339)
+	return nativeConversationCandidate{RuntimeConversationCandidate: RuntimeConversationCandidate{
+		ID: candidateToken("codex", thread.ID), Revision: candidateRevision(thread.ID, thread.Name, thread.Preview, thread.Cwd, fmt.Sprint(thread.CreatedAt), fmt.Sprint(thread.UpdatedAt), fmt.Sprint(updatedAt), fmt.Sprint(thread.Ephemeral)),
+		RuntimeKind: "codex", Name: name, Cwd: thread.Cwd, UpdatedAt: updated, Compatible: compatible, Compatibility: reason,
+	}, nativeRef: thread.ID}
 }
 
 func (d *codexRuntimeHostDriver) HistoryContract(request AgentHostRequest) runtimecontract.Contract {

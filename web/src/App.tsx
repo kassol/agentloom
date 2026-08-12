@@ -1,7 +1,7 @@
 import { Activity, BookOpen, Cable, ChevronRight, CircleHelp, CirclePause, Inbox as InboxIcon, Info, Menu, Network, PanelLeftClose, PanelLeftOpen, Plus, RotateCw, Settings2, X } from "lucide-react";
 import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type ModelProvider, type ModelProviderResponse, type RemoteSnapshot, type TopicSummary } from "./types";
+import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type ModelProvider, type ModelProviderResponse, type RemoteSnapshot, type RuntimeConversationCandidate, type RuntimeConversationCapabilities, type TopicSummary } from "./types";
 import { summarizeTask } from "./feed";
 import { BrandLockup, BrandMark } from "./components/BrandMark";
 import { Button } from "./components/ui/button";
@@ -542,6 +542,11 @@ export default function App() {
     queryFn: () => api("GET", "/api/topics?view=summary"),
     refetchInterval: 30_000,
   });
+  const runtimeCatalogQuery = useQuery<{ runtimes: RuntimeConversationCapabilities[] }>({
+    queryKey: ["runtime-conversation-capabilities"],
+    queryFn: () => api("GET", "/api/runtimes"),
+    staleTime: 30_000,
+  });
   const agents = agentsQuery.data?.agents || [];
   const remote = remoteQuery.data || null;
   const modelProviders = providersQuery.data?.providers || [];
@@ -572,6 +577,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false); // mobile drawer
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("codexloom-sidebar") === "compact");
   const [newAgentOpen, setNewAgentOpen] = useState(false);
+	const [newAgentMode, setNewAgentMode] = useState<"create" | "adopt">("create");
   const [topicCreateRequest, setTopicCreateRequest] = useState<{ agentId?: string; nonce: number } | null>(null);
   const [configRequest, setConfigRequest] = useState<{ agentId: string; nonce: number } | null>(null);
   const [archivingAgentIds, setArchivingAgentIds] = useState<Set<string>>(() => new Set());
@@ -579,12 +585,27 @@ export default function App() {
   const [newCwd, setNewCwd] = useState("");
   const [newDomain, setNewDomain] = useState("");
 	const [newRuntimeKind, setNewRuntimeKind] = useState<"codex" | "pi">("codex");
+	const [newCandidateId, setNewCandidateId] = useState("");
   const [newProviderId, setNewProviderId] = useState("openai");
   const [newModel, setNewModel] = useState("");
   const [newEffort, setNewEffort] = useState("");
   const [creatingAgent, setCreatingAgent] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [restarting, setRestarting] = useState(false);
+	const runtimeCatalogs = runtimeCatalogQuery.data?.runtimes || [];
+	const selectedRuntimeCatalog = runtimeCatalogs.find((runtime) => runtime.runtimeKind === newRuntimeKind);
+	const adoptionAvailable = selectedRuntimeCatalog?.capabilities.some((capability) => capability.id === "conversation_adoption" && capability.available) || false;
+	const conversationCandidatesQuery = useQuery<{ candidates: RuntimeConversationCandidate[] }>({
+		queryKey: ["runtime-conversations", newRuntimeKind],
+		queryFn: () => api("GET", `/api/runtimes/${encodeURIComponent(newRuntimeKind)}/conversations`),
+		enabled: newAgentOpen && newAgentMode === "adopt" && adoptionAvailable,
+	});
+	const conversationCandidateQuery = useQuery<{ candidate: RuntimeConversationCandidate }>({
+		queryKey: ["runtime-conversation", newRuntimeKind, newCandidateId],
+		queryFn: () => api("GET", `/api/runtimes/${encodeURIComponent(newRuntimeKind)}/conversations/${encodeURIComponent(newCandidateId)}`),
+		enabled: newAgentOpen && newAgentMode === "adopt" && Boolean(newCandidateId),
+	});
+	const inspectedCandidate = conversationCandidateQuery.data?.candidate;
 
   useEffect(() => {
     if (!newAgentOpen || creatableProviders.length === 0 || creatableProviders.some((provider) => provider.id === newProviderId)) return;
@@ -765,27 +786,33 @@ export default function App() {
 
   const create = async () => {
     if (creatingAgent) return;
-    if (!newName.trim() || !newCwd.trim()) {
-      showToast("name and cwd required");
+	if (!newName.trim() || (newAgentMode === "create" && !newCwd.trim())) {
+	  showToast(newAgentMode === "adopt" ? "name required" : "name and cwd required");
       return;
     }
-    if (!newCwd.trim().startsWith("/")) {
+	if (newAgentMode === "create" && !newCwd.trim().startsWith("/")) {
       showToast("working directory must be an absolute path");
       return;
     }
-    if (newRuntimeKind === "codex" && !creatableProviders.some((provider) => provider.id === newProviderId)) {
+	if (newAgentMode === "adopt" && (!inspectedCandidate || !inspectedCandidate.compatible)) {
+	  showToast("inspect a compatible conversation first");
+	  return;
+	}
+	if (newAgentMode === "create" && newRuntimeKind === "codex" && !creatableProviders.some((provider) => provider.id === newProviderId)) {
       showToast("configure and verify a model Provider first");
       return;
     }
     setCreatingAgent(true);
     try {
-      const data = await api("POST", "/api/agents", {
-        name: newName.trim(), cwd: newCwd.trim(),
+	  const config = {
+		name: newName.trim(),
 		providerId: newRuntimeKind === "codex" && newProviderId !== "openai" ? newProviderId : "",
-		runtimeKind: newRuntimeKind,
         model: newRuntimeKind === "codex" ? newModel.trim() : "",
         effort: newRuntimeKind === "codex" ? newEffort : "",
-      });
+	  };
+	  const data = newAgentMode === "adopt"
+		? await api("POST", `/api/runtimes/${encodeURIComponent(newRuntimeKind)}/conversations/adopt`, { ...config, candidateId: inspectedCandidate!.id, expectedRevision: inspectedCandidate!.revision })
+		: await api("POST", "/api/agents", { ...config, cwd: newCwd.trim(), runtimeKind: newRuntimeKind });
       if (newDomain.trim()) {
         await api("PUT", `/api/agents/${encodeURIComponent(data.agent.id)}/profile`, { identity: "", domain: newDomain.trim(), scope: "", expectedVersion: 0 });
       }
@@ -795,6 +822,8 @@ export default function App() {
       setNewProviderId("openai");
       setNewModel("");
       setNewEffort("");
+	  setNewCandidateId("");
+	  setNewAgentMode("create");
       setNewAgentOpen(false);
       await refresh();
       setOpenAgentIds((ids) => (ids.includes(data.agent.id) ? ids : [...ids, data.agent.id]));
@@ -1468,25 +1497,42 @@ export default function App() {
       <Dialog open={newAgentOpen} onOpenChange={setNewAgentOpen}>
         <DialogContent>
           <DialogHeader>
-			<DialogTitle>Create agent</DialogTitle>
-			<DialogDescription>Create a long-lived domain agent with an immutable Runtime.</DialogDescription>
+			<DialogTitle>{newAgentMode === "adopt" ? "Adopt conversation" : "Create agent"}</DialogTitle>
+			<DialogDescription>{newAgentMode === "adopt" ? "Inspect and bind an existing native conversation to one long-lived Loom Agent." : "Create a long-lived domain agent with an immutable Runtime."}</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
+			<div className="grid grid-cols-2 rounded-sm bg-muted p-0.5 text-[11px]">
+				<button type="button" onClick={() => setNewAgentMode("create")} className={`h-8 rounded-sm ${newAgentMode === "create" ? "bg-background font-medium shadow-sm" : "text-muted-foreground"}`}>Create new</button>
+				<button type="button" onClick={() => adoptionAvailable && setNewAgentMode("adopt")} disabled={!adoptionAvailable} title={adoptionAvailable ? "Adopt an existing conversation" : "Selected Runtime does not support discovery"} className={`h-8 rounded-sm ${newAgentMode === "adopt" ? "bg-background font-medium shadow-sm" : "text-muted-foreground"} disabled:opacity-40`}>Adopt existing</button>
+			</div>
             <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
               Agent name
               <Input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="codex-research" spellCheck={false} />
             </label>
-			<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
+			{newAgentMode === "create" ? <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
 				Working directory
 				<Input value={newCwd} onChange={(event) => setNewCwd(event.target.value)} placeholder="/absolute/path/to/workspace" spellCheck={false} className="font-mono text-[12px]" />
-			</label>
+			</label> : null}
 			<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
 				Runtime
-				<select value={newRuntimeKind} onChange={(event) => setNewRuntimeKind(event.target.value as "codex" | "pi")} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px]">
-					<option value="codex">Codex</option>
-					<option value="pi">Pi</option>
+				<select value={newRuntimeKind} onChange={(event) => { setNewRuntimeKind(event.target.value as "codex" | "pi"); setNewCandidateId(""); }} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px]">
+					{(runtimeCatalogs.length ? runtimeCatalogs : [{ runtimeKind: "codex" }, { runtimeKind: "pi" }]).map((runtime) => <option key={runtime.runtimeKind} value={runtime.runtimeKind}>{runtime.runtimeKind === "codex" ? "Codex" : runtime.runtimeKind === "pi" ? "Pi" : runtime.runtimeKind}</option>)}
 				</select>
 			</label>
+			{newAgentMode === "adopt" ? <>
+				<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
+					Native conversation
+					<select value={newCandidateId} onChange={(event) => setNewCandidateId(event.target.value)} disabled={conversationCandidatesQuery.isLoading} className="h-9 w-full rounded-sm border border-input bg-background px-3 text-[12px]">
+						<option value="">{conversationCandidatesQuery.isLoading ? "Discovering…" : "Select a conversation"}</option>
+						{(conversationCandidatesQuery.data?.candidates || []).map((candidate) => <option key={candidate.id} value={candidate.id} disabled={!candidate.compatible}>{candidate.name || "Untitled"} · {candidate.cwd}</option>)}
+					</select>
+				</label>
+				{inspectedCandidate ? <div className="rounded-md border border-border bg-muted/25 px-3 py-2 text-[10.5px] leading-4">
+					<div className="font-medium text-foreground">{inspectedCandidate.name || "Untitled conversation"}</div>
+					<div className="mt-1 break-all font-mono text-muted-foreground">{inspectedCandidate.cwd}</div>
+					<div className="mt-1 text-muted-foreground">Updated {new Date(inspectedCandidate.updatedAt).toLocaleString()} · {inspectedCandidate.compatible ? "Ready to adopt" : inspectedCandidate.compatibility || "Incompatible"}</div>
+				</div> : null}
+			</> : null}
 			{newRuntimeKind === "codex" ? <>
             <div className="grid gap-3 sm:grid-cols-2">
               <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
@@ -1531,7 +1577,7 @@ export default function App() {
             </label>
           </div>
           <DialogFooter showCloseButton>
-            <Button onClick={create} disabled={creatingAgent || (newRuntimeKind === "codex" && creatableProviders.length === 0)}>{creatingAgent ? <span className="spinner size-3" /> : <Plus />}{creatingAgent ? "Creating" : "Create agent"}</Button>
+            <Button onClick={create} disabled={creatingAgent || (newAgentMode === "create" && newRuntimeKind === "codex" && creatableProviders.length === 0) || (newAgentMode === "adopt" && !inspectedCandidate?.compatible)}>{creatingAgent ? <span className="spinner size-3" /> : <Plus />}{creatingAgent ? (newAgentMode === "adopt" ? "Adopting" : "Creating") : (newAgentMode === "adopt" ? "Adopt conversation" : "Create agent")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

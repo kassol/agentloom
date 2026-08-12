@@ -11,6 +11,38 @@ import (
 )
 
 func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/runtimes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"runtimes": s.hub.RuntimeConversationCatalogs()})
+	})
+	mux.HandleFunc("GET /api/runtimes/{kind}/conversations", func(w http.ResponseWriter, r *http.Request) {
+		candidates, err := s.hub.DiscoverRuntimeConversations(r.PathValue("kind"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"candidates": candidates})
+	})
+	mux.HandleFunc("GET /api/runtimes/{kind}/conversations/{candidate}", func(w http.ResponseWriter, r *http.Request) {
+		candidate, err := s.hub.InspectRuntimeConversation(r.PathValue("kind"), r.PathValue("candidate"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"candidate": candidate})
+	})
+	mux.HandleFunc("POST /api/runtimes/{kind}/conversations/adopt", func(w http.ResponseWriter, r *http.Request) {
+		var body hub.AdoptConversationParams
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		agent, err := s.hub.AdoptRuntimeConversation(r.PathValue("kind"), body)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 201, map[string]any{"agent": agent})
+	})
 	mux.HandleFunc("GET /api/agents/events", s.globalEvents)
 	mux.HandleFunc("GET /api/agents", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("view") == "summary" {
