@@ -315,10 +315,14 @@ func cmdCreate(a args) {
 	s, _ := resp["agent"].(map[string]any)
 	providerID := str(s, "providerId")
 	if providerID == "" {
-		providerID = "openai"
+		providerID = "—"
+	}
+	model := str(s, "model")
+	if model == "" {
+		model = "—"
 	}
 	fmt.Printf("%s %s (%s)\n  cwd:     %s\n  thread:  %s\n  provider: %s\n  model:    %s\n",
-		green("created"), bold(str(s, "name")), str(s, "id"), str(s, "cwd"), str(s, "threadId"), providerID, str(s, "model"))
+		green("created"), bold(str(s, "name")), str(s, "id"), str(s, "cwd"), str(s, "threadId"), providerID, model)
 }
 
 func cmdList() {

@@ -36,7 +36,7 @@ func TestRuntimeConversationHTTPDiscoveryInspectionAndRedaction(t *testing.T) {
 	server := New(h, st, fstest.MapFS{"index.html": {Data: []byte("ok")}}).Handler()
 
 	runtimes := topicRequest(t, server, http.MethodGet, "/api/runtimes", nil, http.StatusOK)
-	if len(runtimes["runtimes"].([]any)) != 2 {
+	if len(runtimes["runtimes"].([]any)) != 3 {
 		t.Fatalf("runtime capabilities = %#v", runtimes)
 	}
 	discovered := topicRequest(t, server, http.MethodGet, "/api/runtimes/pi/conversations", nil, http.StatusOK)

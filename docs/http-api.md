@@ -93,6 +93,11 @@ Claude generation 写操作不下载凭证、不调用模型、不接受路径�
 `GET /api/agents/{key}/usage` 和 `workload` 支持 `from`/`to`/`tz` 或 `days`。
 Turn 启动返回 `202 Accepted`；重启 pending 时相关写入口返回 `409`。
 
+Claude 的 `/thread/history` 只读取 Loom-owned Canonical Turn Ledger；这是 Loom 已观察并
+成功提交的 typed Turn 边界，不读取 Claude 私有 transcript，也不会冷启动 Node/Claude
+Code。Claude 当前只宣告 mandatory lifecycle/context delivery；model、approval、settings、
+resource adoption 等 optional capability 在对应 typed contract 落地前保持 unavailable。
+
 ### Model Providers
 
 | Method | Path | Purpose |

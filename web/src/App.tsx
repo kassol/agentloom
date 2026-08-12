@@ -2,6 +2,7 @@ import { Activity, BookOpen, Cable, ChevronRight, CircleHelp, CirclePause, Inbox
 import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type ModelProvider, type ModelProviderResponse, type RemoteSnapshot, type RuntimeConversationCandidate, type RuntimeConversationCapabilities, type TopicSummary } from "./types";
+import { createRuntimeOptions, runtimeConfigurationNote, runtimeLabel, type CreateRuntimeKind } from "./runtime-options";
 import { summarizeTask } from "./feed";
 import { BrandLockup, BrandMark } from "./components/BrandMark";
 import { Button } from "./components/ui/button";
@@ -584,7 +585,7 @@ export default function App() {
   const [newName, setNewName] = useState("");
   const [newCwd, setNewCwd] = useState("");
   const [newDomain, setNewDomain] = useState("");
-	const [newRuntimeKind, setNewRuntimeKind] = useState<"codex" | "pi">("codex");
+	const [newRuntimeKind, setNewRuntimeKind] = useState<CreateRuntimeKind>("codex");
 	const [newCandidateId, setNewCandidateId] = useState("");
   const [newProviderId, setNewProviderId] = useState("openai");
   const [newModel, setNewModel] = useState("");
@@ -1515,8 +1516,8 @@ export default function App() {
 			</label> : null}
 			<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
 				Runtime
-				<select value={newRuntimeKind} onChange={(event) => { setNewRuntimeKind(event.target.value as "codex" | "pi"); setNewCandidateId(""); }} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px]">
-					{(runtimeCatalogs.length ? runtimeCatalogs : [{ runtimeKind: "codex" }, { runtimeKind: "pi" }]).map((runtime) => <option key={runtime.runtimeKind} value={runtime.runtimeKind}>{runtime.runtimeKind === "codex" ? "Codex" : runtime.runtimeKind === "pi" ? "Pi" : runtime.runtimeKind}</option>)}
+				<select value={newRuntimeKind} onChange={(event) => { setNewRuntimeKind(event.target.value as CreateRuntimeKind); setNewCandidateId(""); }} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px]">
+					{createRuntimeOptions(runtimeCatalogs).map((runtime) => <option key={runtime.runtimeKind} value={runtime.runtimeKind}>{runtimeLabel(runtime.runtimeKind)}</option>)}
 				</select>
 			</label>
 			{newAgentMode === "adopt" ? <>
@@ -1570,7 +1571,7 @@ export default function App() {
                 </select>
               </label>;
             })()}
-			</> : <div className="rounded-md bg-muted/40 px-3 py-2 text-[11px] leading-4 text-muted-foreground">Pi inherits its native model, authentication, settings, skills, and extensions.</div>}
+			</> : <div className="rounded-md bg-muted/40 px-3 py-2 text-[11px] leading-4 text-muted-foreground">{runtimeConfigurationNote(newRuntimeKind)}</div>}
             <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
               Domain <span className="font-normal text-muted-foreground/70">optional</span>
               <textarea value={newDomain} onChange={(event) => setNewDomain(event.target.value)} placeholder="The enduring subject this Agent will maintain" rows={3} className="w-full resize-y rounded-sm border border-input bg-background px-3 py-2 text-[12px] leading-5 outline-none focus:border-ring focus:ring-2 focus:ring-ring/15" />

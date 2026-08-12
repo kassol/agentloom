@@ -342,6 +342,16 @@ func piControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Capabi
 	}}
 }
 
+func claudeControlPlaneCapabilitySnapshot() runtimecontract.CapabilitySnapshot {
+	snapshot := controlPlaneCapabilitySnapshot("claude")
+	for index := range snapshot.Capabilities {
+		if snapshot.Capabilities[index].ID == runtimecontract.CapabilityContextDelivery {
+			snapshot.Capabilities[index] = runtimeCapabilityDescriptor("claude", runtimecontract.CapabilityContextDelivery, true)
+		}
+	}
+	return snapshot
+}
+
 func capabilityDescriptor(snapshot runtimecontract.CapabilitySnapshot, id string) (runtimecontract.CapabilityDescriptor, bool) {
 	for _, descriptor := range snapshot.Capabilities {
 		if descriptor.ID == id {

@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/claudegen"
 	"github.com/yan5xu/codex-loom/internal/codex"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
@@ -387,6 +388,8 @@ type Hub struct {
 	codexHost                        *codexHostRuntime
 	codexHostDriver                  *codexRuntimeHostDriver
 	piHostDriver                     *piRuntimeHostDriver
+	claudeHostDriver                 *claudeRuntimeHostDriver
+	claudeGenerations                *claudegen.Manager
 	runtimeHostDrivers               map[string]RuntimeHostDriver
 	codexHostGeneration              uint64
 	stop                             chan struct{}
@@ -437,8 +440,9 @@ func New(st *store.Store) *Hub {
 // canaries: it loads projections without importing external registries,
 // reconciling live runtime state, or starting workers.
 type OpenOptions struct {
-	Passive       bool
-	RuntimeAPIURL string
+	Passive           bool
+	RuntimeAPIURL     string
+	ClaudeGenerations *claudegen.Manager
 }
 
 // Open loads all durable projections before starting background work. Required
@@ -450,6 +454,9 @@ func Open(st *store.Store) (*Hub, error) {
 func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	if st == nil {
 		return nil, fmt.Errorf("store is required")
+	}
+	if options.ClaudeGenerations == nil {
+		options.ClaudeGenerations = claudegen.Default()
 	}
 	var ownership *store.WritableOwnership
 	if options.Passive {
@@ -476,6 +483,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		st:                     st,
 		passive:                options.Passive,
 		runtimeAPIURL:          options.RuntimeAPIURL,
+		claudeGenerations:      options.ClaudeGenerations,
 		writerOwnership:        ownership,
 		agents:                 map[string]*Agent{},
 		agentSkillConfigs:      map[string]*AgentSkillConfig{},
@@ -728,12 +736,24 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	recoveryJobs := [][2]string{}
 	restartInterrupted := []*Agent{}
 	restartMessageTurns := []*turnState{}
+	repairedClaudeTurns := []*turnState{}
+	repairedClaudeStatuses := []string{}
+	repairedClaudeAgents := []*Agent{}
 	h.mu.Lock()
 	for _, meta := range h.agents {
 		if meta.Source == "edge" {
 			continue // edge mirrors carry no CodexLoom-driven turn state
 		}
 		if meta.Status == "running" {
+			if repaired, status, repairErr := h.repairClaudeTerminalFromLedgerLocked(meta); repairErr != nil {
+				h.mu.Unlock()
+				return nil, fmt.Errorf("repair Claude terminal from Canonical Turn Ledger: %w", repairErr)
+			} else if repaired != nil {
+				repairedClaudeTurns = append(repairedClaudeTurns, repaired)
+				repairedClaudeStatuses = append(repairedClaudeStatuses, status)
+				repairedClaudeAgents = append(repairedClaudeAgents, meta)
+				continue
+			}
 			interrupted, missingTerminal := reconcileInterruptedTurn(meta)
 			interruptedTurnID := interrupted.TurnID
 			if !missingTerminal {
@@ -799,9 +819,34 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 			recoveryJobs = append(recoveryJobs, [2]string{meta.ID, meta.LastTurn.TurnID})
 		}
 	}
+	for index, turn := range repairedClaudeTurns {
+		status := repairedClaudeStatuses[index]
+		meta := repairedClaudeAgents[index]
+		h.finishInboxAttemptLocked(turn, status, "")
+		h.finishAgentMessageTurnLocked(turn, status, "")
+		if err := h.verifyClaudeTerminalDependentsLocked(turn, status); err != nil {
+			h.mu.Unlock()
+			return nil, fmt.Errorf("persist Claude terminal dependents: %w", err)
+		}
+		if turn.topicID != "" {
+			h.recordTopicWorkEventOnceLocked(turn.topicID, TopicEvent{Type: "turn_" + status, Actor: meta.Name, AgentID: meta.ID, Agent: meta.Name, Summary: status + ": " + summarizeTopicText(turn.task), Ref: &TopicRef{Type: "turn", ID: turn.turnID, Label: meta.Name}, CreatedAt: now()})
+		}
+	}
+	// Dependent delivery projections are idempotent and commit while the
+	// on-disk Agent still says running. A crash here retries repair; only the
+	// final Agent registry commit removes that durable retry marker.
 	if err := h.persistAgentsLocked(); err != nil {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("persist startup recovery: %w", err)
+	}
+	for index, meta := range repairedClaudeAgents {
+		status := repairedClaudeStatuses[index]
+		agentID := meta.ID
+		if status == "completed" && h.goalContinuationReadyLocked(agentID) {
+			h.startWorkerLocked(func() { h.continueGoal(agentID) })
+		} else {
+			h.startPendingWorkersLocked(agentID)
+		}
 	}
 	for _, meta := range restartInterrupted {
 		h.emitLocked(meta.ID, "loom/turn-interrupted", map[string]any{
@@ -835,6 +880,77 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	}
 	opened = true
 	return h, nil
+}
+
+func (h *Hub) verifyClaudeTerminalDependentsLocked(turn *turnState, status string) error {
+	if turn.agentMessageID != "" {
+		message := h.comms[turn.agentMessageID]
+		if message == nil || message.HandlingStatus != status {
+			return fmt.Errorf("internal message %s did not reach %s", turn.agentMessageID, status)
+		}
+	}
+	if turn.attemptID != "" {
+		attempt := h.attempts[turn.attemptID]
+		item := h.inbox[turn.inboxItemID]
+		if attempt == nil || attempt.Status != status || item == nil || item.State == "handling" {
+			return fmt.Errorf("Inbox attempt %s did not reach %s", turn.attemptID, status)
+		}
+	}
+	return nil
+}
+
+func (h *Hub) repairClaudeTerminalFromLedgerLocked(meta *Agent) (*turnState, string, error) {
+	if meta == nil || meta.RuntimeBinding.Kind != "claude" || meta.CurrentTurnID == "" {
+		return nil, "", nil
+	}
+	history, err := h.st.LoadCanonicalTurnLedger(meta.ID, int(^uint(0)>>1), 0)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, turn := range history.Turns {
+		if turn.TurnID != meta.CurrentTurnID || turn.State == runtimecontract.LifecycleAccepted {
+			continue
+		}
+		status := "failed"
+		if turn.State == runtimecontract.LifecycleCompleted {
+			status = "completed"
+		} else if turn.State == runtimecontract.LifecycleInterrupted {
+			status = "interrupted"
+		}
+		turnState := &turnState{turnID: turn.TurnID, task: displayUserTask(meta.CurrentTask)}
+		for _, content := range turn.Content {
+			if content.Kind == runtimecontract.ContentAssistantText && strings.TrimSpace(content.Text) != "" {
+				turnState.finalAnswer = content.Text
+			}
+		}
+		for messageID, message := range h.comms {
+			if message != nil && message.ToAgentID == meta.ID && message.DeliveredTurnID == turn.TurnID {
+				turnState.agentMessageID, turnState.topicID, turnState.source = messageID, message.TopicID, "internal"
+				break
+			}
+		}
+		for attemptID, attempt := range h.attempts {
+			if attempt != nil && attempt.AgentID == meta.ID && attempt.TurnID == turn.TurnID {
+				turnState.attemptID, turnState.inboxItemID, turnState.source = attemptID, attempt.InboxItemID, "external"
+				break
+			}
+		}
+		meta.Status = "idle"
+		meta.LastError = ""
+		if turn.State == runtimecontract.LifecycleFailed || turn.State == runtimecontract.LifecycleIndeterminate || turn.State == runtimecontract.LifecycleRejected {
+			meta.LastError = "Claude Runtime Turn failed"
+		}
+		completedAt := turn.CompletedAt
+		if completedAt == "" {
+			completedAt = now()
+		}
+		meta.LastTurn = &TurnSummary{TurnID: turn.TurnID, Task: displayUserTask(meta.CurrentTask), Status: status, CompletedAt: completedAt}
+		meta.CurrentTask = ""
+		meta.CurrentTurnID = ""
+		meta.UpdatedAt = now()
+		return turnState, status, nil
+	}
+	return nil, "", nil
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -1250,7 +1366,7 @@ func (h *Hub) getRuntimeLockedForResourcePolicy(meta *Agent) (*runtime, error) {
 		rt = &runtime{agentID: agentID, ready: make(chan struct{}), approvals: map[string]*approval{}, acquiring: true}
 		h.runtimes[agentID] = rt
 		h.mu.Unlock()
-		handle, err := driver.Acquire(context.Background(), AgentHostRequest{AgentID: agentID})
+		handle, err := driver.Acquire(context.Background(), AgentHostRequest{AgentID: agentID, Cwd: meta.Cwd})
 		h.mu.Lock()
 		if err != nil {
 			rt.initErr = err
@@ -1385,6 +1501,12 @@ func (h *Hub) runtimeHostDriverLocked(kind string) (RuntimeHostDriver, error) {
 		return h.codexDriverLocked(), nil
 	case "pi":
 		return h.piDriverLocked(), nil
+	case "claude":
+		if h.claudeHostDriver == nil {
+			h.claudeHostDriver = newDefaultClaudeRuntimeHostDriver(h.st, h.claudeGenerations)
+		}
+		h.runtimeHostDrivers["claude"] = h.claudeHostDriver
+		return h.claudeHostDriver, nil
 	default:
 		return nil, errf(400, "unsupported Runtime kind %q", kind)
 	}

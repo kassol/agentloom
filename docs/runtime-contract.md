@@ -22,6 +22,14 @@ active generation described in [claude-runtime-generation.md](claude-runtime-gen
 Its preflight reports that compatibility row or an explicit unavailable/
 unsupported reason; it never searches `PATH` or installs implicitly.
 
+Claude Agents reserve a Loom-generated Claude session UUID without calling the
+model. The first Turn initializes that exact UUID; later process opens verify
+and resume the same UUID rather than silently replacing a missing session. A
+Loom-owned Canonical Turn Ledger is the cold History authority for Claude. The
+Contract commits sanitized, ordered user/assistant/tool/usage/terminal
+projections before canonical SSE; cold History never starts Node, the SDK
+bridge, Claude Code, or a model request.
+
 An `AgentHost` owns one Agent handle. `Close` is idempotent and releases that
 handle; for a shared Codex host it must not stop handles belonging to other
 Agents. Its Contract must report the current `runtimecontract.Version` before

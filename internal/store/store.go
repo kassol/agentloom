@@ -63,6 +63,7 @@ type Store struct {
 	ownerRequired      bool
 	borrowedHandle     bool
 	eventMu            sync.Mutex
+	ledgerMu           sync.Mutex
 	eventMaintenanceMu sync.Mutex
 	eventPolicy        EventLogPolicy
 	eventLastSeq       map[string]int64

@@ -87,6 +87,16 @@ Agent 是稳定治理实体，Codex Thread 是它的主要上下文绑定。新�
 ./bin/loom agent create cici-research --cwd /path/to/project
 ```
 
+选择 Claude Code Runtime 时使用：
+
+```sh
+./bin/loom agent create claude-maintainer --cwd /path/to/project --runtime claude
+```
+
+创建只预留 Claude session identity，不调用模型。首次 Turn 建立该 exact session，重启后
+验证并恢复同一 session；`thread history` 从 Canonical Turn Ledger 冷读，不启动 Claude
+Runtime。尚未实现的 optional Runtime controls 会明确显示 unavailable。
+
 含义：
 
 - `cici-research` 是 Agent 名称，也是之后 `thread send/watch`、`msg` 使用的目标名。

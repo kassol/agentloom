@@ -99,8 +99,8 @@ func (h *Hub) RuntimeConversationCapabilities(kind string) (RuntimeConversationC
 }
 
 func (h *Hub) RuntimeConversationCatalogs() []RuntimeConversationCapabilities {
-	result := make([]RuntimeConversationCapabilities, 0, 2)
-	for _, kind := range []string{"codex", "pi"} {
+	result := make([]RuntimeConversationCapabilities, 0, 3)
+	for _, kind := range []string{"codex", "pi", "claude"} {
 		if snapshot, err := h.RuntimeConversationCapabilities(kind); err == nil {
 			result = append(result, snapshot)
 		}

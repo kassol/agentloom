@@ -2,18 +2,142 @@ package claudegen
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestEmbeddedBridgeHasValidJavaScriptSyntax(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	path := filepath.Join(t.TempDir(), "bridge.mjs")
+	if err := os.WriteFile(path, currentAssets().Bridge, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(node, "--check", path).CombinedOutput(); err != nil {
+		t.Fatalf("embedded bridge syntax: %v\n%s", err, output)
+	}
+}
+
+func TestEmbeddedBridgeWaitsForAcceptedCausalInputBeforeTerminal(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	app := t.TempDir()
+	module := filepath.Join(app, "node_modules", "@anthropic-ai", "claude-agent-sdk")
+	if err := os.MkdirAll(module, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "bridge.mjs"), currentAssets().Bridge, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pkg := `{"type":"module","exports":"./index.js","version":"0.3.228","claudeCodeVersion":"2.1.228"}`
+	if err := os.WriteFile(filepath.Join(module, "package.json"), []byte(pkg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := `
+export async function getSessionInfo() { return undefined; }
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export function query({prompt, options}) {
+  const queued = [];
+  return {
+    async streamInput(stream) { for await (const message of stream) queued.push(message); },
+    async interrupt() {}, close() {},
+    async *[Symbol.asyncIterator]() {
+      const first = await prompt[Symbol.asyncIterator]().next();
+      yield {type:"system", subtype:"init", session_id:options.sessionId};
+      await delay(80);
+      yield {type:"assistant", uuid:"first", session_id:options.sessionId, message:{content:[{type:"text",text:"first"}]}};
+      yield {type:"result", subtype:"success", session_id:options.sessionId, usage:{input_tokens:1,output_tokens:1},num_turns:1,total_cost_usd:0};
+      while (!queued.length) await delay(5);
+      const causal = queued.shift();
+      const sawDeveloper = String(causal.message.content).includes("loom_developer_context");
+      yield {type:"assistant", uuid:"causal", session_id:options.sessionId, message:{content:[{type:"text",text:sawDeveloper?"causal-developer-observed":"missing-developer"}]}};
+      yield {type:"result", subtype:"success", session_id:options.sessionId, usage:{input_tokens:2,output_tokens:2},num_turns:1,total_cost_usd:0};
+    }
+  };
+}`
+	if err := os.WriteFile(filepath.Join(module, "index.js"), []byte(fake), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(node, filepath.Join(app, "bridge.mjs"))
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	scanner := bufio.NewScanner(stdout)
+	read := func() map[string]any {
+		t.Helper()
+		if !scanner.Scan() {
+			t.Fatalf("bridge output ended: %v", scanner.Err())
+		}
+		var frame map[string]any
+		if json.Unmarshal(scanner.Bytes(), &frame) != nil {
+			t.Fatalf("frame = %s", scanner.Bytes())
+		}
+		return frame
+	}
+	write := func(frame any) {
+		t.Helper()
+		encoded, _ := json.Marshal(frame)
+		encoded = append(encoded, '\n')
+		if _, err := stdin.Write(encoded); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = read()
+	write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
+	_ = read()
+	session := "11111111-1111-4111-8111-111111111111"
+	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "input": []any{map[string]any{"kind": "text", "role": "developer", "text": "first-dev"}, map[string]any{"kind": "text", "role": "user", "text": "first-user"}}}})
+	sentContinue := false
+	terminals := map[string]bool{}
+	texts := []string{}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(terminals) < 2 {
+		frame := read()
+		if frame["kind"] == "response" && frame["operation"] == "op-start" && !sentContinue {
+			sentContinue = true
+			write(map[string]any{"kind": "command", "command": "continue_turn", "requestId": "continue", "turnId": "turn", "operation": "op-continue", "payload": map[string]any{"sessionRef": session, "runtimeTurnRef": frame["data"].(map[string]any)["runtimeTurnRef"], "input": []any{map[string]any{"kind": "text", "role": "developer", "text": "causal-dev"}, map[string]any{"kind": "text", "role": "user", "text": "causal-user"}}}})
+		}
+		if frame["kind"] == "event" && frame["event"] == "content" {
+			content := frame["data"].(map[string]any)["content"].(map[string]any)
+			if text, ok := content["text"].(string); ok {
+				texts = append(texts, text)
+			}
+		}
+		if frame["kind"] == "event" && frame["event"] == "turn_completed" {
+			terminals[frame["operation"].(string)] = true
+		}
+	}
+	if !terminals["op-start"] || !terminals["op-continue"] || !slices.Contains(texts, "causal-developer-observed") {
+		t.Fatalf("terminals=%#v texts=%#v", terminals, texts)
+	}
+}
 
 func TestOwnerStagesActivatesAndRollsBackVerifiedGenerations(t *testing.T) {
 	archive := fakeNodeArchive(t)

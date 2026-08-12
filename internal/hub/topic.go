@@ -930,6 +930,19 @@ func (h *Hub) recordTopicWorkEventLocked(topicID string, event TopicEvent) {
 	h.emitGlobalLocked("loom/topic-event", map[string]any{"topicId": topic.ID, "event": stored})
 }
 
+func (h *Hub) recordTopicWorkEventOnceLocked(topicID string, event TopicEvent) {
+	topic := h.topics[topicID]
+	if topic == nil || event.Ref == nil {
+		return
+	}
+	for _, existing := range topic.Events {
+		if existing.Type == event.Type && existing.Ref != nil && existing.Ref.Type == event.Ref.Type && existing.Ref.ID == event.Ref.ID {
+			return
+		}
+	}
+	h.recordTopicWorkEventLocked(topicID, event)
+}
+
 func (h *Hub) topicResponsibilityLocked(topic *Topic, agentID string) string {
 	if agentID == topic.ResponsibleAgentID {
 		return "Maintain the shared brief, route scoped work, manage waiting conditions, and close the Topic."

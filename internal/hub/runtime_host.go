@@ -17,6 +17,7 @@ type RuntimeHostDriver interface {
 
 type AgentHostRequest struct {
 	AgentID string
+	Cwd     string
 }
 
 // AgentHost is one Agent's handle into a Runtime Host. Closing the handle must

@@ -71,6 +71,7 @@ type Response struct {
 }
 
 type Event struct {
+	AgentID   string          `json:"-"`
 	Kind      string          `json:"event"`
 	TurnID    string          `json:"turnId,omitempty"`
 	Operation string          `json:"operation,omitempty"`
@@ -484,7 +485,7 @@ func (b *Bridge) handleFrame(raw json.RawMessage) error {
 			b.mu.Unlock()
 		}
 		if b.events != nil {
-			delivery := eventDelivery{event: Event{Kind: envelope.Event, TurnID: envelope.TurnID, Operation: envelope.Operation, Data: cloneRaw(envelope.Data)}, ack: make(chan struct{})}
+			delivery := eventDelivery{event: Event{AgentID: b.agentID, Kind: envelope.Event, TurnID: envelope.TurnID, Operation: envelope.Operation, Data: cloneRaw(envelope.Data)}, ack: make(chan struct{})}
 			select {
 			case b.events <- delivery:
 			case <-b.stop:
@@ -503,12 +504,12 @@ func (b *Bridge) handleFrame(raw json.RawMessage) error {
 }
 
 func terminalEvent(kind string) bool {
-	return kind == "turn_completed" || kind == "turn_failed" || kind == "turn_interrupted"
+	return kind == "binding_resumed" || kind == "turn_completed" || kind == "turn_failed" || kind == "turn_interrupted"
 }
 
 func knownEvent(kind string) bool {
 	switch kind {
-	case "turn_started", "content", "tool", "usage", "approval", "needs_you", "interrupt_receipt", "turn_completed", "turn_failed", "turn_interrupted":
+	case "binding_resumed", "turn_started", "content", "tool", "usage", "approval", "needs_you", "interrupt_receipt", "turn_completed", "turn_failed", "turn_interrupted":
 		return true
 	default:
 		return false

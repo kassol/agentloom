@@ -483,6 +483,30 @@ func TestCmdAgentSkillsUsesOneRuntimeSnapshotAndExpectedRevision(t *testing.T) {
 	}
 }
 
+func TestCmdCreateClaudeDoesNotInventOpenAIProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/agents" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["runtimeKind"] != "claude" {
+			t.Fatalf("body = %#v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"agent": map[string]any{"id": "agent-claude", "name": "claude", "cwd": "/tmp/project", "threadId": "thread-loom", "runtimeBinding": map[string]any{"kind": "claude"}}})
+	}))
+	defer server.Close()
+	previousBase, previousColor := base, useColor
+	base, useColor = server.URL, false
+	defer func() { base, useColor = previousBase, previousColor }()
+	output := captureStdout(t, func() {
+		cmdCreate(args{positional: []string{"claude"}, flags: map[string]string{"cwd": "/tmp/project", "runtime": "claude"}, flagValues: map[string][]string{}})
+	})
+	if strings.Contains(output, "openai") || !strings.Contains(output, "provider: —") || !strings.Contains(output, "model:    —") {
+		t.Fatalf("output = %q", output)
+	}
+}
+
 func TestRuntimeResourcePolicyMutationErrorUsesTypedAvailabilityAndMutability(t *testing.T) {
 	for _, policy := range []map[string]any{
 		{"available": false, "mutable": false, "reason": "Pi policy unavailable", "alternative": "use Pi settings"},

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/claudegen"
 	"github.com/yan5xu/codex-loom/internal/httpapi"
 	"github.com/yan5xu/codex-loom/internal/hub"
 	"github.com/yan5xu/codex-loom/internal/store"
@@ -47,7 +48,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
-	h, err := hub.OpenWithOptions(st, hub.OpenOptions{Passive: *canary, RuntimeAPIURL: fmt.Sprintf("http://127.0.0.1:%d", *port)})
+	claudeGenerations := claudegen.Default()
+	h, err := hub.OpenWithOptions(st, hub.OpenOptions{Passive: *canary, RuntimeAPIURL: fmt.Sprintf("http://127.0.0.1:%d", *port), ClaudeGenerations: claudeGenerations})
 	if err != nil {
 		_ = st.Close()
 		log.Fatalf("open Hub state: %v", err)
@@ -57,7 +59,7 @@ func main() {
 	if *canary {
 		mode = "canary"
 	}
-	srv := httpapi.NewWithOptions(h, st, webui.FS(), httpapi.Options{StartedAt: startedAt, Mode: mode, ReadOnly: *canary})
+	srv := httpapi.NewWithOptions(h, st, webui.FS(), httpapi.Options{StartedAt: startedAt, Mode: mode, ReadOnly: *canary, ClaudeGenerations: claudeGenerations})
 	if !*canary {
 		startup.Add(3)
 		go func() {

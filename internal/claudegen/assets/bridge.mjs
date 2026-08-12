@@ -1,5 +1,6 @@
-import "@anthropic-ai/claude-agent-sdk";
+import { getSessionInfo, query } from "@anthropic-ai/claude-agent-sdk";
 import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
 const pkg = JSON.parse(await readFile(new URL("./node_modules/@anthropic-ai/claude-agent-sdk/package.json", import.meta.url), "utf8"));
@@ -19,9 +20,213 @@ if (process.argv[2] === "--self-test") {
 }
 
 const write = (frame) => process.stdout.write(JSON.stringify(frame) + "\n");
+const respond = (frame, accepted, data = {}, error) => write({
+  kind: "response", requestId: frame.requestId, turnId: frame.turnId,
+  operation: frame.operation, accepted, data, ...(error ? {error} : {})
+});
+const emit = (frame, event, data) => write({
+  kind: "event", class: "control", event, turnId: frame.turnId,
+  operation: frame.operation, data
+});
+
 write({kind: "hello", ...identity, os: process.platform, arch: process.arch === "x64" ? "amd64" : process.arch});
 
 let initialized = false;
+let active;
+
+function textInput(input) {
+  const blocks = Array.isArray(input) ? input : [];
+  return blocks.filter((block) => block?.kind === "text" && block.role !== "developer")
+    .map((block) => block.text).filter(Boolean).join("\n\n");
+}
+
+function developerInput(input) {
+  const blocks = Array.isArray(input) ? input : [];
+  return blocks.filter((block) => block?.kind === "text" && block.role === "developer")
+    .map((block) => block.text).filter(Boolean).join("\n\n");
+}
+
+function sdkUserMessage(input, sessionRef, includeDeveloper = false) {
+	const developer = includeDeveloper ? developerInput(input) : "";
+	const user = textInput(input);
+	const content = developer ? `<loom_developer_context>\n${developer}\n</loom_developer_context>\n\n${user}` : user;
+	return {type: "user", message: {role: "user", content}, parent_tool_use_id: null, origin: {kind: "human"}, session_id: sessionRef};
+}
+
+async function* initialInput(input, sessionRef) {
+	yield sdkUserMessage(input, sessionRef);
+	await new Promise(() => {});
+}
+
+function usageFrom(result) {
+  const source = "claude_agent_sdk";
+  const observed = (value) => ({available: true, value: Math.max(0, Math.round(Number(value) || 0)), source});
+  const unavailable = () => ({available: false, source});
+  const usage = result?.usage || {};
+  const input = (Number(usage.input_tokens) || 0) + (Number(usage.cache_read_input_tokens) || 0) + (Number(usage.cache_creation_input_tokens) || 0);
+  const cached = Number(usage.cache_read_input_tokens) || 0;
+  const output = Number(usage.output_tokens) || 0;
+  return {
+    inputTokens: observed(input), cachedInputTokens: observed(cached), outputTokens: observed(output),
+    reasoningOutputTokens: unavailable(), totalTokens: observed(input + output),
+    calls: unavailable(), costMicros: observed((Number(result?.total_cost_usd) || 0) * 1_000_000)
+  };
+}
+
+function assistantContent(message) {
+  const blocks = Array.isArray(message?.message?.content) ? message.message.content : [];
+  return blocks.flatMap((block, index) => {
+    const id = block?.id || `${message.uuid || message.message?.id || "assistant"}-${index}`;
+    if (block?.type === "text" && block.text) return [{id, kind: "assistant_text", text: block.text}];
+    if (block?.type === "thinking" && block.thinking) return [{id, kind: "reasoning", text: block.thinking}];
+    if (block?.type === "tool_use" && block.name) return [{id, kind: "tool_call", toolCall: {name: block.name, arguments: block.input ?? {}}}];
+    return [];
+  });
+}
+
+function toolResultContent(message) {
+  const raw = message?.message?.content;
+  const blocks = Array.isArray(raw) ? raw : [];
+  return blocks.flatMap((block, index) => {
+    if (block?.type !== "tool_result" || !block.tool_use_id) return [];
+    const content = typeof block.content === "string" ? block.content : Array.isArray(block.content)
+      ? block.content.map((part) => part?.text || "").filter(Boolean).join("\n") : "";
+    return [{
+      id: `${message.uuid || "tool-result"}-${index}`, kind: "tool_result",
+      toolResult: {toolCallId: block.tool_use_id, text: content, success: !block.is_error}
+    }];
+  });
+}
+
+async function runTurn(frame) {
+  const payload = frame.payload || {};
+  const sessionRef = payload.sessionRef;
+  const runtimeTurnRef = randomUUID();
+  const developer = developerInput(payload.input);
+  let sdkQuery;
+  try {
+	if (!payload.resume && await getSessionInfo(sessionRef, {dir: payload.cwd})) {
+	  respond(frame, false, {}, "Claude Runtime cannot create the reserved session");
+	  return;
+	}
+    const options = {
+      cwd: payload.cwd,
+      ...(payload.resume ? {resume: sessionRef} : {sessionId: sessionRef}),
+      ...(developer ? {systemPrompt: {type: "preset", preset: "claude_code", append: developer}} : {})
+    };
+    sdkQuery = query({prompt: initialInput(payload.input, sessionRef), options});
+	const turn = {frame, operations: [frame], query: sdkQuery, runtimeTurnRef, accepted: false, terminal: false, expectedResults: 1, observedResults: 0};
+	active = turn;
+    for await (const message of sdkQuery) {
+      if (message?.session_id && message.session_id !== sessionRef) {
+        throw new Error("Claude SDK initialized a different session");
+      }
+	  if (!turn.accepted) {
+        if (message?.type !== "system" || message.subtype !== "init" || message.session_id !== sessionRef) {
+          throw new Error("Claude SDK did not initialize the reserved session");
+        }
+		turn.accepted = true;
+        respond(frame, true, {runtimeTurnRef});
+        emit(frame, "turn_started", {runtimeTurnRef});
+		for (const [index, block] of (Array.isArray(payload.input) ? payload.input : []).filter((block) => block?.kind === "text" && block.role !== "developer").entries()) {
+		  emit(frame, "content", {runtimeTurnRef, phase: "completed", content: {id: `user-${index}`, kind: "user_text", text: block.text || ""}});
+		}
+        continue;
+      }
+      const content = message?.type === "assistant" ? assistantContent(message) : message?.type === "user" ? toolResultContent(message) : [];
+      for (const block of content) {
+        emit(frame, "content", {runtimeTurnRef, phase: "completed", content: block});
+      }
+      if (message?.type === "result") {
+		turn.observedResults++;
+        emit(frame, "usage", {runtimeTurnRef, usage: usageFrom(message)});
+		if (turn.observedResults < turn.expectedResults) continue;
+		turn.terminal = true;
+        for (const operation of turn.operations) {
+          emit(operation, message.subtype === "success" ? "turn_completed" : "turn_failed", {
+            runtimeTurnRef, ...(message.subtype === "success" ? {} : {message: "Claude Runtime Turn failed"})
+          });
+        }
+		break;
+      }
+    }
+	if (turn.accepted && !turn.terminal) process.exit(70);
+  } catch {
+	if (!active?.accepted) {
+      respond(frame, false, {}, "Claude Runtime could not initialize the reserved session");
+    } else {
+	  process.exit(70);
+    }
+  } finally {
+    if (active?.frame.operation === frame.operation) active = undefined;
+    sdkQuery?.close();
+  }
+}
+
+async function handleCommand(frame) {
+  const payload = frame.payload || {};
+  switch (frame.command) {
+  case "resume_binding": {
+	const info = await getSessionInfo(payload.sessionRef, {dir: payload.cwd});
+	if (!info || info.sessionId !== payload.sessionRef || info.cwd !== payload.cwd) {
+      respond(frame, false, {}, "Claude session was not found");
+      return;
+    }
+    respond(frame, true);
+    emit(frame, "binding_resumed", {sessionRef: payload.sessionRef});
+    return;
+  }
+  case "start_turn":
+    if (active || typeof payload.sessionRef !== "string" || typeof payload.cwd !== "string") {
+      respond(frame, false, {}, "Claude Runtime cannot start this Turn");
+      return;
+    }
+    void runTurn(frame);
+    return;
+  case "continue_turn":
+	if (!active?.accepted || active.terminal || active.runtimeTurnRef !== payload.runtimeTurnRef) {
+      respond(frame, false, {}, "Claude Runtime has no matching active Turn");
+      return;
+    }
+	{
+	  const turn = active;
+	  turn.operations.push(frame);
+	  turn.expectedResults++;
+    try {
+      await turn.query.streamInput((async function* () {
+		yield sdkUserMessage(payload.input, payload.sessionRef, true);
+		for (const [index, block] of (Array.isArray(payload.input) ? payload.input : []).filter((block) => block?.kind === "text" && block.role !== "developer").entries()) {
+		  emit(frame, "content", {runtimeTurnRef: turn.runtimeTurnRef, phase: "completed", content: {id: `continue-user-${index}`, kind: "user_text", text: block.text || ""}});
+		}
+      })());
+      respond(frame, true);
+    } catch (error) {
+	  turn.expectedResults--;
+	  process.exit(70);
+    }
+	}
+    return;
+  case "interrupt_turn":
+	if (!active?.accepted || active.terminal || active.runtimeTurnRef !== payload.runtimeTurnRef) {
+      respond(frame, false, {}, "Claude Runtime has no matching active Turn");
+      return;
+    }
+	{
+	  const turn = active;
+	  turn.operations.push(frame);
+    try {
+	  await turn.query.interrupt();
+      respond(frame, true);
+    } catch (error) {
+	  process.exit(70);
+    }
+	}
+    return;
+  default:
+    respond(frame, false, {}, "command is not implemented by this bridge build");
+  }
+}
+
 const lines = createInterface({input: process.stdin, crlfDelay: Infinity, terminal: false});
 for await (const line of lines) {
   let frame;
@@ -40,10 +245,13 @@ for await (const line of lines) {
     write({kind: "ready", requestId: frame.requestId, capabilities});
     continue;
   }
-  if (frame.kind === "close") process.exit(0);
+  if (frame.kind === "close") {
+    active?.query.close();
+    process.exit(0);
+  }
   if (frame.kind !== "command" || typeof frame.requestId !== "string" || typeof frame.operation !== "string") {
     process.stderr.write("Claude bridge received unknown control frame\n");
     process.exit(65);
   }
-  write({kind: "response", requestId: frame.requestId, turnId: frame.turnId, operation: frame.operation, accepted: false, error: "command is not implemented by this bridge build"});
+  void handleCommand(frame).catch(() => respond(frame, false, {}, "Claude Runtime command failed"));
 }
