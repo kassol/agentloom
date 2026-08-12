@@ -396,8 +396,12 @@ func (tr *Transcript) handleResponseItem(timestamp string, payload json.RawMessa
 		Cmd         string  `json:"cmd"`
 		Workdir     string  `json:"workdir"`
 		Description *string `json:"description"`
+		Desc        *string `json:"desc"`
 	}
 	_ = json.Unmarshal([]byte(p.Arguments), &argv)
+	if argv.Description == nil {
+		argv.Description = argv.Desc
+	}
 	if argv.Description == nil {
 		argv.Description = p.Description
 	}

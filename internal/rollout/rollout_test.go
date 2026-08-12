@@ -120,7 +120,7 @@ func TestReadPreservesCommandExecutionDescriptionAndLegacyAbsence(t *testing.T) 
 		`{"timestamp":"2026-08-12T01:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-command"}}`,
 		`{"timestamp":"2026-08-12T01:00:01Z","type":"response_item","payload":{"type":"commandExecution","id":"cmd-success","command":"printf probe-ok","cwd":"/tmp/probe-home","description":"Run the isolated successful command probe","status":"completed","aggregatedOutput":"probe-ok","exitCode":0,"durationMs":0}}`,
 		`{"timestamp":"2026-08-12T01:00:02Z","type":"response_item","payload":{"type":"commandExecution","id":"cmd-legacy","command":"printf legacy","cwd":"/tmp/probe-home","status":"completed","exitCode":0}}`,
-		`{"timestamp":"2026-08-12T01:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"cmd-described","arguments":"{\"cmd\":\"printf described\",\"workdir\":\"/tmp/probe-home\",\"description\":\"A described function call\"}"}}`,
+		`{"timestamp":"2026-08-12T01:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"cmd-described","arguments":"{\"cmd\":\"printf described\",\"workdir\":\"/tmp/probe-home\",\"desc\":\"A described function call\"}"}}`,
 		`{"timestamp":"2026-08-12T01:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"cmd-described","output":"described\nProcess exited with code 0\n"}}`,
 		`{"timestamp":"2026-08-12T01:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-command"}}`,
 	}, "\n") + "\n"
