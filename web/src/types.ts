@@ -14,6 +14,9 @@ export interface Approval {
   params: any;
   status: string;
   decision?: string;
+	deliveryStatus?: string;
+	deliveryError?: string;
+	effectStatus?: string;
   requestedAt: string;
   resolvedAt?: string;
   resolutionError?: string;

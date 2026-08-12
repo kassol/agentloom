@@ -819,6 +819,472 @@ func TestClaudeIndeterminateRecoveryCreatesOneNeedsYouWithoutReplay(t *testing.T
 	}
 }
 
+func TestClaudeContractProjectsApprovalAndNeedsYouWithoutNativeIdentity(t *testing.T) {
+	c := newClaudeRuntimeContract("agent-claude", nil, nil)
+	approvals := make(chan runtimecontract.ApprovalProposal, 1)
+	needsYou := make(chan runtimecontract.NeedsYouProposal, 1)
+	c.SetApprovalHandler(func(proposal runtimecontract.ApprovalProposal) { approvals <- proposal })
+	c.SetNeedsYouHandler(func(proposal runtimecontract.NeedsYouProposal) error { needsYou <- proposal; return nil })
+	c.handleBridgeEvent(claudebridge.Event{Kind: "approval", TurnID: "turn-1", Data: json.RawMessage(`{"callbackId":"native-callback-secret","toolCallId":"native-tool-secret","toolName":"Bash","input":{"command":"printf safe"}}`)})
+	approval := <-approvals
+	encoded, _ := json.Marshal(approval)
+	if approval.ID == "" || approval.TurnID != "turn-1" || approval.ToolName != "Bash" || strings.Contains(string(encoded), "native-") {
+		t.Fatalf("Approval proposal = %s", encoded)
+	}
+	c.handleBridgeEvent(claudebridge.Event{Kind: "needs_you", TurnID: "turn-1", Data: json.RawMessage(`{"callbackId":"native-question-secret","toolCallId":"native-question-tool","questions":[{"question":"Ship now?","options":[{"label":"Yes","description":"Ship it"},{"label":"No","description":"Wait"}]}]}`)})
+	request := <-needsYou
+	encoded, _ = json.Marshal(request)
+	if !strings.HasPrefix(request.ID, "hrq_") || request.TurnID != "turn-1" || request.Question != "Ship now?" || len(request.Options) != 2 || strings.Contains(string(encoded), "native-") {
+		t.Fatalf("Needs You proposal = %s", encoded)
+	}
+}
+
+func TestClaudeNeedsYouTerminalIsInterruptedInLedgerAndColdHistory(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newClaudeRuntimeContract("agent-claude", st, nil)
+	c.SetNeedsYouHandler(func(runtimecontract.NeedsYouProposal) error { return nil })
+	c.handleBridgeEvent(claudebridge.Event{Kind: "turn_started", TurnID: "turn-1", Data: json.RawMessage(`{"runtimeTurnRef":"native-turn"}`)})
+	c.handleBridgeEvent(claudebridge.Event{Kind: "needs_you", TurnID: "turn-1", Data: json.RawMessage(`{"callbackId":"question-1","toolCallId":"tool-1","questions":[{"question":"Ship now?","options":[{"label":"Yes"},{"label":"No"}]}]}`)})
+	c.handleBridgeEvent(claudebridge.Event{Kind: "turn_completed", TurnID: "turn-1", Data: json.RawMessage(`{"runtimeTurnRef":"native-turn"}`)})
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	history, err := reopened.LoadCanonicalTurnLedger("agent-claude", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Turns) != 1 || history.Turns[0].State != runtimecontract.LifecycleInterrupted {
+		t.Fatalf("cold canonical history = %#v", history.Turns)
+	}
+}
+
+func TestClaudeCapabilitySnapshotAdvertisesApprovalOnce(t *testing.T) {
+	snapshot := claudeControlPlaneCapabilitySnapshot()
+	if err := snapshot.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, descriptor := range snapshot.Capabilities {
+		if descriptor.ID == runtimecontract.CapabilityApprovalPolicy && descriptor.Availability == runtimecontract.CapabilityAvailable {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("available Approval descriptors = %d", count)
+	}
+}
+
+func TestClaudeDuplicateApprovalReusesProposalAndMismatchFences(t *testing.T) {
+	c := newClaudeRuntimeContract("agent-claude", nil, nil)
+	proposals := make(chan runtimecontract.ApprovalProposal, 2)
+	c.SetApprovalHandler(func(proposal runtimecontract.ApprovalProposal) { proposals <- proposal })
+	event := claudebridge.Event{Kind: "approval", TurnID: "turn-1", Data: json.RawMessage(`{"callbackId":"callback-1","toolCallId":"tool-1","toolName":"Bash","input":{"command":"printf safe"}}`)}
+	c.handleBridgeEvent(event)
+	c.handleBridgeEvent(event)
+	first, second := <-proposals, <-proposals
+	if first.ID != second.ID {
+		t.Fatalf("duplicate proposal IDs = %q, %q", first.ID, second.ID)
+	}
+	failures := make(chan error, 1)
+	host := &claudeAgentHost{contract: c, failure: func(err error) { failures <- err }}
+	c.host = host
+	event.Data = json.RawMessage(`{"callbackId":"callback-1","toolCallId":"tool-1","toolName":"Bash","input":{"command":"printf changed"}}`)
+	c.handleBridgeEvent(event)
+	select {
+	case err := <-failures:
+		if !strings.Contains(err.Error(), "diverged") {
+			t.Fatalf("mismatch error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("mismatched duplicate did not fence the Runtime")
+	}
+}
+
+func TestClaudeApprovalProjectsSafeCustomToolAndRejectsUnsafePayload(t *testing.T) {
+	proposal, safe := claudeApprovalProposal("proposal-1", "turn-1", "tool-1", "mcp__deploy", map[string]any{"command": "printf safe"})
+	if !safe || proposal.Action != "tool/custom" || proposal.ToolName != "mcp__deploy" || len(proposal.Arguments) != 1 {
+		t.Fatalf("safe custom proposal = %#v safe=%v", proposal, safe)
+	}
+	for _, input := range []map[string]any{
+		{"payload": map[string]any{"mutation": "deploy"}},
+		{"input": map[string]any{"secretNativeArgument": "deploy"}},
+	} {
+		if _, safe := claudeApprovalProposal("proposal-2", "turn-1", "tool-2", "mcp__deploy", input); safe {
+			t.Fatalf("unsafe input was approvable: %#v", input)
+		}
+	}
+	if _, safe := claudeApprovalProposal("proposal-3", "turn-1", "tool-3", strings.Repeat("x", 129), map[string]any{"command": "true"}); safe {
+		t.Fatal("unbounded tool name was approvable")
+	}
+	for tool, input := range map[string]map[string]any{
+		"Read":         {"file_path": "/tmp/a", "offset": 1, "limit": 2},
+		"Write":        {"file_path": "/tmp/a", "content": "safe"},
+		"Edit":         {"file_path": "/tmp/a", "old_string": "old", "new_string": "new", "replace_all": false},
+		"Bash":         {"command": "true", "timeout": 1000, "run_in_background": false},
+		"NotebookEdit": {"notebook_path": "/tmp/a.ipynb", "cell_id": "cell-1", "new_source": "1", "edit_mode": "replace"},
+	} {
+		if _, safe := claudeApprovalProposal("proposal-built-in", "turn-1", "tool-built-in", tool, input); !safe {
+			t.Fatalf("built-in %s input was rejected: %#v", tool, input)
+		}
+	}
+}
+
+func TestClaudeUnsafeApprovalIsAbortedWithoutOwnerOrToolExecution(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "resolved.json")
+	executed := filepath.Join(t.TempDir(), "executed")
+	path := filepath.Join(t.TempDir(), "bridge.sh")
+	hello := fmt.Sprintf(`{"kind":"hello","protocolVersion":1,"bridgeBuild":"claude-bridge-v1","nodeVersion":"24.19.0","sdkVersion":"0.3.228","claudeCodeVersion":"2.1.228","os":%q,"arch":%q,"capabilities":["interrupt","approval","hooks","mcp","session_resume"]}`, gort.GOOS, gort.GOARCH)
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' '` + hello + `'
+IFS= read -r init
+printf '%s\n' '{"kind":"ready","requestId":"init","capabilities":["interrupt","approval","hooks","mcp","session_resume"]}'
+while IFS= read -r line; do
+  [ "$line" = '{"kind":"close"}' ] && exit 0
+  printf '%s' "$line" > "$1"
+	printf '%s' "$line" | grep -q '"decision":"approve"' && printf executed > "$2" || true
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p')
+  operation=$(printf '%s' "$line" | sed -n 's/.*"operation":"\([^"]*\)".*/\1/p')
+  turn_id=$(printf '%s' "$line" | sed -n 's/.*"turnId":"\([^"]*\)".*/\1/p')
+  printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":{}}\n' "$request_id" "$turn_id" "$operation"
+done
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := claudegen.CurrentManifest()
+	driver := claudebridge.NewDriver(claudebridge.DriverOptions{
+		ResolveActive: func(context.Context) (claudebridge.LaunchSpec, error) {
+			return claudebridge.LaunchSpec{NodePath: "/bin/sh", BridgePath: path, Args: []string{marker, executed}, Manifest: manifest}, nil
+		},
+		NextID: func() string { return "init" },
+	})
+	bridge, err := driver.Acquire(context.Background(), "agent-claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.Close()
+	c := newClaudeRuntimeContract("agent-claude", nil, bridge)
+	ownerPrompts := 0
+	c.SetApprovalHandler(func(runtimecontract.ApprovalProposal) { ownerPrompts++ })
+	c.handleBridgeEvent(claudebridge.Event{Kind: "approval", TurnID: "turn-1", Data: json.RawMessage(`{"callbackId":"callback-1","toolCallId":"tool-1","toolName":"mcp__deploy","input":{"payload":{"mutation":"deploy"}}}`)})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if raw, readErr := os.ReadFile(marker); readErr == nil {
+			if ownerPrompts != 0 || !bytes.Contains(raw, []byte(`"command":"resolve_approval"`)) || !bytes.Contains(raw, []byte(`"decision":"abort"`)) {
+				t.Fatalf("ownerPrompts=%d command=%s", ownerPrompts, raw)
+			}
+			if _, err := os.Stat(executed); !os.IsNotExist(err) {
+				t.Fatalf("unsafe tool executed: %v", err)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("unsafe callback was not aborted")
+}
+
+func TestClaudeParkedApprovalProcessExitAbortsWithoutReplay(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	hello := fmt.Sprintf(`{"kind":"hello","protocolVersion":1,"bridgeBuild":"claude-bridge-v1","nodeVersion":"24.19.0","sdkVersion":"0.3.228","claudeCodeVersion":"2.1.228","os":%q,"arch":%q,"capabilities":["interrupt","approval","hooks","mcp","session_resume"]}`, gort.GOOS, gort.GOARCH)
+	path := filepath.Join(t.TempDir(), "bridge.sh")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' '` + hello + `'
+IFS= read -r init
+printf '%s\n' '{"kind":"ready","requestId":"init","capabilities":["interrupt","approval","hooks","mcp","session_resume"]}'
+IFS= read -r command
+printf '%s\n' '{"kind":"response","requestId":"request","turnId":"turn-1","operation":"start","accepted":true,"data":{"runtimeTurnRef":"native-turn"}}'
+printf '%s\n' '{"kind":"event","class":"control","event":"turn_started","turnId":"turn-1","operation":"start","data":{"runtimeTurnRef":"native-turn"}}'
+printf '%s\n' '{"kind":"event","class":"control","event":"approval","turnId":"turn-1","operation":"start","data":{"callbackId":"callback-1","toolCallId":"tool-1","toolName":"Bash","input":{"command":"true"}}}'
+sleep 0.05
+exit 70
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var contract *claudeRuntimeContract
+	nextID := 0
+	driver := claudebridge.NewDriver(claudebridge.DriverOptions{
+		ResolveActive: func(context.Context) (claudebridge.LaunchSpec, error) {
+			return claudebridge.LaunchSpec{NodePath: "/bin/sh", BridgePath: path, Manifest: claudegen.CurrentManifest()}, nil
+		},
+		NextID: func() string {
+			nextID++
+			if nextID == 1 {
+				return "init"
+			}
+			return "request"
+		},
+		OnEvent:   func(event claudebridge.Event) { contract.handleBridgeEvent(event) },
+		OnFailure: func(_ string, err error) { contract.fail(err) },
+	})
+	bridge, err := driver.Acquire(context.Background(), "agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.Close()
+	contract = newClaudeRuntimeContract("agent-1", st, bridge)
+	host := &claudeAgentHost{bridge: bridge, contract: contract}
+	contract.host = host
+	h := testHub(st)
+	meta := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, Status: "running", CurrentTurnID: "turn-1", CurrentTask: "work"}
+	rt := &runtime{agentID: meta.ID, agentHost: host, runtimeContract: contract, approvals: map[string]*approval{}, approvalIDs: map[string]string{}, activeTurn: &turnState{turnID: "turn-1", task: "work", startedAt: time.Now(), stopWatchdog: make(chan struct{})}}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	contract.SetEventHandler(func(event runtimecontract.Event) { h.onCanonicalRuntimeEvent(rt, event) })
+	contract.SetApprovalHandler(func(proposal runtimecontract.ApprovalProposal) { h.onRuntimeApprovalRequest(rt, proposal) })
+	host.SetFailureHandler(func(err error) { h.onRuntimeFailure(rt, err) })
+	_, _ = bridge.Request(context.Background(), claudebridge.Command{Kind: "start_turn", TurnID: "turn-1", Operation: "start"})
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		finished := meta.LastTurn != nil && meta.LastTurn.Status == "interrupted"
+		var approval ApprovalView
+		if len(h.approvalOrder) == 1 {
+			approval = *h.approvals[h.approvalOrder[0]]
+		}
+		approvalCount, markerCount := len(h.approvalOrder), len(meta.TurnRecoveryMarkers)
+		h.mu.Unlock()
+		if finished && approval.Decision == "abort" && approval.DeliveryStatus != "pending" {
+			if approvalCount != 1 || markerCount != 1 || approval.Status != "aborted" || approval.DeliveryStatus == "delivered" {
+				t.Fatalf("Approval=%#v markers=%d approvals=%d", approval, markerCount, approvalCount)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("parked exit did not converge")
+}
+
+func TestClaudeNeedsYouRejectsMultipleQuestions(t *testing.T) {
+	c := newClaudeRuntimeContract("agent-claude", nil, nil)
+	requests := 0
+	c.SetNeedsYouHandler(func(runtimecontract.NeedsYouProposal) error { requests++; return nil })
+	failures := make(chan error, 1)
+	c.host = &claudeAgentHost{contract: c, failure: func(err error) { failures <- err }}
+	c.handleBridgeEvent(claudebridge.Event{Kind: "needs_you", TurnID: "turn-1", Data: json.RawMessage(`{"callbackId":"question-1","toolCallId":"tool-1","questions":[{"question":"First?","options":[]},{"question":"Second?","options":[]}]}`)})
+	select {
+	case <-failures:
+	case <-time.After(time.Second):
+		t.Fatal("multiple questions did not fail closed")
+	}
+	if requests != 0 {
+		t.Fatalf("misleading Human Requests = %d", requests)
+	}
+}
+
+func TestClaudeNeedsYouRejectsMalformedCanonicalOptions(t *testing.T) {
+	for name, options := range map[string][]runtimecontract.NeedsYouOption{
+		"too many":    make([]runtimecontract.NeedsYouOption, 9),
+		"blank label": {{Label: "   "}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			h := testHub(st)
+			meta := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}, Status: "running"}
+			rt := &runtime{agentID: meta.ID, activeTurn: &turnState{turnID: "turn-1", startedAt: time.Now(), stopWatchdog: make(chan struct{})}}
+			h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+			if err := h.onRuntimeNeedsYouProposal(rt, runtimecontract.NeedsYouProposal{ID: "hrq-invalid", TurnID: "turn-1", Question: "Continue?", Options: options}); err == nil {
+				t.Fatal("malformed options persisted")
+			}
+			if len(h.humanRequestOrder) != 0 || len(meta.TurnRecoveryMarkers) != 0 {
+				t.Fatalf("requests=%#v markers=%#v", h.humanRequestOrder, meta.TurnRecoveryMarkers)
+			}
+		})
+	}
+}
+
+func TestClaudeNeedsYouInterruptsSourceAndAnswerResumesOnceAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	meta := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, Status: "running", CurrentTurnID: "turn-source", CurrentTask: "ship release"}
+	rt := &runtime{agentID: meta.ID, approvals: map[string]*approval{}, activeTurn: &turnState{turnID: "turn-source", task: "ship release", startedAt: time.Now(), stopWatchdog: make(chan struct{})}}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	if err := h.onRuntimeNeedsYouProposal(rt, runtimecontract.NeedsYouProposal{ID: "hrq_claude_question", TurnID: "turn-source", Question: "Ship now?", Options: []runtimecontract.NeedsYouOption{{Label: "Yes"}, {Label: "No"}}}); err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	h.onRuntimeEventLocked(meta, rt, runtimecontract.Event{Kind: runtimecontract.EventTerminal, TurnID: "turn-source", Outcome: &runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted}})
+	h.mu.Unlock()
+	request, err := h.GetHumanRequest("hrq_claude_question")
+	if err != nil || request.SourceTurnID != "turn-source" || request.BlockedWork != "ship release" || request.DeliveryStatus != "waiting" || meta.LastTurn == nil || meta.LastTurn.Status != "interrupted" {
+		t.Fatalf("request=%#v lastTurn=%#v err=%v", request, meta.LastTurn, err)
+	}
+	deliveries := 0
+	h.dispatchHumanAnswer = func(agentID, input string) (SendResult, error) {
+		deliveries++
+		return SendResult{AgentID: agentID, TurnID: "turn-recovery"}, nil
+	}
+	if _, err := h.AnswerHumanRequest(request.ID, AnswerHumanRequestParams{Answer: "Yes"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		request, _ = h.GetHumanRequest(request.ID)
+		if request.DeliveryStatus == "delivered" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if deliveries != 1 || request.ResumedTurnID != "turn-recovery" {
+		t.Fatalf("deliveries=%d request=%#v", deliveries, request)
+	}
+	if _, err := h.AnswerHumanRequest(request.ID, AnswerHumanRequestParams{Answer: "Again"}); err == nil {
+		t.Fatal("duplicate answer succeeded")
+	}
+	h.Shutdown()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	h2, err := Open(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2.Shutdown()
+	request, err = h2.GetHumanRequest(request.ID)
+	if err != nil || request.ResumedTurnID != "turn-recovery" || request.DeliveryStatus != "delivered" {
+		t.Fatalf("reopened request=%#v err=%v", request, err)
+	}
+}
+
+func TestClaudeNeedsYouRacingTerminalNeverLeavesOrphanRequest(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	meta := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}, Status: "running", CurrentTurnID: "turn-1", CurrentTask: "work"}
+	rt := &runtime{agentID: meta.ID, approvals: map[string]*approval{}, activeTurn: &turnState{turnID: "turn-1", task: "work", startedAt: time.Now(), stopWatchdog: make(chan struct{})}}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	var proposalErr error
+	go func() {
+		<-start
+		proposalErr = h.onRuntimeNeedsYouProposal(rt, runtimecontract.NeedsYouProposal{ID: "hrq-race", TurnID: "turn-1", Question: "Continue?"})
+		done <- struct{}{}
+	}()
+	go func() {
+		<-start
+		h.mu.Lock()
+		h.onRuntimeEventLocked(meta, rt, runtimecontract.Event{Kind: runtimecontract.EventTerminal, TurnID: "turn-1", Outcome: &runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}})
+		h.mu.Unlock()
+		done <- struct{}{}
+	}()
+	close(start)
+	<-done
+	<-done
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	request := h.humanRequests["hrq-race"]
+	marker := meta.TurnRecoveryMarkers["turn-1"]
+	if proposalErr == nil {
+		if request == nil || marker.HumanRequestID != request.ID || meta.LastTurn == nil || meta.LastTurn.Status != "interrupted" {
+			t.Fatalf("successful proposal orphaned: request=%#v marker=%#v Agent=%#v", request, marker, meta)
+		}
+	} else if request != nil {
+		t.Fatalf("failed proposal left orphan request=%#v marker=%#v", request, marker)
+	}
+}
+
+func TestClaudeNeedsYouPersistenceFailureLeavesSourceTurnRunning(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	meta := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}, Status: "running"}
+	rt := &runtime{agentID: meta.ID, activeTurn: &turnState{turnID: "turn-source", task: "work", startedAt: time.Now(), stopWatchdog: make(chan struct{})}}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	if err := os.Mkdir(filepath.Join(dir, "human-requests.ndjson"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.onRuntimeNeedsYouProposal(rt, runtimecontract.NeedsYouProposal{ID: "hrq_failed", TurnID: "turn-source", Question: "Continue?"}); err == nil {
+		t.Fatal("Needs You unexpectedly persisted")
+	}
+	if rt.activeTurn == nil || rt.activeTurn.finished || meta.Status != "running" || len(h.humanRequestOrder) != 0 || len(meta.TurnRecoveryMarkers) != 0 {
+		t.Fatalf("source=%#v meta=%#v requests=%#v", rt.activeTurn, meta, h.humanRequestOrder)
+	}
+}
+
+func TestClaudeNeedsYouHumanRequestOnlyReopenRepairsWaitingMarker(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := now()
+	agent := &Agent{
+		ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"},
+		Status: "running", CurrentTurnID: "turn-source", CurrentTask: "ship release", CreatedAt: stamp, UpdatedAt: stamp,
+	}
+	if err := st.SaveAgents(map[string]*Agent{agent.ID: agent}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendHumanRequest(HumanRequest{
+		ID: "hrq_exact", AgentID: agent.ID, AgentName: agent.Name, ThreadID: agent.ThreadID, SourceTurnID: "turn-source", SourceTask: "ship release",
+		Question: "Ship now?", Context: "release is ready", BlockedWork: "ship release", Options: []HumanRequestOption{{Label: "Yes"}, {Label: "No"}},
+		Expectation: HumanRequestRequired, State: "open", DeliveryStatus: "waiting", CreatedAt: stamp, UpdatedAt: stamp,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	h, err := Open(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Shutdown()
+	request, err := h.GetHumanRequest("hrq_exact")
+	if err != nil || request.Question != "Ship now?" || request.Context != "release is ready" || request.BlockedWork != "ship release" || len(request.Options) != 2 {
+		t.Fatalf("restored request=%#v err=%v", request, err)
+	}
+	if len(h.humanRequestOrder) != 1 {
+		t.Fatalf("Human Requests = %#v", h.humanRequestOrder)
+	}
+	repaired := h.agents[agent.ID]
+	marker := repaired.TurnRecoveryMarkers["turn-source"]
+	if repaired.LastTurn == nil || repaired.LastTurn.Status != "interrupted" || marker.HumanRequestID != request.ID || marker.Disposition != "needs_you" {
+		t.Fatalf("repaired Agent=%#v marker=%#v", repaired, marker)
+	}
+}
+
 func TestClaudeLedgerCommitFailureFencesHostAndCreatesOneNeedsYou(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

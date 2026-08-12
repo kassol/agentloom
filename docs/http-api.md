@@ -85,7 +85,7 @@ Claude generation 写操作不下载凭证、不调用模型、不接受路径�
 | POST | `/api/agents/{key}/runtime/model` | Validate and select one Runtime model/thinking combination |
 | GET | `/api/agents/{key}/thread/history` | Runtime Contract history with Loom IDs |
 | GET | `/api/agents/{key}/thread/events` | Thread SSE stream |
-| POST | `/api/agents/{key}/thread/approvals/{approvalId}` | Resolve approval |
+| POST | `/api/agents/{key}/thread/approvals/{approvalId}` | Persist an Approval decision and deliver it once; body `{decision}` |
 | POST | `/api/agents/{key}/artifacts` | Stage/publish artifact |
 | GET | `/api/agents/{key}/artifacts` | List published artifacts |
 | GET | `/api/agents/{key}/artifacts/{artifactId}` | Download or preview artifact |
@@ -95,8 +95,12 @@ Turn 启动返回 `202 Accepted`；重启 pending 时相关写入口返回 `409`
 
 Claude 的 `/thread/history` 只读取 Loom-owned Canonical Turn Ledger；这是 Loom 已观察并
 成功提交的 typed Turn 边界，不读取 Claude 私有 transcript，也不会冷启动 Node/Claude
-Code。Claude 当前只宣告 mandatory lifecycle/context delivery；model、approval、settings、
+Code。Claude 当前宣告 mandatory lifecycle/context delivery 与 Approval；model、settings、
 resource adoption 等 optional capability 在对应 typed contract 落地前保持 unavailable。
+
+Approval 事件分别投影 Owner decision、callback `deliveryStatus` 和后续 typed tool
+`effectStatus`。callback 送达失败不会把 `approve` 改写成 `abort`。当前版本只支持原样
+approve/deny；非空 `modifiedInput` 会确定性返回 `409`，且不会交付 Runtime callback。
 
 ### Model Providers
 

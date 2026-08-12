@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"log"
 	"regexp"
@@ -151,6 +152,9 @@ type ApprovalView struct {
 	Params          json.RawMessage `json:"params"`
 	Status          string          `json:"status"`
 	Decision        string          `json:"decision,omitempty"`
+	DeliveryStatus  string          `json:"deliveryStatus,omitempty"`
+	DeliveryError   string          `json:"deliveryError,omitempty"`
+	EffectStatus    string          `json:"effectStatus,omitempty"`
 	RequestedAt     string          `json:"requestedAt"`
 	ResolvedAt      string          `json:"resolvedAt,omitempty"`
 	ResolutionError string          `json:"resolutionError,omitempty"`
@@ -269,31 +273,33 @@ type approvalRecord struct {
 }
 
 type approval struct {
-	respond func(decision runtimecontract.ApprovalDecision) error
-	done    chan struct{}
+	toolCallID string
+	respond    func(runtimecontract.ApprovalDecision) error
+	done       chan struct{}
 }
 
 type turnState struct {
-	turnID            string
-	nativeTurnID      string
-	nativeTurnReady   chan struct{}
-	startedConfirmed  bool
-	task              string
-	source            string
-	inboxItemID       string
-	attemptID         string
-	agentMessageID    string
-	humanRequestID    string
-	topicID           string
-	handlingAttemptID string
-	contextAttemptID  string
-	contextEpochID    string
-	finalAnswer       string
-	forcedFailure     string
-	startedAt         time.Time
-	lastActivity      time.Time
-	finished          bool
-	stopWatchdog      chan struct{}
+	turnID                string
+	nativeTurnID          string
+	nativeTurnReady       chan struct{}
+	startedConfirmed      bool
+	task                  string
+	source                string
+	inboxItemID           string
+	attemptID             string
+	agentMessageID        string
+	humanRequestID        string
+	waitingHumanRequestID string
+	topicID               string
+	handlingAttemptID     string
+	contextAttemptID      string
+	contextEpochID        string
+	finalAnswer           string
+	forcedFailure         string
+	startedAt             time.Time
+	lastActivity          time.Time
+	finished              bool
+	stopWatchdog          chan struct{}
 }
 
 type runtime struct {
@@ -310,8 +316,9 @@ type runtime struct {
 	acquiring          bool
 	startMu            sync.Mutex
 
-	activeTurn *turnState           // guarded by Hub.mu
-	approvals  map[string]*approval // guarded by Hub.mu
+	activeTurn  *turnState           // guarded by Hub.mu
+	approvals   map[string]*approval // guarded by Hub.mu
+	approvalIDs map[string]string    // Runtime proposal ID -> Loom Approval ID; guarded by Hub.mu
 	// effectDomainInvalidated fences late events from a transport generation
 	// whose mutating command has an indeterminate outcome.
 	effectDomainInvalidated bool // guarded by Hub.mu
@@ -746,6 +753,24 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 			continue // edge mirrors carry no CodexLoom-driven turn state
 		}
 		if meta.Status == "running" {
+			for _, requestID := range h.humanRequestOrder {
+				request := h.humanRequests[requestID]
+				if request == nil || request.AgentID != meta.ID || request.SourceTurnID != meta.CurrentTurnID || request.State != "open" {
+					continue
+				}
+				if meta.TurnRecoveryMarkers == nil {
+					meta.TurnRecoveryMarkers = map[string]TurnRecoveryMarker{}
+				}
+				if _, exists := meta.TurnRecoveryMarkers[meta.CurrentTurnID]; !exists {
+					stamp := now()
+					meta.TurnRecoveryMarkers[meta.CurrentTurnID] = TurnRecoveryMarker{
+						PredecessorTurnID: meta.CurrentTurnID, Disposition: "needs_you", State: TurnRecoveryDispatched,
+						HumanRequestID: request.ID, RuntimeKind: meta.RuntimeBinding.Kind, Cause: "needs_you", Summary: "Waiting for Owner input",
+						TopicID: request.TopicID, CreatedAt: stamp, UpdatedAt: stamp,
+					}
+				}
+				break
+			}
 			if repaired, status, repairErr := h.repairClaudeTerminalFromLedgerLocked(meta); repairErr != nil {
 				h.mu.Unlock()
 				return nil, fmt.Errorf("repair Claude terminal from Canonical Turn Ledger: %w", repairErr)
@@ -793,11 +818,18 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 			if meta.TurnRecoveryMarkers == nil {
 				meta.TurnRecoveryMarkers = map[string]TurnRecoveryMarker{}
 			}
-			stamp := now()
-			meta.TurnRecoveryMarkers[interrupted.TurnID] = TurnRecoveryMarker{
-				PredecessorTurnID: interrupted.TurnID, NativeTurnID: meta.RuntimeTurnBindings[interrupted.TurnID],
-				RuntimeKind: meta.RuntimeBinding.Kind, Cause: "hub_restart", State: TurnRecoveryObserved,
-				Summary: "CodexLoom restarted while the Turn outcome was not confirmed", CreatedAt: stamp, UpdatedAt: stamp,
+			marker, waiting := meta.TurnRecoveryMarkers[interrupted.TurnID]
+			waiting = waiting && marker.Disposition == "needs_you" && marker.HumanRequestID != ""
+			if waiting {
+				marker.UpdatedAt = now()
+				meta.TurnRecoveryMarkers[interrupted.TurnID] = marker
+			} else {
+				stamp := now()
+				meta.TurnRecoveryMarkers[interrupted.TurnID] = TurnRecoveryMarker{
+					PredecessorTurnID: interrupted.TurnID, NativeTurnID: meta.RuntimeTurnBindings[interrupted.TurnID],
+					RuntimeKind: meta.RuntimeBinding.Kind, Cause: "hub_restart", State: TurnRecoveryObserved,
+					Summary: "CodexLoom restarted while the Turn outcome was not confirmed", CreatedAt: stamp, UpdatedAt: stamp,
+				}
 			}
 			restartInterrupted = append(restartInterrupted, meta)
 		}
@@ -916,6 +948,9 @@ func (h *Hub) repairClaudeTerminalFromLedgerLocked(meta *Agent) (*turnState, str
 		if turn.State == runtimecontract.LifecycleCompleted {
 			status = "completed"
 		} else if turn.State == runtimecontract.LifecycleInterrupted {
+			status = "interrupted"
+		}
+		if marker, ok := meta.TurnRecoveryMarkers[turn.TurnID]; ok && marker.Disposition == "needs_you" && marker.HumanRequestID != "" {
 			status = "interrupted"
 		}
 		turnState := &turnState{turnID: turn.TurnID, task: displayUserTask(meta.CurrentTask)}
@@ -1452,6 +1487,11 @@ func (h *Hub) getRuntimeLockedForResourcePolicy(meta *Agent) (*runtime, error) {
 			h.onRuntimeApprovalRequest(rt, request)
 		})
 	}
+	if source, ok := rt.runtimeContract.(runtimecontract.NeedsYouCapability); ok {
+		source.SetNeedsYouHandler(func(proposal runtimecontract.NeedsYouProposal) error {
+			return h.onRuntimeNeedsYouProposal(rt, proposal)
+		})
+	}
 	h.runtimes[meta.ID] = rt
 	if !h.startWorkerLocked(func() { h.initRuntime(meta.ID, rt) }) {
 		delete(h.runtimes, meta.ID)
@@ -1463,6 +1503,48 @@ func (h *Hub) getRuntimeLockedForResourcePolicy(meta *Agent) (*runtime, error) {
 		return nil, rt.initErr
 	}
 	return rt, nil
+}
+
+func (h *Hub) onRuntimeNeedsYouProposal(rt *runtime, proposal runtimecontract.NeedsYouProposal) error {
+	h.mu.Lock()
+	meta := h.agents[rt.agentID]
+	if meta == nil || h.runtimes[rt.agentID] != rt || rt.activeTurn == nil || rt.activeTurn.finished ||
+		(proposal.TurnID != "" && proposal.TurnID != rt.activeTurn.turnID) {
+		h.mu.Unlock()
+		return errors.New("Runtime Needs You proposal has no matching active Turn")
+	}
+	turnID, task, threadID, topicID := rt.activeTurn.turnID, rt.activeTurn.task, meta.ThreadID, rt.activeTurn.topicID
+	options := make([]HumanRequestOption, len(proposal.Options))
+	for i, option := range proposal.Options {
+		options[i] = HumanRequestOption{Label: option.Label, Description: option.Description}
+	}
+	params, causality, options, err := prepareHumanRequest(CreateHumanRequestParams{
+		Agent: meta.ID, Expectation: HumanRequestRequired, Question: proposal.Question,
+		Context: proposal.Context, BlockedWork: proposal.BlockedWork, Options: options, TopicID: topicID,
+	}, HumanRequestCausality{ID: proposal.ID, ThreadID: threadID, SourceTurnID: turnID, SourceTask: task, TopicID: topicID})
+	if err == nil {
+		_, _, err = h.createOrGetHumanRequestLocked(params, causality, options)
+	}
+	if err != nil {
+		h.mu.Unlock()
+		return err
+	}
+	defer h.mu.Unlock()
+	if meta.TurnRecoveryMarkers == nil {
+		meta.TurnRecoveryMarkers = map[string]TurnRecoveryMarker{}
+	}
+	stamp := now()
+	meta.TurnRecoveryMarkers[turnID] = TurnRecoveryMarker{
+		PredecessorTurnID: turnID, NativeTurnID: rt.activeTurn.nativeTurnID, Disposition: "needs_you", State: TurnRecoveryDispatched,
+		HumanRequestID: proposal.ID, RuntimeKind: meta.RuntimeBinding.Kind, Cause: "needs_you", Summary: "Waiting for Owner input", TopicID: topicID, CreatedAt: stamp, UpdatedAt: stamp,
+	}
+	rt.activeTurn.waitingHumanRequestID = proposal.ID
+	if err := h.persistAgentsLocked(); err != nil {
+		// The Human Request is authoritative and already durable. Startup repairs
+		// the marker from its exact Turn causality if this registry write is lost.
+		log.Printf("[codex-loom] persist dispatched Runtime Needs You marker: %v", err)
+	}
+	return nil
 }
 
 func runtimeHandleAlive(rt *runtime) bool {
@@ -2024,6 +2106,7 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, event runtimecontra
 			h.observeContextModelEventLocked(meta, rt.activeTurn)
 		}
 	}
+	h.observeApprovalEffectLocked(meta, rt, event)
 
 	if event.Kind == runtimecontract.EventTerminal {
 		if rt.activeTurn == nil || rt.activeTurn.finished {
@@ -2056,6 +2139,10 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, event runtimecontra
 		case runtimecontract.LifecycleInterrupted:
 			status = "interrupted"
 		}
+		if rt.activeTurn.waitingHumanRequestID != "" {
+			status, errMsg = "interrupted", "waiting for Owner input"
+			event.Outcome = &runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted}
+		}
 		if event.TurnID == "" {
 			event.TurnID = rt.activeTurn.turnID
 		}
@@ -2065,6 +2152,37 @@ func (h *Hub) onRuntimeEventLocked(meta *Agent, rt *runtime, event runtimecontra
 		return
 	}
 	h.emitCanonicalRuntimeEventLocked(meta, rt, event)
+}
+
+func (h *Hub) observeApprovalEffectLocked(meta *Agent, rt *runtime, event runtimecontract.Event) {
+	if event.Content == nil {
+		return
+	}
+	toolCallID, status := "", ""
+	if event.Content.Kind == runtimecontract.ContentToolResult && event.Content.ToolResult != nil {
+		toolCallID, status = event.Content.ToolResult.ToolCallID, "completed"
+		if !event.Content.ToolResult.Success {
+			status = "failed"
+		}
+	}
+	if toolCallID == "" {
+		return
+	}
+	for id, waiter := range rt.approvals {
+		current := h.approvals[id]
+		if waiter == nil || waiter.toolCallID != toolCallID || current == nil || current.EffectStatus == status {
+			continue
+		}
+		next := *current
+		next.EffectStatus = status
+		if err := h.commitApprovalLocked(next); err != nil {
+			log.Printf("[codex-loom] persist Approval effect %s: %v", id, err)
+			h.emitLocked(meta.ID, "loom/error", map[string]any{"message": "Approval effect evidence could not be persisted"})
+			return
+		}
+		h.emitLocked(meta.ID, "loom/approval-effect", approvalEventPayload(next))
+		delete(rt.approvals, id)
+	}
 }
 
 func runtimeEventText(event runtimecontract.Event) string {
@@ -2266,7 +2384,9 @@ func (h *Hub) onRuntimeApprovalRequest(rt *runtime, request runtimecontract.Appr
 	meta := h.agents[rt.agentID]
 	if meta == nil || h.runtimes[rt.agentID] != rt || rt.activeTurn == nil || rt.activeTurn.finished {
 		if source, ok := rt.runtimeContract.(runtimecontract.ApprovalCapability); ok {
-			h.startWorkerLocked(func() { _ = source.ResolveApproval(context.Background(), request.ID, runtimecontract.ApprovalAbort) })
+			h.startWorkerLocked(func() {
+				_ = source.ResolveApproval(context.Background(), request.ID, runtimecontract.ApprovalAbort)
+			})
 		}
 		h.mu.Unlock()
 		return
@@ -2274,8 +2394,14 @@ func (h *Hub) onRuntimeApprovalRequest(rt *runtime, request runtimecontract.Appr
 	turnID := rt.activeTurn.turnID
 	if request.TurnID != "" && request.TurnID != turnID {
 		if source, ok := rt.runtimeContract.(runtimecontract.ApprovalCapability); ok {
-			h.startWorkerLocked(func() { _ = source.ResolveApproval(context.Background(), request.ID, runtimecontract.ApprovalAbort) })
+			h.startWorkerLocked(func() {
+				_ = source.ResolveApproval(context.Background(), request.ID, runtimecontract.ApprovalAbort)
+			})
 		}
+		h.mu.Unlock()
+		return
+	}
+	if approvalID := rt.approvalIDs[request.ID]; approvalID != "" && h.approvals[approvalID] != nil {
 		h.mu.Unlock()
 		return
 	}
@@ -2294,6 +2420,10 @@ func (h *Hub) onRuntimeApprovalRequest(rt *runtime, request runtimecontract.Appr
 		h.mu.Unlock()
 		return
 	}
+	if rt.approvalIDs == nil {
+		rt.approvalIDs = map[string]string{}
+	}
+	rt.approvalIDs[request.ID] = created.ApprovalID
 	waiter := rt.approvals[created.ApprovalID]
 	if request.Timeout > 0 && waiter != nil {
 		agentID, approvalID, timeout, stop := meta.ID, created.ApprovalID, request.Timeout, h.stop
@@ -2312,9 +2442,16 @@ func (h *Hub) onRuntimeApprovalRequest(rt *runtime, request runtimecontract.Appr
 }
 
 func (h *Hub) ResolveApproval(key, approvalID, decision string) (map[string]any, error) {
-	decision, status, ok := normalizeApprovalDecision(decision)
+	return h.ResolveApprovalWithParams(key, approvalID, ApprovalResolutionParams{Decision: decision})
+}
+
+func (h *Hub) ResolveApprovalWithParams(key, approvalID string, params ApprovalResolutionParams) (map[string]any, error) {
+	decision, status, ok := normalizeApprovalDecision(params.Decision)
 	if !ok {
 		return nil, errf(400, "unsupported Approval decision: %s", decision)
+	}
+	if len(params.ModifiedInput) > 0 {
+		return nil, errf(409, "modified Approval input is unavailable; approve the exact proposal or deny it")
 	}
 	h.mu.Lock()
 	meta := h.resolveLocked(key)
@@ -2340,6 +2477,8 @@ func (h *Hub) ResolveApproval(key, approvalID, decision string) (map[string]any,
 	next := *current
 	next.Status = status
 	next.Decision = decision
+	next.DeliveryStatus = "pending"
+	next.DeliveryError = ""
 	next.ResolvedAt = now()
 	next.ResolutionError = ""
 	if err := h.commitApprovalLocked(next); err != nil {
@@ -2347,13 +2486,15 @@ func (h *Hub) ResolveApproval(key, approvalID, decision string) (map[string]any,
 		// actionable in this process and deny it so the Runtime is not blocked.
 		next.Status = "aborted"
 		next.Decision = "abort"
+		next.DeliveryStatus = "indeterminate"
+		next.DeliveryError = "Approval decision could not be persisted"
 		next.ResolutionError = "persist Approval terminal state: " + err.Error()
 		h.approvals[approvalID] = &next
 		closeApprovalWaiter(ap)
-		delete(rt.approvals, approvalID)
+		respond := ap.respond
+		ap.respond = nil
 		h.emitLocked(meta.ID, "loom/error", map[string]any{"message": next.ResolutionError})
 		h.emitLocked(meta.ID, "loom/approval-resolved", approvalEventPayload(next))
-		respond := ap.respond
 		h.mu.Unlock()
 		if respond != nil {
 			_ = respond(runtimecontract.ApprovalAbort)
@@ -2361,31 +2502,52 @@ func (h *Hub) ResolveApproval(key, approvalID, decision string) (map[string]any,
 		return nil, errf(500, "%s", next.ResolutionError)
 	}
 	closeApprovalWaiter(ap)
-	delete(rt.approvals, approvalID)
 	respond := ap.respond
+	ap.respond = nil
 	h.mu.Unlock()
 
 	if respond != nil {
 		if err := respond(runtimecontract.ApprovalDecision(decision)); err != nil {
 			h.mu.Lock()
 			failed := next
-			failed.Status = "aborted"
-			failed.Decision = "abort"
-			failed.ResolvedAt = now()
-			failed.ResolutionError = "respond Approval: " + err.Error()
+			failed.DeliveryStatus = "failed"
+			failed.DeliveryError = "Runtime callback delivery failed"
+			if isRuntimeIndeterminate(err) {
+				failed.DeliveryStatus = "indeterminate"
+				failed.DeliveryError = "Runtime callback delivery outcome is indeterminate"
+				rt.effectDomainInvalidated = true
+			}
 			if appendErr := h.commitApprovalLocked(failed); appendErr != nil {
-				failed.ResolutionError += "; persist failure: " + appendErr.Error()
+				log.Printf("[codex-loom] persist failed Approval delivery %s: %v", approvalID, appendErr)
+				failed.DeliveryStatus = "indeterminate"
+				failed.DeliveryError = "Approval delivery evidence could not be persisted"
 				h.approvals[approvalID] = &failed
 			}
+			log.Printf("[codex-loom] deliver Approval %s: %v", approvalID, err)
 			h.emitLocked(meta.ID, "loom/approval-resolved", approvalEventPayload(failed))
 			h.mu.Unlock()
-			return nil, errf(500, "%s", failed.ResolutionError)
+			return map[string]any{"approvalId": approvalID, "decision": decision, "status": status, "deliveryStatus": failed.DeliveryStatus}, nil
 		}
 	}
 	h.mu.Lock()
-	h.emitLocked(meta.ID, "loom/approval-resolved", approvalEventPayload(next))
+	delivered := next
+	if current := h.approvals[approvalID]; current != nil {
+		delivered = *current
+	}
+	delivered.DeliveryStatus = "delivered"
+	if err := h.commitApprovalLocked(delivered); err != nil {
+		log.Printf("[codex-loom] persist Approval delivery %s: %v", approvalID, err)
+		delivered.DeliveryStatus = "indeterminate"
+		delivered.DeliveryError = "Approval delivery evidence could not be persisted"
+		h.approvals[approvalID] = &delivered
+		h.emitLocked(meta.ID, "loom/error", map[string]any{"message": delivered.DeliveryError})
+		h.emitLocked(meta.ID, "loom/approval-resolved", approvalEventPayload(delivered))
+		h.mu.Unlock()
+		return nil, errf(500, "%s", delivered.DeliveryError)
+	}
+	h.emitLocked(meta.ID, "loom/approval-resolved", approvalEventPayload(delivered))
 	h.mu.Unlock()
-	return map[string]any{"approvalId": approvalID, "decision": decision, "status": status}, nil
+	return map[string]any{"approvalId": approvalID, "decision": decision, "status": status, "deliveryStatus": delivered.DeliveryStatus}, nil
 }
 
 func (h *Hub) finishTurnLocked(meta *Agent, rt *runtime, status, errMsg string) bool {
@@ -2416,12 +2578,19 @@ func (h *Hub) finishTurnForRecoveryLocked(meta *Agent, rt *runtime, runtimeErr e
 	if meta.TurnRecoveryMarkers == nil {
 		meta.TurnRecoveryMarkers = map[string]TurnRecoveryMarker{}
 	}
-	stamp := now()
-	meta.TurnRecoveryMarkers[turn.turnID] = TurnRecoveryMarker{
-		PredecessorTurnID: turn.turnID, NativeTurnID: turn.nativeTurnID,
-		RuntimeKind: meta.RuntimeBinding.Kind, Cause: cause, FailurePhase: phase,
-		FailureCode: code, Summary: summary, State: TurnRecoveryObserved,
-		TopicID: turn.topicID, CreatedAt: stamp, UpdatedAt: stamp,
+	marker, waiting := meta.TurnRecoveryMarkers[turn.turnID]
+	waiting = waiting && marker.Disposition == "needs_you" && marker.HumanRequestID != ""
+	if waiting {
+		marker.UpdatedAt = now()
+		meta.TurnRecoveryMarkers[turn.turnID] = marker
+	} else {
+		stamp := now()
+		meta.TurnRecoveryMarkers[turn.turnID] = TurnRecoveryMarker{
+			PredecessorTurnID: turn.turnID, NativeTurnID: turn.nativeTurnID,
+			RuntimeKind: meta.RuntimeBinding.Kind, Cause: cause, FailurePhase: phase,
+			FailureCode: code, Summary: summary, State: TurnRecoveryObserved,
+			TopicID: turn.topicID, CreatedAt: stamp, UpdatedAt: stamp,
+		}
 	}
 	if err := h.persistAgentsLocked(); err != nil {
 		*meta = previous

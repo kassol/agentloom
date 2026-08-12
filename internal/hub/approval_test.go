@@ -2,6 +2,7 @@ package hub
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -295,6 +296,35 @@ func TestApprovalTerminalDecisionsAreDurableAndUnblockRuntime(t *testing.T) {
 	}
 }
 
+func TestApprovalIndeterminateCallbackPreservesOwnerDecisionAndFencesEffects(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	meta := &Agent{ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	rt := &runtime{agentID: meta.ID, approvals: map[string]*approval{}}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{
+		AgentID: meta.ID, TurnID: "turn-1", RuntimeKind: "claude", Proposal: testApprovalProposal("tool/bash"),
+	}, func(runtimecontract.ApprovalDecision) error {
+		return &runtimeIndeterminateError{failure: &runtimecontract.Failure{Code: "transport_indeterminate", Phase: runtimecontract.FailurePhaseTurnContinue}}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := h.ResolveApproval(meta.ID, created.ApprovalID, "approve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := h.approvals[created.ApprovalID]
+	if got.Status != "approved" || got.Decision != "approve" || got.DeliveryStatus != "indeterminate" || !rt.effectDomainInvalidated || result["deliveryStatus"] != "indeterminate" {
+		t.Fatalf("Approval outcome=%#v result=%#v fenced=%v", got, result, rt.effectDomainInvalidated)
+	}
+}
+
 func TestFinishingTurnAbortsPendingRuntimeApproval(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -408,5 +438,247 @@ func TestApprovalRequestAppendFailureUnblocksRuntime(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("append failure left Runtime Approval blocked")
+	}
+}
+
+func TestApprovalDecisionAppendFailureReleasesCallbackOnceWithoutApprove(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", approvals: map[string]*approval{}}
+	decisions := []runtimecontract.ApprovalDecision{}
+	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{AgentID: "agent-1", RuntimeKind: "claude", Proposal: testApprovalProposal("Bash")}, func(decision runtimecontract.ApprovalDecision) error {
+		decisions = append(decisions, decision)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.st = st.RetiredReadOnlyView()
+	if _, err := h.ResolveApproval("agent-1", created.ApprovalID, "approve"); err == nil {
+		t.Fatal("decision unexpectedly persisted")
+	}
+	if len(decisions) != 1 || decisions[0] != runtimecontract.ApprovalAbort {
+		t.Fatalf("callback decisions = %#v", decisions)
+	}
+}
+
+func TestModifiedApprovalInputIsRejectedBeforeDecisionOrDelivery(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", approvals: map[string]*approval{}}
+	deliveries := 0
+	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{AgentID: "agent-1", RuntimeKind: "claude", Proposal: testApprovalProposal("Bash")}, func(runtimecontract.ApprovalDecision) error { deliveries++; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.ResolveApprovalWithParams("agent-1", created.ApprovalID, ApprovalResolutionParams{Decision: "approve", ModifiedInput: json.RawMessage(`{"command":"changed"}`)}); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("modified input error = %v", err)
+	}
+	if got := h.approvals[created.ApprovalID]; got.Status != "pending" || deliveries != 0 {
+		t.Fatalf("Approval=%#v deliveries=%d", got, deliveries)
+	}
+}
+
+func TestOpenMarksPersistedTerminalPendingDeliveryIndeterminate(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	if err := st.SaveAgents(map[string]*Agent{agent.ID: agent}); err != nil {
+		t.Fatal(err)
+	}
+	approval := ApprovalView{ApprovalID: "approval-1", AgentID: agent.ID, TurnID: "turn-1", RuntimeKind: "claude", Status: "approved", Decision: "approve", DeliveryStatus: "pending", EffectStatus: "unobserved", RequestedAt: now(), ResolvedAt: now()}
+	if err := st.AppendApproval(approvalRecord{Approval: approval}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	h, err := Open(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Shutdown()
+	got := h.approvals[approval.ApprovalID]
+	if got.Status != "approved" || got.Decision != "approve" || got.DeliveryStatus != "indeterminate" {
+		t.Fatalf("reopened Approval = %#v", got)
+	}
+}
+
+func TestApprovalDeliveryFailurePreservesOwnerDecision(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", approvals: map[string]*approval{}}
+	proposal := testApprovalProposal("Bash")
+	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{AgentID: "agent-1", RuntimeKind: "claude", Proposal: proposal}, func(runtimecontract.ApprovalDecision) error { return errors.New("callback disconnected") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := h.ResolveApproval("agent-1", created.ApprovalID, "approve")
+	if err != nil || result["deliveryStatus"] != "failed" {
+		t.Fatalf("delivery result=%#v err=%v", result, err)
+	}
+	got := h.approvals[created.ApprovalID]
+	if got.Decision != "approve" || got.Status != "approved" || got.DeliveryStatus != "failed" || got.DeliveryError != "Runtime callback delivery failed" {
+		t.Fatalf("Approval evidence = %#v", got)
+	}
+}
+
+func TestApprovalEffectIsPersistedFromCorrelatedToolResult(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	meta := &Agent{ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	rt := &runtime{agentID: meta.ID, approvals: map[string]*approval{}}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	proposal := testApprovalProposal("Bash")
+	proposal.ToolCallID = "native-tool-secret"
+	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{AgentID: meta.ID, RuntimeKind: "claude", Proposal: proposal}, func(runtimecontract.ApprovalDecision) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.ResolveApproval(meta.ID, created.ApprovalID, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	h.observeApprovalEffectLocked(meta, rt, runtimecontract.Event{Content: &runtimecontract.ContentBlock{ID: "result", Kind: runtimecontract.ContentToolResult, ToolResult: &runtimecontract.ToolResult{ToolCallID: "native-tool-secret", Text: "done", Success: true}}})
+	h.mu.Unlock()
+	if got := h.approvals[created.ApprovalID]; got == nil || got.EffectStatus != "completed" || strings.Contains(string(got.Params), "native-tool-secret") {
+		t.Fatalf("Approval effect = %#v", got)
+	}
+}
+
+func TestApprovalEffectRacingDeliveryKeepsBothFacts(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	meta := &Agent{ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	rt := &runtime{agentID: meta.ID, approvals: map[string]*approval{}}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	proposal := testApprovalProposal("Bash")
+	proposal.ToolCallID = "tool-race"
+	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{AgentID: meta.ID, RuntimeKind: "claude", Proposal: proposal}, func(runtimecontract.ApprovalDecision) error {
+		h.mu.Lock()
+		h.observeApprovalEffectLocked(meta, rt, runtimecontract.Event{Content: &runtimecontract.ContentBlock{ID: "result", Kind: runtimecontract.ContentToolResult, ToolResult: &runtimecontract.ToolResult{ToolCallID: "tool-race", Success: true}}})
+		h.mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.ResolveApproval(meta.ID, created.ApprovalID, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	got := h.approvals[created.ApprovalID]
+	if got.DeliveryStatus != "delivered" || got.EffectStatus != "completed" {
+		t.Fatalf("Approval evidence = %#v", got)
+	}
+}
+
+func TestApprovalAbortIndeterminateCallbackIsRecordedSeparately(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	meta := &Agent{ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	rt := &runtime{agentID: meta.ID, approvals: map[string]*approval{}}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{AgentID: meta.ID, TurnID: "turn-1", RuntimeKind: "claude", Proposal: testApprovalProposal("Bash")}, func(runtimecontract.ApprovalDecision) error {
+		return &runtimeIndeterminateError{failure: &runtimecontract.Failure{Code: "transport_indeterminate", Phase: runtimecontract.FailurePhaseTurnInterrupt}}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	h.abortTurnApprovalsLocked(meta.ID, "turn-1", rt, "Turn interrupted")
+	h.mu.Unlock()
+	deadline := time.Now().Add(time.Second)
+	var got ApprovalView
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		got = *h.approvals[created.ApprovalID]
+		h.mu.Unlock()
+		if got.DeliveryStatus != "pending" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got.Decision != "abort" || got.DeliveryStatus != "indeterminate" {
+		t.Fatalf("abort evidence = %#v", got)
+	}
+}
+
+func TestDuplicateRuntimeApprovalCreatesOneDurableProposal(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	meta := &Agent{ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	rt := &runtime{agentID: meta.ID, approvals: map[string]*approval{}, approvalIDs: map[string]string{}, activeTurn: &turnState{turnID: "turn-1", startedAt: time.Now(), stopWatchdog: make(chan struct{})}}
+	contract := &controlPlaneContract{}
+	rt.runtimeContract = contract
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+	proposal := testApprovalProposal("Bash")
+	h.onRuntimeApprovalRequest(rt, proposal)
+	h.onRuntimeApprovalRequest(rt, proposal)
+	if len(h.approvalOrder) != 1 || len(rt.approvals) != 1 {
+		t.Fatalf("approvals=%#v runtime=%#v", h.approvalOrder, rt.approvals)
+	}
+}
+
+func TestLateApprovalDecisionCannotDeliverTwice(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{ID: "agent-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	h.runtimes["agent-1"] = &runtime{agentID: "agent-1", approvals: map[string]*approval{}}
+	deliveries := 0
+	created, err := h.requestRuntimeApprovalLocked(runtimeApprovalRequest{AgentID: "agent-1", RuntimeKind: "claude", Proposal: testApprovalProposal("Bash")}, func(runtimecontract.ApprovalDecision) error { deliveries++; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.ResolveApproval("agent-1", created.ApprovalID, "deny"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.ResolveApproval("agent-1", created.ApprovalID, "approve"); err == nil {
+		t.Fatal("late decision succeeded")
+	}
+	if deliveries != 1 {
+		t.Fatalf("deliveries=%d", deliveries)
 	}
 }

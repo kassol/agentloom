@@ -68,12 +68,34 @@ type ApprovalArgument struct {
 }
 
 type ApprovalProposal struct {
-	ID        string             `json:"id"`
-	TurnID    string             `json:"turnId,omitempty"`
-	ToolName  string             `json:"toolName"`
-	Action    string             `json:"action,omitempty"`
-	Arguments []ApprovalArgument `json:"arguments,omitempty"`
-	Timeout   time.Duration      `json:"-"`
+	ID         string             `json:"id"`
+	ToolCallID string             `json:"-"`
+	TurnID     string             `json:"turnId,omitempty"`
+	ToolName   string             `json:"toolName"`
+	Action     string             `json:"action,omitempty"`
+	Arguments  []ApprovalArgument `json:"arguments,omitempty"`
+	Timeout    time.Duration      `json:"-"`
+}
+
+type NeedsYouOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+type NeedsYouProposal struct {
+	ID          string           `json:"id"`
+	TurnID      string           `json:"turnId,omitempty"`
+	Question    string           `json:"question"`
+	Context     string           `json:"context,omitempty"`
+	BlockedWork string           `json:"blockedWork,omitempty"`
+	Options     []NeedsYouOption `json:"options,omitempty"`
+}
+
+// NeedsYouCapability projects a Runtime question into Loom's durable Human
+// Request workflow. The handler must return only after persistence succeeds;
+// the adapter then releases the live callback and interrupts the source Turn.
+type NeedsYouCapability interface {
+	SetNeedsYouHandler(func(NeedsYouProposal) error)
 }
 
 type Binding struct {

@@ -3,9 +3,12 @@ package hub
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -222,8 +225,14 @@ type claudeRuntimeContract struct {
 
 	mu                        sync.Mutex
 	handler                   func(runtimecontract.Event)
+	approvalHandler           func(runtimecontract.ApprovalProposal)
+	needsYouHandler           func(runtimecontract.NeedsYouProposal) error
+	approvalPolicy            string
+	callbacks                 map[string]claudeCallback
+	callbackProposals         map[string]string
 	turns                     []runtimecontract.HistoryTurn
 	terminal                  map[string]bool
+	waiting                   map[string]bool
 	fenced                    map[string]bool
 	pendingOps                map[string]bool
 	terminalOps               map[string]string
@@ -238,10 +247,18 @@ type claudeRuntimeContract struct {
 	beforeLedgerCommitForTest func()
 }
 
+type claudeCallback struct {
+	callbackID  string
+	toolCallID  string
+	turnID      string
+	fingerprint string
+	settled     bool
+}
+
 func newClaudeRuntimeContract(agentID string, st *store.Store, bridge *claudebridge.Bridge) *claudeRuntimeContract {
 	c := &claudeRuntimeContract{
-		agentID: agentID, st: st, bridge: bridge, terminal: map[string]bool{}, fenced: map[string]bool{}, pendingOps: map[string]bool{}, terminalOps: map[string]string{},
-		opPhases: map[string]runtimecontract.FailurePhase{}, opTurns: map[string]string{},
+		agentID: agentID, st: st, bridge: bridge, terminal: map[string]bool{}, waiting: map[string]bool{}, fenced: map[string]bool{}, pendingOps: map[string]bool{}, terminalOps: map[string]string{},
+		opPhases: map[string]runtimecontract.FailurePhase{}, opTurns: map[string]string{}, callbacks: map[string]claudeCallback{}, callbackProposals: map[string]string{},
 	}
 	if st != nil {
 		if history, err := st.LoadCanonicalTurnLedger(agentID, int(^uint(0)>>1), 0); err == nil {
@@ -256,6 +273,47 @@ func newClaudeRuntimeContract(agentID string, st *store.Store, bridge *claudebri
 		}
 	}
 	return c
+}
+
+func (c *claudeRuntimeContract) SetApprovalHandler(handler func(runtimecontract.ApprovalProposal)) {
+	c.mu.Lock()
+	c.approvalHandler = handler
+	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) SetRuntimeApprovalPolicy(policy string) {
+	c.mu.Lock()
+	c.approvalPolicy = policy
+	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) ResolveApproval(ctx context.Context, proposalID string, decision runtimecontract.ApprovalDecision) error {
+	c.mu.Lock()
+	callback, ok := c.callbacks[proposalID]
+	if ok && callback.settled {
+		ok = false
+	}
+	c.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("Claude Runtime Approval proposal %s is unavailable", proposalID)
+	}
+	_, outcome := c.command(ctx, "resolve_approval", callback.turnID, runtimecontract.FailurePhaseTurnContinue, map[string]any{
+		"callbackId": callback.callbackID, "decision": decision,
+	})
+	c.mu.Lock()
+	callback.settled = true
+	c.callbacks[proposalID] = callback
+	c.mu.Unlock()
+	if outcome.State != runtimecontract.LifecycleAccepted {
+		return lifecycleOutcomeError(outcome)
+	}
+	return nil
+}
+
+func (c *claudeRuntimeContract) SetNeedsYouHandler(handler func(runtimecontract.NeedsYouProposal) error) {
+	c.mu.Lock()
+	c.needsYouHandler = handler
+	c.mu.Unlock()
 }
 
 func (c *claudeRuntimeContract) ContractVersion() int { return runtimecontract.Version }
@@ -517,6 +575,14 @@ func newClaudeSessionID() (string, error) {
 }
 
 func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
+	if source.Kind == "approval" {
+		c.handleApproval(source)
+		return
+	}
+	if source.Kind == "needs_you" {
+		c.handleNeedsYou(source)
+		return
+	}
 	event, err := claudeContractEvent(source)
 	if err != nil {
 		c.fail(err)
@@ -543,6 +609,9 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 	if c.ledgerErr != nil {
 		c.mu.Unlock()
 		return
+	}
+	if event.Kind == runtimecontract.EventTerminal && c.waiting[event.TurnID] {
+		event.Outcome = &runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted, RuntimeTurnRef: event.RuntimeTurnRef}
 	}
 	nextTurns := cloneClaudeLedgerTurns(c.turns)
 	nextTerminal := make(map[string]bool, len(c.terminal)+1)
@@ -599,6 +668,7 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 	}
 	c.turns, c.terminal = nextTurns, nextTerminal
 	if event.Kind == runtimecontract.EventTerminal {
+		delete(c.waiting, event.TurnID)
 		for operation, turnID := range c.opTurns {
 			if turnID == event.TurnID {
 				delete(c.opPhases, operation)
@@ -614,6 +684,174 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 	if handler != nil {
 		handler(event)
 	}
+}
+
+func (c *claudeRuntimeContract) handleApproval(source claudebridge.Event) {
+	var data struct {
+		CallbackID string         `json:"callbackId"`
+		ToolCallID string         `json:"toolCallId"`
+		ToolName   string         `json:"toolName"`
+		Input      map[string]any `json:"input"`
+	}
+	if json.Unmarshal(source.Data, &data) != nil || data.CallbackID == "" || data.ToolCallID == "" || data.ToolName == "" {
+		c.fail(errors.New("Claude bridge emitted malformed Approval"))
+		return
+	}
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(source.Data))
+	c.mu.Lock()
+	if existingID := c.callbackProposals[data.CallbackID]; existingID != "" {
+		existing := c.callbacks[existingID]
+		handler := c.approvalHandler
+		c.mu.Unlock()
+		if existing.turnID != source.TurnID || existing.fingerprint != fingerprint {
+			c.fail(errors.New("Claude Runtime Approval callback diverged"))
+		} else if proposal, safe := claudeApprovalProposal(existingID, source.TurnID, data.ToolCallID, data.ToolName, data.Input); !safe {
+			go func() { _ = c.ResolveApproval(context.Background(), existingID, runtimecontract.ApprovalAbort) }()
+		} else if handler != nil {
+			handler(proposal)
+		}
+		return
+	}
+	proposalID := "runtime-approval-" + strings.TrimPrefix(newIntegrationID("proposal"), "proposal_")
+	c.callbacks[proposalID] = claudeCallback{callbackID: data.CallbackID, toolCallID: data.ToolCallID, turnID: source.TurnID, fingerprint: fingerprint}
+	c.callbackProposals[data.CallbackID] = proposalID
+	handler := c.approvalHandler
+	policy := c.approvalPolicy
+	c.mu.Unlock()
+	proposal, safe := claudeApprovalProposal(proposalID, source.TurnID, data.ToolCallID, data.ToolName, data.Input)
+	if !safe {
+		go func() { _ = c.ResolveApproval(context.Background(), proposalID, runtimecontract.ApprovalAbort) }()
+		return
+	}
+	if policy == "never" {
+		go func() {
+			_ = c.ResolveApproval(context.Background(), proposalID, runtimecontract.ApprovalApprove)
+		}()
+		return
+	}
+	if handler == nil {
+		return
+	}
+	handler(proposal)
+}
+
+func claudeApprovalProposal(id, turnID, toolCallID, toolName string, input map[string]any) (runtimecontract.ApprovalProposal, bool) {
+	if !safeClaudeToolName(toolName) || !safeClaudeApprovalValue(input, 0) {
+		return runtimecontract.ApprovalProposal{}, false
+	}
+	arguments := make([]runtimecontract.ApprovalArgument, 0, len(input))
+	total := 0
+	for name, value := range input {
+		encoded, err := json.Marshal(value)
+		if err != nil || len(encoded) > 16<<10 {
+			return runtimecontract.ApprovalProposal{}, false
+		}
+		total += len(encoded)
+		arguments = append(arguments, runtimecontract.ApprovalArgument{Name: name, Value: strings.Trim(string(encoded), `"`)})
+	}
+	if total > 64<<10 {
+		return runtimecontract.ApprovalProposal{}, false
+	}
+	sort.Slice(arguments, func(i, j int) bool { return arguments[i].Name < arguments[j].Name })
+	action := "tool/" + toolName
+	if !knownClaudeTool(toolName) {
+		action = "tool/custom"
+	}
+	return runtimecontract.ApprovalProposal{ID: id, ToolCallID: toolCallID, TurnID: turnID, ToolName: toolName, Action: action, Arguments: arguments, Timeout: 5 * time.Minute}, true
+}
+
+func safeClaudeToolName(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	for _, char := range name {
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || strings.ContainsRune("_.:-", char)) {
+			return false
+		}
+	}
+	return true
+}
+
+func safeClaudeApprovalValue(value any, depth int) bool {
+	if depth > 8 {
+		return false
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, nested := range typed {
+			if !approvalActionKey(key) || !safeClaudeApprovalValue(nested, depth+1) {
+				return false
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if !safeClaudeApprovalValue(nested, depth+1) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func knownClaudeTool(name string) bool {
+	switch strings.ToLower(name) {
+	case "bash", "read", "edit", "write", "webfetch", "websearch", "notebookedit", "task", "skill":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *claudeRuntimeContract) handleNeedsYou(source claudebridge.Event) {
+	var data struct {
+		CallbackID string `json:"callbackId"`
+		ToolCallID string `json:"toolCallId"`
+		Questions  []struct {
+			Question string                           `json:"question"`
+			Options  []runtimecontract.NeedsYouOption `json:"options"`
+		} `json:"questions"`
+	}
+	if json.Unmarshal(source.Data, &data) != nil || data.CallbackID == "" || data.ToolCallID == "" || len(data.Questions) != 1 || strings.TrimSpace(data.Questions[0].Question) == "" {
+		c.fail(errors.New("Claude bridge emitted malformed Needs You request"))
+		return
+	}
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(source.Data))
+	c.mu.Lock()
+	proposalID := c.callbackProposals[data.CallbackID]
+	if proposalID == "" {
+		proposalID = newIntegrationID("hrq")
+		c.callbackProposals[data.CallbackID] = proposalID
+		c.callbacks[proposalID] = claudeCallback{callbackID: data.CallbackID, toolCallID: data.ToolCallID, turnID: source.TurnID, fingerprint: fingerprint}
+	} else if existing := c.callbacks[proposalID]; existing.turnID != source.TurnID || existing.fingerprint != fingerprint {
+		c.mu.Unlock()
+		c.fail(errors.New("Claude Runtime Needs You callback diverged"))
+		return
+	}
+	handler := c.needsYouHandler
+	c.mu.Unlock()
+	if handler == nil {
+		return
+	}
+	err := handler(runtimecontract.NeedsYouProposal{ID: proposalID, TurnID: source.TurnID, Question: data.Questions[0].Question, Options: data.Questions[0].Options})
+	if err == nil {
+		c.mu.Lock()
+		c.waiting[source.TurnID] = true
+		c.mu.Unlock()
+	}
+	if c.bridge == nil {
+		return
+	}
+	go func() {
+		_, outcome := c.command(context.Background(), "resolve_needs_you", source.TurnID, runtimecontract.FailurePhaseTurnContinue, map[string]any{"callbackId": data.CallbackID, "persisted": err == nil})
+		c.mu.Lock()
+		callback := c.callbacks[proposalID]
+		callback.settled = true
+		c.callbacks[proposalID] = callback
+		c.mu.Unlock()
+		if outcome.State != runtimecontract.LifecycleAccepted && err == nil {
+			c.fail(errors.New("Claude Runtime could not release its Needs You callback"))
+		}
+	}()
 }
 
 func cloneClaudeLedgerTurns(turns []runtimecontract.HistoryTurn) []runtimecontract.HistoryTurn {

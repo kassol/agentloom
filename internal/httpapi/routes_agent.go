@@ -421,14 +421,12 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		writeJSON(w, 200, hist)
 	})
 	mux.HandleFunc("POST /api/agents/{key}/thread/approvals/{approvalId}", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Decision string `json:"decision"`
-		}
+		var body hub.ApprovalResolutionParams
 		if err := readJSON(r, &body); err != nil {
 			writeErr(w, err)
 			return
 		}
-		result, err := s.hub.ResolveApproval(r.PathValue("key"), r.PathValue("approvalId"), body.Decision)
+		result, err := s.hub.ResolveApprovalWithParams(r.PathValue("key"), r.PathValue("approvalId"), body)
 		if err != nil {
 			writeErr(w, err)
 			return

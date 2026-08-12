@@ -227,7 +227,9 @@ func renderEvent(st *watchState, seq int64, ts, typ string, data json.RawMessage
 		fmt.Printf("%s %s %v %s\n", t, red("⚠ approval requested"), d["method"], dim(clip(string(params), 120)))
 		fmt.Printf("%s %s\n", t, dim(fmt.Sprintf("  resolve: %s approve <agent> %v — or via web console", commandName, d["approvalId"])))
 	case "loom/approval-resolved":
-		fmt.Printf("%s %s %s\n", t, green(fmt.Sprintf("approval %v", d["decision"])), dim(fmt.Sprintf("%v", d["approvalId"])))
+		fmt.Printf("%s %s %s %s\n", t, green(fmt.Sprintf("approval %v", d["decision"])), dim(fmt.Sprintf("delivery=%v", d["deliveryStatus"])), dim(fmt.Sprintf("%v", d["approvalId"])))
+	case "loom/approval-effect":
+		fmt.Printf("%s %s %s\n", t, green(fmt.Sprintf("approval effect %v", d["effectStatus"])), dim(fmt.Sprintf("%v", d["approvalId"])))
 	case "loom/error", "loom/host-error":
 		fmt.Printf("%s %s %v\n", t, red("CodexLoom error:"), d["message"])
 	default:

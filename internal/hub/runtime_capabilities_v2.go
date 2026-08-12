@@ -345,8 +345,9 @@ func piControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Capabi
 func claudeControlPlaneCapabilitySnapshot() runtimecontract.CapabilitySnapshot {
 	snapshot := controlPlaneCapabilitySnapshot("claude")
 	for index := range snapshot.Capabilities {
-		if snapshot.Capabilities[index].ID == runtimecontract.CapabilityContextDelivery {
-			snapshot.Capabilities[index] = runtimeCapabilityDescriptor("claude", runtimecontract.CapabilityContextDelivery, true)
+		id := snapshot.Capabilities[index].ID
+		if id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy {
+			snapshot.Capabilities[index] = runtimeCapabilityDescriptor("claude", id, true)
 		}
 	}
 	return snapshot

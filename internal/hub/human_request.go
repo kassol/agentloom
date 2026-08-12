@@ -173,6 +173,16 @@ func (h *Hub) CreateOrGetHumanRequest(params CreateHumanRequestParams, causality
 }
 
 func (h *Hub) createOrGetHumanRequest(params CreateHumanRequestParams, causality HumanRequestCausality) (HumanRequest, bool, error) {
+	params, causality, options, err := prepareHumanRequest(params, causality)
+	if err != nil {
+		return HumanRequest{}, false, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.createOrGetHumanRequestLocked(params, causality, options)
+}
+
+func prepareHumanRequest(params CreateHumanRequestParams, causality HumanRequestCausality) (CreateHumanRequestParams, HumanRequestCausality, []HumanRequestOption, error) {
 	params.Agent = strings.TrimSpace(params.Agent)
 	params.Question = strings.TrimSpace(params.Question)
 	params.Context = strings.TrimSpace(params.Context)
@@ -184,35 +194,39 @@ func (h *Hub) createOrGetHumanRequest(params CreateHumanRequestParams, causality
 	causality.SourceTask = strings.TrimSpace(causality.SourceTask)
 	causality.TopicID = strings.TrimSpace(causality.TopicID)
 	if params.Agent == "" {
-		return HumanRequest{}, false, errf(400, "agent is required")
+		return params, causality, nil, errf(400, "agent is required")
 	}
 	if params.Question == "" {
-		return HumanRequest{}, false, errf(400, "question is required")
+		return params, causality, nil, errf(400, "question is required")
 	}
 	if params.Expectation == "" {
 		params.Expectation = HumanRequestRequired
 	}
 	if params.Expectation != HumanRequestRequired && params.Expectation != HumanRequestOptional {
-		return HumanRequest{}, false, errf(400, "expectation must be required or optional")
+		return params, causality, nil, errf(400, "expectation must be required or optional")
 	}
 	if len(params.Options) > 8 {
-		return HumanRequest{}, false, errf(400, "at most 8 options are allowed")
+		return params, causality, nil, errf(400, "at most 8 options are allowed")
 	}
 	options := make([]HumanRequestOption, 0, len(params.Options))
 	for _, option := range params.Options {
 		option.Label = strings.TrimSpace(option.Label)
 		option.Description = strings.TrimSpace(option.Description)
 		if option.Label == "" {
-			return HumanRequest{}, false, errf(400, "option label is required")
+			return params, causality, nil, errf(400, "option label is required")
 		}
 		options = append(options, option)
 	}
 	if causality.TopicID != "" && params.TopicID != "" && causality.TopicID != params.TopicID {
-		return HumanRequest{}, false, errf(400, "Topic causality does not match requested Topic")
+		return params, causality, nil, errf(400, "Topic causality does not match requested Topic")
 	}
+	params.Options = options
+	return params, causality, options, nil
+}
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
+// createOrGetHumanRequestLocked commits one already-validated request while
+// the caller holds the Hub lifecycle lock.
+func (h *Hub) createOrGetHumanRequestLocked(params CreateHumanRequestParams, causality HumanRequestCausality, options []HumanRequestOption) (HumanRequest, bool, error) {
 	agent := h.resolveLocked(params.Agent)
 	if agent == nil {
 		return HumanRequest{}, false, errf(404, "agent not found: %s", params.Agent)

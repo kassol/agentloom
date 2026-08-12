@@ -929,10 +929,12 @@ export function reduceFeed(state: FeedState, ev: LoomEvent): FeedState {
       return sys(
         { ...state, approvals },
         ev.ts,
-        d.decision === "approve" || d.decision === "accept" ? "ok" : "warn",
-        `approval ${d.decision}`,
+		d.deliveryStatus === "failed" || d.deliveryStatus === "indeterminate" ? "err" : d.decision === "approve" || d.decision === "accept" ? "ok" : "warn",
+		`approval ${d.decision}${d.deliveryStatus ? `; delivery ${d.deliveryStatus}` : ""}`,
       );
     }
+	case "loom/approval-effect":
+	  return sys(state, ev.ts, d.effectStatus === "failed" ? "err" : "ok", `approval effect ${d.effectStatus}`);
   }
 
   return state;

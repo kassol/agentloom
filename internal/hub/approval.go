@@ -3,6 +3,7 @@ package hub
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,11 @@ type runtimeApprovalRequest struct {
 	TurnID      string
 	RuntimeKind string
 	Proposal    runtimecontract.ApprovalProposal
+}
+
+type ApprovalResolutionParams struct {
+	Decision      string          `json:"decision"`
+	ModifiedInput json.RawMessage `json:"modifiedInput,omitempty"`
 }
 
 func newApprovalID(agentID string) string {
@@ -42,6 +48,8 @@ func approvalEventPayload(approval ApprovalView) map[string]any {
 		"runtimeKind": approval.RuntimeKind, "method": approval.Method, "params": approval.Params,
 		"status": approval.Status, "decision": approval.Decision, "requestedAt": approval.RequestedAt,
 		"resolvedAt": approval.ResolvedAt, "resolutionError": approval.ResolutionError,
+		"deliveryStatus": approval.DeliveryStatus, "deliveryError": approval.DeliveryError,
+		"effectStatus": approval.EffectStatus,
 	}
 }
 
@@ -63,7 +71,7 @@ func (h *Hub) requestRuntimeApprovalLocked(request runtimeApprovalRequest, respo
 	next := ApprovalView{
 		ApprovalID: newApprovalID(request.AgentID), AgentID: request.AgentID, TurnID: request.TurnID,
 		RuntimeKind: request.RuntimeKind, Method: method, Params: publicParams,
-		Status: "pending", RequestedAt: requestedAt, TS: requestedAt,
+		Status: "pending", DeliveryStatus: "waiting", EffectStatus: "unobserved", RequestedAt: requestedAt, TS: requestedAt,
 	}
 	if err := h.commitApprovalLocked(next); err != nil {
 		if respond != nil {
@@ -74,7 +82,7 @@ func (h *Hub) requestRuntimeApprovalLocked(request runtimeApprovalRequest, respo
 	if rt.approvals == nil {
 		rt.approvals = map[string]*approval{}
 	}
-	rt.approvals[next.ApprovalID] = &approval{respond: respond, done: make(chan struct{})}
+	rt.approvals[next.ApprovalID] = &approval{toolCallID: request.Proposal.ToolCallID, respond: respond, done: make(chan struct{})}
 	if rt.activeTurn != nil && !rt.activeTurn.finished {
 		rt.activeTurn.lastActivity = time.Now()
 	}
@@ -136,11 +144,16 @@ func projectApprovalAction(value any) any {
 }
 
 func approvalActionKey(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(key)) {
+	normalized := strings.NewReplacer("_", "", "-", "").Replace(strings.ToLower(strings.TrimSpace(key)))
+	switch normalized {
 	case "toolname", "command", "cwd", "path", "filepath", "source", "destination", "target",
 		"url", "host", "port", "method", "reason", "justification", "description", "query",
 		"pattern", "prompt", "content", "oldtext", "newtext", "patch", "input", "args",
-		"arguments", "changes", "edits", "permissions":
+		"arguments", "changes", "edits", "permissions", "oldstring", "newstring", "replaceall",
+		"offset", "limit", "pages", "timeout", "runinbackground", "dangerouslydisablesandbox",
+		"glob", "outputmode", "context", "linenumber", "ignorecase", "type", "headlimit", "multiline",
+		"alloweddomains", "blockeddomains", "notebookpath", "cellid", "newsource", "celltype", "editmode",
+		"subagenttype", "model", "resume", "maxturns", "name", "teamname", "mode", "skill":
 		return true
 	default:
 		return false
@@ -170,6 +183,16 @@ func (h *Hub) loadApprovals() error {
 		if json.Unmarshal(raw, &record) != nil || record.Approval.ApprovalID == "" {
 			return
 		}
+		if record.Approval.DeliveryStatus == "" {
+			if record.Approval.Status == "pending" {
+				record.Approval.DeliveryStatus = "waiting"
+			} else {
+				record.Approval.DeliveryStatus = "delivered"
+			}
+		}
+		if record.Approval.EffectStatus == "" {
+			record.Approval.EffectStatus = "unobserved"
+		}
 		if h.approvals[record.Approval.ApprovalID] == nil {
 			h.approvalOrder = append(h.approvalOrder, record.Approval.ApprovalID)
 		}
@@ -183,14 +206,23 @@ func (h *Hub) loadApprovals() error {
 func (h *Hub) recoverPendingApprovals(persist bool) error {
 	for _, id := range h.approvalOrder {
 		current := h.approvals[id]
-		if current == nil || current.Status != "pending" {
+		if current == nil {
 			continue
 		}
 		next := *current
-		next.Status = "aborted"
-		next.Decision = "abort"
-		next.ResolvedAt = now()
-		next.ResolutionError = "CodexLoom restarted before the Runtime Approval was resolved"
+		switch {
+		case current.Status == "pending":
+			next.Status = "aborted"
+			next.Decision = "abort"
+			next.DeliveryStatus = "unavailable"
+			next.ResolvedAt = now()
+			next.ResolutionError = "CodexLoom restarted before the Runtime Approval was resolved"
+		case current.DeliveryStatus == "pending":
+			next.DeliveryStatus = "indeterminate"
+			next.DeliveryError = "Runtime callback delivery outcome is indeterminate after restart"
+		default:
+			continue
+		}
 		if persist {
 			if err := h.commitApprovalLocked(next); err != nil {
 				return err
@@ -211,6 +243,7 @@ func (h *Hub) abortTurnApprovalsLocked(agentID, turnID string, rt *runtime, reas
 		next := *current
 		next.Status = "aborted"
 		next.Decision = "abort"
+		next.DeliveryStatus = "pending"
 		next.ResolvedAt = now()
 		next.ResolutionError = reason
 		if err := h.commitApprovalLocked(next); err != nil {
@@ -222,9 +255,38 @@ func (h *Hub) abortTurnApprovalsLocked(agentID, turnID string, rt *runtime, reas
 		delete(rt.approvals, id)
 		if waiter != nil && waiter.respond != nil {
 			respond := waiter.respond
-			h.startWorkerLocked(func() { _ = respond(runtimecontract.ApprovalAbort) })
+			h.startWorkerLocked(func() { h.deliverApprovalAbort(agentID, id, respond) })
 		}
 	}
+}
+
+func (h *Hub) deliverApprovalAbort(agentID, approvalID string, respond func(runtimecontract.ApprovalDecision) error) {
+	err := respond(runtimecontract.ApprovalAbort)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	current := h.approvals[approvalID]
+	if current == nil || current.Decision != "abort" || current.DeliveryStatus != "pending" {
+		return
+	}
+	next := *current
+	if err != nil {
+		next.DeliveryStatus = "failed"
+		next.DeliveryError = "Runtime callback delivery failed"
+		if isRuntimeIndeterminate(err) {
+			next.DeliveryStatus = "indeterminate"
+			next.DeliveryError = "Runtime callback delivery outcome is indeterminate"
+		}
+		log.Printf("[codex-loom] deliver Approval abort %s: %v", approvalID, err)
+	} else {
+		next.DeliveryStatus = "delivered"
+	}
+	if persistErr := h.commitApprovalLocked(next); persistErr != nil {
+		log.Printf("[codex-loom] persist Approval abort delivery %s: %v", approvalID, persistErr)
+		next.DeliveryStatus = "indeterminate"
+		next.DeliveryError = "Approval delivery evidence could not be persisted"
+		h.approvals[approvalID] = &next
+	}
+	h.emitLocked(agentID, "loom/approval-resolved", approvalEventPayload(next))
 }
 
 func closeApprovalWaiter(waiter *approval) {

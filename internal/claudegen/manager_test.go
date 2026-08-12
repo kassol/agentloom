@@ -76,7 +76,9 @@ export function query({prompt, options}) {
 	if err := os.WriteFile(filepath.Join(module, "index.js"), []byte(fake), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(node, filepath.Join(app, "bridge.mjs"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, node, filepath.Join(app, "bridge.mjs"))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -147,6 +149,100 @@ export function query({prompt, options}) {
 	if terminalCount != 1 || !slices.Contains(texts, "causal-developer-observed") {
 		t.Fatalf("terminalCount=%d texts=%#v", terminalCount, texts)
 	}
+}
+
+func TestEmbeddedBridgeResolvesApprovalAndReleasesNeedsYou(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	app := t.TempDir()
+	module := filepath.Join(app, "node_modules", "@anthropic-ai", "claude-agent-sdk")
+	if err := os.MkdirAll(module, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "bridge.mjs"), currentAssets().Bridge, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(module, "package.json"), []byte(`{"type":"module","exports":"./index.js","version":"0.3.228","claudeCodeVersion":"2.1.228"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := `
+export async function getSessionInfo() { return undefined; }
+export function query({prompt, options}) {
+  let interrupted = false;
+  return {
+    async streamInput() {}, async interrupt() { interrupted = true; }, close() {},
+    async *[Symbol.asyncIterator]() {
+      await prompt[Symbol.asyncIterator]().next();
+      yield {type:"system", subtype:"init", session_id:options.sessionId};
+      const approval = await options.canUseTool("Bash", {command:"printf original"}, {signal:new AbortController().signal, requestId:"callback-approval", toolUseID:"tool-approval"});
+      yield {type:"assistant", uuid:"approval", session_id:options.sessionId, message:{content:[{type:"text",text:approval.updatedInput?.command || approval.behavior}]}};
+      await options.canUseTool("AskUserQuestion", {questions:[{question:"Ship now?",options:[{label:"Yes",description:"Ship"},{label:"No",description:"Wait"}]}]}, {signal:new AbortController().signal, requestId:"callback-question", toolUseID:"tool-question"});
+      yield {type:"result", subtype:"error_during_execution", terminal_reason:interrupted?"aborted_tools":"other", session_id:options.sessionId, usage:{input_tokens:1,output_tokens:1},total_cost_usd:0};
+    }
+  };
+}`
+	if err := os.WriteFile(filepath.Join(module, "index.js"), []byte(fake), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, node, filepath.Join(app, "bridge.mjs"))
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	scanner := bufio.NewScanner(stdout)
+	read := func() map[string]any {
+		t.Helper()
+		if !scanner.Scan() {
+			t.Fatalf("bridge output ended: %v", scanner.Err())
+		}
+		var frame map[string]any
+		if json.Unmarshal(scanner.Bytes(), &frame) != nil {
+			t.Fatalf("frame=%s", scanner.Bytes())
+		}
+		return frame
+	}
+	write := func(frame any) { encoded, _ := json.Marshal(frame); _, _ = stdin.Write(append(encoded, '\n')) }
+	_ = read()
+	write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
+	_ = read()
+	session := "11111111-1111-4111-8111-111111111111"
+	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "input": []any{map[string]any{"kind": "text", "role": "user", "text": "work"}}}})
+	for {
+		frame := read()
+		if frame["event"] == "approval" {
+			data := frame["data"].(map[string]any)
+			write(map[string]any{"kind": "command", "command": "resolve_approval", "requestId": "resolve", "turnId": "turn", "operation": "op-approval", "payload": map[string]any{"callbackId": data["callbackId"], "decision": "approve"}})
+			break
+		}
+	}
+	sawOriginal := false
+	for {
+		frame := read()
+		if frame["event"] == "content" {
+			content := frame["data"].(map[string]any)["content"].(map[string]any)
+			sawOriginal = sawOriginal || content["text"] == "printf original"
+		}
+		if frame["event"] == "needs_you" {
+			data := frame["data"].(map[string]any)
+			write(map[string]any{"kind": "command", "command": "resolve_needs_you", "requestId": "needs", "turnId": "turn", "operation": "op-needs", "payload": map[string]any{"callbackId": data["callbackId"], "persisted": true}})
+			break
+		}
+	}
+	sawInterrupted := false
+	for !sawInterrupted {
+		frame := read()
+		sawInterrupted = frame["event"] == "turn_interrupted"
+	}
+	if !sawOriginal {
+		t.Fatal("exact Approval input did not reach the SDK callback")
+	}
+	write(map[string]any{"kind": "close"})
 }
 
 func TestEmbeddedBridgeClassifiesTerminalBeforeInterruptReceipt(t *testing.T) {

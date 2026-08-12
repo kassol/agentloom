@@ -138,6 +138,15 @@ only the Codex adapter translates it to rollout records. Provider-history
 sanitization and restore are Codex Host maintenance capabilities rather than
 shared Hub calls into rollout storage.
 
+Proposal, Owner decision, live-callback delivery, and subsequent typed tool
+effect are separate durable Approval facts. A delivery failure never rewrites
+an Owner approval as a denial or claims that the tool executed. The current
+contract supports exact-input approve/deny only; modified input is rejected
+before decision persistence or callback delivery. Claude `AskUserQuestion`
+instead creates a durable Human Request, releases its callback, and interrupts
+the source Turn. Its answer starts one new causal Recovery Turn rather than
+replaying the callback.
+
 Codex Remote remains a shared Codex Host integration, not an Agent Runtime
 capability. An Agent descriptor that marks Remote unavailable must not cause
 the Web or Hub to route through a hidden per-Agent fallback.

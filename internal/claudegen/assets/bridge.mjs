@@ -34,6 +34,37 @@ write({kind: "hello", ...identity, os: process.platform, arch: process.arch === 
 let initialized = false;
 let active;
 
+function stableJSON(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJSON).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJSON(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+function requestPermission(turn, toolName, input, options) {
+  const callbackId = `${options.requestId}:${options.toolUseID}`;
+  const fingerprint = stableJSON({toolName, input});
+  const existing = turn.callbacks.get(callbackId);
+  if (existing) {
+    if (existing.fingerprint !== fingerprint) process.exit(70);
+    return existing.promise;
+  }
+  let settle;
+  const promise = new Promise((resolve) => { settle = resolve; });
+	const callback = {callbackId, toolCallId: options.toolUseID, input, fingerprint, promise, settle, settled: false};
+  turn.callbacks.set(callbackId, callback);
+  const questions = toolName === "AskUserQuestion" && Array.isArray(input?.questions) ? input.questions : undefined;
+  emit(turn.frame, questions ? "needs_you" : "approval", questions
+    ? {callbackId, toolCallId: options.toolUseID, questions}
+    : {callbackId, toolCallId: options.toolUseID, toolName, input});
+  options.signal?.addEventListener("abort", () => {
+	if (!callback.settled) {
+	  callback.settled = true;
+	  settle({behavior: "deny", message: "Runtime callback aborted", interrupt: true, toolUseID: options.toolUseID});
+	}
+  }, {once: true});
+  return promise;
+}
+
 function textInput(input) {
   const blocks = Array.isArray(input) ? input : [];
   return blocks.filter((block) => block?.kind === "text" && block.role !== "developer")
@@ -103,7 +134,7 @@ async function runTurn(frame) {
   const sessionRef = payload.sessionRef;
   const runtimeTurnRef = randomUUID();
   const developer = developerInput(payload.input);
-  let sdkQuery;
+  let sdkQuery, turn;
   try {
 	if (!payload.resume && await getSessionInfo(sessionRef, {dir: payload.cwd})) {
 	  respond(frame, false, {}, "Claude Runtime cannot create the reserved session");
@@ -112,10 +143,11 @@ async function runTurn(frame) {
     const options = {
       cwd: payload.cwd,
       ...(payload.resume ? {resume: sessionRef} : {sessionId: sessionRef}),
-      ...(developer ? {systemPrompt: {type: "preset", preset: "claude_code", append: developer}} : {})
+      ...(developer ? {systemPrompt: {type: "preset", preset: "claude_code", append: developer}} : {}),
+      canUseTool: (toolName, input, callbackOptions) => requestPermission(turn, toolName, input, callbackOptions)
     };
     sdkQuery = query({prompt: initialInput(payload.input, sessionRef), options});
-	const turn = {frame, operations: [frame], query: sdkQuery, runtimeTurnRef, accepted: false, terminal: false, expectedResults: 1, observedResults: 0};
+	turn = {frame, operations: [frame], query: sdkQuery, runtimeTurnRef, callbacks: new Map(), accepted: false, terminal: false, expectedResults: 1, observedResults: 0};
 	active = turn;
     for await (const message of sdkQuery) {
       if (message?.session_id && message.session_id !== sessionRef) {
@@ -223,6 +255,45 @@ async function handleCommand(frame) {
 	  process.exit(70);
     }
 	}
+    return;
+  case "resolve_approval":
+    if (!active?.accepted || active.terminal) {
+      respond(frame, false, {}, "Claude Runtime has no matching active Turn");
+      return;
+    }
+    {
+      const callback = active.callbacks.get(payload.callbackId);
+	  if (!callback || callback.settled) {
+        respond(frame, false, {}, "Claude Runtime callback is unavailable");
+        return;
+      }
+	  callback.settled = true;
+      const allow = payload.decision === "approve";
+	  callback.settle(allow
+		? {behavior: "allow", updatedInput: callback.input, toolUseID: callback.toolCallId}
+        : {behavior: "deny", message: "Owner did not authorize this tool", interrupt: false, toolUseID: callback.toolCallId});
+      respond(frame, true);
+    }
+    return;
+  case "resolve_needs_you":
+    if (!active?.accepted || active.terminal) {
+      respond(frame, false, {}, "Claude Runtime has no matching active Turn");
+      return;
+    }
+    {
+      const callback = active.callbacks.get(payload.callbackId);
+	  if (!callback || callback.settled) {
+        respond(frame, false, {}, "Claude Runtime callback is unavailable");
+        return;
+      }
+	  callback.settled = true;
+      callback.settle({behavior: "deny", message: payload.persisted ? "Waiting for Owner input" : "Owner request could not be persisted", interrupt: Boolean(payload.persisted), toolUseID: callback.toolCallId});
+      if (payload.persisted) {
+		active.interruptRequested = true;
+		await active.query.interrupt();
+	  }
+      respond(frame, true);
+    }
     return;
   default:
     respond(frame, false, {}, "command is not implemented by this bridge build");
