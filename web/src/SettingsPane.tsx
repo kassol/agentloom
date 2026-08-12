@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { DesignPane } from "./DesignPane";
 import { RemotePane } from "./RemotePane";
-import { api, type BackupStatus, type GitHubDeviceFlow, type ModelProvider, type ModelProviderResponse, type PlatformConnection, type RemoteSnapshot } from "./types";
+import { api, type BackupStatus, type ClaudeRuntimeGenerationStatus, type GitHubDeviceFlow, type ModelProvider, type ModelProviderResponse, type PlatformConnection, type RemoteSnapshot } from "./types";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 
@@ -65,7 +65,7 @@ export function SettingsPane({ section, remote, backupStatus, backingUp, restart
           {section === "providers" ? <ProviderSettings onError={onError} /> : null}
           {section === "connectors" ? <ConnectorSettings onOpenExternal={onOpenExternal} onError={onError} /> : null}
           {section === "recovery" ? <RecoverySettings status={backupStatus} backingUp={backingUp} onBackup={onBackup} /> : null}
-          {section === "system" ? <SystemSettings restarting={restarting} restartStatus={restartStatus} onRestart={onRestart} /> : null}
+          {section === "system" ? <SystemSettings restarting={restarting} restartStatus={restartStatus} onRestart={onRestart} onError={onError} /> : null}
           {section === "developer" ? <DesignPane embedded /> : null}
         </div>
       </div>
@@ -339,10 +339,44 @@ function RecoverySettings({ status, backingUp, onBackup }: { status: BackupStatu
   </SettingsBody>;
 }
 
-function SystemSettings({ restarting, restartStatus, onRestart }: { restarting: boolean; restartStatus: any; onRestart: () => void }) {
+function SystemSettings({ restarting, restartStatus, onRestart, onError }: { restarting: boolean; restartStatus: any; onRestart: () => void; onError: (message: string) => void }) {
   const state = restartStatus?.state || "ready";
   const pending = restarting || state === "waiting" || state === "restarting";
-  return <SettingsBody title="System" description="Restart the built release through the supervised Loom reloader. Running work drains before the process changes.">
+  const queryClient = useQueryClient();
+  const generationQuery = useQuery<{ generation: ClaudeRuntimeGenerationStatus }>({ queryKey: ["claude-runtime-generation"], queryFn: () => api("GET", "/api/runtime-generations/claude") });
+  const generation = generationQuery.data?.generation;
+  const [acceptTerms, setAcceptTerms] = useState(false);
+  const [generationWorking, setGenerationWorking] = useState(false);
+  const runGenerationAction = async (action: "install" | "verify" | "activate" | "rollback") => {
+    setGenerationWorking(true);
+    try {
+      const body = action === "install" ? { acceptTerms } : action === "verify" ? { target: generation?.staged ? "staged" : "active" } : {};
+      const data = await api("POST", `/api/runtime-generations/claude/${action}`, body) as { generation: ClaudeRuntimeGenerationStatus };
+      queryClient.setQueryData(["claude-runtime-generation"], data);
+      setAcceptTerms(false);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+      await queryClient.invalidateQueries({ queryKey: ["claude-runtime-generation"] });
+    } finally {
+      setGenerationWorking(false);
+    }
+  };
+  return <SettingsBody title="System" description="Manage pinned Agent Runtime generations and restart the built release through the supervised Loom reloader.">
+    <div className="mb-2 text-[10px] font-semibold uppercase text-muted-foreground">Agent Runtimes</div>
+    <div className="border-y border-border py-4">
+      <div className="flex flex-wrap items-start gap-3"><Cpu className="mt-0.5 size-4 text-primary" /><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><span className="text-[12px] font-semibold">Claude Runtime generation</span>{generation?.developerPreview ? <span className="rounded-sm bg-warning/10 px-1.5 py-0.5 font-mono text-[8px] uppercase text-warning">developer preview</span> : null}</div><div className="mt-0.5 text-[10.5px] text-muted-foreground">{generation ? `${generation.state} · ${generation.platform.os}/${generation.platform.arch}` : generationQuery.isLoading ? "Inspecting compatibility…" : "Unavailable"}</div></div></div>
+      {generation ? <>
+        <dl className="mt-4 grid gap-3 text-[10px] sm:grid-cols-3"><SettingFact label="Required" value={generation.required.id} /><SettingFact label="Toolchain" value={`Node ${generation.required.nodeVersion || "—"} · SDK ${generation.required.sdkVersion || "—"}`} /><SettingFact label="Claude Code" value={generation.required.claudeCodeVersion || "—"} /></dl>
+        {generation.reason ? <div className="mt-3 border-l-2 border-warning bg-warning/5 px-3 py-2 text-[10px] leading-4 text-warning">{generation.reason}{generation.alternative ? ` ${generation.alternative}` : ""}</div> : null}
+        {!generation.termsAccepted ? <label className="mt-4 flex items-start gap-2 text-[10.5px] text-muted-foreground"><input aria-label="Accept Anthropic terms" type="checkbox" checked={acceptTerms} onChange={(event) => setAcceptTerms(event.target.checked)} className="mt-0.5" /><span>I have reviewed and accept the <a href={generation.termsUrl} target="_blank" rel="noreferrer" className="text-primary underline">Anthropic Commercial Terms</a> for this generation.</span></label> : null}
+        <div className="mt-4 flex flex-wrap justify-end gap-2">
+          <Button variant="outline" onClick={() => void runGenerationAction("verify")} disabled={generationWorking || (!generation.active && !generation.staged)}><ShieldCheck />Verify</Button>
+          {generation.previous ? <Button variant="outline" onClick={() => void runGenerationAction("rollback")} disabled={generationWorking}>Rollback</Button> : null}
+          {generation.staged ? <Button onClick={() => void runGenerationAction("activate")} disabled={generationWorking}>Activate generation</Button> : <Button onClick={() => void runGenerationAction("install")} disabled={generationWorking || !generation.platform.supported || (!generation.termsAccepted && !acceptTerms)}>Install generation</Button>}
+        </div>
+      </> : null}
+    </div>
+    <div className="mb-2 mt-7 text-[10px] font-semibold uppercase text-muted-foreground">Loom process</div>
     <div className="flex items-center gap-3 border-y border-border py-4"><RotateCw className={`size-4 text-primary ${pending ? "animate-spin" : ""}`} /><div className="min-w-0 flex-1"><div className="text-[12px] font-semibold">Restart Loom</div><div className="mt-0.5 text-[10.5px] text-muted-foreground">{restartStatus?.message || "Ready. Existing active Turns will drain first."}</div></div><Button variant="outline" onClick={onRestart} disabled={pending}>{state === "waiting" ? "Waiting" : state === "restarting" ? "Restarting" : "Restart"}</Button></div>
     {restartStatus?.running?.length ? <div className="mt-4 border-l-2 border-warning bg-warning/5 px-3 py-2 text-[11px] text-warning">Waiting for {restartStatus.running.map((agent: any) => agent.name).join(", ")}</div> : null}
     {restartStatus?.operations?.length ? <div className="mt-3 border-l-2 border-warning bg-warning/5 px-3 py-2 text-[11px] text-warning">Waiting for {restartStatus.operations.map((operation: any) => `${operation.provider || "connector"} ${operation.kind}`).join(", ")}</div> : null}

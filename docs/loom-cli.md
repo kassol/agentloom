@@ -450,6 +450,19 @@ Context 命令用于检查 Loom 注入到 Agent 的 developer/input 分层与 ep
 ./bin/loom doctor
 ```
 
+Claude Runtime developer preview 使用显式 generation 生命周期；安装只做固定版本与
+零模型核验，安装完成后仍需单独激活：
+
+```sh
+./bin/loom runtime claude status
+./bin/loom runtime claude install --accept-terms
+./bin/loom runtime claude verify --target staged
+./bin/loom runtime claude activate
+./bin/loom runtime claude rollback
+```
+
+详见 [Claude Runtime generation](claude-runtime-generation.md)。
+
 `version` 默认显示本地 CLI build；`--running` 读取运行中服务的 `/api/version`。
 `doctor` 同时读取 `/api/version` 与 `/api/health`，并在 CLI 与服务 commit 不一致时提示
 `restart required`。

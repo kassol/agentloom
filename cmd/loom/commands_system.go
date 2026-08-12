@@ -3,11 +3,63 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"runtime"
 	"strings"
 
 	"github.com/yan5xu/codex-loom/internal/buildinfo"
 )
+
+func cmdRuntime(a args) {
+	if len(a.positional) == 0 || a.positional[0] != "claude" {
+		usage("runtime claude status|install|verify|activate|rollback")
+	}
+	a.positional = a.positional[1:]
+	cmdRuntimeGeneration(a)
+}
+
+func cmdRuntimeGeneration(a args) {
+	action := "status"
+	if len(a.positional) > 0 {
+		action = a.positional[0]
+	}
+	method, path, body := http.MethodGet, "/api/runtime-generations/claude", any(nil)
+	switch action {
+	case "status":
+	case "install":
+		method, path = http.MethodPost, path+"/install"
+		body = map[string]any{"acceptTerms": a.flags["accept-terms"] == "true"}
+	case "verify":
+		method, path = http.MethodPost, path+"/verify"
+		body = map[string]any{"target": a.flags["target"]}
+	case "activate", "rollback":
+		method, path = http.MethodPost, path+"/"+action
+		body = map[string]any{}
+	default:
+		usage("runtime claude status|install|verify|activate|rollback [--accept-terms] [--target staged]")
+	}
+	response, err := api(method, path, body)
+	if err != nil {
+		fail(err)
+	}
+	generation, _ := response["generation"].(map[string]any)
+	fmt.Print(formatRuntimeGeneration(generation))
+}
+
+func formatRuntimeGeneration(generation map[string]any) string {
+	required, _ := generation["required"].(map[string]any)
+	platform, _ := generation["platform"].(map[string]any)
+	var text strings.Builder
+	fmt.Fprintf(&text, "Claude Runtime generation · %s · developer preview\n", value(generation, "state", "unknown"))
+	fmt.Fprintf(&text, "required: %s · Node %s · SDK %s · Claude Code %s\n", value(required, "id", "unknown"), value(required, "nodeVersion", "unknown"), value(required, "sdkVersion", "unknown"), value(required, "claudeCodeVersion", "unknown"))
+	fmt.Fprintf(&text, "platform: %s/%s · supported %t\n", value(platform, "os", "unknown"), value(platform, "arch", "unknown"), boolean(platform, "supported"))
+	for _, key := range []string{"reason", "alternative"} {
+		if message := value(generation, key, ""); message != "" {
+			fmt.Fprintf(&text, "%s: %s\n", key, message)
+		}
+	}
+	return text.String()
+}
 
 func cmdVersion(a args) {
 	if a.flags["running"] != "" {

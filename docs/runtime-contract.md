@@ -17,6 +17,11 @@ A registered `RuntimeHostDriver` owns Runtime process or client supervision:
   installing the result.
 - `Shutdown` stops resources owned by the Driver and is idempotent.
 
+The Claude developer preview resolves its Driver executable only from the exact
+active generation described in [claude-runtime-generation.md](claude-runtime-generation.md).
+Its preflight reports that compatibility row or an explicit unavailable/
+unsupported reason; it never searches `PATH` or installs implicitly.
+
 An `AgentHost` owns one Agent handle. `Close` is idempotent and releases that
 handle; for a shared Codex host it must not stop handles belonging to other
 Agents. Its Contract must report the current `runtimecontract.Version` before

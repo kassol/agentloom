@@ -1,12 +1,14 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/claudegen"
 	"github.com/yan5xu/codex-loom/internal/hub"
 )
 
@@ -21,6 +23,68 @@ func (s *Server) registerSystemRoutes(mux *http.ServeMux) {
 			"ok": true, "product": "CodexLoom", "dataDir": s.st.Dir(),
 			"agents": len(agents), "sessions": len(agents), "build": s.build,
 		})
+	})
+
+	mux.HandleFunc("GET /api/runtime-generations/claude", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"generation": s.claudeGenerations.Status(r.Context())})
+	})
+	mux.HandleFunc("POST /api/runtime-generations/claude/install", func(w http.ResponseWriter, r *http.Request) {
+		if !allowClaudeGenerationAdminRequest(w, r) {
+			return
+		}
+		if !s.beginGenerationMutation(w) {
+			return
+		}
+		defer s.endGenerationMutation()
+		var request struct {
+			AcceptTerms bool `json:"acceptTerms"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		status, err := s.claudeGenerations.Install(r.Context(), claudegen.InstallRequest{AcceptTerms: request.AcceptTerms})
+		s.writeClaudeGenerationResult(w, "install", status, err)
+	})
+	mux.HandleFunc("POST /api/runtime-generations/claude/verify", func(w http.ResponseWriter, r *http.Request) {
+		if !allowClaudeGenerationAdminRequest(w, r) {
+			return
+		}
+		if !s.beginGenerationMutation(w) {
+			return
+		}
+		defer s.endGenerationMutation()
+		var request struct {
+			Target string `json:"target"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil && err.Error() != "EOF" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		status, err := s.claudeGenerations.Verify(r.Context(), request.Target)
+		s.writeClaudeGenerationResult(w, "verify", status, err)
+	})
+	mux.HandleFunc("POST /api/runtime-generations/claude/activate", func(w http.ResponseWriter, r *http.Request) {
+		if !allowClaudeGenerationAdminRequest(w, r) {
+			return
+		}
+		if !s.beginGenerationMutation(w) {
+			return
+		}
+		defer s.endGenerationMutation()
+		status, err := s.claudeGenerations.Activate(r.Context())
+		s.writeClaudeGenerationResult(w, "activate", status, err)
+	})
+	mux.HandleFunc("POST /api/runtime-generations/claude/rollback", func(w http.ResponseWriter, r *http.Request) {
+		if !allowClaudeGenerationAdminRequest(w, r) {
+			return
+		}
+		if !s.beginGenerationMutation(w) {
+			return
+		}
+		defer s.endGenerationMutation()
+		status, err := s.claudeGenerations.Rollback(r.Context())
+		s.writeClaudeGenerationResult(w, "rollback", status, err)
 	})
 
 	mux.HandleFunc("POST /api/admin/restart", s.adminRestart)
@@ -124,6 +188,24 @@ func (s *Server) registerSystemRoutes(mux *http.ServeMux) {
 		writeJSON(w, 200, map[string]any{"revoked": true})
 	})
 
+}
+
+func (s *Server) writeClaudeGenerationResult(w http.ResponseWriter, action string, status claudegen.Status, err error) {
+	message := claudegen.PublicMessage(err)
+	s.hub.EmitGlobal("loom/runtime-generation", map[string]any{"action": action, "generation": status, "succeeded": err == nil, "error": message})
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": message, "generation": status})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"generation": status})
+}
+
+func allowClaudeGenerationAdminRequest(w http.ResponseWriter, r *http.Request) bool {
+	if allowAdminRequest(r) {
+		return true
+	}
+	writeErr(w, &hub.HubError{Status: http.StatusForbidden, Message: "Claude Runtime generation changes are only allowed from localhost unless CODEX_LOOM_ADMIN_TOKEN is configured"})
+	return false
 }
 
 func dailyActivityWindowFromRequest(r *http.Request, now time.Time) (time.Time, time.Time, int, error) {

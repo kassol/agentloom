@@ -26,6 +26,11 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 |---|---|---|
 | GET | `/api/version` | Build, commit, builtAt, dataDir, mode, webAsset |
 | GET | `/api/health` | Liveness and current Agent count |
+| GET | `/api/runtime-generations/claude` | Inspect the exact Claude Runtime generation and platform availability |
+| POST | `/api/runtime-generations/claude/install` | Explicitly stage the pinned generation; body `{acceptTerms}` |
+| POST | `/api/runtime-generations/claude/verify` | Run the zero-model verification for `active` or `staged` |
+| POST | `/api/runtime-generations/claude/activate` | Atomically activate the verified staged generation |
+| POST | `/api/runtime-generations/claude/rollback` | Explicitly swap to the retained previous generation |
 | GET | `/api/usage` | Team token usage overview |
 | GET | `/api/workload` | Team workload overview |
 | GET | `/api/activity/daily` | Daily activity buckets |
@@ -45,6 +50,8 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 
 `GET /api/usage`、`GET /api/workload`、`GET /api/activity/daily` 支持
 `from`/`to`/`tz` 或 `days`/`date` 查询参数。没有显式窗口时使用默认窗口。
+Claude generation 写操作不下载凭证、不调用模型、不接受路径；完整边界见
+[claude-runtime-generation.md](claude-runtime-generation.md)。
 
 ## Agent, Turn, and Thread
 

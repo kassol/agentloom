@@ -278,6 +278,35 @@ export interface BackupStatus {
   };
 }
 
+export interface RuntimeGenerationIdentity {
+  id: string;
+  compatibility?: string;
+  bridgeProtocol?: number;
+  bridgeBuild?: string;
+  nodeVersion?: string;
+  sdkVersion?: string;
+  claudeCodeVersion?: string;
+  capabilities?: string[];
+  verifiedAt?: string;
+}
+
+export interface ClaudeRuntimeGenerationStatus {
+  state: "install_required" | "staged" | "active" | "broken" | "unsupported" | string;
+  required: RuntimeGenerationIdentity;
+  active?: RuntimeGenerationIdentity;
+  staged?: RuntimeGenerationIdentity;
+  previous?: RuntimeGenerationIdentity;
+  platform: { os: string; arch: string; distribution?: string; version?: string; libc?: string; supported: boolean };
+  termsAccepted: boolean;
+  termsRevision: string;
+  termsUrl: string;
+  termsAcceptedAt?: string;
+  developerPreview: boolean;
+  productionReady: boolean;
+  reason?: string;
+  alternative?: string;
+}
+
 export interface RemotePairing {
   pairingCode: string;
   manualPairingCode?: string;

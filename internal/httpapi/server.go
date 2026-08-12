@@ -23,22 +23,49 @@ import (
 
 	"github.com/yan5xu/codex-loom/internal/backup"
 	"github.com/yan5xu/codex-loom/internal/buildinfo"
+	"github.com/yan5xu/codex-loom/internal/claudegen"
 	"github.com/yan5xu/codex-loom/internal/hub"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
 type Server struct {
-	hub              *hub.Hub
-	st               *store.Store
-	web              fs.FS
-	restartMu        sync.Mutex
-	restart          restartState
-	connectorMu      sync.Mutex
-	activeConnectors map[string]struct{}
-	githubMu         sync.Mutex
-	githubDevices    map[string]*githubDeviceFlow
-	build            buildinfo.Info
-	readOnly         bool
+	hub                *hub.Hub
+	st                 *store.Store
+	web                fs.FS
+	restartMu          sync.Mutex
+	restart            restartState
+	connectorMu        sync.Mutex
+	activeConnectors   map[string]struct{}
+	githubMu           sync.Mutex
+	githubDevices      map[string]*githubDeviceFlow
+	build              buildinfo.Info
+	readOnly           bool
+	claudeGenerations  *claudegen.Manager
+	generationMu       sync.Mutex
+	generationWorkers  sync.WaitGroup
+	generationStopping bool
+}
+
+func (s *Server) beginGenerationMutation(w http.ResponseWriter) bool {
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
+	if s.generationStopping {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "CodexLoom is shutting down"})
+		return false
+	}
+	s.generationWorkers.Add(1)
+	return true
+}
+
+func (s *Server) endGenerationMutation() { s.generationWorkers.Done() }
+
+// StopRuntimeGenerationOperations fences new installs/activation and waits for
+// entered handlers to finish their durable audit before Hub/Store retirement.
+func (s *Server) StopRuntimeGenerationOperations() {
+	s.generationMu.Lock()
+	s.generationStopping = true
+	s.generationMu.Unlock()
+	s.generationWorkers.Wait()
 }
 
 func New(h *hub.Hub, st *store.Store, web fs.FS) *Server {
@@ -46,15 +73,19 @@ func New(h *hub.Hub, st *store.Store, web fs.FS) *Server {
 }
 
 type Options struct {
-	StartedAt time.Time
-	Mode      string
-	ReadOnly  bool
+	StartedAt         time.Time
+	Mode              string
+	ReadOnly          bool
+	ClaudeGenerations *claudegen.Manager
 }
 
 func NewWithOptions(h *hub.Hub, st *store.Store, web fs.FS, options Options) *Server {
 	dataDir := ""
 	if st != nil {
 		dataDir = st.Dir()
+	}
+	if options.ClaudeGenerations == nil {
+		options.ClaudeGenerations = claudegen.Default()
 	}
 	return &Server{
 		hub: h, st: st, web: web, restart: restartState{State: "idle"},
@@ -63,7 +94,7 @@ func NewWithOptions(h *hub.Hub, st *store.Store, web fs.FS, options Options) *Se
 		build: buildinfo.Current(web, buildinfo.Runtime{
 			StartedAt: options.StartedAt, DataDir: dataDir, Mode: options.Mode, ReadOnly: options.ReadOnly,
 		}),
-		readOnly: options.ReadOnly,
+		readOnly: options.ReadOnly, claudeGenerations: options.ClaudeGenerations,
 	}
 }
 

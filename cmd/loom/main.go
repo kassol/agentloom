@@ -322,6 +322,8 @@ func main() {
 		cmdVersion(a)
 	case "doctor":
 		cmdDoctor(a)
+	case "runtime":
+		cmdRuntime(a)
 	case "dev":
 		cmdDev(a)
 	case "approve", "reject":
@@ -450,6 +452,7 @@ Compatibility shortcuts:
   chub backups [prune]
   chub version [--running]
   chub doctor
+  loom runtime claude status|install|verify|activate|rollback [--accept-terms]
   chub dev canary start [--agent NAME ...] [--port auto|N] [--from DATA_DIR]
   chub dev canary status|stop
   chub approve <name|id> <approvalId>   /  chub reject <name|id> <approvalId>

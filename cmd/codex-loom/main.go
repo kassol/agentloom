@@ -96,6 +96,7 @@ func main() {
 		_ = httpServer.Shutdown(ctx)
 		cancel()
 		_ = httpServer.Close() // Close long-lived SSE streams after the request grace window.
+		srv.StopRuntimeGenerationOperations()
 		startup.Wait()
 		h.Shutdown()
 		if err := st.Close(); err != nil {
