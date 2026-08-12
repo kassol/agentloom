@@ -44,6 +44,18 @@ _Avoid_: Failed Turn, safe retry
 The durable association between an Agent and its Agent Runtime's native conversation.
 _Avoid_: Thread ID, provider binding
 
+**Native Conversation Divergence**:
+A Runtime Binding state where passive native evidence contains activity that is not correlated to a Loom-owned Turn, requiring an Owner recovery decision before execution continues.
+_Avoid_: Imported Turn, external Turn
+
+**History Boundary**:
+The point from which Loom begins owning and exposing canonical Turns for an adopted native conversation; earlier native context may remain usable by the Agent Runtime but is not retroactively presented as Loom History.
+_Avoid_: Imported history, synthetic Turn
+
+**Canonical Turn Ledger**:
+The durable Loom-owned record of Runtime-neutral Turn content, tool state, terminal outcome, usage, and correlation that backs public History independently of native conversation retention.
+_Avoid_: Transcript copy, Runtime history cache
+
 **Thread**:
 The long-lived trajectory of one Agent's work, independent of whether its Agent Runtime calls the native conversation a thread or a session.
 _Avoid_: Session, runtime session
