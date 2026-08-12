@@ -44,7 +44,7 @@ func TestAgentDetailUsesCapabilitySnapshotAsOnlyRuntimeCapabilitySurface(t *test
 	}
 }
 
-func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
+func TestUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +62,6 @@ func TestPiUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 	tests := []struct {
 		name, method, path, body, capability string
 	}{
-		{name: "manual compaction", method: http.MethodPost, path: "/api/agents/agent-pi/compact", capability: "compaction"},
 		{name: "sandbox config", method: http.MethodPatch, path: "/api/agents/agent-pi/config", body: `{"sandbox":"read-only"}`, capability: "sandbox"},
 	}
 	for _, tt := range tests {

@@ -36,6 +36,18 @@ export interface Agent {
   currentTask: string;
   currentTurnId: string;
   lastError: string;
+	contextMaintenance?: {
+		id: string;
+		agentId: string;
+		threadId: string;
+		origin: "owner" | string;
+		state: "started" | "completed" | "failed" | "interrupted" | "indeterminate" | string;
+		startedAt: string;
+		completedAt?: string;
+		error?: string;
+		baselineRevision: string;
+		bindingRevision: string;
+	};
   lastTurn?: {
     turnId: string;
     task: string;

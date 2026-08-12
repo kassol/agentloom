@@ -85,10 +85,6 @@ func (h *Hub) GetAgent(key string) (AgentView, error) {
 		h.mu.Unlock()
 		return AgentView{}, errf(404, "agent not found: %s", key)
 	}
-	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
-		h.mu.Unlock()
-		return AgentView{}, err
-	}
 	view := h.viewLocked(meta)
 	h.mu.Unlock()
 	if snapshot, ok := h.refreshRuntimeCapabilitySnapshot(view.ID, false); ok {
@@ -480,10 +476,17 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 	h.mu.Unlock()
 
 	if nameChanged && binding.NativeRef != "" {
-		if err := h.syncRuntimeBindingName(rt, binding, nextName); err != nil {
+		if rt != nil {
+			rt.startMu.Lock()
+		}
+		syncErr := h.syncRuntimeBindingName(rt, binding, nextName)
+		if rt != nil {
+			rt.startMu.Unlock()
+		}
+		if syncErr != nil {
 			// The Hub name remains authoritative. Runtime initialization and the
 			// later native synchronization may retry this optional convenience.
-			log.Printf("[codex-loom] sync native binding name for Agent %s to %q: %v", meta.ID, nextName, err)
+			log.Printf("[codex-loom] sync native binding name for Agent %s to %q: %v", meta.ID, nextName, syncErr)
 		}
 	}
 	if snapshot, ok := h.refreshRuntimeCapabilitySnapshot(view.ID, true); ok {
@@ -686,6 +689,10 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		h.mu.Unlock()
 		return SendResult{}, errf(404, "agent not found: %s", key)
 	}
+	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+		h.mu.Unlock()
+		return SendResult{}, err
+	}
 	if topicID != "" {
 		topic := h.topics[topicID]
 		if topic == nil || !topicHasAgent(topic, meta.ID, meta.ID) {
@@ -785,6 +792,11 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		h.mu.Unlock()
 		rt.startMu.Unlock()
 		return SendResult{}, errf(404, "agent vanished")
+	}
+	if err := h.runtimeMutationAllowedLocked(agentID); err != nil {
+		h.mu.Unlock()
+		rt.startMu.Unlock()
+		return SendResult{}, err
 	}
 	goalID, goalVersion := "", int64(0)
 	if goal := h.goals[agentID]; goal != nil {
@@ -1184,9 +1196,19 @@ func (h *Hub) ArchiveAgent(key string) (map[string]any, error) {
 		h.mu.Unlock()
 		if rt != nil {
 			rt.startMu.Lock()
+			if h.archiveStartLockForTest != nil {
+				h.archiveStartLockForTest(agentID)
+			}
 		}
 		h.mu.Lock()
 		if h.agents[agentID] == meta && h.runtimes[agentID] == rt {
+			if err := h.runtimeMutationAllowedLocked(agentID); err != nil {
+				h.mu.Unlock()
+				if rt != nil {
+					rt.startMu.Unlock()
+				}
+				return nil, err
+			}
 			break
 		}
 		h.mu.Unlock()

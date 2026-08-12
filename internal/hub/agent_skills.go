@@ -250,6 +250,15 @@ func (h *Hub) UpdateRuntimeResourcePolicy(key string, params AgentSkillConfigPar
 		h.mu.Unlock()
 		return RuntimeResourceSnapshot{}, errf(409, "CodexLoom is shutting down; Runtime resource policy cannot be changed")
 	}
+	meta := h.resolveLocked(key)
+	if meta == nil {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, errf(404, "agent not found: %s", key)
+	}
+	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, err
+	}
 	h.mu.Unlock()
 	current, err := h.GetRuntimeResources(key)
 	if err != nil {
@@ -279,10 +288,14 @@ func (h *Hub) UpdateRuntimeResourcePolicy(key string, params AgentSkillConfigPar
 	}
 
 	h.mu.Lock()
-	meta := h.resolveLocked(key)
+	meta = h.resolveLocked(key)
 	if meta == nil {
 		h.mu.Unlock()
 		return RuntimeResourceSnapshot{}, errf(404, "agent not found: %s", key)
+	}
+	if err := h.runtimeMutationAllowedLocked(meta.ID); err != nil {
+		h.mu.Unlock()
+		return RuntimeResourceSnapshot{}, err
 	}
 	if meta.ID != current.AgentID || meta.Name != current.AgentName || meta.Cwd != current.Cwd || meta.RuntimeBinding.Kind != current.RuntimeKind || h.runtimeCapabilityScopeLocked(meta).BindingRevision != current.BindingRevision || resourcePolicyConfigurationRevision(meta, h.disabledSkillPathsLocked(meta.ID)) != current.ConfigurationRevision {
 		h.mu.Unlock()
@@ -435,6 +448,9 @@ func (h *Hub) UpdateRuntimeResourcePolicy(key string, params AgentSkillConfigPar
 func (h *Hub) runtimeMutationAllowedLocked(agentID string) error {
 	if h.resourcePolicyApplying[agentID] {
 		return errf(409, "Runtime resource policy is being applied; retry after it settles")
+	}
+	if agent := h.agents[agentID]; agent != nil && agent.ContextMaintenance != nil && agent.ContextMaintenance.State == contextMaintenanceStarted {
+		return errf(409, "Runtime context maintenance is in progress; retry after it settles")
 	}
 	return nil
 }

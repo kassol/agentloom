@@ -65,6 +65,15 @@ narrow typed optional hooks. A `CapabilitySnapshot` may say `available` only
 when the corresponding hook is present and passes its capability-specific
 exercise. Unknown or malformed descriptors fail closed.
 
+`ContextMaintenanceCapability` is the `manual_compaction` hook. Its passive
+`InspectContextMaintenance` reports an opaque revision, while `MaintainContext`
+returns a typed terminal `Outcome`. Loom persists the Owner operation before
+calling the Runtime and persists its terminal result before emitting the single
+canonical `loom/context-maintenance` event. Restart recovery never repeats the
+mutation: changed passive evidence proves completion and ambiguous evidence is
+recorded as `indeterminate`. Runtime-native IDs, paths, and compaction summaries
+remain adapter-private.
+
 `ModelControlCapability` is the single per-Agent model surface. Its typed
 state carries the available catalog, active model, per-model thinking choices,
 and image-input truth; `SelectModel` applies one provider/model/thinking

@@ -284,8 +284,9 @@ Message / Inbox / Trigger / Schedule / Needs You 来源，以及 rollout 中记�
 
 ## Compaction：主动压缩长 Thread
 
-长期 Agent 的 Thread 可能积累很多历史，尤其是 DeepSeek 等长上下文模型会继续写入
-reasoning 和工具轨迹。CodexLoom 支持显式请求 Codex 压缩一个 Agent 的 primary Thread：
+长期 Agent 的 Thread 可能积累很多历史。CodexLoom 通过 Runtime Contract 的
+`manual_compaction` capability 显式维护一个 Agent 的 primary Thread；当前 Codex 与
+Pi Runtime 都支持：
 
 ```sh
 ./bin/loom compact cici-research
@@ -293,10 +294,17 @@ reasoning 和工具轨迹。CodexLoom 支持显式请求 Codex 压缩一个 Agen
 ```
 
 - 仅允许 Agent 空闲、无 active Turn、无 pending approval、无 active Goal 时执行。
-- 命令调用 Codex `thread/compact/start`，Codex 异步完成压缩；请求成功只表示已开始。
+- 请求成功只表示 durable operation 已进入 `started`；最终状态通过 Agent 状态和
+  `loom/context-maintenance` SSE 呈现为 `completed`、`failed`、`interrupted` 或
+  `indeterminate`。
+- Codex adapter 等待原生 `thread/compacted` 或 compaction Turn 终态；Pi adapter 等待
+  blocking `compact` RPC。Runtime-native Thread/Turn ID 与摘要不会进入公开 operation。
+- Loom 重启后绝不自动重发压缩命令，只读取 Runtime 的 durable evidence：revision
+  已变化时确认 `completed`，否则记录 `indeterminate`，由 Owner 决定是否再次执行。
 - compaction 会开启新的 context epoch；下一 Turn 启动时，Loom 会重新注入当前
   Agent Prompt、Profile 和 Relationships，避免压缩摘要吞掉 durable context。
-- 长历史压缩可能耗时，不应与运行中的 Turn 并行触发。
+- 长历史压缩可能耗时；进行期间 Turn start、模型、Resources、archive 与 Goal mutation
+  会被拒绝，读取 Agent 状态仍然可用。
 
 ## Model Provider 与模型目录
 

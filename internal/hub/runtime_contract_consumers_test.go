@@ -14,43 +14,44 @@ import (
 )
 
 type controlPlaneContract struct {
-	createBinding    runtimecontract.Binding
-	createOutcome    runtimecontract.Outcome
-	createCalls      int
-	version          int
-	archiveOutcome   runtimecontract.Outcome
-	archiveCalls     int
-	archiveBinding   runtimecontract.Binding
-	closeCalls       int
-	closeBinding     runtimecontract.Binding
-	continueOutcome  runtimecontract.Outcome
-	continueSet      bool
-	continueCalls    int
-	continueRequest  runtimecontract.CausalInput
-	interruptOutcome runtimecontract.Outcome
-	interruptCalls   int
-	interruptRequest runtimecontract.TurnTarget
-	callOrder        []string
-	contextMode      runtimecontract.ContextDeliveryMode
-	startOutcome     runtimecontract.Outcome
-	startCalls       int
-	startRequest     runtimecontract.TurnRequest
-	resumeStarted    chan struct{}
-	resumeRelease    chan struct{}
-	resumeOutcome    runtimecontract.Outcome
-	startStarted     chan struct{}
-	startRelease     chan struct{}
-	closeOutcome     runtimecontract.Outcome
-	nameOutcome      runtimecontract.Outcome
-	nameCalls        int
-	nameBinding      runtimecontract.Binding
-	name             string
-	snapshot         runtimecontract.CapabilitySnapshot
-	snapshotHook     func()
-	history          runtimecontract.History
-	historyFailure   *runtimecontract.Failure
-	eventHandler     func(runtimecontract.Event)
-	resourcePaths    []string
+	createBinding      runtimecontract.Binding
+	createOutcome      runtimecontract.Outcome
+	createCalls        int
+	version            int
+	archiveOutcome     runtimecontract.Outcome
+	archiveCalls       int
+	archiveBinding     runtimecontract.Binding
+	closeCalls         int
+	closeBinding       runtimecontract.Binding
+	continueOutcome    runtimecontract.Outcome
+	continueSet        bool
+	continueCalls      int
+	continueRequest    runtimecontract.CausalInput
+	interruptOutcome   runtimecontract.Outcome
+	interruptCalls     int
+	interruptRequest   runtimecontract.TurnTarget
+	callOrder          []string
+	contextMode        runtimecontract.ContextDeliveryMode
+	startOutcome       runtimecontract.Outcome
+	startCalls         int
+	startRequest       runtimecontract.TurnRequest
+	resumeStarted      chan struct{}
+	resumeRelease      chan struct{}
+	resumeOutcome      runtimecontract.Outcome
+	startStarted       chan struct{}
+	startRelease       chan struct{}
+	closeOutcome       runtimecontract.Outcome
+	nameOutcome        runtimecontract.Outcome
+	nameCalls          int
+	nameBinding        runtimecontract.Binding
+	name               string
+	snapshot           runtimecontract.CapabilitySnapshot
+	snapshotHook       func()
+	history            runtimecontract.History
+	historyFailure     *runtimecontract.Failure
+	eventHandler       func(runtimecontract.Event)
+	resourcePaths      []string
+	maintenanceOutcome runtimecontract.Outcome
 }
 
 func (c *controlPlaneContract) SetApprovalHandler(func(runtimecontract.ApprovalProposal)) {}
@@ -408,8 +409,14 @@ func (c *controlPlaneContract) InspectModelControl(context.Context, runtimecontr
 func (c *controlPlaneContract) SelectModel(context.Context, runtimecontract.Binding, runtimecontract.ModelSelection) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
 	return runtimecontract.ModelControlState{}, nil
 }
-func (c *controlPlaneContract) CompactRuntimeBinding(context.Context, runtimecontract.Binding) error {
-	return nil
+func (c *controlPlaneContract) InspectContextMaintenance(context.Context, runtimecontract.Binding) (runtimecontract.ContextMaintenanceInspection, *runtimecontract.Failure) {
+	return runtimecontract.ContextMaintenanceInspection{Revision: "fixture-context-maintenance"}, nil
+}
+func (c *controlPlaneContract) MaintainContext(context.Context, runtimecontract.Binding) runtimecontract.Outcome {
+	if c.maintenanceOutcome.State != "" {
+		return c.maintenanceOutcome
+	}
+	return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
 }
 func (c *controlPlaneContract) ContractVersion() int {
 	if c.version != 0 {

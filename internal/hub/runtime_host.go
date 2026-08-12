@@ -75,10 +75,6 @@ type runtimeGoalCapability interface {
 	ClearRuntimeGoal(context.Context, runtimecontract.Binding) (bool, error)
 }
 
-type runtimeCompactionCapability interface {
-	CompactRuntimeBinding(context.Context, runtimecontract.Binding) error
-}
-
 type RuntimeContextEvidenceQuery = runtimecontract.ContextEvidenceQuery
 type RuntimeContextEvidence = runtimecontract.ContextEvidence
 

@@ -41,10 +41,17 @@ type codexRuntimeContract struct {
 	approvalResponses         map[string]codexNativeApprovalResponse
 	modelCatalog              func() ([]runtimecontract.Model, error)
 	modelCompensation         *codexModelCompensation
+	contextMaintenance        *codexContextMaintenanceWaiter
 	bindingRef                string
 	release                   func()
 	pendingTurn               runtimeTurnCorrelation
 	turnsByNative             map[string]runtimeTurnCorrelation
+}
+
+type codexContextMaintenanceWaiter struct {
+	bindingRef   string
+	nativeTurnID string
+	result       chan runtimecontract.Outcome
 }
 
 type codexModelCompensation struct {
@@ -471,6 +478,7 @@ func (c *codexRuntimeContract) SetEventHandler(handler func(runtimecontract.Even
 }
 
 func (c *codexRuntimeContract) handleNativeEvent(method string, params json.RawMessage) int {
+	c.handleContextMaintenanceEvent(method, params)
 	events := c.native.NormalizeEvent(method, params)
 	emitted := 0
 	for _, event := range events {
@@ -490,6 +498,63 @@ func (c *codexRuntimeContract) handleNativeEvent(method string, params json.RawM
 		}
 	}
 	return emitted
+}
+
+func (c *codexRuntimeContract) handleContextMaintenanceEvent(method string, params json.RawMessage) {
+	threadID := notificationThreadID(params)
+	c.mu.Lock()
+	waiter := c.contextMaintenance
+	if waiter == nil || threadID != waiter.bindingRef {
+		c.mu.Unlock()
+		return
+	}
+	outcome := runtimecontract.Outcome{}
+	switch method {
+	case "thread/compacted":
+		outcome.State = runtimecontract.LifecycleCompleted
+	case "item/started", "item/completed":
+		var envelope struct {
+			TurnID string         `json:"turnId"`
+			Item   map[string]any `json:"item"`
+		}
+		if json.Unmarshal(params, &envelope) == nil && envelope.Item["type"] == "contextCompaction" {
+			waiter.nativeTurnID = envelope.TurnID
+		}
+	case "turn/completed":
+		if waiter.nativeTurnID == "" || notificationTurnID(params) != waiter.nativeTurnID {
+			break
+		}
+		var envelope struct {
+			Turn struct {
+				Status string `json:"status"`
+				Error  *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			} `json:"turn"`
+		}
+		_ = json.Unmarshal(params, &envelope)
+		switch strings.ToLower(envelope.Turn.Status) {
+		case "completed":
+			outcome.State = runtimecontract.LifecycleCompleted
+		case "interrupted", "aborted", "cancelled", "canceled":
+			outcome.State = runtimecontract.LifecycleInterrupted
+		default:
+			message := "Codex context maintenance failed"
+			if envelope.Turn.Error != nil && strings.TrimSpace(envelope.Turn.Error.Message) != "" {
+				message = envelope.Turn.Error.Message
+			}
+			outcome = runtimecontract.Outcome{State: runtimecontract.LifecycleFailed, Failure: &runtimecontract.Failure{
+				Code: "context_maintenance_failed", Phase: runtimecontract.FailurePhaseContextMaintenance, Message: message,
+			}}
+		}
+	}
+	c.mu.Unlock()
+	if outcome.State != "" {
+		select {
+		case waiter.result <- outcome:
+		default:
+		}
+	}
 }
 
 func (c *codexRuntimeContract) setPendingTurn(turnID, predecessorTurnID string) {
@@ -865,9 +930,53 @@ func codexRuntimeUsageReport(report *rollout.UsageReport) runtimecontract.UsageR
 	return result
 }
 
-func (c *codexRuntimeContract) CompactRuntimeBinding(ctx context.Context, binding runtimecontract.Binding) error {
-	_, err := c.native.client.Request("thread/compact/start", map[string]any{"threadId": binding.NativeRef}, contractTimeout(ctx, 60*time.Second))
-	return err
+func (c *codexRuntimeContract) InspectContextMaintenance(ctx context.Context, binding runtimecontract.Binding) (runtimecontract.ContextMaintenanceInspection, *runtimecontract.Failure) {
+	if err := ctx.Err(); err != nil {
+		return runtimecontract.ContextMaintenanceInspection{}, contextMaintenanceFailure("context_maintenance_inspection_failed", err)
+	}
+	state, err := rollout.ContextHistory(binding.NativeRef, rollout.ContextHistoryQuery{})
+	if err != nil {
+		return runtimecontract.ContextMaintenanceInspection{}, contextMaintenanceFailure("context_maintenance_inspection_failed", err)
+	}
+	return runtimecontract.ContextMaintenanceInspection{
+		Revision: fmt.Sprintf("%s\x00%d\x00%s", state.EpochID, state.WindowNumber, state.CompactedAt), ObservedAt: state.CompactedAt,
+	}, nil
+}
+
+func (c *codexRuntimeContract) MaintainContext(ctx context.Context, binding runtimecontract.Binding) runtimecontract.Outcome {
+	waiter := &codexContextMaintenanceWaiter{bindingRef: binding.NativeRef, result: make(chan runtimecontract.Outcome, 1)}
+	c.mu.Lock()
+	if c.contextMaintenance != nil {
+		c.mu.Unlock()
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: &runtimecontract.Failure{
+			Code: "context_maintenance_busy", Phase: runtimecontract.FailurePhaseContextMaintenance, Message: "Codex context maintenance is already active",
+		}}
+	}
+	c.contextMaintenance = waiter
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if c.contextMaintenance == waiter {
+			c.contextMaintenance = nil
+		}
+		c.mu.Unlock()
+	}()
+	if _, err := c.native.client.Request("thread/compact/start", map[string]any{"threadId": binding.NativeRef}, contractTimeout(ctx, 60*time.Second)); err != nil {
+		return codexFailureOutcome(err, runtimecontract.FailurePhaseContextMaintenance)
+	}
+	select {
+	case outcome := <-waiter.result:
+		return outcome
+	case <-ctx.Done():
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleIndeterminate, Failure: &runtimecontract.Failure{
+			Code: "context_maintenance_indeterminate", Phase: runtimecontract.FailurePhaseContextMaintenance,
+			Message: "Codex context maintenance completion is indeterminate", Cause: ctx.Err(),
+		}}
+	}
+}
+
+func contextMaintenanceFailure(code string, err error) *runtimecontract.Failure {
+	return &runtimecontract.Failure{Code: code, Phase: runtimecontract.FailurePhaseContextMaintenance, Message: err.Error(), Diagnostic: err.Error(), Cause: err}
 }
 
 func (c *codexRuntimeContract) CloseBinding(ctx context.Context, _ runtimecontract.Binding) runtimecontract.Outcome {
@@ -909,7 +1018,8 @@ func codexMutatingFailurePhase(phase runtimecontract.FailurePhase) bool {
 	switch phase {
 	case runtimecontract.FailurePhaseBindingCreate, runtimecontract.FailurePhaseBindingResume,
 		runtimecontract.FailurePhaseContextDelivery, runtimecontract.FailurePhaseTurnStart,
-		runtimecontract.FailurePhaseTurnContinue, runtimecontract.FailurePhaseTurnInterrupt:
+		runtimecontract.FailurePhaseTurnContinue, runtimecontract.FailurePhaseTurnInterrupt,
+		runtimecontract.FailurePhaseContextMaintenance:
 		return true
 	default:
 		return false

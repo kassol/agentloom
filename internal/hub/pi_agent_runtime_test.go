@@ -1429,6 +1429,8 @@ func TestFakePiHubRPCProcess(t *testing.T) {
 			fmt.Printf(`{"id":%q,"type":"response","command":"set_thinking_level","success":true}`+"\n", id)
 		case "get_commands":
 			respondFakePiCommands(id)
+		case "compact":
+			respondFakePiCompact(id, sessionFile)
 		default:
 			os.Exit(34)
 		}
@@ -1456,6 +1458,9 @@ entriesReady:
 			continue
 		case "get_commands":
 			respondFakePiCommands(id)
+			continue
+		case "compact":
+			respondFakePiCompact(id, sessionFile)
 			continue
 		}
 		break
@@ -1797,11 +1802,41 @@ func serveFakePiHistory(reader *bufio.Reader, sessionFile string) {
 			return
 		}
 		var command map[string]any
-		if json.Unmarshal([]byte(line), &command) != nil || command["type"] != "get_entries" {
+		if json.Unmarshal([]byte(line), &command) != nil {
 			os.Exit(34)
 		}
-		respondFakePiEntries(command, sessionFile)
+		id, _ := command["id"].(string)
+		switch command["type"] {
+		case "get_entries":
+			respondFakePiEntries(command, sessionFile)
+		case "compact":
+			respondFakePiCompact(id, sessionFile)
+		default:
+			os.Exit(34)
+		}
 	}
+}
+
+func respondFakePiCompact(id, sessionFile string) {
+	entries, leafID, err := readPiSessionEntries(sessionFile)
+	if err != nil {
+		os.Exit(33)
+	}
+	entry := map[string]any{
+		"type": "compaction", "id": fmt.Sprintf("compact-%d", len(entries)+1), "parentId": leafID,
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano), "summary": "fixture", "firstKeptEntryId": leafID, "tokensBefore": 100,
+	}
+	line, _ := json.Marshal(entry)
+	file, err := os.OpenFile(sessionFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		os.Exit(33)
+	}
+	_, err = file.Write(append(line, '\n'))
+	_ = file.Close()
+	if err != nil {
+		os.Exit(33)
+	}
+	fmt.Printf(`{"id":%q,"type":"response","command":"compact","success":true,"data":{"summary":"fixture","firstKeptEntryId":%q,"tokensBefore":100}}`+"\n", id, leafID)
 }
 
 func respondFakePiEntries(command map[string]any, sessionFile string) {

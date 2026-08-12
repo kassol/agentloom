@@ -67,7 +67,7 @@ REST 与 SSE 入口。业务对象、字段和命令语义以对应领域文档�
 | GET | `/api/agents/{key}/goal` | Get Loom Goal and current slot `revision` |
 | PUT | `/api/agents/{key}/goal` | Set/update Loom Goal; body requires current `expectedVersion` |
 | DELETE | `/api/agents/{key}/goal?expectedVersion=N` | Clear Goal and persist the next tombstone revision |
-| POST | `/api/agents/{key}/compact` | Start manual Codex Thread compaction |
+| POST | `/api/agents/{key}/compact` | Start Runtime-neutral context maintenance; returns the durable `started` operation |
 | DELETE | `/api/agents/{key}` | Archive Agent |
 | GET | `/api/turns/{turnId}` | Get one Turn by stable ID |
 | POST | `/api/agents/{key}/turns` | Start a Turn; body `{text, artifactIds, timeoutSec}` |

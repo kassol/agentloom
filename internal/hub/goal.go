@@ -497,6 +497,10 @@ func (h *Hub) UpdateGoal(key string, update GoalUpdateParams) (*ThreadGoal, erro
 		h.mu.Unlock()
 		return nil, errf(404, "agent not found: %s", key)
 	}
+	if err := h.runtimeMutationAllowedLocked(agent.ID); err != nil {
+		h.mu.Unlock()
+		return nil, err
+	}
 	agentID := agent.ID
 	current := h.goals[agentID]
 	currentVersion := int64(0)
@@ -595,6 +599,10 @@ func (h *Hub) ClearGoalVersion(key string, expectedVersion *int64) (bool, error)
 	if agent == nil {
 		h.mu.Unlock()
 		return false, errf(404, "agent not found: %s", key)
+	}
+	if err := h.runtimeMutationAllowedLocked(agent.ID); err != nil {
+		h.mu.Unlock()
+		return false, err
 	}
 	agentID := agent.ID
 	current := h.goals[agentID]

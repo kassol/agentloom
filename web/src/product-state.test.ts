@@ -30,6 +30,8 @@ describe("product state", () => {
     expect(isOwnerResultEvent({ type: "loom/turn-completed", data: { source: "owner" } })).toBe(true);
     expect(isOwnerResultEvent({ type: "loom/turn-interrupted", data: { source: "remote" } })).toBe(true);
     expect(isOwnerResultEvent({ type: "loom/turn-completed", data: { source: "internal" } })).toBe(false);
+		expect(isOwnerResultEvent({ type: "loom/context-maintenance", data: { origin: "owner", state: "started" } })).toBe(false);
+		expect(isOwnerResultEvent({ type: "loom/context-maintenance", data: { origin: "owner", state: "completed" } })).toBe(true);
     expect(isOwnerResultEvent({ type: "item/completed", data: {} })).toBe(false);
   });
 

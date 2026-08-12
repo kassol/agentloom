@@ -24,6 +24,7 @@ type runtimeConformanceFixture struct {
 	emitAfterReopenStart func(runtimecontract.Binding, runtimecontract.Outcome)
 	emitAfterReopenStop  func(runtimecontract.Binding, runtimecontract.Outcome)
 	expectedUsageTotal   int64
+	maintainContext      func(runtimecontract.ContextMaintenanceCapability, runtimecontract.Binding) runtimecontract.Outcome
 	verifyEffects        func(runtimecontract.Binding, runtimecontract.Outcome)
 	reopen               func(context.Context, AgentHost, runtimecontract.Binding) (RuntimeHostDriver, AgentHost, runtimecontract.Contract, runtimecontract.Outcome)
 	verifyClosed         func(AgentHost)
@@ -94,7 +95,7 @@ func runRuntimeContractConformance(t *testing.T, fixture runtimeConformanceFixtu
 	if err := validateRuntimeCapabilityHooks(contract, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	certifyAvailableRuntimeHooks(t, contract, binding, snapshot)
+	certifyAvailableRuntimeHooks(t, contract, binding, snapshot, fixture.maintainContext)
 	if configured := contract.ResumeBinding(ctx, binding); runtimeLifecycleOutcomeError(configured, runtimecontract.LifecycleCompleted, false) != nil {
 		t.Fatalf("ResumeBinding after capability configuration = %#v", configured)
 	}
@@ -390,7 +391,7 @@ func collectConformanceStream(t *testing.T, events <-chan runtimecontract.Event)
 	}
 }
 
-func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contract, binding runtimecontract.Binding, snapshot runtimecontract.CapabilitySnapshot) {
+func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contract, binding runtimecontract.Binding, snapshot runtimecontract.CapabilitySnapshot, maintainContext func(runtimecontract.ContextMaintenanceCapability, runtimecontract.Binding) runtimecontract.Outcome) {
 	t.Helper()
 	for _, descriptor := range snapshot.Capabilities {
 		if descriptor.Availability != runtimecontract.CapabilityAvailable {
@@ -472,8 +473,18 @@ func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contrac
 				t.Fatalf("model switch: %v", failure)
 			}
 		case runtimecontract.CapabilityManualCompaction:
-			if err := contract.(runtimeCompactionCapability).CompactRuntimeBinding(context.Background(), binding); err != nil {
-				t.Fatalf("manual compaction: %v", err)
+			capability := contract.(runtimecontract.ContextMaintenanceCapability)
+			if inspection, failure := capability.InspectContextMaintenance(context.Background(), binding); failure != nil || inspection.Validate() != nil {
+				t.Fatalf("manual compaction inspection = %#v, failure=%v", inspection, failure)
+			}
+			outcome := runtimecontract.Outcome{}
+			if maintainContext != nil {
+				outcome = maintainContext(capability, binding)
+			} else {
+				outcome = capability.MaintainContext(context.Background(), binding)
+			}
+			if outcome.State != runtimecontract.LifecycleCompleted || outcome.Validate() != nil {
+				t.Fatalf("manual compaction outcome = %#v", outcome)
 			}
 		case runtimecontract.CapabilityImageInput:
 			if failure := contract.(runtimecontract.InputCapability).ValidateInput(context.Background(), binding, []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage, Ref: "data:image/png;base64,iVBORw0KGgo=", MIMEType: "image/png"}}); failure != nil {
@@ -513,6 +524,29 @@ func newCodexConformanceFixture(t *testing.T) runtimeConformanceFixture {
 	}
 	return runtimeConformanceFixture{
 		driver: driver, agentID: "codex-conformance", createCwd: "/tmp/one", expectedUsageTotal: 17,
+		maintainContext: func(capability runtimecontract.ContextMaintenanceCapability, binding runtimecontract.Binding) runtimecontract.Outcome {
+			result := make(chan runtimecontract.Outcome, 1)
+			go func() { result <- capability.MaintainContext(context.Background(), binding) }()
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				requests, _ := os.ReadFile(logPath)
+				if strings.Contains(string(requests), `"method":"thread/compact/start"`) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("Codex context maintenance request did not start")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			driver.dispatchNativeEvent("codex-conformance", "thread/compacted", []byte(`{"threadId":"thr-stale","turnId":"turn-compact"}`))
+			select {
+			case outcome := <-result:
+				return outcome
+			case <-time.After(2 * time.Second):
+				t.Fatal("Codex context maintenance did not observe its terminal event")
+				return runtimecontract.Outcome{}
+			}
+		},
 		prepareBinding: func(binding runtimecontract.Binding) runtimecontract.Binding {
 			binding.NativeRef = "thr-stale"
 			return binding

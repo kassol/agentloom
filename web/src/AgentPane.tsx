@@ -1162,6 +1162,9 @@ export function AgentPane({
 						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{label === "Image input" && runtimeModelIdentityChanged ? `${available ? "Available" : "Unavailable"} after Save` : available ? "Available" : label === "Image input" && !agent.processAlive ? "Checked on start" : "Unavailable"}</span></div>
 					  ))}
 					</div>
+					{agent.contextMaintenance ? <div className={`mt-2 rounded-sm px-2 py-1.5 text-[10.5px] ${agent.contextMaintenance.state === "completed" ? "bg-success/10 text-success" : agent.contextMaintenance.state === "started" ? "bg-warning/10 text-warning" : "bg-destructive/10 text-destructive"}`}>
+					  Context maintenance {agent.contextMaintenance.state}{agent.contextMaintenance.error ? ` · ${readableRuntimeError(agent.contextMaintenance.error)}` : ""}
+					</div> : null}
 				  </div>
 				  <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Name</span>
@@ -1600,9 +1603,11 @@ export function AgentPane({
                 {!answeringRequest ? <button type="button" onClick={onTrackTopic} disabled={sending} className="flex size-8 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-35" aria-label="Track this work as a Topic" title="Track this work as a Topic"><GitBranch className="size-4" /></button> : null}
                 <div className="min-w-0 truncate font-mono text-[10px] text-muted-foreground" aria-live="polite">
                 {sendStatus === "sending" && <span className="inline-flex items-center gap-1.5"><Loader2 className="size-3 animate-spin" />{sendKind === "answer" ? "Submitting answer" : sendKind === "compact" ? "Compacting context" : sendingAttachmentCount > 0 ? `Uploading ${sendingAttachmentCount} attachment${sendingAttachmentCount === 1 ? "" : "s"}` : "Sending to thread"}</span>}
-                {sendStatus === "sent" && <span className="inline-flex items-center gap-1.5 text-success"><Check className="size-3" />{sendKind === "answer" ? "Answer queued" : sendKind === "compact" ? "Compaction started" : "Sent to thread"}</span>}
-                {sendStatus === "failed" && <span className="text-destructive">Send failed · draft restored</span>}
-                {sendStatus === "idle" && <span className="hidden sm:inline">Enter to send · Shift+Enter for new line</span>}
+				{sendStatus === "sent" && !agent.contextMaintenance && <span className="inline-flex items-center gap-1.5 text-success"><Check className="size-3" />{sendKind === "answer" ? "Answer queued" : sendKind === "compact" ? "Compaction started" : "Sent to thread"}</span>}
+				{sendStatus === "failed" && <span className="text-destructive">Send failed · draft restored</span>}
+				{sendStatus !== "sending" && sendStatus !== "failed" && agent.contextMaintenance?.state === "started" && <span className="inline-flex items-center gap-1.5 text-warning"><Loader2 className="size-3 animate-spin" />Maintaining context</span>}
+				{sendStatus !== "sending" && sendStatus !== "failed" && agent.contextMaintenance?.state && agent.contextMaintenance.state !== "started" && <span className={agent.contextMaintenance.state === "completed" ? "text-success" : "text-destructive"}>Context maintenance {agent.contextMaintenance.state}</span>}
+				{sendStatus === "idle" && !agent.contextMaintenance?.state && <span className="hidden sm:inline">Enter to send · Shift+Enter for new line</span>}
                 </div>
               </div>
               {running && !answeringRequest ? (

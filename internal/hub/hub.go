@@ -96,6 +96,7 @@ type Agent struct {
 	UpdatedAt             string                        `json:"updatedAt"`
 	PendingProviderSwitch *ProviderSwitchBinding        `json:"pendingProviderSwitch,omitempty"`
 	ProviderHistory       []ProviderBindingChange       `json:"providerHistory,omitempty"`
+	ContextMaintenance    *ContextMaintenanceOperation  `json:"contextMaintenance,omitempty"`
 	// Source is "edge" for Agents mirrored read-only from pinix-edge's
 	// registry (they are re-imported each startup and never persisted here);
 	// empty for Agents CodexLoom owns. Starting a Turn promotes an edge mirror
@@ -416,6 +417,7 @@ type Hub struct {
 	larkMigrationRecordRemoveForTest func(string) error
 	saveAgentSkillConfigsForTest     func(any) error
 	saveAgentsForTest                func(any) error
+	archiveStartLockForTest          func(string)
 }
 
 // New is retained for in-process callers that cannot recover from an invalid
@@ -552,6 +554,11 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 			}
 		default:
 			return nil, fmt.Errorf("load agents: Agent %s uses unsupported Runtime Binding schema version %d", id, meta.RuntimeBinding.SchemaVersion)
+		}
+		if meta.ContextMaintenance != nil {
+			if err := meta.ContextMaintenance.Validate(meta); err != nil {
+				return nil, fmt.Errorf("load agents: Agent %s has invalid context maintenance state: %w", id, err)
+			}
 		}
 		if meta.Status == "idle" && meta.LastError == piShutdownInterruptError && meta.LastTurn != nil && meta.LastTurn.Status == "completed" {
 			meta.LastError = ""
@@ -819,6 +826,10 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 	for _, agentID := range h.goalStartupAgentIDs() {
 		id := agentID
 		h.startWorker(func() { h.resumeGoalAfterOpen(id) })
+	}
+	for _, agentID := range h.contextMaintenanceStartupAgentIDs() {
+		id := agentID
+		h.startWorker(func() { h.reconcileContextMaintenanceAfterOpen(id) })
 	}
 	opened = true
 	return h, nil
@@ -2534,6 +2545,10 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 	if meta.LastTurn != nil {
 		last := *meta.LastTurn
 		view.LastTurn = &last
+	}
+	if meta.ContextMaintenance != nil {
+		operation := *meta.ContextMaintenance
+		view.ContextMaintenance = &operation
 	}
 	view.RuntimeBinding.NativeRef = ""
 	view.RuntimeBinding.SchemaVersion = 0

@@ -33,6 +33,7 @@ export function executionDotClass(agent: Agent) {
 }
 
 export function isOwnerResultEvent(event: any) {
+	if (event?.type === "loom/context-maintenance") return event?.data?.origin === "owner" && event?.data?.state !== "started";
   if (!["loom/turn-completed", "loom/turn-failed", "loom/turn-interrupted"].includes(event?.type)) return false;
   const source = String(event?.data?.source || "");
   return source === "owner" || source === "remote";

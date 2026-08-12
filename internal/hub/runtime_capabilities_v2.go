@@ -89,7 +89,7 @@ func validateRuntimeCapabilityHooks(contract runtimecontract.Contract, snapshot 
 		case runtimecontract.CapabilityModelConfiguration:
 			_, implemented = contract.(runtimecontract.ModelControlCapability)
 		case runtimecontract.CapabilityManualCompaction:
-			_, implemented = contract.(runtimeCompactionCapability)
+			_, implemented = contract.(runtimecontract.ContextMaintenanceCapability)
 		case runtimecontract.CapabilityImageInput:
 			_, implemented = contract.(runtimecontract.InputCapability)
 		}
@@ -337,7 +337,7 @@ func piControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Capabi
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityRemote, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityUsageReporting, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityModelConfiguration, true),
-		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityManualCompaction, false),
+		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityManualCompaction, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityImageInput, imageAvailable),
 	}}
 }

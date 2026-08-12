@@ -839,6 +839,13 @@ while IFS= read -r line; do
 	*'"method":"thread/resume"'*)
 	  : > "$CODEX_HOST_RESUMED"
 	  printf '{"id":%s,"result":{"thread":{"id":"thr-stale"}}}\n' "$id" ;;
+	*'"method":"thread/compact/start"'*'"threadId":"thr-compact"'*)
+	  printf '{"id":%s,"result":{}}\n' "$id"
+	  printf '{"method":"item/started","params":{"threadId":"thr-compact","turnId":"turn-compact","item":{"id":"item-compact","type":"contextCompaction"}}}\n'
+	  printf '{"method":"turn/completed","params":{"threadId":"thr-compact","turn":{"id":"turn-compact","status":"completed"}}}\n' ;;
+	*'"method":"thread/compact/start"'*)
+	  printf '{"id":%s,"result":{}}\n' "$id"
+	  printf '{"method":"thread/compacted","params":{"threadId":"thr-stale","turnId":"turn-compact"}}\n' ;;
 	*'"method":"turn/start"'*'verify restored image input'*)
 	  printf '{"id":%s,"result":{"turn":{"id":"turn-one-image"}}}\n' "$id"
 	  printf '{"method":"turn/started","params":{"threadId":"thr-one","turn":{"id":"turn-one-image","status":"inProgress"}}}\n'

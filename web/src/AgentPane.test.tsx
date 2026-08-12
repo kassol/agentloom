@@ -171,6 +171,25 @@ describe("AgentPane scroll restoration", () => {
 	expect(view.queryByDisplayValue("codex")).toBeNull();
   });
 
+	it("starts Runtime-neutral context maintenance and renders its canonical outcome", async () => {
+	  const view = render(<AgentPane {...props} active />);
+	  const task = view.getByRole("textbox", { name: "task message" });
+	  fireEvent.change(task, { target: { value: "/compact" } });
+	  fireEvent.click(view.getByRole("button", { name: "send task" }));
+	  await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+		`/api/agents/${testAgent.id}/compact`,
+		expect.objectContaining({ method: "POST" }),
+	  ));
+	  const operation = {
+		id: "cmop-1", agentId: testAgent.id, threadId: testAgent.threadId, origin: "owner",
+		state: "started", startedAt: "2026-08-12T00:00:00Z", baselineRevision: "maintenance:base", bindingRevision: "binding:base",
+	  };
+	  view.rerender(<AgentPane {...props} agent={{ ...testAgent, contextMaintenance: operation }} active />);
+	  expect(view.getByText("Maintaining context")).toBeInTheDocument();
+	  view.rerender(<AgentPane {...props} agent={{ ...testAgent, contextMaintenance: { ...operation, state: "completed", completedAt: "2026-08-12T00:00:01Z" } }} active />);
+	  expect(view.getByText("Context maintenance completed")).toBeInTheDocument();
+	});
+
   it("shows Runtime-neutral context evidence for the relevant Loom Turn", async () => {
 	vi.mocked(fetch).mockImplementation(async (input) => {
 	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname + input.search : input.url;

@@ -590,6 +590,22 @@ func (r *piAgentRuntime) Interrupt(_ string, _ string, timeout time.Duration) er
 	}
 }
 
+func (r *piAgentRuntime) Compact(timeout time.Duration) (bool, error) {
+	r.mu.Lock()
+	rpc := r.rpc
+	r.mu.Unlock()
+	if rpc == nil || !rpc.Alive() {
+		return false, errors.New("Pi RPC process is unavailable")
+	}
+	if timeout <= 0 {
+		timeout = 15 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	response, err := rpc.Request(ctx, "compact", nil)
+	return response.Command == "compact", err
+}
+
 func (r *piAgentRuntime) NormalizeEvent(_ string, raw json.RawMessage) []nativeEvent {
 	r.mu.Lock()
 	events, _ := r.normalizeEventLocked(raw)

@@ -141,6 +141,26 @@ type ContextEvidenceCapability interface {
 	InspectContextEvidence(context.Context, Binding, ContextEvidenceQuery) (ContextEvidence, *Failure)
 }
 
+// ContextMaintenanceCapability exposes one Runtime-native context maintenance
+// action without pretending different Runtimes use the same algorithm. The
+// inspection revision is opaque and only supports crash reconciliation.
+type ContextMaintenanceCapability interface {
+	InspectContextMaintenance(context.Context, Binding) (ContextMaintenanceInspection, *Failure)
+	MaintainContext(context.Context, Binding) Outcome
+}
+
+type ContextMaintenanceInspection struct {
+	Revision   string `json:"revision"`
+	ObservedAt string `json:"observedAt,omitempty"`
+}
+
+func (i ContextMaintenanceInspection) Validate() error {
+	if i.Revision == "" {
+		return fmt.Errorf("Runtime context maintenance revision is required")
+	}
+	return nil
+}
+
 type ContextEvidenceState string
 
 const (
@@ -468,20 +488,21 @@ func (o Outcome) Validate() error {
 type FailurePhase string
 
 const (
-	FailurePhaseBindingCreate     FailurePhase = "binding_create"
-	FailurePhaseBindingResume     FailurePhase = "binding_resume"
-	FailurePhaseTurnStart         FailurePhase = "turn_start"
-	FailurePhaseTurnContinue      FailurePhase = "turn_continue"
-	FailurePhaseTurnInterrupt     FailurePhase = "turn_interrupt"
-	FailurePhaseHistory           FailurePhase = "history"
-	FailurePhaseClose             FailurePhase = "close"
-	FailurePhaseBindingName       FailurePhase = "binding_name"
-	FailurePhaseBindingArchive    FailurePhase = "binding_archive"
-	FailurePhaseContextDelivery   FailurePhase = "context_delivery"
-	FailurePhaseModelControl      FailurePhase = "model_control"
-	FailurePhaseResourceInventory FailurePhase = "resource_inventory"
-	FailurePhaseResourcePolicy    FailurePhase = "resource_policy"
-	FailurePhaseUsageInspection   FailurePhase = "usage_inspection"
+	FailurePhaseBindingCreate      FailurePhase = "binding_create"
+	FailurePhaseBindingResume      FailurePhase = "binding_resume"
+	FailurePhaseTurnStart          FailurePhase = "turn_start"
+	FailurePhaseTurnContinue       FailurePhase = "turn_continue"
+	FailurePhaseTurnInterrupt      FailurePhase = "turn_interrupt"
+	FailurePhaseHistory            FailurePhase = "history"
+	FailurePhaseClose              FailurePhase = "close"
+	FailurePhaseBindingName        FailurePhase = "binding_name"
+	FailurePhaseBindingArchive     FailurePhase = "binding_archive"
+	FailurePhaseContextDelivery    FailurePhase = "context_delivery"
+	FailurePhaseModelControl       FailurePhase = "model_control"
+	FailurePhaseResourceInventory  FailurePhase = "resource_inventory"
+	FailurePhaseResourcePolicy     FailurePhase = "resource_policy"
+	FailurePhaseUsageInspection    FailurePhase = "usage_inspection"
+	FailurePhaseContextMaintenance FailurePhase = "context_maintenance"
 )
 
 type Failure struct {
@@ -505,7 +526,8 @@ func (f Failure) Validate() error {
 		FailurePhaseTurnContinue, FailurePhaseTurnInterrupt, FailurePhaseHistory,
 		FailurePhaseClose, FailurePhaseBindingName, FailurePhaseBindingArchive,
 		FailurePhaseContextDelivery, FailurePhaseModelControl,
-		FailurePhaseResourceInventory, FailurePhaseResourcePolicy, FailurePhaseUsageInspection:
+		FailurePhaseResourceInventory, FailurePhaseResourcePolicy, FailurePhaseUsageInspection,
+		FailurePhaseContextMaintenance:
 		return nil
 	default:
 		return fmt.Errorf("Runtime failure has unknown phase %q", f.Phase)

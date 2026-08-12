@@ -349,6 +349,41 @@ func (c *piRuntimeContract) InspectInterruptedTurn(ctx context.Context, target r
 	return inspectPiInterruptedTurn(entries, leafID, target.RuntimeTurnRef)
 }
 
+func (c *piRuntimeContract) InspectContextMaintenance(ctx context.Context, binding runtimecontract.Binding) (runtimecontract.ContextMaintenanceInspection, *runtimecontract.Failure) {
+	if err := ctx.Err(); err != nil {
+		return runtimecontract.ContextMaintenanceInspection{}, contextMaintenanceFailure("context_maintenance_inspection_failed", err)
+	}
+	entries, _, err := readPiSessionEntries(binding.NativeRef)
+	if err != nil {
+		return runtimecontract.ContextMaintenanceInspection{}, contextMaintenanceFailure("context_maintenance_inspection_failed", err)
+	}
+	revision, observedAt := "none", ""
+	for _, entry := range entries {
+		if entry.Type == "compaction" {
+			revision, observedAt = entry.ID+"\x00"+entry.Timestamp, entry.Timestamp
+		}
+	}
+	return runtimecontract.ContextMaintenanceInspection{Revision: revision, ObservedAt: observedAt}, nil
+}
+
+func (c *piRuntimeContract) MaintainContext(ctx context.Context, _ runtimecontract.Binding) runtimecontract.Outcome {
+	if err := ctx.Err(); err != nil {
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: contextMaintenanceFailure("context_maintenance_cancelled", err)}
+	}
+	if c.native == nil {
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleFailed, Failure: contextMaintenanceFailure("context_maintenance_unavailable", errors.New("Pi Runtime context maintenance is unavailable"))}
+	}
+	responded, err := c.native.Compact(contractTimeout(ctx, 15*time.Minute))
+	if err == nil {
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
+	}
+	state, code := runtimecontract.LifecycleIndeterminate, "context_maintenance_indeterminate"
+	if responded {
+		state, code = runtimecontract.LifecycleFailed, "context_maintenance_failed"
+	}
+	return runtimecontract.Outcome{State: state, Failure: contextMaintenanceFailure(code, err)}
+}
+
 func (c *piRuntimeContract) CapabilitySnapshot(context.Context, runtimecontract.Binding) runtimecontract.CapabilitySnapshot {
 	if c.native == nil {
 		return piControlPlaneCapabilitySnapshot()

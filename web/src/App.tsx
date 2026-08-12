@@ -252,6 +252,9 @@ function applyThreadStatus(agent: Agent, event: any): Agent {
       updatedAt,
     };
   }
+	if (eventType === "loom/context-maintenance") {
+		return { ...agent, contextMaintenance: data, updatedAt };
+	}
   return agent;
 }
 
