@@ -4,6 +4,7 @@ package runtimecontract
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -231,6 +232,50 @@ type ContextEvidence struct {
 	CompactedAt           string                    `json:"compactedAt,omitempty"`
 	DeliveriesPersisted   bool                      `json:"deliveriesPersisted,omitempty"`
 	PersistedDeliveryKeys map[string]bool           `json:"persistedDeliveryKeys,omitempty"`
+}
+
+func (e ContextEvidence) Validate() error {
+	if e.TurnID == "" {
+		return fmt.Errorf("context evidence Turn ID is required")
+	}
+	switch e.State {
+	case ContextEvidenceProven, ContextEvidenceUnknown, ContextEvidenceUnavailable:
+	default:
+		return fmt.Errorf("unknown context evidence state %q", e.State)
+	}
+	switch e.Mode {
+	case ContextDeliveryFullPerTurn, ContextDeliveryEpochIncremental:
+	default:
+		return fmt.Errorf("unknown context delivery mode %q", e.Mode)
+	}
+	seenSources := map[string]bool{}
+	for _, source := range e.Sources {
+		if source.Key == "" || source.Channel == "" || source.State == "" {
+			return fmt.Errorf("context evidence source is incomplete")
+		}
+		key := source.Key + "\x00" + source.Channel
+		if seenSources[key] {
+			return fmt.Errorf("duplicate context evidence source %q", source.Key)
+		}
+		seenSources[key] = true
+	}
+	seenDeliveries := map[string]bool{}
+	for _, delivery := range e.Deliveries {
+		if delivery.Channel == "" || delivery.Role == "" || delivery.Hash == "" || delivery.Content == "" {
+			return fmt.Errorf("context evidence delivery is incomplete")
+		}
+		if seenDeliveries[delivery.Channel] {
+			return fmt.Errorf("duplicate context evidence delivery %q", delivery.Channel)
+		}
+		if fmt.Sprintf("%x", sha256.Sum256([]byte(delivery.Content))) != delivery.Hash {
+			return fmt.Errorf("context evidence delivery %q hash does not match content", delivery.Channel)
+		}
+		seenDeliveries[delivery.Channel] = true
+	}
+	if e.State == ContextEvidenceProven && len(e.Deliveries) == 0 {
+		return fmt.Errorf("proven context evidence requires a delivery")
+	}
+	return nil
 }
 
 // ModelControlCapability is the optional, Runtime-neutral model-control
@@ -767,6 +812,7 @@ type Event struct {
 	ContentPhase      ContentPhase  `json:"contentPhase,omitempty"`
 	Content           *ContentBlock `json:"content,omitempty"`
 	Usage             *Usage        `json:"usage,omitempty"`
+	UsageDetails      *UsageDetails `json:"usageDetails,omitempty"`
 	Outcome           *Outcome      `json:"outcome,omitempty"`
 }
 
@@ -776,11 +822,11 @@ func (e Event) Validate() error {
 	}
 	switch e.Kind {
 	case EventTurnStarted:
-		if e.Content != nil || e.Usage != nil || e.Outcome != nil {
+		if e.Content != nil || e.Usage != nil || e.UsageDetails != nil || e.Outcome != nil {
 			return fmt.Errorf("turn_started event cannot carry content, usage, or outcome")
 		}
 	case EventContent:
-		if e.Content == nil || e.Usage != nil || e.Outcome != nil {
+		if e.Content == nil || e.Usage != nil || e.UsageDetails != nil || e.Outcome != nil {
 			return fmt.Errorf("content event requires only content")
 		}
 		switch e.ContentPhase {
@@ -795,8 +841,16 @@ func (e Event) Validate() error {
 		if e.Usage == nil || e.Content != nil || e.Outcome != nil {
 			return fmt.Errorf("usage event requires only usage")
 		}
+		if err := e.Usage.validate("usage event"); err != nil {
+			return err
+		}
+		if e.UsageDetails != nil {
+			if err := e.UsageDetails.validate("usage event"); err != nil {
+				return err
+			}
+		}
 	case EventTerminal:
-		if e.Outcome == nil || e.Content != nil || e.Usage != nil {
+		if e.Outcome == nil || e.Content != nil || e.Usage != nil || e.UsageDetails != nil {
 			return fmt.Errorf("terminal event requires only an outcome")
 		}
 		if err := e.Outcome.Validate(); err != nil {
@@ -860,6 +914,50 @@ type UsageText struct {
 	Available bool   `json:"available"`
 	Value     string `json:"value,omitempty"`
 	Source    string `json:"source"`
+}
+
+// UsageDetails carries optional native-reported dimensions that are not
+// numeric counters. Each field retains its own availability and source.
+type UsageDetails struct {
+	ObservedAt UsageText    `json:"observedAt"`
+	Models     []ModelUsage `json:"models"`
+}
+
+func (d UsageDetails) validate(prefix string) error {
+	if err := d.ObservedAt.validate(prefix + " observed at"); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for index, model := range d.Models {
+		if err := model.Provider.validate(fmt.Sprintf("%s model %d provider", prefix, index)); err != nil {
+			return err
+		}
+		if err := model.Model.validate(fmt.Sprintf("%s model %d name", prefix, index)); err != nil {
+			return err
+		}
+		if !model.Model.Available {
+			return fmt.Errorf("%s model %d has no model name", prefix, index)
+		}
+		if err := model.Usage.validate(fmt.Sprintf("%s model %d usage", prefix, index)); err != nil {
+			return err
+		}
+		if err := model.ContextWindow.validate(fmt.Sprintf("%s model %d context window", prefix, index)); err != nil {
+			return err
+		}
+		key := model.Provider.Value + "\x00" + model.Model.Value
+		if seen[key] {
+			return fmt.Errorf("%s has duplicate model %q", prefix, model.Model.Value)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+type ModelUsage struct {
+	Provider      UsageText   `json:"provider"`
+	Model         UsageText   `json:"model"`
+	Usage         Usage       `json:"usage"`
+	ContextWindow UsageMetric `json:"contextWindow"`
 }
 
 type UsageBool struct {
@@ -1014,15 +1112,17 @@ type HistoryRequest struct {
 }
 
 type HistoryTurn struct {
-	TurnID            string          `json:"turnId"`
-	PredecessorTurnID string          `json:"predecessorTurnId,omitempty"`
-	RuntimeTurnRef    string          `json:"-"`
-	State             LifecycleState  `json:"state"`
-	Content           []ContentBlock  `json:"content"`
-	Usage             *Usage          `json:"usage,omitempty"`
-	StartedAt         string          `json:"startedAt,omitempty"`
-	CompletedAt       string          `json:"completedAt,omitempty"`
-	Diagnostic        json.RawMessage `json:"-"`
+	TurnID            string           `json:"turnId"`
+	PredecessorTurnID string           `json:"predecessorTurnId,omitempty"`
+	RuntimeTurnRef    string           `json:"-"`
+	State             LifecycleState   `json:"state"`
+	Content           []ContentBlock   `json:"content"`
+	Usage             *Usage           `json:"usage,omitempty"`
+	UsageDetails      *UsageDetails    `json:"usageDetails,omitempty"`
+	ContextEvidence   *ContextEvidence `json:"contextEvidence,omitempty"`
+	StartedAt         string           `json:"startedAt,omitempty"`
+	CompletedAt       string           `json:"completedAt,omitempty"`
+	Diagnostic        json.RawMessage  `json:"-"`
 }
 
 type History struct {
@@ -1046,6 +1146,24 @@ func (h History) Validate() error {
 		for contentIndex, content := range turn.Content {
 			if err := content.Validate(); err != nil {
 				return fmt.Errorf("Runtime history Turn %q content %d: %w", turn.TurnID, contentIndex, err)
+			}
+		}
+		if turn.Usage != nil {
+			if err := turn.Usage.validate(fmt.Sprintf("Runtime history Turn %q usage", turn.TurnID)); err != nil {
+				return err
+			}
+		}
+		if turn.UsageDetails != nil {
+			if err := turn.UsageDetails.validate(fmt.Sprintf("Runtime history Turn %q usage details", turn.TurnID)); err != nil {
+				return err
+			}
+		}
+		if turn.ContextEvidence != nil {
+			if err := turn.ContextEvidence.Validate(); err != nil {
+				return fmt.Errorf("Runtime history Turn %q context evidence: %w", turn.TurnID, err)
+			}
+			if turn.ContextEvidence.TurnID != turn.TurnID {
+				return fmt.Errorf("Runtime history Turn %q context evidence has Turn ID %q", turn.TurnID, turn.ContextEvidence.TurnID)
 			}
 		}
 	}

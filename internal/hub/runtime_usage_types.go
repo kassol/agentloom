@@ -99,3 +99,11 @@ func emptyRuntimeTokenUsage(value runtimecontract.Usage) RuntimeTokenUsage {
 	result.ReasoningOutputTokens, result.TotalTokens, result.Calls, result.CostMicros = 0, 0, 0, 0
 	return result
 }
+
+func unavailableRuntimeTokenUsage(source string) RuntimeTokenUsage {
+	metrics := map[string]RuntimeUsageMetricCoverage{}
+	for _, name := range []string{"inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens", "calls", "costMicros"} {
+		metrics[name] = RuntimeUsageMetricCoverage{Sources: []string{source}}
+	}
+	return RuntimeTokenUsage{Metrics: metrics}
+}

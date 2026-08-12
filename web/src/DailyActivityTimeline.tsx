@@ -5,7 +5,7 @@ import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { activityIntensity, shiftCalendarDate, type DailyActivityOverview, type DailyAgentActivity } from "./daily-activity";
 import { api } from "./types";
-import { browserTimezone, formatOptionalUsageMetric, todayDate } from "./usage";
+import { browserTimezone, formatOptionalUsageMetric, todayDate, usageMetricAvailable } from "./usage";
 
 const AGENT_COLUMN = 176;
 const SUMMARY_COLUMN = 136;
@@ -41,7 +41,7 @@ export function DailyActivityTimeline({ onSelectAgent }: { onSelectAgent: (id: s
 
   const gridTemplateColumns = `${AGENT_COLUMN}px repeat(${activity.buckets.length}, minmax(${BUCKET_COLUMN}px, 1fr)) ${SUMMARY_COLUMN}px`;
   const gridMinWidth = AGENT_COLUMN + activity.buckets.length * BUCKET_COLUMN + SUMMARY_COLUMN;
-  const maxBucketTokens = Math.max(0, ...activity.buckets.map((bucket) => bucket.usage.totalTokens));
+  const maxBucketTokens = Math.max(0, ...activity.buckets.filter((bucket) => usageMetricAvailable(bucket.usage, "totalTokens")).map((bucket) => bucket.usage.totalTokens));
   const labelEvery = Math.max(1, Math.round(120 / activity.bucketMinutes));
 
   const showHover = (event: ReactPointerEvent<HTMLElement>, title: string, lines: string[]) => {
@@ -67,7 +67,7 @@ export function DailyActivityTimeline({ onSelectAgent }: { onSelectAgent: (id: s
             {activity.live ? <span className="font-mono text-[8.5px] uppercase text-success">live</span> : null}
           </div>
           <p className="mt-1 text-[10.5px] text-muted-foreground">
-            {activity.activeAgents} active {activity.activeAgents === 1 ? "Agent" : "Agents"} · {formatDuration(activity.executingSeconds)} execution · {formatTokens(activity.usage.totalTokens)} tokens · {formatTurnCount(activity.turnCount)}
+            {activity.activeAgents} active {activity.activeAgents === 1 ? "Agent" : "Agents"} · {formatDuration(activity.executingSeconds)} execution · {formatOptionalUsageMetric(activity.usage, "totalTokens", formatTokens)} tokens · {formatTurnCount(activity.turnCount)}
           </p>
         </div>
         <div className="flex w-full items-center gap-1 sm:w-auto">
@@ -95,24 +95,24 @@ export function DailyActivityTimeline({ onSelectAgent }: { onSelectAgent: (id: s
               <div><div className="text-[10.5px] font-semibold">Token volume</div><div className="mt-0.5 font-mono text-[8.5px] text-muted-foreground">same 30m axis</div></div>
             </div>
             {activity.buckets.map((bucket, index) => {
-              const height = maxBucketTokens > 0 && bucket.usage.totalTokens > 0 ? Math.max(2, bucket.usage.totalTokens / maxBucketTokens * 38) : 0;
+              const height = usageMetricAvailable(bucket.usage, "totalTokens") && maxBucketTokens > 0 && bucket.usage.totalTokens > 0 ? Math.max(2, bucket.usage.totalTokens / maxBucketTokens * 38) : 0;
               return (
                 <button
                   key={bucket.startedAt}
                   type="button"
                   className={`relative flex h-full min-w-0 items-end justify-center border-l outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/40 ${index % labelEvery === 0 ? "border-border/60" : "border-border/20"}`}
                   onPointerEnter={(event) => showHover(event, `${formatBucketRange(bucket.startedAt, bucket.endedAt, timezone)} · team`, [
-                    `${formatTokens(bucket.usage.totalTokens)} tokens · ${formatOptionalUsageMetric(bucket.usage, "calls", formatTokens)} calls`,
+                    `${formatOptionalUsageMetric(bucket.usage, "totalTokens", formatTokens)} tokens · ${formatOptionalUsageMetric(bucket.usage, "calls", formatTokens)} calls`,
                     `${bucket.activeAgents} active Agents · ${formatDuration(bucket.executingSeconds)} execution`,
                   ])}
                   onPointerLeave={() => setHover(null)}
-                  aria-label={`${formatBucketRange(bucket.startedAt, bucket.endedAt, timezone)}: ${formatTokens(bucket.usage.totalTokens)} tokens, ${bucket.activeAgents} active Agents`}
+                  aria-label={`${formatBucketRange(bucket.startedAt, bucket.endedAt, timezone)}: ${formatOptionalUsageMetric(bucket.usage, "totalTokens", formatTokens)} tokens, ${bucket.activeAgents} active Agents`}
                 >
                   <span className="w-[70%] bg-[var(--loom-blue)]/65" style={{ height }} />
                 </button>
               );
             })}
-            <div className="flex h-full items-center justify-end border-l border-border px-2 font-mono text-[10px] font-semibold">{formatTokens(activity.usage.totalTokens)}</div>
+            <div className="flex h-full items-center justify-end border-l border-border px-2 font-mono text-[10px] font-semibold">{formatOptionalUsageMetric(activity.usage, "totalTokens", formatTokens)}</div>
           </div>
 
           {activity.agents.map((agent) => (
@@ -124,7 +124,7 @@ export function DailyActivityTimeline({ onSelectAgent }: { onSelectAgent: (id: s
               {agent.buckets.map((bucket, index) => {
                 const timelineBucket = activity.buckets[index];
                 const intensity = activityIntensity(bucket.executingSeconds);
-                const active = bucket.executingSeconds > 0 || bucket.turnCount > 0 || bucket.usage.totalTokens > 0;
+                const active = bucket.executingSeconds > 0 || bucket.turnCount > 0 || usageMetricAvailable(bucket.usage, "totalTokens") && bucket.usage.totalTokens > 0;
                 const selected = selection?.agent.agentId === agent.agentId && selection.bucketIndex === index;
                 return (
                   <button
@@ -134,21 +134,21 @@ export function DailyActivityTimeline({ onSelectAgent }: { onSelectAgent: (id: s
                     onClick={() => active && setSelection({ agent, bucketIndex: index })}
                     onPointerEnter={(event) => showHover(event, `${agent.agentName} · ${formatBucketRange(timelineBucket.startedAt, timelineBucket.endedAt, timezone)}`, [
                       `${formatDuration(bucket.executingSeconds)} execution · ${formatTurnCount(bucket.turnCount)}`,
-                      `${formatTokens(bucket.usage.totalTokens)} tokens · ${formatOptionalUsageMetric(bucket.usage, "calls", formatTokens)} calls`,
+                      `${formatOptionalUsageMetric(bucket.usage, "totalTokens", formatTokens)} tokens · ${formatOptionalUsageMetric(bucket.usage, "calls", formatTokens)} calls`,
                     ])}
                     onPointerLeave={() => setHover(null)}
-                    aria-label={`${agent.agentName}, ${formatBucketRange(timelineBucket.startedAt, timelineBucket.endedAt, timezone)}: ${formatDuration(bucket.executingSeconds)} execution, ${formatTokens(bucket.usage.totalTokens)} tokens`}
+                    aria-label={`${agent.agentName}, ${formatBucketRange(timelineBucket.startedAt, timelineBucket.endedAt, timezone)}: ${formatDuration(bucket.executingSeconds)} execution, ${formatOptionalUsageMetric(bucket.usage, "totalTokens", formatTokens)} tokens`}
                     aria-pressed={selected}
                     className={`relative min-w-0 border-l outline-none focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/45 disabled:cursor-default ${index % labelEvery === 0 ? "border-border/60" : "border-border/20"} ${selected ? "ring-2 ring-inset ring-foreground/70" : ""}`}
                     style={{ background: cellBackground(intensity, timelineBucket.observedSeconds, activity.bucketMinutes) }}
                   >
-                    {bucket.usage.totalTokens > 0 && intensity === 0 ? <span className="absolute left-1/2 top-1/2 size-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--loom-blue)]" /> : null}
+                    {usageMetricAvailable(bucket.usage, "totalTokens") && bucket.usage.totalTokens > 0 && intensity === 0 ? <span className="absolute left-1/2 top-1/2 size-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--loom-blue)]" /> : null}
                     {timelineBucket.observedSeconds > 0 && timelineBucket.observedSeconds < activity.bucketMinutes * 60 ? <span className="absolute inset-x-0 bottom-0 h-px bg-foreground/35" /> : null}
                   </button>
                 );
               })}
               <button type="button" onClick={() => onSelectAgent(agent.agentId)} className="flex min-w-0 items-center justify-end border-l border-border px-2 text-right hover:bg-muted/35">
-                <span className="truncate font-mono text-[8.5px] text-muted-foreground"><span className="font-semibold text-foreground">{formatDuration(agent.executingSeconds)}</span> · {formatTokens(agent.usage.totalTokens)}</span>
+                <span className="truncate font-mono text-[8.5px] text-muted-foreground"><span className="font-semibold text-foreground">{formatDuration(agent.executingSeconds)}</span> · {formatOptionalUsageMetric(agent.usage, "totalTokens", formatTokens)}</span>
               </button>
             </div>
           ))}
@@ -179,7 +179,7 @@ function SelectedBucket({ selection, activity, timezone, onOpenAgent }: { select
       <div className="min-w-[180px] flex-1"><div className="text-[11px] font-semibold">{selection.agent.agentName}</div><div className="mt-0.5 font-mono text-[9px] text-muted-foreground">{formatBucketRange(timelineBucket.startedAt, timelineBucket.endedAt, timezone)}</div></div>
       <MiniMetric label="Execution" value={formatDuration(bucket.executingSeconds)} />
       <MiniMetric label="Turns" value={String(bucket.turnCount)} />
-      <MiniMetric label="Tokens" value={formatTokens(bucket.usage.totalTokens)} />
+      <MiniMetric label="Tokens" value={formatOptionalUsageMetric(bucket.usage, "totalTokens", formatTokens)} />
       <MiniMetric label="Calls" value={formatOptionalUsageMetric(bucket.usage, "calls", formatTokens)} />
       <Button type="button" variant="outline" size="sm" onClick={onOpenAgent} className="h-7 text-[9.5px]">Open Agent</Button>
     </div>

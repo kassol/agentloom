@@ -413,7 +413,7 @@ Compatibility shortcuts:
   chub profile set <agent> [--identity TEXT] [--domain TEXT] [--scope TEXT] [--file profile.json]
   chub profile clear <agent>
   loom context prompt get|set|clear ...
-  loom context explain <agent> [--json]
+  loom context explain <agent> [--turn TURN_ID] [--json]
   loom context coverage <agent> [--json]
   chub goal <agent> [show]
   chub goal <agent> set <objective> [--token-budget N|--clear-token-budget]

@@ -91,13 +91,13 @@ export function UsagePane({ onSelectAgent, embedded = false, controlledRange, on
         loading: query.isLoading,
         trackedAgents: usage?.trackedAgents || 0,
         agentsCount: usage?.agents.length || 0,
-        periodTokens: usage?.period.totalTokens || 0,
-        todayTokens: usage?.today.totalTokens || 0,
+        periodTokens: usage && usageMetricAvailable(usage.period, "totalTokens") ? usage.period.totalTokens : null,
+        todayTokens: usage && usageMetricAvailable(usage.today, "totalTokens") ? usage.today.totalTokens : null,
         dailyPoints: usage?.daily.length || 0,
         topAgent: usage?.agents[0]?.agentName || null,
         selectedUsageAgent: selectedAgent?.agentName || null,
         selectedUsageAgentId: selectedAgent?.agentId || null,
-        selectedDailyTokens: selectedAgent?.period.totalTokens || usage?.period.totalTokens || 0,
+        selectedDailyTokens: selectedAgent ? (usageMetricAvailable(selectedAgent.period, "totalTokens") ? selectedAgent.period.totalTokens : null) : usage && usageMetricAvailable(usage.period, "totalTokens") ? usage.period.totalTokens : null,
       }),
       setRange: async (value: Partial<UsageDateRange>) => {
         const mode = value.mode || range.mode;
@@ -378,23 +378,24 @@ function TokenUsageWorkspace({
   onRangeChange: (range: UsageDateRange) => void;
 }) {
   const selectedAgent = usage.agents.find((agent) => agent.agentId === selectedAgentId) || null;
-  const previousDelta = usageDelta(usage.period.totalTokens, usage.previous.totalTokens);
+  const completeTotal = usageMetricAvailable(usage.period, "totalTokens") ? usage.period.totalTokens : null;
+  const previousDelta = usageMetricAvailable(usage.period, "totalTokens") && usageMetricAvailable(usage.previous, "totalTokens") ? usageDelta(usage.period.totalTokens, usage.previous.totalTokens) : { label: "unavailable", direction: "flat" as const };
   return (
     <div className="mx-auto w-full min-w-0 max-w-[1240px] overflow-x-hidden px-4 py-5 md:px-8 md:py-7">
       <UsageRangeToolbar subject="Token usage" range={range} live={usage.live} generatedAt={usage.generatedAt} onChange={onRangeChange} />
 
       <SectionHeading title="Overview" detail="Measured from each Runtime's passive usage records" />
       <section className="grid grid-cols-2 border-y border-border lg:grid-cols-6" aria-label="Usage summary">
-        <Metric label="Total tokens" value={formatTokens(usage.period.totalTokens)} detail={`${previousDelta.label} previous period`} />
+        <Metric label="Total tokens" value={formatOptionalUsageMetric(usage.period, "totalTokens", formatTokens)} detail={`${previousDelta.label} previous period`} />
         <Metric label="Model calls" value={formatOptionalUsageMetric(usage.period, "calls", formatTokens)} detail={usageMetricAvailable(usage.period, "calls") ? `${formatTokens(averagePerCall(usage.period))} average / call` : "unavailable from one or more Runtimes"} />
         <Metric
           label={usage.days === 1 ? "Active agents" : "Average / day"}
-          value={usage.days === 1 ? `${usage.agents.filter((agent) => agent.period.totalTokens > 0).length}/${usage.agents.length}` : formatTokens(usage.period.totalTokens / usage.days)}
+          value={usage.days === 1 ? `${usage.agents.filter((agent) => usageMetricAvailable(agent.period, "totalTokens") && agent.period.totalTokens > 0).length}/${usage.agents.length}` : usageMetricAvailable(usage.period, "totalTokens") ? formatTokens(usage.period.totalTokens / usage.days) : "—"}
           detail={usage.days === 1 ? "with token activity" : `${usage.days} calendar days`}
         />
-        <Metric label="Output" value={formatTokens(usage.period.outputTokens)} detail={usageMetricAvailable(usage.period, "reasoningOutputTokens") ? `${formatTokens(usage.period.reasoningOutputTokens)} reasoning` : "reasoning unavailable"} />
-        <Metric label="Cache hit" value={usageMetricAvailable(usage.period, "cachedInputTokens") ? formatPercent(cachePercent(usage.period)) : "—"} detail={usageMetricAvailable(usage.period, "cachedInputTokens") ? `${formatTokens(usage.period.inputTokens - usage.period.cachedInputTokens)} uncached` : "cache unavailable"} />
-        <Metric label="Tracked" value={`${usage.trackedAgents}/${usage.agents.length}`} detail={`lifetime ${formatTokens(usage.lifetime.totalTokens)}`} />
+        <Metric label="Output" value={formatOptionalUsageMetric(usage.period, "outputTokens", formatTokens)} detail={usageMetricAvailable(usage.period, "reasoningOutputTokens") ? `${formatTokens(usage.period.reasoningOutputTokens)} reasoning` : "reasoning unavailable"} />
+        <Metric label="Cache hit" value={usageMetricAvailable(usage.period, "inputTokens") && usageMetricAvailable(usage.period, "cachedInputTokens") ? formatPercent(cachePercent(usage.period)) : "—"} detail={usageMetricAvailable(usage.period, "inputTokens") && usageMetricAvailable(usage.period, "cachedInputTokens") ? `${formatTokens(usage.period.inputTokens - usage.period.cachedInputTokens)} uncached` : "cache unavailable"} />
+        <Metric label="Tracked" value={`${usage.trackedAgents}/${usage.agents.length}`} detail={`lifetime ${formatOptionalUsageMetric(usage.lifetime, "totalTokens", formatTokens)}`} />
       </section>
 
       {usage.days > 1 && <section data-usage-chart-section className="scroll-mt-14 border-b border-border py-6">
@@ -419,19 +420,19 @@ function TokenUsageWorkspace({
         <TokenTreemap
           agents={usage.agents}
           organizationLinks={team?.organizationLinks || []}
-          total={usage.period.totalTokens}
+          total={completeTotal}
           selectedAgentId={selectedAgent?.agentId || null}
           onSelect={onSelectUsageAgent}
         />
       </section>
 
-      {selectedAgent && <AgentUsageInspector agent={selectedAgent} total={usage.period.totalTokens} onClose={() => onSelectUsageAgent(null)} onOpenAgent={onSelectAgent} />}
+      {selectedAgent && <AgentUsageInspector agent={selectedAgent} total={completeTotal} onClose={() => onSelectUsageAgent(null)} onOpenAgent={onSelectAgent} />}
 
       <section className="border-b border-border py-6">
         <SectionHeading title="Agent comparison" detail="Exact values for the selected calendar range" />
         <AgentUsageTable
           agents={usage.agents}
-          total={usage.period.totalTokens}
+          total={completeTotal}
           selectedAgentId={selectedAgent?.agentId || null}
           onInspectAgent={(id) => onSelectUsageAgent(id, true)}
           onSelectAgent={onSelectAgent}
@@ -445,7 +446,7 @@ function TokenUsageWorkspace({
         </div>
         <div className="min-w-0">
           <SectionHeading title="Models" detail="Selected period" />
-          <ModelBreakdown models={usage.models} total={usage.period.totalTokens} />
+          <ModelBreakdown models={usage.models} total={completeTotal} />
         </div>
       </section>
     </div>
@@ -558,12 +559,12 @@ function TokenTreemap({
 }: {
   agents: AgentTokenUsage[];
   organizationLinks: TeamView["organizationLinks"];
-  total: number;
+  total: number | null;
   selectedAgentId: string | null;
   onSelect: (id: string | null) => void;
 }) {
   const layout = useMemo(() => buildTokenTreemap(agents, organizationLinks), [agents, organizationLinks]);
-  if (total <= 0 || layout.leaves.length === 0) {
+  if (layout.leaves.length === 0) {
     return <div className="flex h-64 items-center justify-center border-y border-border text-[11px] text-muted-foreground">No token usage in this period.</div>;
   }
   return (
@@ -580,7 +581,7 @@ function TokenTreemap({
         ))}
         {layout.leaves.map((leaf) => {
           const agent = leaf.data.agent!;
-          const share = total > 0 ? (agent.period.totalTokens / total) * 100 : 0;
+          const share = total != null && total > 0 ? (agent.period.totalTokens / total) * 100 : null;
           const width = leaf.x1 - leaf.x0;
           const height = leaf.y1 - leaf.y0;
           const detailed = width >= 105 && height >= 65;
@@ -596,13 +597,13 @@ function TokenTreemap({
                   ...treemapBox(leaf),
                   background: `color-mix(in oklch, ${leaf.data.color} ${selected ? "38%" : "24%"}, var(--background))`,
                 }}
-                aria-label={`${agent.agentName}: ${formatTokens(agent.period.totalTokens)}, ${formatPercent(share)} of selected period`}
+                aria-label={`${agent.agentName}: ${formatOptionalUsageMetric(agent.period, "totalTokens", formatTokens)}, ${share != null ? formatPercent(share) : "share unavailable"} of selected period`}
               >
                 {named && <div className="flex h-full min-w-0 flex-col p-2">
                   <span className="truncate text-[10.5px] font-semibold text-foreground">{agent.agentName}</span>
                   {detailed && <>
-                    <span className="mt-auto font-mono text-[13px] font-semibold text-foreground">{formatTokens(agent.period.totalTokens)}</span>
-                    <span className="font-mono text-[8.5px] text-muted-foreground">{formatPercent(share)} · {formatOptionalUsageMetric(agent.period, "calls", formatTokens)} calls</span>
+                    <span className="mt-auto font-mono text-[13px] font-semibold text-foreground">{formatOptionalUsageMetric(agent.period, "totalTokens", formatTokens)}</span>
+                    <span className="font-mono text-[8.5px] text-muted-foreground">{share != null ? formatPercent(share) : "share unavailable"} · {formatOptionalUsageMetric(agent.period, "calls", formatTokens)} calls</span>
                   </>}
                 </div>}
               </Tooltip.Trigger>
@@ -610,13 +611,13 @@ function TokenTreemap({
                 <Tooltip.Positioner side="top" sideOffset={8} className="z-50 outline-none">
                   <Tooltip.Popup className="w-56 border border-border bg-popover px-3 py-2.5 text-popover-foreground shadow-float outline-none data-closed:hidden">
                     <div className="truncate text-[11px] font-semibold">{agent.agentName}</div>
-                    <div className="mt-1 font-mono text-[10px] font-semibold">{formatTokens(agent.period.totalTokens)} · {formatPercent(share)}</div>
+                    <div className="mt-1 font-mono text-[10px] font-semibold">{formatOptionalUsageMetric(agent.period, "totalTokens", formatTokens)} · {share != null ? formatPercent(share) : "share unavailable"}</div>
                     <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[8.5px] text-muted-foreground">
                       <span>Calls</span><span className="text-right text-foreground">{formatOptionalUsageMetric(agent.period, "calls", formatTokens)}</span>
-                      <span>Input</span><span className="text-right text-foreground">{formatTokens(agent.period.inputTokens)}</span>
-                      <span>Cached</span><span className="text-right text-foreground">{usageMetricAvailable(agent.period, "cachedInputTokens") ? formatPercent(cachePercent(agent.period)) : "—"}</span>
-                      <span>Output</span><span className="text-right text-foreground">{formatTokens(agent.period.outputTokens)}</span>
-                      <span>Previous</span><span className="text-right text-foreground">{usageDelta(agent.period.totalTokens, agent.previous.totalTokens).label}</span>
+                      <span>Input</span><span className="text-right text-foreground">{formatOptionalUsageMetric(agent.period, "inputTokens", formatTokens)}</span>
+                      <span>Cached</span><span className="text-right text-foreground">{usageMetricAvailable(agent.period, "inputTokens") && usageMetricAvailable(agent.period, "cachedInputTokens") ? formatPercent(cachePercent(agent.period)) : "—"}</span>
+                      <span>Output</span><span className="text-right text-foreground">{formatOptionalUsageMetric(agent.period, "outputTokens", formatTokens)}</span>
+                      <span>Previous</span><span className="text-right text-foreground">{usageMetricAvailable(agent.period, "totalTokens") && usageMetricAvailable(agent.previous, "totalTokens") ? usageDelta(agent.period.totalTokens, agent.previous.totalTokens).label : "—"}</span>
                     </div>
                   </Tooltip.Popup>
                 </Tooltip.Positioner>
@@ -634,7 +635,7 @@ function buildTokenTreemap(agents: AgentTokenUsage[], links: TeamView["organizat
   const parentByChild = new Map(links.map((link) => [link.childAgentId, link.parentAgentId]));
   const linked = new Set(links.flatMap((link) => [link.parentAgentId, link.childAgentId]));
   const groups = new Map<string, AgentTokenUsage[]>();
-  for (const agent of agents.filter((item) => item.period.totalTokens > 0)) {
+  for (const agent of agents.filter((item) => usageMetricAvailable(item.period, "totalTokens") && item.period.totalTokens > 0)) {
     let rootID = agent.agentId;
     const visited = new Set<string>();
     while (parentByChild.has(rootID) && !visited.has(rootID)) {
@@ -654,7 +655,7 @@ function buildTokenTreemap(agents: AgentTokenUsage[], links: TeamView["organizat
     }))
     .sort((a, b) => sumGroup(b) - sumGroup(a));
   const root = hierarchy<TreemapDatum>({ name: "Agents", color: "var(--muted)", children })
-    .sum((datum) => datum.agent?.period.totalTokens || 0)
+    .sum((datum) => datum.agent && usageMetricAvailable(datum.agent.period, "totalTokens") ? datum.agent.period.totalTokens : 0)
     .sort((a, b) => (b.value || 0) - (a.value || 0));
   const laidOut = treemap<TreemapDatum>()
     .size([1000, 500])
@@ -678,11 +679,11 @@ function treemapBox(node: { x0: number; y0: number; x1: number; y1: number }) {
 }
 
 function sumGroup(group: TreemapDatum) {
-  return (group.children || []).reduce((sum, child) => sum + (child.agent?.period.totalTokens || 0), 0);
+  return (group.children || []).reduce((sum, child) => sum + (child.agent && usageMetricAvailable(child.agent.period, "totalTokens") ? child.agent.period.totalTokens : 0), 0);
 }
 
-function AgentUsageInspector({ agent, total, onClose, onOpenAgent }: { agent: AgentTokenUsage; total: number; onClose: () => void; onOpenAgent: (id: string) => void }) {
-  const delta = usageDelta(agent.period.totalTokens, agent.previous.totalTokens);
+function AgentUsageInspector({ agent, total, onClose, onOpenAgent }: { agent: AgentTokenUsage; total: number | null; onClose: () => void; onOpenAgent: (id: string) => void }) {
+  const delta = usageMetricAvailable(agent.period, "totalTokens") && usageMetricAvailable(agent.previous, "totalTokens") ? usageDelta(agent.period.totalTokens, agent.previous.totalTokens) : { label: "unavailable", direction: "flat" as const };
   const contextAvailable = agent.context.available ?? agent.context.windowTokens > 0;
   return (
     <section data-usage-inspector className="scroll-mt-14 border-b border-border py-6">
@@ -700,11 +701,11 @@ function AgentUsageInspector({ agent, total, onClose, onOpenAgent }: { agent: Ag
         </div>
       </div>
       <div className="grid grid-cols-2 border-y border-border lg:grid-cols-6">
-        <Metric label="Tokens" value={formatTokens(agent.period.totalTokens)} detail={`${formatPercent(total ? agent.period.totalTokens * 100 / total : 0)} of period`} />
-        <Metric label="Previous" value={formatTokens(agent.previous.totalTokens)} detail={`${delta.label} previous period`} />
+        <Metric label="Tokens" value={formatOptionalUsageMetric(agent.period, "totalTokens", formatTokens)} detail={total != null && usageMetricAvailable(agent.period, "totalTokens") ? `${formatPercent(total ? agent.period.totalTokens * 100 / total : 0)} of period` : "complete period share unavailable"} />
+        <Metric label="Previous" value={formatOptionalUsageMetric(agent.previous, "totalTokens", formatTokens)} detail={`${delta.label} previous period`} />
         <Metric label="Calls" value={formatOptionalUsageMetric(agent.period, "calls", formatTokens)} detail={usageMetricAvailable(agent.period, "calls") ? `${formatTokens(averagePerCall(agent.period))} average / call` : "Runtime does not report calls"} />
-        <Metric label="Cache hit" value={usageMetricAvailable(agent.period, "cachedInputTokens") ? formatPercent(cachePercent(agent.period)) : "—"} detail={usageMetricAvailable(agent.period, "cachedInputTokens") ? `${formatTokens(agent.period.cachedInputTokens)} cached` : "Runtime does not report cache"} />
-        <Metric label="Output" value={formatTokens(agent.period.outputTokens)} detail={usageMetricAvailable(agent.period, "reasoningOutputTokens") ? `${formatTokens(agent.period.reasoningOutputTokens)} reasoning` : "reasoning unavailable"} />
+        <Metric label="Cache hit" value={usageMetricAvailable(agent.period, "inputTokens") && usageMetricAvailable(agent.period, "cachedInputTokens") ? formatPercent(cachePercent(agent.period)) : "—"} detail={usageMetricAvailable(agent.period, "cachedInputTokens") ? `${formatTokens(agent.period.cachedInputTokens)} cached` : "Runtime does not report cache"} />
+        <Metric label="Output" value={formatOptionalUsageMetric(agent.period, "outputTokens", formatTokens)} detail={usageMetricAvailable(agent.period, "reasoningOutputTokens") ? `${formatTokens(agent.period.reasoningOutputTokens)} reasoning` : "reasoning unavailable"} />
         <Metric label="Current context" value={contextAvailable ? formatPercent(agent.context.usedPercent) : "—"} detail={contextAvailable ? `${formatTokens(agent.context.inputTokens)} / ${formatTokens(agent.context.windowTokens)}` : "live snapshot unavailable"} />
       </div>
     </section>
@@ -713,12 +714,17 @@ function AgentUsageInspector({ agent, total, onClose, onOpenAgent }: { agent: Ag
 
 function TokenComposition({ usage }: { usage: TokenUsage }) {
   const segments = [
-    ...(usageMetricAvailable(usage, "cachedInputTokens") ? [{ label: "Cached input", value: usage.cachedInputTokens, color: "var(--loom-teal)" }] : []),
-    { label: "Uncached input", value: Math.max(0, usage.inputTokens - usage.cachedInputTokens), color: "var(--loom-blue)" },
-    ...(usageMetricAvailable(usage, "reasoningOutputTokens") ? [{ label: "Reasoning output", value: usage.reasoningOutputTokens, color: "var(--loom-vermilion)" }] : []),
-    { label: "Other output", value: Math.max(0, usage.outputTokens - usage.reasoningOutputTokens), color: "var(--loom-amber)" },
+    ...(usageMetricAvailable(usage, "inputTokens") && usageMetricAvailable(usage, "cachedInputTokens") ? [
+      { label: "Cached input", value: usage.cachedInputTokens, color: "var(--loom-teal)" },
+      { label: "Uncached input", value: Math.max(0, usage.inputTokens - usage.cachedInputTokens), color: "var(--loom-blue)" },
+    ] : []),
+    ...(usageMetricAvailable(usage, "outputTokens") && usageMetricAvailable(usage, "reasoningOutputTokens") ? [
+      { label: "Reasoning output", value: usage.reasoningOutputTokens, color: "var(--loom-vermilion)" },
+      { label: "Other output", value: Math.max(0, usage.outputTokens - usage.reasoningOutputTokens), color: "var(--loom-amber)" },
+    ] : []),
   ];
-  const denominator = Math.max(1, usage.inputTokens + usage.outputTokens);
+  const denominator = Math.max(1, segments.reduce((sum, segment) => sum + segment.value, 0));
+  if (segments.length === 0) return <div className="border-y border-border py-8 text-center text-[11px] text-muted-foreground">Token composition unavailable.</div>;
   return (
     <div className="border-y border-border py-4">
       <div className="flex h-3 w-full overflow-hidden bg-muted">
@@ -1028,14 +1034,14 @@ function SectionHeading({ title, detail }: { title: string; detail: string }) {
 }
 
 function DailyBars({ days, chartId = "overview", onSelectDay }: { days: UsageDay[]; chartId?: string; onSelectDay: (date: string) => void }) {
-  const max = Math.max(1, ...days.map((day) => day.usage.totalTokens));
+  const max = Math.max(1, ...days.filter((day) => usageMetricAvailable(day.usage, "totalTokens")).map((day) => day.usage.totalTokens));
   const labelEvery = days.length <= 7 ? 1 : days.length <= 30 ? 5 : 15;
   return (
     <div className="overflow-x-auto pb-1">
       <div data-usage-chart={chartId} className="flex h-48 min-w-[620px] items-end gap-1 border-b border-border px-1 pt-4">
         {days.map((day, index) => {
-          const height = day.usage.totalTokens > 0 ? Math.max(3, (day.usage.totalTokens / max) * 100) : 1;
-          const cached = cachePercent(day.usage);
+          const height = usageMetricAvailable(day.usage, "totalTokens") && day.usage.totalTokens > 0 ? Math.max(3, (day.usage.totalTokens / max) * 100) : 1;
+          const cached = usageMetricAvailable(day.usage, "inputTokens") && usageMetricAvailable(day.usage, "cachedInputTokens") ? cachePercent(day.usage) : 0;
           const showLabel = index % labelEvery === 0 || index === days.length - 1;
           const tooltipAlign = index === 0 ? "start" : index === days.length - 1 ? "end" : "center";
           return (
@@ -1043,7 +1049,7 @@ function DailyBars({ days, chartId = "overview", onSelectDay }: { days: UsageDay
               <UsageBarTooltip day={day} align={tooltipAlign} />
               <div className="relative w-full bg-muted" style={{ height: `${height}%` }}>
                 <div className="absolute inset-x-0 bottom-0 bg-[var(--loom-teal)]/65" style={{ height: `${cached}%` }} />
-                {day.usage.outputTokens > 0 && <div className="absolute inset-x-0 top-0 h-0.5 bg-[var(--loom-vermilion)]" />}
+                {usageMetricAvailable(day.usage, "outputTokens") && day.usage.outputTokens > 0 && <div className="absolute inset-x-0 top-0 h-0.5 bg-[var(--loom-vermilion)]" />}
               </div>
               {showLabel && <span className="absolute -bottom-5 left-0 whitespace-nowrap font-mono text-[8.5px] text-muted-foreground">{shortDate(day.date)}</span>}
             </button>
@@ -1140,7 +1146,7 @@ function UsageScopePicker({ agents, selectedAgentId, onSelect }: { agents: Agent
               key={agent.agentId}
               label={agent.agentName}
               selected={agent.agentId === selected?.agentId}
-              detail={agent.available ? formatTokens(agent.period.totalTokens) : "No usage"}
+              detail={agent.available ? formatOptionalUsageMetric(agent.period, "totalTokens", formatTokens) : "No usage"}
               onClick={() => choose(agent.agentId)}
             />
           ))}
@@ -1173,7 +1179,7 @@ function AgentUsageTable({
   onSelectAgent,
 }: {
   agents: AgentTokenUsage[];
-  total: number;
+  total: number | null;
   selectedAgentId: string | null;
   onInspectAgent: (id: string) => void;
   onSelectAgent: (id: string) => void;
@@ -1218,13 +1224,13 @@ function AgentUsageTable({
               </td>
               {agent.available ? (
                 <>
-                  <NumberCell value={formatTokens(agent.period.totalTokens)} />
-                  <NumberCell value={formatPercent(total ? agent.period.totalTokens * 100 / total : 0)} />
+                  <NumberCell value={formatOptionalUsageMetric(agent.period, "totalTokens", formatTokens)} />
+                  <NumberCell value={total != null && usageMetricAvailable(agent.period, "totalTokens") ? formatPercent(total ? agent.period.totalTokens * 100 / total : 0) : "—"} />
                   <NumberCell value={formatOptionalUsageMetric(agent.period, "calls", formatTokens)} />
                   <NumberCell value={usageMetricAvailable(agent.period, "calls") ? formatTokens(averagePerCall(agent.period)) : "—"} />
-                  <NumberCell value={usageMetricAvailable(agent.period, "cachedInputTokens") ? formatPercent(cachePercent(agent.period)) : "—"} />
-                  <NumberCell value={formatTokens(agent.period.outputTokens)} />
-                  <NumberCell value={usageDelta(agent.period.totalTokens, agent.previous.totalTokens).label.replace(" vs", "")} strong />
+                  <NumberCell value={usageMetricAvailable(agent.period, "inputTokens") && usageMetricAvailable(agent.period, "cachedInputTokens") ? formatPercent(cachePercent(agent.period)) : "—"} />
+                  <NumberCell value={formatOptionalUsageMetric(agent.period, "outputTokens", formatTokens)} />
+                  <NumberCell value={usageMetricAvailable(agent.period, "totalTokens") && usageMetricAvailable(agent.previous, "totalTokens") ? usageDelta(agent.period.totalTokens, agent.previous.totalTokens).label.replace(" vs", "") : "—"} strong />
                 </>
               ) : (
                 <td colSpan={7} className="px-3 py-2.5 text-right font-mono text-[10px] text-muted-foreground">No Thread usage yet</td>
@@ -1255,18 +1261,18 @@ function NumberCell({ value, strong = false }: { value: string; strong?: boolean
   return <td className={`px-3 py-2.5 text-right font-mono text-[10.5px] ${strong ? "font-semibold text-foreground" : "text-muted-foreground"}`}>{value}</td>;
 }
 
-function ModelBreakdown({ models, total }: { models: TokenUsageOverview["models"]; total: number }) {
+function ModelBreakdown({ models, total }: { models: TokenUsageOverview["models"]; total: number | null }) {
   if (models.length === 0) return <div className="py-8 text-center text-[11px] text-muted-foreground">No model usage in this period.</div>;
   return (
     <div className="divide-y divide-border border-y border-border">
       {models.map((model) => {
-        const share = total > 0 ? (model.usage.totalTokens / total) * 100 : 0;
+        const share = total != null && total > 0 && usageMetricAvailable(model.usage, "totalTokens") ? (model.usage.totalTokens / total) * 100 : null;
         return (
           <div key={`${model.providerId}:${model.model}`} className="grid items-center gap-3 py-3 sm:grid-cols-[180px_1fr_100px_80px]">
             <span className="truncate font-mono text-[11px] font-medium">{model.providerId} / {model.model}</span>
-            <div className="h-1.5 bg-muted"><div className="h-full bg-[var(--loom-blue)]/70" style={{ width: `${share}%` }} /></div>
-            <span className="text-right font-mono text-[10px] text-muted-foreground">{formatTokens(model.usage.totalTokens)}</span>
-            <span className="text-right font-mono text-[9px] text-muted-foreground">{formatPercent(share)}</span>
+            <div className="h-1.5 bg-muted"><div className="h-full bg-[var(--loom-blue)]/70" style={{ width: `${share ?? 0}%` }} /></div>
+            <span className="text-right font-mono text-[10px] text-muted-foreground">{formatOptionalUsageMetric(model.usage, "totalTokens", formatTokens)}</span>
+            <span className="text-right font-mono text-[9px] text-muted-foreground">{share != null ? formatPercent(share) : "—"}</span>
           </div>
         );
       })}

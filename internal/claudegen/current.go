@@ -18,7 +18,7 @@ func CurrentManifest() Manifest {
 	lockHash := sha256.Sum256(assets.PackageLock)
 	const nodeVersion = "24.19.0"
 	return Manifest{
-		ID:                   "claude-runtime-v6-node24.19.0-sdk0.3.228",
+		ID:                   "claude-runtime-v7-node24.19.0-sdk0.3.228",
 		Compatibility:        "claude-runtime-v1",
 		BridgeProtocol:       1,
 		BridgeBuild:          "claude-bridge-v1",

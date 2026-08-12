@@ -981,7 +981,11 @@ done
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if raw, readErr := os.ReadFile(marker); readErr == nil {
-			if ownerPrompts != 0 || !bytes.Contains(raw, []byte(`"command":"resolve_approval"`)) || !bytes.Contains(raw, []byte(`"decision":"abort"`)) {
+			if !bytes.Contains(raw, []byte(`"command":"resolve_approval"`)) {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			if ownerPrompts != 0 || !bytes.Contains(raw, []byte(`"decision":"abort"`)) {
 				t.Fatalf("ownerPrompts=%d command=%s", ownerPrompts, raw)
 			}
 			if _, err := os.Stat(executed); !os.IsNotExist(err) {

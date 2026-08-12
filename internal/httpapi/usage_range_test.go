@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/hub"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -66,6 +69,72 @@ func TestUsageAPIReportsPiConsumedWorkAndUnavailableCalls(t *testing.T) {
 		}
 		if strings.Contains(response.Body.String(), path) {
 			t.Fatalf("GET %s leaked the private Runtime reference: %s", target, response.Body.String())
+		}
+	}
+}
+
+func TestClaudeObservabilityAPIPreservesPartialTruthWithoutNativeRefs(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	developer := `<loom_developer_context prompt_revision="owner:2" prompt_hash="p" profile_revision="profile:3" profile_hash="q"></loom_developer_context>`
+	input := `<loom_context><loom_agent_relationships revision="relationships:4" hash="r"></loom_agent_relationships></loom_context>`
+	hash := func(value string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(value))) }
+	source := "claude_agent_sdk"
+	unavailable := runtimecontract.UsageMetric{Source: "runtime_unavailable"}
+	usage := &runtimecontract.Usage{
+		InputTokens: runtimecontract.UsageMetric{Available: true, Value: 6, Source: source}, CachedInputTokens: runtimecontract.UsageMetric{Available: true, Source: source}, OutputTokens: runtimecontract.UsageMetric{Available: true, Value: 2, Source: source},
+		ReasoningOutputTokens: unavailable, TotalTokens: unavailable, Calls: unavailable, CostMicros: runtimecontract.UsageMetric{Available: true, Value: 9, Source: source},
+	}
+	if err := st.SaveCanonicalTurnLedger("claude-api", []runtimecontract.HistoryTurn{{
+		TurnID: "turn-claude-api", State: runtimecontract.LifecycleCompleted, StartedAt: "2026-08-12T01:00:00Z", CompletedAt: "2026-08-12T01:00:01Z", Content: []runtimecontract.ContentBlock{}, Usage: usage,
+		ContextEvidence: &runtimecontract.ContextEvidence{State: runtimecontract.ContextEvidenceProven, TurnID: "turn-claude-api", Mode: runtimecontract.ContextDeliveryFullPerTurn,
+			Sources:    []runtimecontract.ContextEvidenceSource{{Key: "loom_agent_prompt", Revision: "owner:2", Hash: "p", Channel: "developer", State: "delivered"}, {Key: "loom_agent_profile", Revision: "profile:3", Hash: "q", Channel: "developer", State: "delivered"}, {Key: "loom_agent_relationships", Revision: "relationships:4", Hash: "r", Channel: "input", State: "delivered"}},
+			Deliveries: []runtimecontract.ContextEvidenceDelivery{{Channel: "developer", Role: "developer", Hash: hash(developer), Content: developer}, {Channel: "input", Role: "user", Hash: hash(input), Content: input}}, UnsupportedDimensions: []string{"coverage", "epoch", "replay", "resend"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	privateSession := "/Users/owner/.claude/projects/private-session.jsonl"
+	if err := st.SaveAgents(map[string]*hub.Agent{"claude-api": {ID: "claude-api", Name: "claude-api", Cwd: t.TempDir(), ThreadID: "loom-claude-api", RuntimeBinding: hub.RuntimeBinding{SchemaVersion: 2, Kind: "claude", NativeRef: privateSession}, RuntimeTurnBindings: map[string]string{"turn-claude-api": "native-secret"}, Status: "idle", CreatedAt: nowForTest(), UpdatedAt: nowForTest()}}); err != nil {
+		t.Fatal(err)
+	}
+	h := hub.New(st)
+	defer h.Shutdown()
+	handler := New(h, st, fstest.MapFS{"index.html": {Data: []byte("ok")}}).Handler()
+	for _, target := range []string{
+		"/api/usage?from=2026-08-12&to=2026-08-12&tz=UTC",
+		"/api/agents/claude-api/usage?from=2026-08-12&to=2026-08-12&tz=UTC",
+		"/api/agents/claude-api/context/explain?turnId=turn-claude-api",
+		"/api/workload?from=2026-08-12&to=2026-08-12&tz=UTC",
+		"/api/activity/daily?date=2026-08-12&tz=UTC&bucket=30",
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d %s", target, response.Code, response.Body.String())
+		}
+		text := response.Body.String()
+		if strings.Contains(text, privateSession) || strings.Contains(text, "native-secret") {
+			t.Fatalf("GET %s leaked native correlation: %s", target, text)
+		}
+		switch {
+		case strings.Contains(target, "context/explain"):
+			if !containsAll(text, `"state":"proven"`, `"revision":"owner:2"`, `"revision":"profile:3"`, `"revision":"relationships:4"`) {
+				t.Fatalf("GET %s context is incomplete: %s", target, text)
+			}
+		case strings.Contains(target, "/workload"):
+			if !containsAll(text, `"activityAvailable":true`, `"turnCount":1`, `"trackedActivityAgents":1`) {
+				t.Fatalf("GET %s omitted Claude activity: %s", target, text)
+			}
+		case strings.Contains(target, "/activity/daily"):
+			if !containsAll(text, `"trackedAgents":1`, `"turnCount":1`, `"inputTokens":6`, `"totalTokens":{"available":false`) {
+				t.Fatalf("GET %s daily activity is not partial: %s", target, text)
+			}
+		default:
+			if !containsAll(text, `"inputTokens":6`, `"totalTokens":0`, `"totalTokens":{"available":false`, `"calls":{"available":false`) {
+				t.Fatalf("GET %s usage is not partial: %s", target, text)
+			}
 		}
 	}
 }

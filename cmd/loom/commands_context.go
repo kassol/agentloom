@@ -18,9 +18,13 @@ func cmdContext(a args) {
 		cmdContextPrompt(a)
 	case "explain":
 		if len(a.positional) < 2 {
-			usage("context explain <agent> [--json]")
+			usage("context explain <agent> [--turn TURN_ID] [--json]")
 		}
-		resp, err := api("GET", "/api/agents/"+url.PathEscape(a.positional[1])+"/context/explain", nil)
+		path := "/api/agents/" + url.PathEscape(a.positional[1]) + "/context/explain"
+		if turnID := strings.TrimSpace(a.flags["turn"]); turnID != "" {
+			path += "?turnId=" + url.QueryEscape(turnID)
+		}
+		resp, err := api("GET", path, nil)
 		if err != nil {
 			fail(err)
 		}
@@ -114,12 +118,21 @@ func printContextValue(value any, asJSON bool) {
 	}
 	context, _ := value.(map[string]any)
 	epoch, _ := context["epoch"].(map[string]any)
-	fmt.Printf("%s · epoch %s\n", bold(str(context, "agentName")), str(epoch, "id"))
+	fmt.Printf("%s", bold(str(context, "agentName")))
+	if turnID := str(context, "turnId"); turnID != "" {
+		fmt.Printf(" · Turn %s", turnID)
+	}
+	if epochID := str(epoch, "id"); epochID != "" {
+		fmt.Printf(" · epoch %s", epochID)
+	}
+	fmt.Printf(" · %s\n", str(context, "state"))
 	for _, value := range anySlice(context["sources"]) {
 		source, _ := value.(map[string]any)
-		state := yellow("missing")
+		state := yellow(str(source, "state"))
 		if covered, _ := source["covered"].(bool); covered {
 			state = green("covered")
+		} else if str(source, "state") == "delivered" {
+			state = green("delivered")
 		}
 		fmt.Printf("  %-28s %-12s %s\n", str(source, "key"), state, str(source, "revision"))
 	}

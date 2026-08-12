@@ -63,6 +63,7 @@ func (s *Store) LoadCanonicalTurnLedger(agentID string, count, offset int) (runt
 		return runtimecontract.History{}, fmt.Errorf("unsupported Canonical Turn Ledger version %d", ledger.Version)
 	}
 	turns := ledger.Agents[agentID]
+	normalizeCanonicalTurnLedgerUsage(turns)
 	total := len(turns)
 	if count <= 0 {
 		count = 10
@@ -83,4 +84,28 @@ func (s *Store) LoadCanonicalTurnLedger(agentID string, count, offset int) (runt
 		return runtimecontract.History{}, fmt.Errorf("invalid Canonical Turn Ledger: %w", err)
 	}
 	return history, nil
+}
+
+// Canonical Turn Ledger v1 predates per-field usage provenance. Preserve
+// readable v1 data by marking omitted provenance explicitly at the cold-read
+// boundary; newly written snapshots are already fully attributed.
+func normalizeCanonicalTurnLedgerUsage(turns []runtimecontract.HistoryTurn) {
+	for index := range turns {
+		if turns[index].Usage == nil {
+			continue
+		}
+		usage := turns[index].Usage
+		for _, metric := range []*runtimecontract.UsageMetric{
+			&usage.InputTokens, &usage.CachedInputTokens, &usage.OutputTokens,
+			&usage.ReasoningOutputTokens, &usage.TotalTokens, &usage.Calls, &usage.CostMicros,
+		} {
+			if metric.Source == "" {
+				if metric.Available {
+					metric.Source = "canonical_turn_ledger"
+				} else {
+					metric.Source = "runtime_unavailable"
+				}
+			}
+		}
+	}
 }

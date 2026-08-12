@@ -346,7 +346,7 @@ func claudeControlPlaneCapabilitySnapshot() runtimecontract.CapabilitySnapshot {
 	snapshot := controlPlaneCapabilitySnapshot("claude")
 	for index := range snapshot.Capabilities {
 		id := snapshot.Capabilities[index].ID
-		if id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy {
+		if id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy || id == runtimecontract.CapabilityUsageReporting {
 			snapshot.Capabilities[index] = runtimeCapabilityDescriptor("claude", id, true)
 		}
 	}

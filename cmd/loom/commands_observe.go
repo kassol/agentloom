@@ -74,12 +74,8 @@ func cmdTurnGet(a args) {
 		}
 		fmt.Println()
 	}
-	if model := str(turn, "model"); model != "" {
-		fmt.Printf("model: %s", model)
-		if usage, ok := turn["usage"].(map[string]any); ok {
-			fmt.Printf(" · %.0f tokens", num(usage, "totalTokens"))
-		}
-		fmt.Println()
+	if line := turnModelUsageLine(turn); line != "" {
+		fmt.Println(line)
 	}
 	if message := str(turn, "error"); message != "" {
 		fmt.Printf("error: %s\n", red(message))
@@ -90,6 +86,52 @@ func cmdTurnGet(a args) {
 		block, _ := value.(map[string]any)
 		printCanonicalContent(block)
 	}
+}
+
+func turnModelUsageLine(turn map[string]any) string {
+	model := str(turn, "model")
+	if model == "" {
+		if details, ok := turn["usageDetails"].(map[string]any); ok {
+			models := anySlice(details["models"])
+			if len(models) > 1 {
+				model = "multiple models"
+			} else if len(models) == 1 {
+				if item, ok := models[0].(map[string]any); ok {
+					if value, ok := item["model"].(map[string]any); ok {
+						model = str(value, "value")
+					}
+				}
+			}
+		}
+	}
+	usage, hasUsage := turn["usage"].(map[string]any)
+	if model == "" && !hasUsage {
+		return ""
+	}
+	if model == "" {
+		model = "unavailable"
+	}
+	line := "model: " + model
+	if hasUsage {
+		if tokens, available := usageMetricValue(usage["totalTokens"]); available {
+			line += fmt.Sprintf(" · %.0f tokens", tokens)
+		} else {
+			line += " · tokens unavailable"
+		}
+	}
+	return line
+}
+
+func usageMetricValue(value any) (float64, bool) {
+	if metric, ok := value.(map[string]any); ok {
+		available, _ := metric["available"].(bool)
+		if !available {
+			return 0, false
+		}
+		value = metric["value"]
+	}
+	number, ok := value.(float64)
+	return number, ok
 }
 
 func printCanonicalContent(content map[string]any) {

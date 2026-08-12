@@ -248,6 +248,14 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time, r
 		Daily: emptyUsageDays(start, days), Models: []UsageModel{},
 	}
 	if report == nil {
+		result.Lifetime = unavailableRuntimeTokenUsage("runtime_unavailable")
+		result.Period = unavailableRuntimeTokenUsage("runtime_unavailable")
+		result.Previous = unavailableRuntimeTokenUsage("runtime_unavailable")
+		result.Today = unavailableRuntimeTokenUsage("runtime_unavailable")
+		result.LatestCall = unavailableRuntimeTokenUsage("runtime_unavailable")
+		for index := range result.Daily {
+			result.Daily[index].Usage = unavailableRuntimeTokenUsage("runtime_unavailable")
+		}
 		return result
 	}
 	runtimeRef := agent.nativeRuntimeRef
@@ -264,7 +272,9 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time, r
 		return result
 	}
 	result.Available = true
-	result.Lifetime = projectRuntimeTokenUsage(report.Lifetime)
+	if len(report.Events) == 0 {
+		result.Lifetime = projectRuntimeTokenUsage(report.Lifetime)
+	}
 	result.Period = emptyRuntimeTokenUsage(report.Lifetime)
 	result.Previous = emptyRuntimeTokenUsage(report.Lifetime)
 	result.Today = emptyRuntimeTokenUsage(report.Lifetime)
@@ -292,13 +302,14 @@ func buildAgentUsageRange(agent AgentView, start, endExclusive, now time.Time, r
 	}
 	models := map[string]RuntimeTokenUsage{}
 	for _, event := range report.Events {
+		projected := projectRuntimeTokenUsage(event.Usage)
+		result.Lifetime.Add(projected)
 		timestamp, err := time.Parse(time.RFC3339Nano, event.Timestamp.Value)
 		if err != nil {
 			continue
 		}
 		local := timestamp.In(now.Location())
 		if !local.Before(start) && local.Before(endLimit) {
-			projected := projectRuntimeTokenUsage(event.Usage)
 			result.Period.Add(projected)
 			if index, ok := dailyIndex[local.Format("2006-01-02")]; ok {
 				result.Daily[index].Usage.Add(projected)

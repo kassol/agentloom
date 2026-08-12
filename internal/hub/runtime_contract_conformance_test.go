@@ -307,7 +307,12 @@ func conformanceUsageTotal(usage *runtimecontract.Usage) int64 {
 
 func conformanceUsage(total int64) *runtimecontract.Usage {
 	metric := runtimecontract.UsageMetric{Available: true, Value: total, Source: "runtime"}
-	return &runtimecontract.Usage{TotalTokens: metric, Calls: runtimecontract.UsageMetric{Available: true, Value: 1, Source: "runtime"}}
+	unavailable := runtimecontract.UsageMetric{Source: "runtime_unavailable"}
+	return &runtimecontract.Usage{
+		InputTokens: unavailable, CachedInputTokens: unavailable, OutputTokens: unavailable,
+		ReasoningOutputTokens: unavailable, TotalTokens: metric,
+		Calls: runtimecontract.UsageMetric{Available: true, Value: 1, Source: "runtime"}, CostMicros: unavailable,
+	}
 }
 
 func conformanceStreamUsage(stream []runtimecontract.Event) *runtimecontract.Usage {

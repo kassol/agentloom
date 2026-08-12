@@ -70,6 +70,7 @@ Claude generation 写操作不下载凭证、不调用模型、不接受路径�
 | GET | `/api/agents/{key}/profile` | Get Profile |
 | PUT | `/api/agents/{key}/profile` | Update Profile |
 | GET | `/api/agents/{key}/usage` | Agent token usage |
+| GET | `/api/agents/{key}/context/explain?turnId=...` | Runtime-neutral context evidence for one Loom Turn |
 | GET | `/api/agents/{key}/workload` | Agent workload |
 | GET | `/api/agents/{key}/goal` | Get Loom Goal and current slot `revision` |
 | PUT | `/api/agents/{key}/goal` | Set/update Loom Goal; body requires current `expectedVersion` |
@@ -95,7 +96,7 @@ Turn 启动返回 `202 Accepted`；重启 pending 时相关写入口返回 `409`
 
 Claude 的 `/thread/history` 只读取 Loom-owned Canonical Turn Ledger；这是 Loom 已观察并
 成功提交的 typed Turn 边界，不读取 Claude 私有 transcript，也不会冷启动 Node/Claude
-Code。Claude 当前宣告 mandatory lifecycle/context delivery 与 Approval；model、settings、
+Code。Claude 当前宣告 mandatory lifecycle/context delivery、Approval 与 ledger-backed Usage；model、settings、
 resource adoption 等 optional capability 在对应 typed contract 落地前保持 unavailable。
 
 Approval 事件分别投影 Owner decision、callback `deliveryStatus` 和后续 typed tool

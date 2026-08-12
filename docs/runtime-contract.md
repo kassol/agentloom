@@ -125,6 +125,15 @@ blocks and source revisions it can prove. Missing evidence is `unknown`; an
 unreadable or malformed native record is `unavailable`. Native references and
 paths never cross the capability result.
 
+Claude persists the exact Loom-managed Developer and input context blocks only
+after the SDK accepts the correlated Turn. Its cold Context Evidence and Usage
+Inspection read that same Canonical Turn Ledger without resolving a Runtime
+generation or starting Node, Claude Code, or a model. Claude `modelUsage`
+snapshots are cumulative, so each later result replaces the Turn snapshot;
+per-model Provider, model, cache, cost, and context-window fields retain their
+native availability while total tokens, reasoning tokens, and call counts stay
+unavailable when the SDK does not report them.
+
 Codex Provider definitions, credentials, verification, and shared Host restart
 remain a Codex Host integration. They are not part of
 `ModelControlCapability`, and Pi does not implement that administration

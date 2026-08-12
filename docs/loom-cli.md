@@ -444,12 +444,14 @@ Context 命令用于检查 Loom 注入到 Agent 的 developer/input 分层与 ep
 ./bin/loom context prompt set --file /absolute/path/prompt.md --expected-version 3
 ./bin/loom context prompt clear --expected-version 3
 ./bin/loom context explain cici-research
+./bin/loom context explain cici-research --turn TURN_ID
 ./bin/loom context explain cici-research --json
 ./bin/loom context coverage cici-research
 ```
 
 `context prompt` 是全局 Loom 注入文本，不是某个 Agent Profile；`expectedVersion` 用于并发
-保护。`context explain` / `coverage` 是只读诊断，不修改任何持久化状态。权威分层与 coverage
+保护。`context explain --turn` 读取指定 Loom Turn 的持久证据；`context explain` / `coverage`
+是只读诊断，不修改任何持久化状态。权威分层与 coverage
 状态机见 [epoch-context-coverage.md](epoch-context-coverage.md)。
 
 版本与健康检查：

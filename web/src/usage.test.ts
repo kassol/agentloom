@@ -10,6 +10,7 @@ import {
   resolveUsageScope,
   shiftUsageRange,
   usageAPIQuery,
+  formatOptionalUsageMetric,
   usageRangeEndingOn,
 } from "./usage";
 
@@ -23,6 +24,12 @@ const tokens = (totalTokens: number): TokenUsage => ({
 });
 
 describe("Usage location and scope", () => {
+	it("renders unavailable metrics as a dash while preserving observed zero", () => {
+		const unavailable = { ...tokens(0), metrics: { totalTokens: { available: false, complete: false, sources: ["runtime_unavailable"] } } };
+		const observedZero = { ...tokens(0), metrics: { totalTokens: { available: true, complete: true, sources: ["claude_agent_sdk"] } } };
+		expect(formatOptionalUsageMetric(unavailable, "totalTokens", String)).toBe("—");
+		expect(formatOptionalUsageMetric(observedZero, "totalTokens", String)).toBe("0");
+	});
   it("round-trips an explicit calendar range and Agent through the URL", () => {
     const range = usageRangeEndingOn("7d", "2026-07-15", "Asia/Shanghai");
     const hash = buildUsageHash(range, "agent one");

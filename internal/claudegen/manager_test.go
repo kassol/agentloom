@@ -64,12 +64,12 @@ export function query({prompt, options}) {
       yield {type:"system", subtype:"init", session_id:options.sessionId};
       await delay(80);
       yield {type:"assistant", uuid:"first", session_id:options.sessionId, message:{content:[{type:"text",text:"first"}]}};
-      yield {type:"result", subtype:"success", session_id:options.sessionId, usage:{input_tokens:1,output_tokens:1},num_turns:1,total_cost_usd:0};
+      yield {type:"result", subtype:"success", session_id:options.sessionId, usage:{input_tokens:1,output_tokens:1},num_turns:1,total_cost_usd:0,modelUsage:{"claude-main":{inputTokens:1,outputTokens:0,cacheReadInputTokens:0,costUSD:0,contextWindow:200000,provider:"firstParty"}}};
       while (!queued.length) await delay(5);
       const causal = queued.shift();
       const sawDeveloper = String(causal.message.content).includes("loom_developer_context");
       yield {type:"assistant", uuid:"causal", session_id:options.sessionId, message:{content:[{type:"text",text:sawDeveloper?"causal-developer-observed":"missing-developer"}]}};
-      yield {type:"result", subtype:"success", session_id:options.sessionId, usage:{input_tokens:2,output_tokens:2},num_turns:1,total_cost_usd:0};
+      yield {type:"result", subtype:"success", session_id:options.sessionId, usage:{input_tokens:2,output_tokens:2},num_turns:1,total_cost_usd:0,modelUsage:{"claude-main":{inputTokens:3,outputTokens:2,cacheReadInputTokens:0,cacheCreationInputTokens:1,costUSD:0.000006,contextWindow:200000,provider:"firstParty"},"claude-side":{inputTokens:4,outputTokens:1,cacheReadInputTokens:2,cacheCreationInputTokens:0,costUSD:0.000007,contextWindow:100000,provider:"gateway"}}};
     }
   };
 }`
@@ -119,6 +119,7 @@ export function query({prompt, options}) {
 	sentContinue := false
 	terminalCount := 0
 	texts := []string{}
+	usageFrames := []map[string]any{}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) && terminalCount < 1 {
 		frame := read()
@@ -131,6 +132,9 @@ export function query({prompt, options}) {
 			if text, ok := content["text"].(string); ok {
 				texts = append(texts, text)
 			}
+		}
+		if frame["kind"] == "event" && frame["event"] == "usage" {
+			usageFrames = append(usageFrames, frame["data"].(map[string]any))
 		}
 		if frame["kind"] == "event" && frame["event"] == "turn_completed" {
 			terminalCount++
@@ -148,6 +152,22 @@ export function query({prompt, options}) {
 	}
 	if terminalCount != 1 || !slices.Contains(texts, "causal-developer-observed") {
 		t.Fatalf("terminalCount=%d texts=%#v", terminalCount, texts)
+	}
+	if len(usageFrames) != 2 {
+		t.Fatalf("usage frames = %#v", usageFrames)
+	}
+	firstUsage := usageFrames[0]["usage"].(map[string]any)
+	if firstUsage["inputTokens"].(map[string]any)["available"] != false || firstUsage["cachedInputTokens"].(map[string]any)["value"] != float64(0) || firstUsage["totalTokens"].(map[string]any)["available"] != false {
+		t.Fatalf("absent versus observed-zero usage = %#v", firstUsage)
+	}
+	latestUsage, latestDetails := usageFrames[1]["usage"].(map[string]any), usageFrames[1]["details"].(map[string]any)
+	models := latestDetails["models"].([]any)
+	if latestUsage["inputTokens"].(map[string]any)["value"] != float64(10) || latestUsage["costMicros"].(map[string]any)["value"] != float64(13) || latestUsage["calls"].(map[string]any)["available"] != false || len(models) != 2 {
+		t.Fatalf("latest cumulative multi-model usage = usage %#v details %#v", latestUsage, latestDetails)
+	}
+	mainModel, sideModel := models[0].(map[string]any), models[1].(map[string]any)
+	if mainModel["model"].(map[string]any)["value"] != "claude-main" || mainModel["provider"].(map[string]any)["value"] != "firstParty" || mainModel["contextWindow"].(map[string]any)["value"] != float64(200000) || sideModel["model"].(map[string]any)["value"] != "claude-side" || sideModel["provider"].(map[string]any)["value"] != "gateway" || sideModel["contextWindow"].(map[string]any)["value"] != float64(100000) || latestDetails["observedAt"].(map[string]any)["source"] != "canonical_turn_ledger" {
+		t.Fatalf("multi-model attribution = %#v", latestDetails)
 	}
 }
 

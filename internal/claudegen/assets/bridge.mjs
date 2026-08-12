@@ -91,17 +91,26 @@ async function* initialInput(input, sessionRef) {
 
 function usageFrom(result) {
   const source = "claude_agent_sdk";
-  const observed = (value) => ({available: true, value: Math.max(0, Math.round(Number(value) || 0)), source});
   const unavailable = () => ({available: false, source});
-  const usage = result?.usage || {};
-  const input = (Number(usage.input_tokens) || 0) + (Number(usage.cache_read_input_tokens) || 0) + (Number(usage.cache_creation_input_tokens) || 0);
-  const cached = Number(usage.cache_read_input_tokens) || 0;
-  const output = Number(usage.output_tokens) || 0;
-  return {
-    inputTokens: observed(input), cachedInputTokens: observed(cached), outputTokens: observed(output),
-    reasoningOutputTokens: unavailable(), totalTokens: observed(input + output),
-    calls: unavailable(), costMicros: observed((Number(result?.total_cost_usd) || 0) * 1_000_000)
+  const number = (object, key, scale = 1) => {
+    if (!object || !Object.hasOwn(object, key) || !Number.isFinite(object[key]) || object[key] < 0) return unavailable();
+    return {available: true, value: Math.round(object[key] * scale), source};
   };
+  const text = (value) => typeof value === "string" && value ? {available: true, value, source} : {available: false, source};
+  const models = Object.entries(result?.modelUsage || {}).map(([model, raw]) => {
+    const input = ["inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"].map((key) => number(raw, key));
+    const inputTokens = input.every((item) => item.available) ? {available: true, value: input.reduce((sum, item) => sum + item.value, 0), source} : unavailable();
+    return {provider: text(raw?.provider), model: text(model), usage: {
+      inputTokens, cachedInputTokens: number(raw, "cacheReadInputTokens"), outputTokens: number(raw, "outputTokens"),
+      reasoningOutputTokens: unavailable(), totalTokens: unavailable(), calls: unavailable(), costMicros: number(raw, "costUSD", 1_000_000)
+    }, contextWindow: number(raw, "contextWindow")};
+  });
+  const sum = (key) => models.length && models.every((item) => item.usage[key].available)
+    ? {available: true, value: models.reduce((total, item) => total + item.usage[key].value, 0), source} : unavailable();
+  return {usage: {
+    inputTokens: sum("inputTokens"), cachedInputTokens: sum("cachedInputTokens"), outputTokens: sum("outputTokens"),
+    reasoningOutputTokens: unavailable(), totalTokens: unavailable(), calls: unavailable(), costMicros: sum("costMicros")
+  }, details: {observedAt: {available: true, value: new Date().toISOString(), source: "canonical_turn_ledger"}, models}};
 }
 
 function assistantContent(message) {
@@ -171,7 +180,8 @@ async function runTurn(frame) {
       }
       if (message?.type === "result") {
 		turn.observedResults++;
-        emit(frame, "usage", {runtimeTurnRef, usage: usageFrom(message)});
+		const observedUsage = usageFrom(message);
+        emit(frame, "usage", {runtimeTurnRef, ...observedUsage});
 		if (turn.observedResults < turn.expectedResults) continue;
 		turn.terminal = true;
 		const interrupted = message.subtype !== "success" && turn.interruptRequested && ["aborted_streaming", "aborted_tools"].includes(message.terminal_reason);

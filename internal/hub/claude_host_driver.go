@@ -243,6 +243,7 @@ type claudeRuntimeContract struct {
 	ops                       atomic.Uint64
 	opPhases                  map[string]runtimecontract.FailurePhase
 	opTurns                   map[string]string
+	pendingContext            map[string]*runtimecontract.ContextEvidence
 	afterLedgerCommitForTest  func()
 	beforeLedgerCommitForTest func()
 }
@@ -258,11 +259,11 @@ type claudeCallback struct {
 func newClaudeRuntimeContract(agentID string, st *store.Store, bridge *claudebridge.Bridge) *claudeRuntimeContract {
 	c := &claudeRuntimeContract{
 		agentID: agentID, st: st, bridge: bridge, terminal: map[string]bool{}, waiting: map[string]bool{}, fenced: map[string]bool{}, pendingOps: map[string]bool{}, terminalOps: map[string]string{},
-		opPhases: map[string]runtimecontract.FailurePhase{}, opTurns: map[string]string{}, callbacks: map[string]claudeCallback{}, callbackProposals: map[string]string{},
+		opPhases: map[string]runtimecontract.FailurePhase{}, opTurns: map[string]string{}, callbacks: map[string]claudeCallback{}, callbackProposals: map[string]string{}, pendingContext: map[string]*runtimecontract.ContextEvidence{},
 	}
 	if st != nil {
 		if history, err := st.LoadCanonicalTurnLedger(agentID, int(^uint(0)>>1), 0); err == nil {
-			c.turns = history.Turns
+			c.turns = sanitizeClaudeHistory(history.Turns)
 			for _, turn := range c.turns {
 				if turn.State != runtimecontract.LifecycleAccepted {
 					c.terminal[turn.TurnID] = true
@@ -322,6 +323,56 @@ func (c *claudeRuntimeContract) ContextDeliveryMode() runtimecontract.ContextDel
 	return runtimecontract.ContextDeliveryFullPerTurn
 }
 
+func (c *claudeRuntimeContract) InspectContextEvidence(ctx context.Context, _ runtimecontract.Binding, query runtimecontract.ContextEvidenceQuery) (runtimecontract.ContextEvidence, *runtimecontract.Failure) {
+	base := runtimecontract.ContextEvidence{State: runtimecontract.ContextEvidenceUnknown, TurnID: query.TurnID, Mode: runtimecontract.ContextDeliveryFullPerTurn, Sources: []runtimecontract.ContextEvidenceSource{}, Deliveries: []runtimecontract.ContextEvidenceDelivery{}, UnsupportedDimensions: []string{"coverage", "epoch", "replay", "resend"}}
+	if err := ctx.Err(); err != nil {
+		base.State, base.Reason = runtimecontract.ContextEvidenceUnavailable, "Runtime evidence inspection was cancelled"
+		return base, nil
+	}
+	if c.st == nil {
+		base.State, base.Reason = runtimecontract.ContextEvidenceUnavailable, "Canonical Turn Ledger is unavailable"
+		return base, nil
+	}
+	history, err := c.st.LoadCanonicalTurnLedger(c.agentID, int(^uint(0)>>1), 0)
+	if err != nil {
+		base.State, base.Reason = runtimecontract.ContextEvidenceUnavailable, "Canonical Turn Ledger is unreadable"
+		return base, nil
+	}
+	for _, turn := range history.Turns {
+		if turn.TurnID != query.TurnID {
+			continue
+		}
+		if turn.ContextEvidence == nil {
+			base.Reason = "No durable Loom context evidence exists for this Turn"
+			return base, nil
+		}
+		if err := validateClaudeContextEvidence(*turn.ContextEvidence); err != nil {
+			base.State, base.Reason = runtimecontract.ContextEvidenceUnavailable, "Canonical Turn Ledger contains malformed Claude context evidence"
+			return base, nil
+		}
+		report := *turn.ContextEvidence
+		report.Sources = append([]runtimecontract.ContextEvidenceSource(nil), report.Sources...)
+		report.Deliveries = append([]runtimecontract.ContextEvidenceDelivery(nil), report.Deliveries...)
+		return report, nil
+	}
+	base.Reason = "No durable Runtime correlation exists for this Loom Turn"
+	return base, nil
+}
+
+func (c *claudeRuntimeContract) InspectUsage(ctx context.Context, _ runtimecontract.Binding) (runtimecontract.UsageReport, *runtimecontract.Failure) {
+	if err := ctx.Err(); err != nil {
+		return runtimecontract.UsageReport{}, claudeUsageFailure(err)
+	}
+	if c.st == nil {
+		return runtimecontract.UsageReport{}, claudeUsageFailure(errors.New("Canonical Turn Ledger is unavailable"))
+	}
+	history, err := c.st.LoadCanonicalTurnLedger(c.agentID, int(^uint(0)>>1), 0)
+	if err != nil {
+		return runtimecontract.UsageReport{}, claudeUsageFailure(err)
+	}
+	return projectClaudeUsage(history.Turns), nil
+}
+
 func (c *claudeRuntimeContract) CreateBinding(ctx context.Context, request runtimecontract.BindingRequest) (runtimecontract.Binding, runtimecontract.Outcome) {
 	c.cwd = request.Cwd
 	if err := ctx.Err(); err != nil {
@@ -364,11 +415,18 @@ func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimeco
 	if err := c.persistLedgerFence(); err != nil {
 		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseTurnStart, "ledger_unavailable", err)
 	}
+	evidence := claudeContextEvidence(request.TurnID, request.Input, "developer")
 	c.mu.Lock()
+	if evidence != nil {
+		c.pendingContext[request.TurnID] = evidence
+	}
 	resume := len(c.turns) > 0 || c.observed
 	c.mu.Unlock()
 	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input})
 	if outcome.State != runtimecontract.LifecycleAccepted {
+		c.mu.Lock()
+		delete(c.pendingContext, request.TurnID)
+		c.mu.Unlock()
 		return outcome
 	}
 	if err := c.ledgerFailure(); err != nil {
@@ -390,6 +448,11 @@ func (c *claudeRuntimeContract) ContinueTurn(ctx context.Context, request runtim
 	}
 	_, outcome := c.command(ctx, "continue_turn", request.TurnID, runtimecontract.FailurePhaseTurnContinue, map[string]any{"sessionRef": request.Binding.NativeRef, "runtimeTurnRef": request.RuntimeTurnRef, "input": request.Input})
 	if outcome.State == runtimecontract.LifecycleAccepted {
+		if evidence := claudeContextEvidence(request.TurnID, request.Input, "user"); evidence != nil {
+			if err := c.persistAcceptedContext(request.TurnID, evidence); err != nil {
+				return claudeFailure(runtimecontract.LifecycleIndeterminate, runtimecontract.FailurePhaseTurnContinue, "ledger_commit_indeterminate", err)
+			}
+		}
 		if err := c.ledgerFailure(); err != nil {
 			return claudeFailure(runtimecontract.LifecycleIndeterminate, runtimecontract.FailurePhaseTurnContinue, "ledger_commit_indeterminate", err)
 		}
@@ -398,6 +461,25 @@ func (c *claudeRuntimeContract) ContinueTurn(ctx context.Context, request runtim
 		outcome.RuntimeTurnRef = request.RuntimeTurnRef
 	}
 	return outcome
+}
+
+func (c *claudeRuntimeContract) persistAcceptedContext(turnID string, evidence *runtimecontract.ContextEvidence) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ledgerErr != nil {
+		return c.ledgerErr
+	}
+	next := cloneClaudeLedgerTurns(c.turns)
+	claudeLedgerTurn(&next, turnID).ContextEvidence = evidence
+	if c.st == nil {
+		return errors.New("Canonical Turn Ledger Store is unavailable")
+	}
+	if err := c.saveLedger(next); err != nil {
+		c.ledgerErr = err
+		return err
+	}
+	c.turns = next
+	return nil
 }
 
 func (c *claudeRuntimeContract) InterruptTurn(ctx context.Context, request runtimecontract.TurnTarget) runtimecontract.Outcome {
@@ -423,7 +505,7 @@ func (c *claudeRuntimeContract) persistLedgerFence() error {
 	if c.st == nil {
 		return errors.New("Canonical Turn Ledger Store is unavailable")
 	}
-	if err := c.st.SaveCanonicalTurnLedger(c.agentID, c.turns); err != nil {
+	if err := c.saveLedger(c.turns); err != nil {
 		c.ledgerErr = err
 		return err
 	}
@@ -501,6 +583,7 @@ func (c *claudeRuntimeContract) ReadHistory(ctx context.Context, request runtime
 		failure := claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseHistory, "history_unavailable", err)
 		return runtimecontract.History{}, failure.Failure
 	}
+	history.Turns = sanitizeClaudeHistory(history.Turns)
 	return history, nil
 }
 
@@ -623,6 +706,10 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 	case runtimecontract.EventTurnStarted:
 		turn.State = runtimecontract.LifecycleAccepted
 		turn.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if c.opTurns[source.Operation] == event.TurnID {
+			turn.ContextEvidence = c.pendingContext[event.TurnID]
+			delete(c.pendingContext, event.TurnID)
+		}
 	case runtimecontract.EventContent:
 		projected, ok := projectRuntimeContentBlock(&AgentView{Agent: Agent{ID: c.agentID}}, event.TurnID, *event.Content)
 		if !ok {
@@ -642,6 +729,7 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 	case runtimecontract.EventUsage:
 		usage := *event.Usage
 		turn.Usage = &usage
+		turn.UsageDetails = event.UsageDetails
 	case runtimecontract.EventTerminal:
 		turn.State = event.Outcome.State
 		turn.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
@@ -653,7 +741,7 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 		c.fail(errors.New("persist Canonical Turn Ledger before canonical event: Store is unavailable"))
 		return
 	}
-	if err := c.st.SaveCanonicalTurnLedger(c.agentID, nextTurns); err != nil {
+	if err := c.saveLedger(nextTurns); err != nil {
 		c.ledgerErr = err
 		phase := c.opPhases[source.Operation]
 		c.mu.Unlock()
@@ -862,8 +950,141 @@ func cloneClaudeLedgerTurns(turns []runtimecontract.HistoryTurn) []runtimecontra
 			usage := *cloned[index].Usage
 			cloned[index].Usage = &usage
 		}
+		if cloned[index].UsageDetails != nil {
+			details := *cloned[index].UsageDetails
+			details.Models = append([]runtimecontract.ModelUsage(nil), details.Models...)
+			cloned[index].UsageDetails = &details
+		}
+		if cloned[index].ContextEvidence != nil {
+			evidence := *cloned[index].ContextEvidence
+			evidence.Sources = append([]runtimecontract.ContextEvidenceSource(nil), evidence.Sources...)
+			evidence.Deliveries = append([]runtimecontract.ContextEvidenceDelivery(nil), evidence.Deliveries...)
+			cloned[index].ContextEvidence = &evidence
+		}
 	}
 	return cloned
+}
+
+func claudeContextEvidence(turnID string, input []runtimecontract.InputBlock, developerRole string) *runtimecontract.ContextEvidence {
+	report := &runtimecontract.ContextEvidence{State: runtimecontract.ContextEvidenceUnknown, TurnID: turnID, Mode: runtimecontract.ContextDeliveryFullPerTurn, Sources: []runtimecontract.ContextEvidenceSource{}, Deliveries: []runtimecontract.ContextEvidenceDelivery{}, UnsupportedDimensions: []string{"coverage", "epoch", "replay", "resend"}}
+	seen := map[string]bool{}
+	for _, block := range input {
+		if block.Kind != runtimecontract.InputText {
+			continue
+		}
+		content := block.Text
+		trimmed := strings.TrimSpace(content)
+		channel := ""
+		if strings.HasPrefix(trimmed, "<loom_developer_context") {
+			channel = "developer"
+		} else if strings.HasPrefix(trimmed, "<loom_context") {
+			channel = "input"
+		} else {
+			continue
+		}
+		if seen[channel] {
+			return nil
+		}
+		seen[channel] = true
+		sources, valid := piContextEvidenceSources(trimmed, channel)
+		if !valid {
+			return nil
+		}
+		report.Sources = append(report.Sources, sources...)
+		role := "user"
+		if channel == "developer" {
+			role = developerRole
+		}
+		report.Deliveries = append(report.Deliveries, runtimecontract.ContextEvidenceDelivery{Channel: channel, Role: role, Hash: sha256Hex([]byte(content)), Content: content})
+	}
+	if !seen["developer"] || !seen["input"] || !contextEvidenceHasSources(report.Sources, "loom_agent_prompt", "loom_agent_profile", "loom_agent_relationships") {
+		return nil
+	}
+	report.State = runtimecontract.ContextEvidenceProven
+	return report
+}
+
+func (c *claudeRuntimeContract) saveLedger(turns []runtimecontract.HistoryTurn) error {
+	if err := validateClaudeLedger(turns); err != nil {
+		return err
+	}
+	return c.st.SaveCanonicalTurnLedger(c.agentID, turns)
+}
+
+func validateClaudeLedger(turns []runtimecontract.HistoryTurn) error {
+	for _, turn := range turns {
+		if turn.ContextEvidence != nil {
+			if err := validateClaudeContextEvidence(*turn.ContextEvidence); err != nil {
+				return fmt.Errorf("Claude Turn %q context evidence: %w", turn.TurnID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func sanitizeClaudeHistory(turns []runtimecontract.HistoryTurn) []runtimecontract.HistoryTurn {
+	turns = cloneClaudeLedgerTurns(turns)
+	for index := range turns {
+		evidence := turns[index].ContextEvidence
+		if evidence == nil || validateClaudeContextEvidence(*evidence) == nil {
+			continue
+		}
+		turns[index].ContextEvidence = &runtimecontract.ContextEvidence{
+			State: runtimecontract.ContextEvidenceUnavailable, TurnID: turns[index].TurnID,
+			Mode: runtimecontract.ContextDeliveryFullPerTurn, Reason: "Canonical Turn Ledger contains malformed Claude context evidence",
+			Sources: []runtimecontract.ContextEvidenceSource{}, Deliveries: []runtimecontract.ContextEvidenceDelivery{}, UnsupportedDimensions: []string{"coverage", "epoch", "replay", "resend"},
+		}
+	}
+	return turns
+}
+
+func validateClaudeContextEvidence(evidence runtimecontract.ContextEvidence) error {
+	if err := evidence.Validate(); err != nil {
+		return err
+	}
+	if evidence.State != runtimecontract.ContextEvidenceProven {
+		return nil
+	}
+	if evidence.Mode != runtimecontract.ContextDeliveryFullPerTurn || len(evidence.Deliveries) != 2 {
+		return errors.New("proven Claude context requires exact developer and input deliveries")
+	}
+	expected := map[string]runtimecontract.ContextEvidenceSource{}
+	for _, delivery := range evidence.Deliveries {
+		if delivery.Channel == "developer" {
+			if delivery.Role != "developer" && delivery.Role != "user" {
+				return errors.New("Claude developer context has an invalid accepted role")
+			}
+		} else if delivery.Channel == "input" {
+			if delivery.Role != "user" {
+				return errors.New("Claude input context has an invalid accepted role")
+			}
+		} else {
+			return fmt.Errorf("unknown Claude context channel %q", delivery.Channel)
+		}
+		sources, valid := piContextEvidenceSources(strings.TrimSpace(delivery.Content), delivery.Channel)
+		if !valid {
+			return fmt.Errorf("Claude %s context is malformed", delivery.Channel)
+		}
+		for _, source := range sources {
+			expected[source.Key+"\x00"+source.Channel] = source
+		}
+	}
+	if len(expected) != len(evidence.Sources) {
+		return errors.New("Claude context source attribution does not match accepted content")
+	}
+	for _, source := range evidence.Sources {
+		key := source.Key + "\x00" + source.Channel
+		if source.State != "delivered" || expected[key] != source {
+			return fmt.Errorf("Claude context source %q does not match accepted content", source.Key)
+		}
+	}
+	for _, key := range []string{"loom_agent_prompt\x00developer", "loom_agent_profile\x00developer", "loom_agent_relationships\x00input"} {
+		source, ok := expected[key]
+		if !ok || source.Revision == "" || source.Hash == "" {
+			return errors.New("Claude context is missing required source revisions")
+		}
+	}
+	return nil
 }
 
 func (c *claudeRuntimeContract) ledgerHealthy() bool {
@@ -912,13 +1133,14 @@ func claudeContractEvent(source claudebridge.Event) (runtimecontract.Event, erro
 		event.Kind, event.RuntimeTurnRef, event.ContentPhase, event.Content = runtimecontract.EventContent, data.RuntimeTurnRef, data.Phase, &data.Content
 	case "usage":
 		var data struct {
-			RuntimeTurnRef string                `json:"runtimeTurnRef"`
-			Usage          runtimecontract.Usage `json:"usage"`
+			RuntimeTurnRef string                        `json:"runtimeTurnRef"`
+			Usage          runtimecontract.Usage         `json:"usage"`
+			Details        *runtimecontract.UsageDetails `json:"details"`
 		}
 		if json.Unmarshal(source.Data, &data) != nil {
 			return runtimecontract.Event{}, errors.New("Claude bridge emitted malformed usage")
 		}
-		event.Kind, event.RuntimeTurnRef, event.Usage = runtimecontract.EventUsage, data.RuntimeTurnRef, &data.Usage
+		event.Kind, event.RuntimeTurnRef, event.Usage, event.UsageDetails = runtimecontract.EventUsage, data.RuntimeTurnRef, &data.Usage, data.Details
 	case "turn_completed", "turn_failed", "turn_interrupted":
 		var data struct {
 			RuntimeTurnRef string `json:"runtimeTurnRef"`

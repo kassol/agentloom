@@ -11,6 +11,7 @@ import (
 	"testing/fstest"
 
 	"github.com/yan5xu/codex-loom/internal/hub"
+	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
@@ -41,6 +42,23 @@ func TestThreadSSEProjectsOnlyCanonicalNamespace(t *testing.T) {
 	writeThreadSSE(&canonical, event)
 	if got := canonical.String(); !strings.Contains(got, `"type":"loom/agent-created"`) || strings.Contains(got, `"type":"hub/session-created"`) {
 		t.Fatalf("canonical SSE = %q", got)
+	}
+}
+
+func TestThreadSSEPreservesUsageAvailabilityWithoutNativeRefs(t *testing.T) {
+	usage := runtimecontract.Usage{
+		InputTokens:       runtimecontract.UsageMetric{Available: true, Value: 0, Source: "claude_agent_sdk"},
+		CachedInputTokens: runtimecontract.UsageMetric{Source: "runtime_unavailable"}, OutputTokens: runtimecontract.UsageMetric{Source: "runtime_unavailable"}, ReasoningOutputTokens: runtimecontract.UsageMetric{Source: "runtime_unavailable"}, TotalTokens: runtimecontract.UsageMetric{Source: "runtime_unavailable"}, Calls: runtimecontract.UsageMetric{Source: "runtime_unavailable"}, CostMicros: runtimecontract.UsageMetric{Source: "runtime_unavailable"},
+	}
+	payload, err := json.Marshal(runtimecontract.Event{Kind: runtimecontract.EventUsage, TurnID: "turn-1", RuntimeTurnRef: "native-secret", Usage: &usage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	writeThreadSSE(&output, store.Event{Type: "loom/runtime-event", Data: payload})
+	got := output.String()
+	if !containsAll(got, `"inputTokens":{"available":true`, `"totalTokens":{"available":false`) || strings.Contains(got, "native-secret") {
+		t.Fatalf("partial Claude usage SSE = %s", got)
 	}
 }
 
