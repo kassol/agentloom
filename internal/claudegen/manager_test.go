@@ -115,10 +115,10 @@ export function query({prompt, options}) {
 	session := "11111111-1111-4111-8111-111111111111"
 	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "input": []any{map[string]any{"kind": "text", "role": "developer", "text": "first-dev"}, map[string]any{"kind": "text", "role": "user", "text": "first-user"}}}})
 	sentContinue := false
-	terminals := map[string]bool{}
+	terminalCount := 0
 	texts := []string{}
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && len(terminals) < 2 {
+	for time.Now().Before(deadline) && terminalCount < 1 {
 		frame := read()
 		if frame["kind"] == "response" && frame["operation"] == "op-start" && !sentContinue {
 			sentContinue = true
@@ -131,11 +131,117 @@ export function query({prompt, options}) {
 			}
 		}
 		if frame["kind"] == "event" && frame["event"] == "turn_completed" {
-			terminals[frame["operation"].(string)] = true
+			terminalCount++
+			if frame["operation"] != "op-start" {
+				t.Fatalf("terminal operation = %#v, want stable Turn operation op-start", frame["operation"])
+			}
 		}
 	}
-	if !terminals["op-start"] || !terminals["op-continue"] || !slices.Contains(texts, "causal-developer-observed") {
-		t.Fatalf("terminals=%#v texts=%#v", terminals, texts)
+	write(map[string]any{"kind": "close"})
+	for scanner.Scan() {
+		var frame map[string]any
+		if json.Unmarshal(scanner.Bytes(), &frame) == nil && frame["kind"] == "event" && frame["event"] == "turn_completed" {
+			terminalCount++
+		}
+	}
+	if terminalCount != 1 || !slices.Contains(texts, "causal-developer-observed") {
+		t.Fatalf("terminalCount=%d texts=%#v", terminalCount, texts)
+	}
+}
+
+func TestEmbeddedBridgeClassifiesTerminalBeforeInterruptReceipt(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	app := t.TempDir()
+	module := filepath.Join(app, "node_modules", "@anthropic-ai", "claude-agent-sdk")
+	if err := os.MkdirAll(module, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "bridge.mjs"), currentAssets().Bridge, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(module, "package.json"), []byte(`{"type":"module","exports":"./index.js","version":"0.3.228","claudeCodeVersion":"2.1.228"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := `
+export async function getSessionInfo() { return undefined; }
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let interruptRequested = false;
+export function query({prompt, options}) {
+  return {
+    async streamInput() {},
+    async interrupt() { interruptRequested = true; await delay(80); },
+    close() {},
+    async *[Symbol.asyncIterator]() {
+      await prompt[Symbol.asyncIterator]().next();
+      yield {type:"system", subtype:"init", session_id:options.sessionId};
+      while (!interruptRequested) await delay(2);
+      yield {type:"result", subtype:"error_during_execution", terminal_reason:"aborted_streaming", session_id:options.sessionId, usage:{},num_turns:1,total_cost_usd:0};
+    }
+  };
+}`
+	if err := os.WriteFile(filepath.Join(module, "index.js"), []byte(fake), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(node, filepath.Join(app, "bridge.mjs"))
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	scanner := bufio.NewScanner(stdout)
+	read := func() map[string]any {
+		t.Helper()
+		if !scanner.Scan() {
+			t.Fatalf("bridge output ended: %v", scanner.Err())
+		}
+		var frame map[string]any
+		if json.Unmarshal(scanner.Bytes(), &frame) != nil {
+			t.Fatalf("frame = %s", scanner.Bytes())
+		}
+		return frame
+	}
+	write := func(frame any) {
+		t.Helper()
+		encoded, _ := json.Marshal(frame)
+		if _, err := stdin.Write(append(encoded, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = read()
+	write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
+	_ = read()
+	session := "11111111-1111-4111-8111-111111111111"
+	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "input": []any{map[string]any{"kind": "text", "role": "user", "text": "work"}}}})
+	var runtimeTurnRef any
+	for runtimeTurnRef == nil {
+		frame := read()
+		if frame["kind"] == "response" && frame["operation"] == "op-start" {
+			runtimeTurnRef = frame["data"].(map[string]any)["runtimeTurnRef"]
+		}
+	}
+	write(map[string]any{"kind": "command", "command": "interrupt_turn", "requestId": "interrupt", "turnId": "turn", "operation": "op-interrupt", "payload": map[string]any{"runtimeTurnRef": runtimeTurnRef}})
+	terminalBeforeReceipt, receipt := false, false
+	for !receipt {
+		frame := read()
+		if frame["kind"] == "event" && frame["event"] == "turn_interrupted" {
+			terminalBeforeReceipt = true
+		}
+		if frame["kind"] == "event" && frame["event"] == "interrupt_receipt" {
+			receipt = true
+		}
+	}
+	if !terminalBeforeReceipt {
+		t.Fatal("terminal observed before interrupt Promise resolved was not classified as interrupted")
 	}
 }
 

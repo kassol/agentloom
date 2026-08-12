@@ -813,6 +813,22 @@ func (h *Hub) tryDeliverReplyToActiveTurn(target string, timeout time.Duration) 
 
 func (h *Hub) requestTurnSteer(rt *runtime, threadID, expectedTurnID, input string, timeout time.Duration) (string, error) {
 	h.mu.Lock()
+	if h.stopping {
+		h.mu.Unlock()
+		return "", errors.New("CodexLoom is shutting down")
+	}
+	if err := h.runtimeMutationAllowedLocked(rt.agentID); err != nil {
+		h.mu.Unlock()
+		return "", err
+	}
+	h.mu.Unlock()
+	rt.startMu.Lock()
+	defer rt.startMu.Unlock()
+	h.mu.Lock()
+	if h.stopping {
+		h.mu.Unlock()
+		return "", errors.New("CodexLoom is shutting down")
+	}
 	if err := h.runtimeMutationAllowedLocked(rt.agentID); err != nil {
 		h.mu.Unlock()
 		return "", err

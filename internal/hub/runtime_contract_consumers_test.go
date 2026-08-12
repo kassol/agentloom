@@ -27,9 +27,13 @@ type controlPlaneContract struct {
 	continueSet        bool
 	continueCalls      int
 	continueRequest    runtimecontract.CausalInput
+	continueStarted    chan struct{}
+	continueRelease    chan struct{}
 	interruptOutcome   runtimecontract.Outcome
 	interruptCalls     int
 	interruptRequest   runtimecontract.TurnTarget
+	interruptStarted   chan struct{}
+	interruptRelease   chan struct{}
 	callOrder          []string
 	contextMode        runtimecontract.ContextDeliveryMode
 	startOutcome       runtimecontract.Outcome
@@ -354,7 +358,7 @@ func TestMandatoryRuntimeOperationsRejectWrongSuccessfulLifecycleStates(t *testi
 		{name: "start completed", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted, RuntimeTurnRef: "native-turn"}, expected: runtimecontract.LifecycleAccepted, requireRef: true},
 		{name: "start missing ref", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}, expected: runtimecontract.LifecycleAccepted, requireRef: true},
 		{name: "continue completed", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}, expected: runtimecontract.LifecycleAccepted},
-		{name: "interrupt accepted", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}, expected: runtimecontract.LifecycleInterrupted},
+		{name: "interrupt completed", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}, expected: runtimecontract.LifecycleInterrupted},
 		{name: "close interrupted", outcome: runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted}, expected: runtimecontract.LifecycleCompleted},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -467,6 +471,10 @@ func (c *controlPlaneContract) StartTurn(_ context.Context, request runtimecontr
 func (c *controlPlaneContract) ContinueTurn(_ context.Context, request runtimecontract.CausalInput) runtimecontract.Outcome {
 	c.continueCalls++
 	c.continueRequest = request
+	if c.continueStarted != nil {
+		close(c.continueStarted)
+		<-c.continueRelease
+	}
 	if c.continueSet || c.continueOutcome.State != "" {
 		return c.continueOutcome
 	}
@@ -476,6 +484,10 @@ func (c *controlPlaneContract) InterruptTurn(_ context.Context, request runtimec
 	c.interruptCalls++
 	c.interruptRequest = request
 	c.callOrder = append(c.callOrder, "interrupt")
+	if c.interruptStarted != nil {
+		close(c.interruptStarted)
+		<-c.interruptRelease
+	}
 	if c.interruptOutcome.State != "" {
 		return c.interruptOutcome
 	}
@@ -1178,6 +1190,143 @@ func TestArchiveInterruptsCommittedActiveBindingBeforeArchiveAndClose(t *testing
 	}
 }
 
+func TestArchiveAcceptsCorrelatedInterruptReceipt(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	contract := &controlPlaneContract{
+		interruptOutcome: runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted},
+		archiveOutcome:   runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted},
+	}
+	meta := &Agent{
+		ID: "agent-accepted-interrupt", Name: "worker", ThreadID: "thread-loom",
+		RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "fake", NativeRef: "native-binding"},
+		Status:         "running", CurrentTurnID: "turn-loom", CreatedAt: now(), UpdatedAt: now(),
+	}
+	rt := &runtime{
+		agentID: meta.ID, runtimeContract: contract, binding: runtimeContractBinding(meta),
+		activeTurn: &turnState{turnID: "turn-loom", nativeTurnID: "native-turn", stopWatchdog: make(chan struct{})}, approvals: map[string]*approval{},
+	}
+	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+
+	if _, err := h.ArchiveAgent(meta.ID); err != nil {
+		t.Fatal(err)
+	}
+	if rt.effectDomainInvalidated {
+		t.Fatal("accepted interrupt receipt was treated as an archive failure")
+	}
+	if got := strings.Join(contract.callOrder, ","); got != "interrupt,archive,close" {
+		t.Fatalf("native effect order = %s", got)
+	}
+}
+
+func TestShutdownWaitsForSerializedRuntimeMutationBeforeStoreRetirement(t *testing.T) {
+	for _, operation := range []string{"start", "continue", "interrupt"} {
+		t.Run(operation, func(t *testing.T) {
+			st, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			started, release := make(chan struct{}), make(chan struct{})
+			contract := &controlPlaneContract{
+				contextMode:  runtimecontract.ContextDeliveryFullPerTurn,
+				startOutcome: runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted, RuntimeTurnRef: "native-turn"},
+			}
+			switch operation {
+			case "start":
+				contract.startStarted, contract.startRelease = started, release
+			case "continue":
+				contract.continueStarted, contract.continueRelease = started, release
+			case "interrupt":
+				contract.interruptStarted, contract.interruptRelease = started, release
+				contract.interruptOutcome = runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}
+			}
+			host := &controlPlaneHost{contract: contract, alive: true}
+			driver := &controlPlaneDriver{hosts: []*controlPlaneHost{host}}
+			h := testHub(st)
+			h.runtimeHostDrivers["fake"] = driver
+			ready := make(chan struct{})
+			close(ready)
+			meta := &Agent{
+				ID: "agent-" + operation, Name: "worker-" + operation, Cwd: t.TempDir(), ThreadID: "thread-loom",
+				RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "fake", NativeRef: "native-binding"},
+				Status:         "idle", CreatedAt: now(), UpdatedAt: now(),
+			}
+			rt := &runtime{
+				agentID: meta.ID, agentHost: host, runtimeContract: contract, binding: runtimeContractBinding(meta), ready: ready,
+				approvals: map[string]*approval{},
+			}
+			if operation != "start" {
+				meta.Status, meta.CurrentTask, meta.CurrentTurnID = "running", "work", "turn-loom"
+				rt.activeTurn = &turnState{turnID: "turn-loom", nativeTurnID: "native-turn", task: "work", stopWatchdog: make(chan struct{})}
+			}
+			h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
+
+			mutationDone := make(chan error, 1)
+			switch operation {
+			case "start":
+				go func() { _, err := h.SendTask(meta.ID, "work", time.Second); mutationDone <- err }()
+			case "continue":
+				go func() {
+					_, err := h.requestTurnSteer(rt, meta.ThreadID, "turn-loom", "more", time.Second)
+					mutationDone <- err
+				}()
+			case "interrupt":
+				go func() { _, err := h.Interrupt(meta.ID, "stop"); mutationDone <- err }()
+			}
+			select {
+			case <-started:
+			case err := <-mutationDone:
+				t.Fatalf("%s did not reach Runtime mutation: %v", operation, err)
+			case <-time.After(time.Second):
+				t.Fatalf("%s did not reach Runtime mutation", operation)
+			}
+			shutdownDone := make(chan struct{})
+			go func() { h.Shutdown(); close(shutdownDone) }()
+			deadline := time.Now().Add(time.Second)
+			for {
+				h.mu.Lock()
+				stopping, currentStore := h.stopping, h.st
+				h.mu.Unlock()
+				if stopping {
+					if currentStore.ReadOnly() || contract.closeCalls != 0 || !host.Alive() {
+						t.Fatalf("shutdown retired resources during %s: readOnly=%v closeCalls=%d alive=%v", operation, currentStore.ReadOnly(), contract.closeCalls, host.Alive())
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("Shutdown did not enter stopping state")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			select {
+			case <-shutdownDone:
+				t.Fatalf("Shutdown overtook serialized %s", operation)
+			case <-time.After(20 * time.Millisecond):
+			}
+			close(release)
+			if err := <-mutationDone; err != nil && !strings.Contains(err.Error(), "shutting down") {
+				t.Fatalf("%s mutation: %v", operation, err)
+			}
+			select {
+			case <-shutdownDone:
+			case <-time.After(time.Second):
+				t.Fatalf("Shutdown did not finish after %s", operation)
+			}
+			h.mu.Lock()
+			retired := h.st.ReadOnly()
+			h.mu.Unlock()
+			if !retired || contract.closeCalls != 1 || host.Alive() || driver.shutdownCalls != 1 {
+				t.Fatalf("shutdown result after %s: retired=%v closeCalls=%d alive=%v driverCalls=%d", operation, retired, contract.closeCalls, host.Alive(), driver.shutdownCalls)
+			}
+			_ = st.Close()
+		})
+	}
+}
+
 func TestArchiveWaitsForResumeAndStartThenClosesTheBinding(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -1322,7 +1471,7 @@ func TestOwnerInterruptUsesV2ContractWithLoomTurnIdentity(t *testing.T) {
 	defer st.Close()
 	h := testHub(st)
 	contract := &controlPlaneContract{interruptOutcome: runtimecontract.Outcome{
-		State: runtimecontract.LifecycleInterrupted, RuntimeTurnRef: "native-secret-returned-by-runtime",
+		State: runtimecontract.LifecycleAccepted, RuntimeTurnRef: "native-secret-returned-by-runtime",
 	}}
 	meta := &Agent{
 		ID: "agent-1", Name: "worker", ThreadID: "thread-loom",
@@ -1347,6 +1496,13 @@ func TestOwnerInterruptUsesV2ContractWithLoomTurnIdentity(t *testing.T) {
 	}
 	if contract.interruptCalls != 1 || contract.interruptRequest.TurnID != "turn-loom" || contract.interruptRequest.RuntimeTurnRef != "turn-native-secret" {
 		t.Fatalf("InterruptTurn request = %#v calls=%d", contract.interruptRequest, contract.interruptCalls)
+	}
+	if meta.Status != "running" || turn.finished || rt.activeTurn != turn {
+		t.Fatalf("interrupt receipt settled Turn before terminal: meta=%#v turn=%#v", meta, turn)
+	}
+	h.onCanonicalRuntimeEvent(rt, runtimecontract.Event{Kind: runtimecontract.EventTerminal, TurnID: turn.turnID, RuntimeTurnRef: turn.nativeTurnID, Outcome: &runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted, RuntimeTurnRef: turn.nativeTurnID}})
+	if meta.Status != "idle" || meta.LastTurn == nil || meta.LastTurn.Status != "interrupted" || !turn.finished {
+		t.Fatalf("canonical terminal did not settle Turn: meta=%#v turn=%#v", meta, turn)
 	}
 	h.Shutdown()
 }

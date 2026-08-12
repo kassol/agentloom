@@ -1491,9 +1491,13 @@ export function AgentPane({
 
       <div className="relative shrink-0 border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] md:px-6 md:py-3 md:pb-3">
         <div className="mx-auto max-w-[880px]">
-          {agent.status === "interrupted" && agent.lastTurn?.status === "interrupted" ? (
-            <InterruptedTurnBar agent={agent} action={interruptedAction} onContinue={continueInterruptedTurn} onDismiss={dismissInterruptedTurn} />
-          ) : null}
+		  {agent.status === "interrupted" && agent.lastTurn?.status === "interrupted" ? (
+			agent.recovery ? (
+			  <div className="mb-2 border-l-2 border-warning bg-warning/5 px-3 py-2 text-[11.5px] text-warning" role="status">
+				<span className="font-semibold">Outcome indeterminate:</span> {agent.recovery.summary} Check Needs You before continuing; Loom will not replay the Turn.
+			  </div>
+			) : <InterruptedTurnBar agent={agent} action={interruptedAction} onContinue={continueInterruptedTurn} onDismiss={dismissInterruptedTurn} />
+		  ) : null}
           {agent.lastError && !running && agent.status !== "interrupted" ? (
             <div className="mb-2 border-l-2 border-destructive bg-destructive/5 px-3 py-2 text-[11.5px] text-destructive" role="alert">
               <span className="font-semibold">Last turn failed:</span>{" "}

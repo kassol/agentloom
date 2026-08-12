@@ -54,6 +54,15 @@ export interface Agent {
     status: "completed" | "interrupted" | "failed" | string;
     completedAt: string;
   };
+	recovery?: {
+		predecessorTurnId: string;
+		runtimeKind: string;
+		state: string;
+		cause: string;
+		failurePhase?: string;
+		failureCode?: string;
+		summary: string;
+	};
   createdAt: string;
   updatedAt: string;
   processAlive: boolean;

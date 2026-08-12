@@ -333,6 +333,39 @@ while IFS= read -r line; do [ "$line" = '{"kind":"close"}' ] && exit 0; done
 	}
 }
 
+func TestBridgeOneTurnTerminalSettlesEveryAcceptedOperation(t *testing.T) {
+	t.Parallel()
+	failures := make(chan error, 2)
+	path := writeFakeBridge(t, fmt.Sprintf(`
+printf '%%s\n' '%s'
+IFS= read -r init
+printf '%%s\n' '{"kind":"ready","requestId":"loom-1","capabilities":["interrupt","approval","hooks","mcp","session_resume"]}'
+IFS= read -r start
+printf '%%s\n' '{"kind":"response","requestId":"loom-2","turnId":"loom-turn","operation":"loom-start","accepted":true}'
+IFS= read -r continue
+printf '%%s\n' '{"kind":"response","requestId":"loom-3","turnId":"loom-turn","operation":"loom-continue","accepted":true}'
+printf '%%s\n' '{"kind":"event","class":"control","event":"turn_completed","turnId":"loom-turn","operation":"loom-continue"}'
+exit 70
+`, matrixHello()))
+	bridge, err := matrixDriver(path, func(options *DriverOptions) {
+		options.OnFailure = func(_ string, err error) { failures <- err }
+	}).Acquire(context.Background(), "agent-one-terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response, err := bridge.Request(context.Background(), Command{Kind: "start_turn", TurnID: "loom-turn", Operation: "loom-start"}); err != nil || !response.Accepted {
+		t.Fatalf("start response=%#v err=%v", response, err)
+	}
+	if response, err := bridge.Request(context.Background(), Command{Kind: "continue_turn", TurnID: "loom-turn", Operation: "loom-continue"}); err != nil || !response.Accepted {
+		t.Fatalf("continue response=%#v err=%v", response, err)
+	}
+	select {
+	case err := <-failures:
+		t.Fatalf("Turn terminal left an accepted operation indeterminate: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestBridgeCloseReapsProcessWhenEventConsumerNeverReturns(t *testing.T) {
 	t.Parallel()
 	entered := make(chan struct{})

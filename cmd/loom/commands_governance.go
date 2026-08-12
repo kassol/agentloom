@@ -780,7 +780,7 @@ func cmdInterrupt(a args) {
 		fail(err)
 	}
 	if interrupted, _ := resp["interrupted"].(bool); interrupted {
-		fmt.Println(yellow("interrupt requested"))
+		fmt.Println(yellow("interrupt accepted; waiting for terminal state"))
 		if messageID := str(resp, "heldMessageId"); messageID != "" {
 			subject := str(resp, "heldSubject")
 			if subject != "" {

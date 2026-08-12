@@ -66,6 +66,16 @@ func runtimeLifecycleOutcomeError(outcome runtimecontract.Outcome, expected runt
 	return nil
 }
 
+func runtimeInterruptReceiptError(outcome runtimecontract.Outcome) error {
+	if err := lifecycleOutcomeError(outcome); err != nil {
+		return err
+	}
+	if outcome.State != runtimecontract.LifecycleAccepted && outcome.State != runtimecontract.LifecycleInterrupted {
+		return fmt.Errorf("invalid Runtime lifecycle outcome: interrupt requires correlated receipt, got %q", outcome.State)
+	}
+	return nil
+}
+
 func isRuntimeIndeterminate(err error) bool {
 	var target *runtimeIndeterminateError
 	return errors.As(err, &target)

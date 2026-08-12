@@ -11,6 +11,15 @@ func (h *Hub) Shutdown() {
 	h.shutdownOnce.Do(func() {
 		h.mu.Lock()
 		h.stopping = true
+		serialized := make([]*runtime, 0, len(h.runtimes))
+		for _, rt := range h.runtimes {
+			serialized = append(serialized, rt)
+		}
+		h.mu.Unlock()
+		for _, rt := range serialized {
+			rt.startMu.Lock()
+		}
+		h.mu.Lock()
 		snapshots := map[string]Agent{}
 		shutdownTurns := map[string]*turnState{}
 		for agentID, rt := range h.runtimes {
@@ -71,6 +80,9 @@ func (h *Hub) Shutdown() {
 			}
 		}
 		h.mu.Unlock()
+		for _, rt := range serialized {
+			rt.startMu.Unlock()
+		}
 		h.stopOnce.Do(func() {
 			if h.stop != nil {
 				close(h.stop)

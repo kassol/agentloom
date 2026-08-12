@@ -406,6 +406,7 @@ type Hub struct {
 	contextHistoryProbe              contextHistoryProbeFunc
 	threadResumeTimeout              time.Duration
 	developerContextTimeout          time.Duration
+	interruptTerminalGraceForTest    time.Duration
 	integrationNormalizationPending  bool
 	gatewayState                     gatewayState
 	gatewayFoundationPoisoned        bool
@@ -1896,6 +1897,10 @@ func (h *Hub) onCanonicalRuntimeEvent(rt *runtime, event runtimecontract.Event) 
 }
 
 func (h *Hub) onRuntimeFailure(rt *runtime, err error) {
+	if isRuntimeIndeterminate(err) {
+		h.onRuntimeIndeterminate(rt, err)
+		return
+	}
 	agentID, predecessorTurnID, checkpointed := h.checkpointRuntimeFailure(rt, err)
 	if !checkpointed {
 		return

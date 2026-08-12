@@ -124,11 +124,12 @@ type Bridge struct {
 	events       chan eventDelivery
 	stop         chan struct{}
 
-	mu         sync.Mutex
-	pending    map[string]pendingRequest
-	operations map[string]operationState
-	failed     error
-	closing    bool
+	mu           sync.Mutex
+	pending      map[string]pendingRequest
+	operations   map[string]operationState
+	terminalSeen bool
+	failed       error
+	closing      bool
 
 	writeMu    sync.Mutex
 	opMu       sync.Mutex
@@ -361,7 +362,6 @@ func (b *Bridge) Request(ctx context.Context, command Command) (Response, error)
 		frame["payload"] = command.Payload
 	}
 	if err := b.writeFrame(frame); err != nil {
-		b.removePending(requestID)
 		indeterminate := &IndeterminateError{Operation: command.Operation, Cause: fmt.Errorf("write Claude bridge command %s: %w", command.Kind, err)}
 		b.fail(indeterminate)
 		return Response{}, indeterminate
@@ -370,17 +370,10 @@ func (b *Bridge) Request(ctx context.Context, command Command) (Response, error)
 	case result := <-result:
 		return result.response, result.err
 	case <-ctx.Done():
-		b.removePending(requestID)
 		err := &IndeterminateError{Operation: command.Operation, Cause: ctx.Err()}
 		b.fail(err)
 		return Response{}, err
 	}
-}
-
-func (b *Bridge) removePending(requestID string) {
-	b.mu.Lock()
-	delete(b.pending, requestID)
-	b.mu.Unlock()
 }
 
 func (b *Bridge) read() {
@@ -480,8 +473,18 @@ func (b *Bridge) handleFrame(raw json.RawMessage) error {
 		}
 		if terminalEvent(envelope.Event) {
 			b.mu.Lock()
-			operation.terminal = true
-			b.operations[envelope.Operation] = operation
+			b.terminalSeen = true
+			for operationID, state := range b.operations {
+				if state.turnID != envelope.TurnID {
+					continue
+				}
+				if state.accepted {
+					delete(b.operations, operationID)
+					continue
+				}
+				state.terminal = true
+				b.operations[operationID] = state
+			}
 			b.mu.Unlock()
 		}
 		if b.events != nil {
@@ -581,6 +584,7 @@ func (b *Bridge) fail(cause error) {
 		b.pending = map[string]pendingRequest{}
 		operations := b.operations
 		b.operations = map[string]operationState{}
+		terminalSeen := b.terminalSeen
 		closing := b.closing
 		b.mu.Unlock()
 		for _, request := range pending {
@@ -596,7 +600,10 @@ func (b *Bridge) fail(cause error) {
 					b.reportFailure(&IndeterminateError{Operation: operation, Cause: cause})
 				}
 			}
-			if accepted == 0 {
+			// An in-flight request owns its operation-scoped outcome. Reporting
+			// the same process failure through OnFailure would race that caller
+			// and can resurrect a Turn whose terminal was already delivered.
+			if accepted == 0 && len(pending) == 0 && !terminalSeen {
 				b.reportFailure(cause)
 			}
 		}

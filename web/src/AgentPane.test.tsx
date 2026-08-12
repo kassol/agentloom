@@ -165,6 +165,18 @@ describe("AgentPane scroll restoration", () => {
 	await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/thread/history?count=25&offset=0"), expect.anything()));
   });
 
+	it("shows indeterminate recovery without offering replay", () => {
+	  const agent: Agent = {
+		...testAgent,
+		status: "interrupted",
+		lastTurn: { turnId: "turn-uncertain", task: "deploy", status: "interrupted", completedAt: "2026-08-12T00:00:00Z" },
+		recovery: { predecessorTurnId: "turn-uncertain", runtimeKind: "claude", state: "dispatched", cause: "command_indeterminate", summary: "Runtime command outcome is indeterminate" },
+	  };
+	  const view = render(<AgentPane {...props} agent={agent} active />);
+	  expect(view.getByText(/Outcome indeterminate/)).toBeInTheDocument();
+	  expect(view.queryByRole("button", { name: /Continue/ })).toBeNull();
+	});
+
   it("shows the immutable Runtime kind in the Inspector", () => {
 	const view = render(<AgentPane {...props} active configRequestNonce={1} />);
 	expect(view.getByText("Runtime kind").nextElementSibling).toHaveTextContent("codex");

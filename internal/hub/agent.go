@@ -752,6 +752,12 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		rt.startMu.Unlock()
 		return SendResult{}, errf(500, "Runtime not ready: %s", err)
 	}
+	if preparer, ok := rt.runtimeContract.(runtimeTurnPersistencePreparer); ok {
+		if err := preparer.prepareTurnPersistence(); err != nil {
+			rt.startMu.Unlock()
+			return SendResult{}, errf(500, "prepare Runtime Turn persistence: %s", err)
+		}
+	}
 	// A shared app-server may unload an idle Thread. Resume immediately before
 	// every Turn so Web, CLI and queued deliveries do not depend on a stale
 	// in-memory binding left by an earlier request.
@@ -1051,10 +1057,20 @@ func (h *Hub) watchdog(agentID string, turn *turnState, inactivity time.Duration
 
 type InterruptResult struct {
 	Interrupted   bool   `json:"interrupted"`
+	State         string `json:"state,omitempty"`
 	Message       string `json:"message,omitempty"`
 	Reason        string `json:"reason,omitempty"`
 	HeldMessageID string `json:"heldMessageId,omitempty"`
 	HeldSubject   string `json:"heldSubject,omitempty"`
+}
+
+const interruptTerminalGrace = 3 * time.Second
+
+func (h *Hub) effectiveInterruptTerminalGrace() time.Duration {
+	if h.interruptTerminalGraceForTest > 0 {
+		return h.interruptTerminalGraceForTest
+	}
+	return interruptTerminalGrace
 }
 
 func activeTurnInterruptMismatch(err error) (string, bool) {
@@ -1111,6 +1127,20 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	}
 	turn := rt.activeTurn
 	agentID := meta.ID
+	h.mu.Unlock()
+
+	rt.startMu.Lock()
+	defer rt.startMu.Unlock()
+	h.mu.Lock()
+	meta = h.agents[agentID]
+	if h.stopping || meta == nil || h.runtimes[agentID] != rt || rt.activeTurn != turn || turn.finished {
+		h.mu.Unlock()
+		return InterruptResult{Interrupted: false, Message: "no active task"}, nil
+	}
+	if err := h.runtimeMutationAllowedLocked(agentID); err != nil {
+		h.mu.Unlock()
+		return InterruptResult{}, err
+	}
 	turnID := turn.nativeTurnID
 	contract := rt.runtimeContract
 	binding := rt.binding
@@ -1133,9 +1163,9 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 	interrupt := func(targetTurnID string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return runtimeLifecycleOutcomeError(contract.InterruptTurn(ctx, runtimecontract.TurnTarget{
+		return runtimeInterruptReceiptError(contract.InterruptTurn(ctx, runtimecontract.TurnTarget{
 			Binding: binding, TurnID: turn.turnID, RuntimeTurnRef: targetTurnID,
-		}), runtimecontract.LifecycleInterrupted, false)
+		}))
 	}
 	err := interrupt(turnID)
 	if err != nil {
@@ -1145,10 +1175,10 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 		}
 		return InterruptResult{}, errf(500, "turn/interrupt failed: %s", err)
 	}
-	// codex should follow up with turn/completed(status=interrupted); force
-	// the bookkeeping if that doesn't arrive shortly.
+	// Interrupt success is only correlated receipt. The first canonical terminal
+	// settles the Turn; silence is ambiguous and fences the effect domain.
 	h.startWorker(func() {
-		timer := time.NewTimer(3 * time.Second)
+		timer := time.NewTimer(h.effectiveInterruptTerminalGrace())
 		defer timer.Stop()
 		select {
 		case <-turn.stopWatchdog:
@@ -1156,14 +1186,21 @@ func (h *Hub) Interrupt(key, reason string) (InterruptResult, error) {
 		case <-timer.C:
 		}
 		h.mu.Lock()
-		defer h.mu.Unlock()
-		if !turn.finished && rt.activeTurn == turn {
-			if m := h.agents[agentID]; m != nil {
-				h.finishTurnLocked(m, rt, "interrupted", reason)
+		active := !turn.finished && rt.activeTurn == turn
+		h.mu.Unlock()
+		if active {
+			if inspector, ok := contract.(runtimeTurnSettlementInspector); ok {
+				if !inspector.claimTurnUnsettled(turn.turnID) {
+					return
+				}
 			}
+			h.onRuntimeIndeterminate(rt, &runtimeIndeterminateError{failure: &runtimecontract.Failure{
+				Code: "interrupt_terminal_missing", Phase: runtimecontract.FailurePhaseTurnInterrupt,
+				Message: "Runtime interrupt terminal outcome is indeterminate", Cause: context.DeadlineExceeded,
+			}})
 		}
 	})
-	return InterruptResult{Interrupted: true, Reason: reason, HeldMessageID: heldMessageID, HeldSubject: heldSubject}, nil
+	return InterruptResult{Interrupted: true, State: "accepted", Reason: reason, HeldMessageID: heldMessageID, HeldSubject: heldSubject}, nil
 }
 
 func (h *Hub) ArchiveAgent(key string) (map[string]any, error) {
@@ -1292,9 +1329,9 @@ func interruptRuntimeForArchive(rt *runtime, binding runtimecontract.Binding, tu
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return runtimeLifecycleOutcomeError(rt.runtimeContract.InterruptTurn(ctx, runtimecontract.TurnTarget{
+	return runtimeInterruptReceiptError(rt.runtimeContract.InterruptTurn(ctx, runtimecontract.TurnTarget{
 		Binding: binding, TurnID: turnID, RuntimeTurnRef: runtimeTurnRef,
-	}), runtimecontract.LifecycleInterrupted, false)
+	}))
 }
 
 func archiveRuntimeBinding(rt *runtime, binding runtimecontract.Binding) {

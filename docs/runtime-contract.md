@@ -30,6 +30,11 @@ Contract commits sanitized, ordered user/assistant/tool/usage/terminal
 projections before canonical SSE; cold History never starts Node, the SDK
 bridge, Claude Code, or a model request.
 
+Claude interrupt success is correlated receipt only. The first committed
+canonical terminal settles the Turn. Missing terminal evidence fences the
+Runtime and uses the existing durable Recovery/Needs You path; Loom never
+replays the input or interrupt.
+
 An `AgentHost` owns one Agent handle. `Close` is idempotent and releases that
 handle; for a shared Codex host it must not stop handles belonging to other
 Agents. Its Contract must report the current `runtimecontract.Version` before
@@ -37,7 +42,8 @@ the Hub may use or persist a result.
 
 The mandatory Contract is deliberately small and Loom-neutral. Create and
 Start/Continue succeed only with `accepted`; Resume and Close only with
-`completed`; Interrupt only with `interrupted`. Create/Resume bindings must
+`completed`; Interrupt receipt with `accepted` (legacy Contracts may return
+`interrupted`). Create/Resume bindings must
 have schema v2, the selected Driver kind, and a non-empty native reference.
 Start must provide a native Turn reference. A wrong success state, malformed
 binding, invalid content/event/history, or malformed typed failure fails before

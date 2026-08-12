@@ -127,7 +127,7 @@ func runRuntimeContractConformance(t *testing.T, fixture runtimeConformanceFixtu
 		t.Fatalf("ContinueTurn: %v (%#v)", err, continued)
 	}
 	interrupted := contract.InterruptTurn(ctx, runtimecontract.TurnTarget{Binding: binding, TurnID: "turn-conformance", RuntimeTurnRef: started.RuntimeTurnRef})
-	if err := runtimeLifecycleOutcomeError(interrupted, runtimecontract.LifecycleInterrupted, false); err != nil {
+	if err := runtimeInterruptReceiptError(interrupted); err != nil {
 		t.Fatalf("InterruptTurn: %v (%#v)", err, interrupted)
 	}
 	if fixture.emitAfterStop != nil {
@@ -229,7 +229,7 @@ historyReady:
 		t.Fatalf("causal continuation after reopen: %v (%#v)", err, causal)
 	}
 	causalTerminal := contract.InterruptTurn(ctx, runtimecontract.TurnTarget{Binding: binding, TurnID: "turn-after-reopen", RuntimeTurnRef: causal.RuntimeTurnRef})
-	if err := runtimeLifecycleOutcomeError(causalTerminal, runtimecontract.LifecycleInterrupted, false); err != nil {
+	if err := runtimeInterruptReceiptError(causalTerminal); err != nil {
 		t.Fatalf("causal interrupt after reopen: %v (%#v)", err, causalTerminal)
 	}
 	if fixture.emitAfterReopenStop != nil {

@@ -126,11 +126,11 @@ async function runTurn(frame) {
           throw new Error("Claude SDK did not initialize the reserved session");
         }
 		turn.accepted = true;
-        respond(frame, true, {runtimeTurnRef});
         emit(frame, "turn_started", {runtimeTurnRef});
 		for (const [index, block] of (Array.isArray(payload.input) ? payload.input : []).filter((block) => block?.kind === "text" && block.role !== "developer").entries()) {
 		  emit(frame, "content", {runtimeTurnRef, phase: "completed", content: {id: `user-${index}`, kind: "user_text", text: block.text || ""}});
 		}
+        respond(frame, true, {runtimeTurnRef});
         continue;
       }
       const content = message?.type === "assistant" ? assistantContent(message) : message?.type === "user" ? toolResultContent(message) : [];
@@ -142,11 +142,11 @@ async function runTurn(frame) {
         emit(frame, "usage", {runtimeTurnRef, usage: usageFrom(message)});
 		if (turn.observedResults < turn.expectedResults) continue;
 		turn.terminal = true;
-        for (const operation of turn.operations) {
-          emit(operation, message.subtype === "success" ? "turn_completed" : "turn_failed", {
-            runtimeTurnRef, ...(message.subtype === "success" ? {} : {message: "Claude Runtime Turn failed"})
-          });
-        }
+		const interrupted = message.subtype !== "success" && turn.interruptRequested && ["aborted_streaming", "aborted_tools"].includes(message.terminal_reason);
+		const terminal = message.subtype === "success" ? "turn_completed" : interrupted ? "turn_interrupted" : "turn_failed";
+		emit(turn.frame, terminal, {
+		  runtimeTurnRef, ...(terminal === "turn_failed" ? {message: "Claude Runtime Turn failed"} : {})
+		});
 		break;
       }
     }
@@ -215,7 +215,9 @@ async function handleCommand(frame) {
 	  const turn = active;
 	  turn.operations.push(frame);
     try {
+	  turn.interruptRequested = true;
 	  await turn.query.interrupt();
+	  emit(frame, "interrupt_receipt", {runtimeTurnRef: turn.runtimeTurnRef});
       respond(frame, true);
     } catch (error) {
 	  process.exit(70);

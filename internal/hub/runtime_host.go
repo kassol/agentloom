@@ -39,6 +39,14 @@ type runtimeTurnCorrelationSeeder interface {
 	seedTurnBindings(map[string]string)
 }
 
+type runtimeTurnPersistencePreparer interface {
+	prepareTurnPersistence() error
+}
+
+type runtimeTurnSettlementInspector interface {
+	claimTurnUnsettled(string) bool
+}
+
 // runtimeHistoryContractProvider creates a passive Contract reader without
 // acquiring or starting a Runtime Host. History stays behind the registered
 // Driver boundary even when an Agent is cold after restart.

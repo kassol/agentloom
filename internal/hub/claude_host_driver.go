@@ -143,12 +143,18 @@ func (d *claudeRuntimeHostDriver) Shutdown(ctx context.Context) error {
 }
 
 func (d *claudeRuntimeHostDriver) onBridgeEvent(event claudebridge.Event) {
-	if event.Kind == "binding_resumed" {
-		return
-	}
 	d.mu.Lock()
 	host := d.handles[event.AgentID]
 	d.mu.Unlock()
+	if event.Kind == "binding_resumed" {
+		if host != nil {
+			host.contract.forgetOperation(event.Operation)
+		}
+		return
+	}
+	if event.Kind == "interrupt_receipt" {
+		return
+	}
 	if host != nil {
 		host.contract.handleBridgeEvent(event)
 	}
@@ -159,7 +165,7 @@ func (d *claudeRuntimeHostDriver) onBridgeFailure(agentID string, err error) {
 	host := d.handles[agentID]
 	d.mu.Unlock()
 	if host != nil {
-		host.fail(err)
+		host.fail(host.contract.runtimeFailure(err))
 	}
 }
 
@@ -214,19 +220,29 @@ type claudeRuntimeContract struct {
 	bridge  *claudebridge.Bridge
 	host    *claudeAgentHost
 
-	mu        sync.Mutex
-	handler   func(runtimecontract.Event)
-	turns     []runtimecontract.HistoryTurn
-	terminal  map[string]bool
-	observed  bool
-	ledgerErr error
-	cwd       string
-	release   func()
-	ops       atomic.Uint64
+	mu                        sync.Mutex
+	handler                   func(runtimecontract.Event)
+	turns                     []runtimecontract.HistoryTurn
+	terminal                  map[string]bool
+	fenced                    map[string]bool
+	pendingOps                map[string]bool
+	terminalOps               map[string]string
+	observed                  bool
+	ledgerErr                 error
+	cwd                       string
+	release                   func()
+	ops                       atomic.Uint64
+	opPhases                  map[string]runtimecontract.FailurePhase
+	opTurns                   map[string]string
+	afterLedgerCommitForTest  func()
+	beforeLedgerCommitForTest func()
 }
 
 func newClaudeRuntimeContract(agentID string, st *store.Store, bridge *claudebridge.Bridge) *claudeRuntimeContract {
-	c := &claudeRuntimeContract{agentID: agentID, st: st, bridge: bridge, terminal: map[string]bool{}}
+	c := &claudeRuntimeContract{
+		agentID: agentID, st: st, bridge: bridge, terminal: map[string]bool{}, fenced: map[string]bool{}, pendingOps: map[string]bool{}, terminalOps: map[string]string{},
+		opPhases: map[string]runtimecontract.FailurePhase{}, opTurns: map[string]string{},
+	}
 	if st != nil {
 		if history, err := st.LoadCanonicalTurnLedger(agentID, int(^uint(0)>>1), 0); err == nil {
 			c.turns = history.Turns
@@ -287,12 +303,18 @@ func (c *claudeRuntimeContract) seedTurnBindings(bindings map[string]string) {
 }
 
 func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimecontract.TurnRequest) runtimecontract.Outcome {
+	if err := c.persistLedgerFence(); err != nil {
+		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseTurnStart, "ledger_unavailable", err)
+	}
 	c.mu.Lock()
 	resume := len(c.turns) > 0 || c.observed
 	c.mu.Unlock()
 	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input})
 	if outcome.State != runtimecontract.LifecycleAccepted {
 		return outcome
+	}
+	if err := c.ledgerFailure(); err != nil {
+		return claudeFailure(runtimecontract.LifecycleIndeterminate, runtimecontract.FailurePhaseTurnStart, "ledger_commit_indeterminate", err)
 	}
 	var data struct {
 		RuntimeTurnRef string `json:"runtimeTurnRef"`
@@ -305,7 +327,15 @@ func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimeco
 }
 
 func (c *claudeRuntimeContract) ContinueTurn(ctx context.Context, request runtimecontract.CausalInput) runtimecontract.Outcome {
+	if err := c.persistLedgerFence(); err != nil {
+		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseTurnContinue, "ledger_unavailable", err)
+	}
 	_, outcome := c.command(ctx, "continue_turn", request.TurnID, runtimecontract.FailurePhaseTurnContinue, map[string]any{"sessionRef": request.Binding.NativeRef, "runtimeTurnRef": request.RuntimeTurnRef, "input": request.Input})
+	if outcome.State == runtimecontract.LifecycleAccepted {
+		if err := c.ledgerFailure(); err != nil {
+			return claudeFailure(runtimecontract.LifecycleIndeterminate, runtimecontract.FailurePhaseTurnContinue, "ledger_commit_indeterminate", err)
+		}
+	}
 	if outcome.State == runtimecontract.LifecycleAccepted {
 		outcome.RuntimeTurnRef = request.RuntimeTurnRef
 	}
@@ -313,12 +343,77 @@ func (c *claudeRuntimeContract) ContinueTurn(ctx context.Context, request runtim
 }
 
 func (c *claudeRuntimeContract) InterruptTurn(ctx context.Context, request runtimecontract.TurnTarget) runtimecontract.Outcome {
+	if err := c.persistLedgerFence(); err != nil {
+		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseTurnInterrupt, "ledger_unavailable", err)
+	}
 	_, outcome := c.command(ctx, "interrupt_turn", request.TurnID, runtimecontract.FailurePhaseTurnInterrupt, map[string]any{"runtimeTurnRef": request.RuntimeTurnRef})
 	if outcome.State == runtimecontract.LifecycleAccepted {
-		outcome.State = runtimecontract.LifecycleInterrupted
+		if err := c.ledgerFailure(); err != nil {
+			return claudeFailure(runtimecontract.LifecycleIndeterminate, runtimecontract.FailurePhaseTurnInterrupt, "ledger_commit_indeterminate", err)
+		}
 		outcome.RuntimeTurnRef = request.RuntimeTurnRef
 	}
 	return outcome
+}
+
+func (c *claudeRuntimeContract) persistLedgerFence() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ledgerErr != nil {
+		return c.ledgerErr
+	}
+	if c.st == nil {
+		return errors.New("Canonical Turn Ledger Store is unavailable")
+	}
+	if err := c.st.SaveCanonicalTurnLedger(c.agentID, c.turns); err != nil {
+		c.ledgerErr = err
+		return err
+	}
+	return nil
+}
+
+func (c *claudeRuntimeContract) prepareTurnPersistence() error { return c.persistLedgerFence() }
+
+func (c *claudeRuntimeContract) claimTurnUnsettled(turnID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.terminal[turnID] || c.fenced[turnID] {
+		return false
+	}
+	c.fenced[turnID] = true
+	return true
+}
+
+func (c *claudeRuntimeContract) ledgerFailure() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ledgerErr
+}
+
+func (c *claudeRuntimeContract) forgetOperation(operation string) {
+	c.mu.Lock()
+	delete(c.opPhases, operation)
+	delete(c.opTurns, operation)
+	delete(c.pendingOps, operation)
+	delete(c.terminalOps, operation)
+	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) runtimeFailure(err error) error {
+	var indeterminate *claudebridge.IndeterminateError
+	if !errors.As(err, &indeterminate) {
+		return err
+	}
+	c.mu.Lock()
+	phase := c.opPhases[indeterminate.Operation]
+	c.mu.Unlock()
+	if phase == "" {
+		phase = runtimecontract.FailurePhaseTurnStart
+	}
+	return &runtimeIndeterminateError{failure: &runtimecontract.Failure{
+		Code: "transport_indeterminate", Phase: phase,
+		Message: "Claude Runtime Turn outcome is indeterminate", Diagnostic: err.Error(), Cause: err,
+	}}
 }
 
 func (c *claudeRuntimeContract) SetEventHandler(handler func(runtimecontract.Event)) {
@@ -367,8 +462,24 @@ func (c *claudeRuntimeContract) command(ctx context.Context, kind, turnID string
 		return claudebridge.Response{}, claudeFailure(runtimecontract.LifecycleFailed, phase, "runtime_unavailable", errors.New("Claude bridge is unavailable"))
 	}
 	operation := fmt.Sprintf("%s-%d", c.agentID, c.ops.Add(1))
+	c.mu.Lock()
+	c.opPhases[operation] = phase
+	c.opTurns[operation] = turnID
+	c.pendingOps[operation] = true
+	c.mu.Unlock()
 	response, err := c.bridge.Request(ctx, claudebridge.Command{Kind: kind, TurnID: turnID, Operation: operation, Payload: payload})
 	if err != nil {
+		c.mu.Lock()
+		runtimeTurnRef, settled := c.terminalOps[operation]
+		delete(c.pendingOps, operation)
+		delete(c.terminalOps, operation)
+		delete(c.opPhases, operation)
+		delete(c.opTurns, operation)
+		c.mu.Unlock()
+		if settled {
+			data, _ := json.Marshal(map[string]string{"runtimeTurnRef": runtimeTurnRef})
+			return claudebridge.Response{TurnID: turnID, Operation: operation, Accepted: true, Data: data}, runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted, RuntimeTurnRef: runtimeTurnRef}
+		}
 		state, code := runtimecontract.LifecycleFailed, "runtime_error"
 		var indeterminate *claudebridge.IndeterminateError
 		if errors.As(err, &indeterminate) {
@@ -376,7 +487,12 @@ func (c *claudeRuntimeContract) command(ctx context.Context, kind, turnID string
 		}
 		return claudebridge.Response{}, claudeFailure(state, phase, code, err)
 	}
+	c.mu.Lock()
+	delete(c.pendingOps, operation)
+	delete(c.terminalOps, operation)
+	c.mu.Unlock()
 	if !response.Accepted {
+		c.forgetOperation(operation)
 		return response, claudeFailure(runtimecontract.LifecycleRejected, phase, "runtime_rejected", errors.New(publicClaudeError(response.Error)))
 	}
 	return response, runtimecontract.Outcome{State: runtimecontract.LifecycleAccepted}
@@ -407,6 +523,19 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 		return
 	}
 	c.mu.Lock()
+	beforeCommit := c.beforeLedgerCommitForTest
+	c.mu.Unlock()
+	if beforeCommit != nil {
+		beforeCommit()
+	}
+	c.mu.Lock()
+	if c.fenced[event.TurnID] {
+		c.mu.Unlock()
+		return
+	}
+	if event.Kind == runtimecontract.EventTerminal && c.pendingOps[source.Operation] {
+		c.terminalOps[source.Operation] = event.RuntimeTurnRef
+	}
 	if c.terminal[event.TurnID] {
 		c.mu.Unlock()
 		return
@@ -457,11 +586,31 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 	}
 	if err := c.st.SaveCanonicalTurnLedger(c.agentID, nextTurns); err != nil {
 		c.ledgerErr = err
+		phase := c.opPhases[source.Operation]
 		c.mu.Unlock()
+		if phase == "" {
+			phase = runtimecontract.FailurePhaseTurnStart
+		}
+		go c.fail(&runtimeIndeterminateError{failure: &runtimecontract.Failure{
+			Code: "ledger_commit_indeterminate", Phase: phase,
+			Message: "Claude Runtime Turn outcome is indeterminate", Diagnostic: err.Error(), Cause: err,
+		}})
 		return
 	}
 	c.turns, c.terminal = nextTurns, nextTerminal
+	if event.Kind == runtimecontract.EventTerminal {
+		for operation, turnID := range c.opTurns {
+			if turnID == event.TurnID {
+				delete(c.opPhases, operation)
+				delete(c.opTurns, operation)
+			}
+		}
+	}
+	afterCommit := c.afterLedgerCommitForTest
 	c.mu.Unlock()
+	if afterCommit != nil {
+		afterCommit()
+	}
 	if handler != nil {
 		handler(event)
 	}
