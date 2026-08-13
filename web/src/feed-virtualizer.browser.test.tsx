@@ -111,7 +111,7 @@ describe("Agent feed virtual row geometry", () => {
     await waitForGeometry(streaming);
   });
 
-  it("detects the historical cache-clear overlap without waiting for another resize entry", async () => {
+  it("keeps appended rows measured when the virtualizer cache is cleared", async () => {
     container = document.createElement("div");
     document.body.replaceChildren(container);
     root = createRoot(container);
@@ -122,11 +122,7 @@ describe("Agent feed virtual row geometry", () => {
 
     const appended = [first[0], { id: "usage", height: 36, label: "Token usage" }];
     await act(() => root.render(<FeedHarness active clearMeasurements rows={appended} />));
-    await expect.poll(() => {
-      const message = document.querySelector<HTMLElement>('[data-row="message"]');
-      const usage = document.querySelector<HTMLElement>('[data-row="usage"]');
-      return message && usage ? usage.getBoundingClientRect().top - message.getBoundingClientRect().bottom : 0;
-    }).toBeLessThan(0);
+    await waitForGeometry(appended);
   });
 });
 

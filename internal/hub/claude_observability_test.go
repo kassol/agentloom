@@ -136,6 +136,7 @@ func TestClaudeContextEvidenceRejectsStaleTurnStartCorrelation(t *testing.T) {
 }
 
 func TestClaudeAcceptedTurnPersistsContextEvidenceAcrossReopen(t *testing.T) {
+	t.Setenv("LOOM_TEST_CLAUDE_START_EVENT_DELAY", "0.05")
 	dir := t.TempDir()
 	st, err := store.Open(dir)
 	if err != nil {
@@ -151,9 +152,16 @@ func TestClaudeAcceptedTurnPersistsContextEvidenceAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := h.ExplainTurnContext(agent.ID, result.TurnID)
-	if err != nil || view.State != runtimecontract.ContextEvidenceProven || len(view.Deliveries) != 2 {
-		t.Fatalf("live accepted context = %#v, err=%v", view, err)
+	var view ContextExplainView
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		view, err = h.ExplainTurnContext(agent.ID, result.TurnID)
+		if err == nil && view.State == runtimecontract.ContextEvidenceProven && len(view.Deliveries) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live accepted context = %#v, err=%v", view, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
