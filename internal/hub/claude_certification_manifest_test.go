@@ -141,20 +141,20 @@ func TestClaudePreviewResultVerifierRequiresCurrentCommitAndAllRows(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	verify := func() error {
+	verify := func() ([]byte, error) {
 		command := exec.Command("sh", filepath.Join(root, "scripts", "verify-claude-preview-results.sh"), results)
 		command.Dir = root
-		return command.Run()
+		return command.CombinedOutput()
 	}
-	if err := verify(); err != nil {
-		t.Fatalf("four current preview rows did not verify: %v", err)
+	if output, err := verify(); err != nil {
+		t.Fatalf("four current preview rows did not verify: %v\n%s", err, output)
 	}
 	stale := filepath.Join(results, "linux-x64.json")
 	payload := fmt.Sprintf(`{"schemaVersion":1,"row":"linux-x64","os":"linux","arch":"x64","generation":%q,"commit":"0000000000000000000000000000000000000000","status":"passed","reason":"verified","productionReady":false}`+"\n", generation)
 	if err := os.WriteFile(stale, []byte(payload), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := verify(); err == nil {
+	if _, err := verify(); err == nil {
 		t.Fatal("four-row verifier accepted a stale commit")
 	}
 }

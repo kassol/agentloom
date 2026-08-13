@@ -1579,17 +1579,17 @@ func TestClaudeNeedsYouInterruptsSourceAndAnswerResumesOnceAcrossReopen(t *testi
 	if err := h.onRuntimeNeedsYouProposal(rt, runtimecontract.NeedsYouProposal{ID: "hrq_claude_question", TurnID: "turn-source", Question: "Ship now?", Options: []runtimecontract.NeedsYouOption{{Label: "Yes"}, {Label: "No"}}}); err != nil {
 		t.Fatal(err)
 	}
+	deliveries := 0
+	h.dispatchHumanAnswer = func(agentID, input string) (SendResult, error) {
+		deliveries++
+		return SendResult{AgentID: agentID, TurnID: "turn-recovery"}, nil
+	}
 	h.mu.Lock()
 	h.onRuntimeEventLocked(meta, rt, runtimecontract.Event{Kind: runtimecontract.EventTerminal, TurnID: "turn-source", Outcome: &runtimecontract.Outcome{State: runtimecontract.LifecycleInterrupted}})
 	h.mu.Unlock()
 	request, err := h.GetHumanRequest("hrq_claude_question")
 	if err != nil || request.SourceTurnID != "turn-source" || request.BlockedWork != "ship release" || request.DeliveryStatus != "waiting" || meta.LastTurn == nil || meta.LastTurn.Status != "interrupted" {
 		t.Fatalf("request=%#v lastTurn=%#v err=%v", request, meta.LastTurn, err)
-	}
-	deliveries := 0
-	h.dispatchHumanAnswer = func(agentID, input string) (SendResult, error) {
-		deliveries++
-		return SendResult{AgentID: agentID, TurnID: "turn-recovery"}, nil
 	}
 	if _, err := h.AnswerHumanRequest(request.ID, AnswerHumanRequestParams{Answer: "Yes"}); err != nil {
 		t.Fatal(err)

@@ -21,19 +21,24 @@ for row in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
     missing=1
     continue
   fi
+  row_commit=$(sed -n 's/.*"commit":"\([0-9a-f][0-9a-f]*\)".*/\1/p' "$result")
+  commit_valid=1
+  case "$row_commit" in
+    *[!0-9a-f]*|"") commit_valid=0 ;;
+  esac
   if ! rg -q '"schemaVersion":1' "$result" ||
      ! rg -q "\"row\":\"$row\"" "$result" ||
      ! rg -q "\"os\":\"$expected_os\"" "$result" ||
      ! rg -q "\"arch\":\"$expected_arch\"" "$result" ||
      ! rg -q "\"generation\":\"$generation\"" "$result" ||
-     ! rg -q '"commit":"[0-9a-f]{40}"' "$result" ||
+     [ "$commit_valid" -ne 1 ] ||
+     [ "${#row_commit}" -ne 40 ] ||
      ! rg -q '"status":"passed"' "$result" ||
      ! rg -q '"reason":"verified"' "$result" ||
      ! rg -q '"productionReady":false' "$result"; then
     echo "$row: result is missing, failed, or malformed: $(tr -d '\n' <"$result")" >&2
     missing=1
   else
-    row_commit=$(rg -o '"commit":"[0-9a-f]{40}"' "$result" | cut -d '"' -f4)
     if [ -z "$verified_commit" ]; then
       verified_commit=$row_commit
     elif [ "$row_commit" != "$verified_commit" ]; then
