@@ -571,7 +571,7 @@ make build
 铁律：构建绿不等于完成。
 
 ```sh
-cd web && npm run build
+pnpm --dir web run build
 make build
 ```
 

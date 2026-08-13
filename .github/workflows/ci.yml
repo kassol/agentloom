@@ -33,15 +33,18 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
 
-      # make build is the production path and performs the job's sole npm ci.
+      - name: Enable pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.2 --activate
+
+      # make build is the production path and performs the job's sole frozen install.
       - name: Build production binaries
         run: make build
 
       - name: Verify the frontend lockfile is reproducible
-        run: git diff --exit-code -- web/package-lock.json
+        run: git diff --exit-code -- web/pnpm-lock.yaml
 
       - name: Vet Go packages
         run: go vet ./...
@@ -59,13 +62,13 @@ jobs:
         run: go test -race ./...
 
       - name: Run frontend tests
-        run: npm --prefix web test
+        run: pnpm --dir web test
 
       - name: Install Chromium for browser regressions
-        run: cd web && npx playwright install --with-deps chromium
+        run: pnpm --dir web exec playwright install --with-deps chromium
 
       - name: Run frontend browser tests
-        run: npm --prefix web run test:browser
+        run: pnpm --dir web run test:browser
 
   windows:
     name: Windows build and core tests
@@ -84,14 +87,18 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
+
+      - name: Enable pinned pnpm
+        shell: pwsh
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.2 --activate
 
       - name: Install and build WebUI
         shell: pwsh
         run: |
-          npm --prefix web ci
-          npm --prefix web run build
+          pnpm --dir web install --frozen-lockfile
+          pnpm --dir web run build
 
       - name: Build Hub, CLI, reloader, and gateways
         shell: pwsh

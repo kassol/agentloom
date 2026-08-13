@@ -121,6 +121,140 @@ describe("durable Approval projection", () => {
 });
 
 describe("rollout history projection", () => {
+  it("keeps one realtime command block and preserves description when completion omits it", () => {
+    const started = reduceFeed(emptyFeed, {
+      seq: 1,
+      ts: "2026-08-12T01:00:00Z",
+      type: "loom/runtime-event",
+      data: {
+        kind: "content",
+        contentPhase: "started",
+        content: {
+          id: "cmd-1",
+          kind: "tool_call",
+          toolCall: { name: "exec_command", description: "Run the isolated command probe", arguments: { command: "printf probe-ok" } },
+        }
+      },
+    });
+    const completedCall = reduceFeed(started, {
+      seq: 2,
+      ts: "2026-08-12T01:00:01Z",
+      type: "loom/runtime-event",
+      data: {
+        kind: "content",
+        contentPhase: "completed",
+        content: { id: "cmd-1", kind: "tool_call", toolCall: { name: "exec_command", arguments: { command: "printf probe-ok" } } },
+      },
+    });
+    const completed = reduceFeed(completedCall, {
+      seq: 3,
+      ts: "2026-08-12T01:00:02Z",
+      type: "loom/runtime-event",
+      data: {
+        kind: "content",
+        contentPhase: "completed",
+        content: { id: "result-1", kind: "tool_result", toolResult: { toolCallId: "cmd-1", success: true, text: "probe-ok" } },
+      },
+    });
+
+    expect(completed.blocks).toHaveLength(1);
+    expect(completed.blocks[0]).toMatchObject({
+      kind: "command",
+      id: "cmd-1",
+      description: "Run the isolated command probe",
+      status: "completed",
+      output: "probe-ok",
+    });
+  });
+
+  it("updates description during realtime lifecycle without creating another block", () => {
+    const started = reduceFeed(emptyFeed, {
+      seq: 1,
+      ts: "2026-08-12T01:00:00Z",
+      type: "loom/runtime-event",
+      data: {
+        kind: "content",
+        contentPhase: "started",
+        content: { id: "cmd-2", kind: "tool_call", toolCall: { name: "exec_command", arguments: { command: "printf probe-ok" } } },
+      },
+    });
+    const updated = reduceFeed(started, {
+      seq: 2,
+      ts: "2026-08-12T01:00:00Z",
+      type: "loom/runtime-event",
+      data: {
+        kind: "content",
+        contentPhase: "updated",
+        content: {
+          id: "cmd-2",
+          kind: "tool_call",
+          toolCall: { name: "exec_command", description: "Run the isolated command probe", arguments: { command: "printf probe-ok" } },
+        }
+      },
+    });
+
+    expect(updated.blocks).toHaveLength(1);
+    expect(updated.blocks[0]).toMatchObject({ id: "cmd-2", description: "Run the isolated command probe" });
+  });
+
+  it("projects command history and keeps the raw command fallback", () => {
+    const state = reduceFeed(emptyFeed, {
+      seq: 0,
+      ts: "",
+      type: "__history__",
+      data: {
+        turns: [{
+          state: "completed",
+          content: [
+            { id: "cmd-described", kind: "tool_call", toolCall: { name: "exec_command", description: "Historical command", arguments: { command: "printf probe-ok" } } },
+            { id: "result-described", kind: "tool_result", toolResult: { toolCallId: "cmd-described", success: true, text: "canonical" } },
+            { id: "cmd-legacy", kind: "tool_call", toolCall: { name: "exec_command", arguments: { command: "printf legacy" } } },
+            { id: "result-legacy", kind: "tool_result", toolResult: { toolCallId: "cmd-legacy", success: true, text: "" } },
+          ],
+        }],
+      },
+    });
+
+    expect(state.blocks).toHaveLength(2);
+    expect(state.blocks[0]).toMatchObject({ kind: "command", description: "Historical command", output: "canonical" });
+    expect(state.blocks[1]).toMatchObject({ kind: "command", command: "printf legacy" });
+    expect((state.blocks[1] as { description?: string }).description).toBeUndefined();
+  });
+
+  it("preserves description across history reconcile and prepend", () => {
+    const turn = (id: string, command: string, description: string) => ({
+      turnId: id,
+      state: "completed",
+      content: [
+        { id: `cmd-${id}`, kind: "tool_call", toolCall: { name: "exec_command", description, arguments: { command } } },
+        { id: `result-${id}`, kind: "tool_result", toolResult: { toolCallId: `cmd-${id}`, success: true, text: "" } },
+      ],
+    });
+    const current = reduceFeed(emptyFeed, {
+      seq: 0,
+      ts: "",
+      type: "__history__",
+      data: { turns: [turn("current", "printf current", "Current command")] },
+    });
+    const reconciled = reduceFeed(current, {
+      seq: 0,
+      ts: "",
+      type: "__history_reconcile__",
+      data: { turns: [turn("current", "printf current", "Current command")] },
+    });
+    const prepended = reduceFeed(reconciled, {
+      seq: 0,
+      ts: "",
+      type: "__history_prepend__",
+      data: { offset: 1, turns: [turn("older", "printf older", "Older command")] },
+    });
+
+    expect(reconciled.blocks).toHaveLength(1);
+    expect(reconciled.blocks[0]).toMatchObject({ description: "Current command" });
+    expect(prepended.blocks).toHaveLength(2);
+    expect(prepended.blocks.map((block) => (block.kind === "command" ? block.description : ""))).toEqual(["Older command", "Current command"]);
+  });
+
   it("summarizes a Human Input response without exposing its XML envelope", () => {
     const text = `<human_input_response version="1" request_id="hrq_test" expectation="required">
   <question><![CDATA[May I restart?]]></question>

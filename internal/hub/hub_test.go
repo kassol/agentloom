@@ -58,6 +58,55 @@ func TestAgentEventIsMultiplexedToGlobalSubscribers(t *testing.T) {
 	}
 }
 
+func TestCommandExecutionDescriptionRemainsInRealtimeCanonicalEvent(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.stopping = true
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "worker", ThreadID: "thread-1", Status: "running",
+		RuntimeBinding:      RuntimeBinding{Kind: "codex", NativeRef: "thread-native"},
+		RuntimeTurnBindings: map[string]string{"turn-1": "turn-native"},
+		CurrentTurnID:       "turn-1", CreatedAt: now(), UpdatedAt: now(),
+	}
+	rt := &runtime{
+		agentID:   "agent-1",
+		approvals: map[string]*approval{},
+		activeTurn: &turnState{
+			turnID: "turn-1", nativeTurnID: "turn-native", startedAt: time.Now(), stopWatchdog: make(chan struct{}),
+		},
+	}
+	for _, method := range []string{"item/started", "item/completed"} {
+		deliverTestNativeNotification(h, rt, method, json.RawMessage(`{"threadId":"thread-native","turnId":"turn-native","item":{"type":"commandExecution","id":"cmd-1","command":"printf probe-ok","description":"Run the isolated command probe","status":"completed"}}`))
+	}
+	events, err := st.ReadEvents("agent-1", 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, event := range events {
+		if event.Type != "loom/runtime-event" {
+			continue
+		}
+		var canonical runtimecontract.Event
+		if err := json.Unmarshal(event.Data, &canonical); err != nil {
+			t.Fatal(err)
+		}
+		if canonical.Kind != runtimecontract.EventContent || canonical.Content == nil || canonical.Content.Kind != runtimecontract.ContentToolCall {
+			continue
+		}
+		if canonical.Content.ToolCall == nil || canonical.Content.ToolCall.Description != "Run the isolated command probe" {
+			t.Fatalf("%s content = %#v", canonical.ContentPhase, canonical.Content)
+		}
+		seen++
+	}
+	if seen != 1 {
+		t.Fatalf("canonical command events = %d, want 1", seen)
+	}
+}
+
 func TestAgentStatusIncludesOnlyScopedCapabilitySnapshot(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

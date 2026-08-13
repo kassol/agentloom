@@ -23,14 +23,8 @@ try {
     Set-Location $repoRoot
 
     if (-not $SkipWeb) {
-        Push-Location "web"
-        try {
-            Invoke-Checked npm ci
-            Invoke-Checked npm run build
-        }
-        finally {
-            Pop-Location
-        }
+        Invoke-Checked pnpm --dir web install --frozen-lockfile
+        Invoke-Checked pnpm --dir web run build
     }
 
     $commit = (& git rev-parse --short=12 HEAD).Trim()

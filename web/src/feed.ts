@@ -145,8 +145,8 @@ export type Block =
       kind: "command";
       id: string;
       ts?: string;
-      command: string;
       description?: string;
+      command: string;
       status: string;
       exitCode: number | null;
       durationMs: number | null;

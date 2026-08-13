@@ -9,7 +9,7 @@ operations contract.
 - Windows 11 22H2 or newer on x86-64.
 - PowerShell 7 or Windows PowerShell 5.1.
 - Go 1.25, as pinned by `go.mod`.
-- Node.js 22 with the npm version represented by `web/package-lock.json`.
+- Node.js 22 and pnpm 11.1.2, pinned by `web/package.json`.
 - Git for Windows.
 - `codex` in `PATH`, plus Pi 0.84.1 or newer in `PATH` (or `PI_BIN`).
 
@@ -28,11 +28,11 @@ Set-Location agentloom
 .\scripts\build.ps1
 ```
 
-The PowerShell script is the canonical Windows production build. It runs
-`npm ci` and the WebUI build first, builds the Hub, reloader, CLI, and gateway
-binaries second, and verifies that `bin\codex-loom.exe` contains the current
-Vite entrypoint. Do not publish a bare `go build` result because it may embed a
-stale WebUI.
+The PowerShell script is the canonical Windows production build. It performs a
+frozen pnpm install and the WebUI build first, builds the Hub, reloader, CLI,
+and gateway binaries second, and verifies that `bin\codex-loom.exe` contains
+the current Vite entrypoint. Do not publish a bare `go build` result because it
+may embed a stale WebUI.
 
 Stop a running Hub before replacing its executable. Windows locks a running
 `.exe`, so an in-place build over the active binary can fail.
