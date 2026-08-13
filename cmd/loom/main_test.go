@@ -30,6 +30,59 @@ func TestAPIRequestIncludesAdminToken(t *testing.T) {
 	}
 }
 
+func TestIntegrationCredentialCommandsUseGenericOperations(t *testing.T) {
+	type observedRequest struct {
+		Method string
+		Path   string
+		Body   map[string]any
+	}
+	var observed []observedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]any{}
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+		}
+		observed = append(observed, observedRequest{Method: r.Method, Path: r.URL.RequestURI(), Body: body})
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]any{"connections": []any{}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"receipt": map[string]any{
+			"id": "creceipt_test", "connectionId": "conn_test", "status": "completed",
+		}})
+	}))
+	defer server.Close()
+	previousBase := base
+	base = server.URL
+	defer func() { base = previousBase }()
+
+	captureStdout(t, func() {
+		cmdIntegration(args{positional: []string{"credential", "preflight", "conn_test"}, flags: map[string]string{"json": "true"}})
+	})
+	captureStdout(t, func() {
+		cmdIntegration(args{positional: []string{"credential", "migrate", "conn_test"}, flags: map[string]string{"dry-run": "true", "confirm": "conn_test", "json": "true"}})
+	})
+	captureStdout(t, func() {
+		cmdIntegration(args{positional: []string{"credential", "rollback", "creceipt_test"}, flags: map[string]string{"confirm": "creceipt_test", "json": "true"}})
+	})
+
+	if len(observed) != 3 {
+		t.Fatalf("requests = %#v", observed)
+	}
+	if observed[0].Method != http.MethodGet || observed[0].Path != "/api/integrations/credentials/preflight?connectionId=conn_test" {
+		t.Fatalf("preflight request = %#v", observed[0])
+	}
+	if observed[1].Method != http.MethodPost || observed[1].Path != "/api/integrations/credentials/migrate" ||
+		observed[1].Body["connectionId"] != "conn_test" || observed[1].Body["dryRun"] != true || observed[1].Body["confirm"] != "conn_test" {
+		t.Fatalf("migrate request = %#v", observed[1])
+	}
+	if observed[2].Method != http.MethodPost || observed[2].Path != "/api/integrations/credentials/rollback" ||
+		observed[2].Body["receiptId"] != "creceipt_test" || observed[2].Body["confirm"] != "creceipt_test" {
+		t.Fatalf("rollback request = %#v", observed[2])
+	}
+}
+
 func TestFormatProfilePreservesReadableMultilineFields(t *testing.T) {
 	profile := map[string]any{
 		"version":  3.0,

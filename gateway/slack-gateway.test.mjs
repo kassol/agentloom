@@ -93,10 +93,10 @@ test('gateway sends a Loom outbox command through Slack and reports the durable 
     env: {
       ...process.env,
       SLACK_API_URL: `http://127.0.0.1:${port}/slack`,
-      SLACK_BOT_TOKEN: 'xoxb-test',
     },
-    stdio: ['ignore', 'ignore', 'pipe'],
+    stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
   });
+  child.stdio[3].end(JSON.stringify({ botToken: 'xoxb-test', appToken: 'unused-socket-disabled' }));
   let stderr = '';
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (chunk) => { stderr += chunk; });

@@ -30,6 +30,55 @@ func (s *Server) registerIntegrationRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/integrations/connections", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"connections": s.hub.ListConnections()})
 	})
+	mux.HandleFunc("GET /api/integrations/credentials/preflight", func(w http.ResponseWriter, r *http.Request) {
+		results, err := s.hub.CredentialPreflightList(r.URL.Query().Get("connectionId"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"connections": results})
+	})
+	credentialMigrate := func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ConnectionID string `json:"connectionId"`
+			DryRun       bool   `json:"dryRun"`
+			Confirm      string `json:"confirm"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		receipt, err := s.hub.MigrateCredential(r.Context(), body.ConnectionID, body.DryRun, body.Confirm)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"receipt": receipt})
+	}
+	mux.HandleFunc("POST /api/integrations/credentials/migrate", credentialMigrate)
+	mux.HandleFunc("POST /api/integrations/credentials/migrations", credentialMigrate)
+	credentialRollback := func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ReceiptID string `json:"receiptId"`
+			DryRun    bool   `json:"dryRun"`
+			Confirm   string `json:"confirm"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		if body.ReceiptID == "" {
+			body.ReceiptID = r.PathValue("id")
+		}
+		receipt, err := s.hub.RollbackCredential(body.ReceiptID, body.DryRun, body.Confirm)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"receipt": receipt})
+	}
+	mux.HandleFunc("POST /api/integrations/credentials/rollback", credentialRollback)
+	mux.HandleFunc("POST /api/integrations/credentials/receipts/{id}/rollback", credentialRollback)
 	mux.HandleFunc("POST /api/integrations/providers/github/token", func(w http.ResponseWriter, r *http.Request) {
 		var body githubTokenParams
 		if err := readJSON(r, &body); err != nil {

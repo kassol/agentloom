@@ -57,17 +57,18 @@ type Snapshot struct {
 }
 
 type manifest struct {
-	Version          int          `json:"version"`
-	CreatedAt        string       `json:"createdAt"`
-	Reason           string       `json:"reason"`
-	DataDir          string       `json:"dataDir"`
-	CodexSessionsDir string       `json:"codexSessionsDir"`
-	EdgeNamesFile    string       `json:"edgeNamesFile,omitempty"`
-	Agents           []AgentRef   `json:"agents"`
-	Sessions         []SessionRef `json:"sessions,omitempty"`
-	Files            []string     `json:"files"`
-	Excluded         []string     `json:"excluded,omitempty"`
-	Warnings         []string     `json:"warnings,omitempty"`
+	Version            int          `json:"version"`
+	CreatedAt          string       `json:"createdAt"`
+	Reason             string       `json:"reason"`
+	DataDir            string       `json:"dataDir"`
+	CodexSessionsDir   string       `json:"codexSessionsDir"`
+	EdgeNamesFile      string       `json:"edgeNamesFile,omitempty"`
+	Agents             []AgentRef   `json:"agents"`
+	Sessions           []SessionRef `json:"sessions,omitempty"`
+	Files              []string     `json:"files"`
+	Excluded           []string     `json:"excluded,omitempty"`
+	CredentialReceipts string       `json:"credentialReceipts"`
+	Warnings           []string     `json:"warnings,omitempty"`
 }
 
 func DefaultDir(dataDir string) string {
@@ -126,14 +127,15 @@ func Create(opts Options) (*Snapshot, error) {
 	gz := gzip.NewWriter(out)
 	tw := tar.NewWriter(gz)
 	m := manifest{
-		Version:          2,
-		CreatedAt:        created.Format(time.RFC3339Nano),
-		Reason:           opts.Reason,
-		DataDir:          opts.DataDir,
-		CodexSessionsDir: opts.CodexSessionsDir,
-		EdgeNamesFile:    opts.EdgeNamesFile,
-		Agents:           opts.Agents,
-		Sessions:         opts.Agents,
+		Version:            2,
+		CreatedAt:          created.Format(time.RFC3339Nano),
+		Reason:             opts.Reason,
+		DataDir:            opts.DataDir,
+		CodexSessionsDir:   opts.CodexSessionsDir,
+		EdgeNamesFile:      opts.EdgeNamesFile,
+		Agents:             opts.Agents,
+		Sessions:           opts.Agents,
+		CredentialReceipts: "codex-loom/credential-receipts/** (non-secret migration receipts included; credential material excluded)",
 		Excluded: []string{
 			"codex-loom/events/** (derived SSE replay cache)",
 			"codex-loom/" + credentials.DirectoryName + "/** (managed credential material excluded)",

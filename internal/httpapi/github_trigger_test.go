@@ -235,13 +235,14 @@ func TestGitHubTokenConnectionsMigrateLegacyAndSeparateResourceOwners(t *testing
 	if len(connections) != 2 {
 		t.Fatalf("connections = %#v", connections)
 	}
-	parallToken, err := githubapi.LoadCredential("keychain:" + githubapi.ScopedCredentialService("yan5xu", "parall-hq"))
-	if err != nil || parallToken != "parall-token" {
-		t.Fatalf("parall token = %q, %v", parallToken, err)
+	parallCredential, err := h.ResolveManagedCredential(parall["credentialRef"].(string), "github")
+	if err != nil || parallCredential["token"] != "parall-token" {
+		t.Fatalf("parall managed credential = %#v, %v", parallCredential, err)
 	}
-	personalToken, err := githubapi.LoadCredential("keychain:" + githubapi.ScopedCredentialService("yan5xu", "yan5xu"))
-	if err != nil || personalToken != "personal-token-updated" {
-		t.Fatalf("personal token = %q, %v", personalToken, err)
+	personalConnection := third["connection"].(map[string]any)
+	personalCredential, err := h.ResolveManagedCredential(personalConnection["credentialRef"].(string), "github")
+	if err != nil || personalCredential["token"] != "personal-token-updated" {
+		t.Fatalf("personal managed credential = %#v, %v", personalCredential, err)
 	}
 }
 

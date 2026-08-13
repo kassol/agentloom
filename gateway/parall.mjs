@@ -7,6 +7,7 @@ import path from 'node:path';
 import { inboxDispatchAction, parallConversationCandidates, parallConversationType, parallDeliveryReceipts, parallOutboxRequest, parallProviderReadRequest, parallThreadContext } from './parall-protocol.mjs';
 
 const args = parseArgs(process.argv.slice(2));
+const credential = readCredentialFD();
 const config = {
   hub: trimSlash(
     args.service || args.hub || process.env.CODEX_LOOM_URL || process.env.CHUB_URL || 'http://127.0.0.1:4870',
@@ -20,9 +21,9 @@ const config = {
     'address id',
   ),
   connectorToken: process.env.CODEX_LOOM_CONNECTOR_TOKEN || process.env.CODEX_HUB_CONNECTOR_TOKEN || '',
-  apiUrl: trimSlash(required(process.env.PRLL_API_URL, 'PRLL_API_URL')),
-  wsUrl: process.env.PRLL_WS_URL || parallWebSocketURL(process.env.PRLL_API_URL),
-  apiKey: required(process.env.PRLL_API_KEY, 'PRLL_API_KEY'),
+  apiUrl: trimSlash(required(credential.apiUrl, 'managed Parall API URL')),
+  wsUrl: process.env.PRLL_WS_URL || parallWebSocketURL(credential.apiUrl),
+  apiKey: required(credential.apiKey, 'managed Parall API key'),
   orgId: required(process.env.PRLL_ORG_ID, 'PRLL_ORG_ID'),
   stateFile:
     args['state-file'] || path.join(defaultDataDir(), 'gateway', `parall-${args.connection}.json`),
@@ -30,6 +31,15 @@ const config = {
   pollInbound: args['poll-inbound'] === 'true',
   includeReceived: args['include-received'] === 'true',
 };
+
+function readCredentialFD() {
+  try {
+    const payload = JSON.parse(fs.readFileSync(3, 'utf8'));
+    return payload && typeof payload === 'object' ? payload : {};
+  } catch {
+    throw new Error('Parall credential descriptor is missing or invalid');
+  }
+}
 
 const controller = new AbortController();
 process.on('SIGINT', () => controller.abort());

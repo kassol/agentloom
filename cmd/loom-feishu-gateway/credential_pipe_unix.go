@@ -3,16 +3,11 @@
 package main
 
 import (
-	"encoding/json"
 	"os"
 	"syscall"
 )
 
-func execWithCredentialPipe(executable string, arguments, environment []string, values map[string]string) error {
-	payload, err := json.Marshal(values)
-	if err != nil {
-		return err
-	}
+func reexecWithCredentialPipe(payload []byte) error {
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		return err
@@ -28,5 +23,10 @@ func execWithCredentialPipe(executable string, arguments, environment []string, 
 	if err := syscall.Dup2(int(reader.Fd()), 3); err != nil {
 		return err
 	}
-	return syscall.Exec(executable, arguments, environment)
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	environment := append(os.Environ(), "CODEX_LOOM_CREDENTIAL_FD_CHILD=1")
+	return syscall.Exec(executable, os.Args, environment)
 }

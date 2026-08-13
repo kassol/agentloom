@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -39,20 +40,34 @@ func main() {
 	if err := validateGatewayStartup(processProof, managedRefSet, managedRef); err != nil {
 		log.Fatal(err)
 	}
-	secret := ""
-	if managedRefSet {
-		resolved, err := resolveManagedSecret(dataDir(), credentials.Ref(managedRef))
-		if err != nil {
-			log.Fatalf("resolve managed credential: %v", err)
-		}
-		secret = string(resolved)
-	} else {
-		secret = strings.TrimSpace(os.Getenv("FEISHU_APP_SECRET"))
-		if secret == "" {
-			if inherited, ok := readInheritedCredentialFD(); ok {
-				secret = strings.TrimSpace(string(inherited))
+	if os.Getenv("CODEX_LOOM_CREDENTIAL_FD_CHILD") != "1" {
+		var payload []byte
+		values, resolveErr := credentials.ResolveConnectionPayload(dataDir(), *connectionID, "lark")
+		if resolveErr == nil {
+			payload = []byte(values["appSecret"])
+		} else if !errors.Is(resolveErr, credentials.ErrConnectionNotManaged) {
+			log.Fatalf("resolve managed credential: %v", resolveErr)
+		} else if managedRefSet {
+			resolved, err := resolveManagedSecret(dataDir(), credentials.Ref(managedRef))
+			if err != nil {
+				log.Fatalf("resolve managed credential: %v", err)
+			}
+			if values, decodeErr := credentials.DecodePayload(resolved, "lark"); decodeErr == nil {
+				payload = []byte(values["appSecret"])
+			} else {
+				payload = resolved // compatibility with the original Lark migration slice
 			}
 		}
+		if len(payload) > 0 {
+			if err := reexecWithCredentialPipe(payload); err != nil {
+				log.Fatalf("start Feishu gateway credential child: %v", err)
+			}
+		}
+	}
+	secret := ""
+	if inherited, ok := readInheritedCredentialFD(); ok {
+		secret = strings.TrimSpace(string(inherited))
+	} else {
 		if secret == "" && strings.TrimSpace(*appID) != "" {
 			var err error
 			secret, err = feishu.LoadAppSecret(*appID)

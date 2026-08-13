@@ -453,6 +453,8 @@ type Hub struct {
 	gatewayOpenGeneration            string
 	gatewayCoordinatorInitMu         sync.Mutex
 	gatewayCoordinator               *gatewayConnectionCoordinator
+	credentialLockMu                 sync.Mutex
+	credentialLocks                  map[string]*sync.Mutex
 	saveGatewayStateForTest          func(gatewayState) error
 	loadGatewayStateForTest          func(*gatewayState) (bool, error)
 	gatewayServiceAdapterForTest     func(gatewayLaunchPlan) (gatewayServiceAdapter, error)
@@ -460,6 +462,7 @@ type Hub struct {
 	larkUpdateConnectionForTest      func(string, string) (PlatformConnection, error)
 	larkMigrationRecordWriteForTest  func() error
 	larkMigrationRecordRemoveForTest func(string) error
+	deleteManagedCredentialForTest   func(string) error
 	saveAgentSkillConfigsForTest     func(any) error
 	saveAgentsForTest                func(any) error
 	archiveStartLockForTest          func(string)

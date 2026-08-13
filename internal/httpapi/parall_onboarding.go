@@ -173,7 +173,7 @@ func (s *Server) discoverParall(ctx context.Context, connectionID, requestedOrgI
 		result.Agents = append(result.Agents, entry)
 	}
 
-	ownerCredentials, ownerCredentialsErr := loadParallOwnerCredentials(orgID)
+	_, ownerCredentials, ownerCredentialsErr := s.loadParallOwnerManaged(orgID)
 	if ownerCredentialsErr != nil {
 		result.OwnerError = "Read Parall Owner credentials: " + ownerCredentialsErr.Error()
 	} else {
@@ -207,8 +207,8 @@ func (s *Server) discoverParall(ctx context.Context, connectionID, requestedOrgI
 				result.OwnerError = "Read Parall Agents: " + agentsErr.Error()
 			} else {
 				for _, item := range agents {
-					credentials, _ := loadParallAgentCredentials(orgID, item.ID)
-					addAgent(item, credentials.APIKey != "")
+					_, agentCredentials, _ := s.loadParallAgentManaged(orgID, item.ID)
+					addAgent(item, agentCredentials.APIKey != "")
 				}
 			}
 			if chats, chatsErr := ownerClient.GetChats(ctx, orgID); chatsErr != nil {
@@ -225,7 +225,7 @@ func (s *Server) discoverParall(ctx context.Context, connectionID, requestedOrgI
 	}
 
 	if agentID != "" {
-		agentCredentials, agentCredentialsErr := loadParallAgentCredentials(orgID, agentID)
+		_, agentCredentials, agentCredentialsErr := s.loadParallAgentManaged(orgID, agentID)
 		if agentCredentialsErr != nil {
 			result.Error = "Read Parall Agent credentials: " + agentCredentialsErr.Error()
 		} else {
@@ -292,8 +292,8 @@ func (s *Server) saveParallCredentials(ctx context.Context, p parallCredentialPa
 	if organization.Role != "owner" {
 		return parallDiscovery{}, &hub.HubError{Status: 403, Message: "Parall Owner credentials are required; current role is " + organization.Role}
 	}
-	if err := saveParallOwnerCredentials(orgID, apiURL, apiKey); err != nil {
-		return parallDiscovery{}, &hub.HubError{Status: 500, Message: "Save Parall Owner credentials: " + err.Error()}
+	if _, err := s.storeOnboardingCredential("parall-owner", onboardingCredentialKey("parall-owner", orgID), map[string]string{"apiUrl": apiURL, "apiKey": apiKey}); err != nil {
+		return parallDiscovery{}, &hub.HubError{Status: 500, Message: "Save managed Parall Owner credentials: " + err.Error()}
 	}
 	return s.discoverParall(ctx, "", orgID, ""), nil
 }
@@ -317,8 +317,8 @@ func (s *Server) saveParallAgentCredential(ctx context.Context, p parallAgentCre
 	if _, err := client.GetWSTicket(ctx); err != nil {
 		return parallDiscovery{}, &hub.HubError{Status: 400, Message: "Verify Parall WebSocket: " + err.Error()}
 	}
-	if err := saveParallAgentCredentials(orgID, agentID, apiURL, apiKey); err != nil {
-		return parallDiscovery{}, &hub.HubError{Status: 500, Message: "Save Parall Agent credentials: " + err.Error()}
+	if _, err := s.storeOnboardingCredential("parall", onboardingCredentialKey("parall", orgID, agentID), map[string]string{"apiUrl": apiURL, "apiKey": apiKey}); err != nil {
+		return parallDiscovery{}, &hub.HubError{Status: 500, Message: "Save managed Parall Agent credentials: " + err.Error()}
 	}
 	return s.discoverParall(ctx, "", orgID, agentID), nil
 }
@@ -329,7 +329,7 @@ func (s *Server) importParallAgent(ctx context.Context, p parallImportParams, hu
 	if agent == "" || orgID == "" || externalID == "" {
 		return nil, &hub.HubError{Status: 400, Message: "Loom Agent, Parall Organization ID, and external Agent ID are required"}
 	}
-	previousCredential, err := loadParallAgentCredentials(orgID, externalID)
+	previousRef, previousCredential, err := s.loadParallAgentManaged(orgID, externalID)
 	if err != nil {
 		return nil, &hub.HubError{Status: 500, Message: "Read existing Parall Agent credentials: " + err.Error()}
 	}
@@ -344,7 +344,7 @@ func (s *Server) importParallAgent(ctx context.Context, p parallImportParams, hu
 			return nil, &hub.HubError{Status: 409, Message: "Parall Agent key is not stored; provide --agent-key-file for the first import"}
 		}
 		if apiURL != "" && strings.TrimRight(apiURL, "/") != strings.TrimRight(storedAPIURL, "/") {
-			return nil, &hub.HubError{Status: 409, Message: "Cannot override the stored Parall API URL while reusing a Keychain credential"}
+			return nil, &hub.HubError{Status: 409, Message: "Cannot override the stored Parall API URL while reusing a credential"}
 		}
 		apiKey = previousCredential.APIKey
 		apiURL = storedAPIURL
@@ -380,16 +380,11 @@ func (s *Server) importParallAgent(ctx context.Context, p parallImportParams, hu
 	for _, address := range addressesBefore {
 		addressBefore[address.ID] = struct{}{}
 	}
+	replacementRef := previousRef
 	if credentialProvided {
-		if err := saveParallAgentCredentials(orgID, externalID, apiURL, apiKey); err != nil {
-			rollbackErr := deleteParallAgentCredentials(orgID, externalID)
-			if previousCredential.APIKey != "" {
-				rollbackErr = saveParallAgentCredentials(orgID, externalID, previousCredential.APIURL, previousCredential.APIKey)
-			}
-			if rollbackErr != nil {
-				return nil, &hub.HubError{Status: 500, Message: fmt.Sprintf("Save Parall Agent credentials: %v; restore previous credential: %v", err, rollbackErr)}
-			}
-			return nil, &hub.HubError{Status: 500, Message: "Save Parall Agent credentials: " + err.Error()}
+		replacementRef, err = s.storeOnboardingCredential("parall", onboardingCredentialKey("parall", orgID, externalID), map[string]string{"apiUrl": apiURL, "apiKey": apiKey})
+		if err != nil {
+			return nil, &hub.HubError{Status: 500, Message: "Save managed Parall Agent credentials: " + err.Error()}
 		}
 	}
 
@@ -405,13 +400,10 @@ func (s *Server) importParallAgent(ctx context.Context, p parallImportParams, hu
 
 	var credentialRollbackErr error
 	if credentialProvided {
-		credentialRollbackErr = deleteParallAgentCredentials(orgID, externalID)
-		if previousCredential.APIKey != "" {
-			credentialRollbackErr = saveParallAgentCredentials(orgID, externalID, previousCredential.APIURL, previousCredential.APIKey)
-		}
+		credentialRollbackErr = s.restoreOnboardingCredential(onboardingCredentialKey("parall", orgID, externalID), previousRef, replacementRef)
 	}
 	createdConnections := []string{}
-	targetCredentialRef := "keychain:" + parall.AgentCredentialService(orgID, externalID)
+	targetCredentialRef := replacementRef
 	for _, connection := range s.hub.ListConnections() {
 		if _, existed := connectionBefore[connection.ID]; !existed && connection.Provider == "parall" && connection.CredentialRef == targetCredentialRef {
 			createdConnections = append(createdConnections, connection.ID)
@@ -468,7 +460,7 @@ func (s *Server) setupParall(ctx context.Context, p parallSetupParams, hubURL st
 	}
 	externalID := strings.TrimSpace(p.ExternalAgentID)
 	chatID := strings.TrimSpace(p.ChatID)
-	ownerCredentials, ownerCredentialErr := loadParallOwnerCredentials(orgID)
+	_, ownerCredentials, ownerCredentialErr := s.loadParallOwnerManaged(orgID)
 	var ownerClient parallAPI
 	ownerReady := false
 	if ownerCredentialErr == nil && ownerCredentials.APIURL != "" && ownerCredentials.APIKey != "" {
@@ -516,11 +508,11 @@ func (s *Server) setupParall(ctx context.Context, p parallSetupParams, hubURL st
 			return nil, &hub.HubError{Status: 502, Message: "Parall created an Agent without a stable ID or one-time API key"}
 		}
 		external, externalID = created.User, created.User.ID
-		if err := saveParallAgentCredentials(orgID, externalID, ownerCredentials.APIURL, created.APIKey); err != nil {
+		if _, err := s.storeOnboardingCredential("parall", onboardingCredentialKey("parall", orgID, externalID), map[string]string{"apiUrl": ownerCredentials.APIURL, "apiKey": created.APIKey}); err != nil {
 			return nil, &hub.HubError{Status: 500, Message: "Secure the new Parall Agent API key: " + err.Error()}
 		}
 	} else {
-		credentials, loadErr := loadParallAgentCredentials(orgID, externalID)
+		_, credentials, loadErr := s.loadParallAgentManaged(orgID, externalID)
 		if loadErr != nil {
 			return nil, &hub.HubError{Status: 500, Message: "Read Parall Agent credentials: " + loadErr.Error()}
 		}
@@ -569,7 +561,7 @@ func (s *Server) setupParall(ctx context.Context, p parallSetupParams, hubURL st
 			if key.APIKey == "" {
 				return nil, &hub.HubError{Status: 502, Message: "Parall did not return the new Agent API key"}
 			}
-			if err := saveParallAgentCredentials(orgID, externalID, ownerCredentials.APIURL, key.APIKey); err != nil {
+			if _, err := s.storeOnboardingCredential("parall", onboardingCredentialKey("parall", orgID, externalID), map[string]string{"apiUrl": ownerCredentials.APIURL, "apiKey": key.APIKey}); err != nil {
 				return nil, &hub.HubError{Status: 500, Message: "Secure the Parall Agent API key: " + err.Error()}
 			}
 		}
@@ -577,9 +569,17 @@ func (s *Server) setupParall(ctx context.Context, p parallSetupParams, hubURL st
 	if external.DisplayName == "" {
 		external.DisplayName = displayName
 	}
-	agentCredentials, err := loadParallAgentCredentials(orgID, externalID)
+	credentialRef, agentCredentials, err := s.loadParallAgentManaged(orgID, externalID)
 	if err != nil || agentCredentials.APIKey == "" {
 		return nil, &hub.HubError{Status: 409, Message: "Parall Agent credentials are unavailable after setup"}
+	}
+	if credentialRef == "" {
+		credentialRef, err = s.storeOnboardingCredential("parall", onboardingCredentialKey("parall", orgID, externalID), map[string]string{
+			"apiUrl": agentCredentials.APIURL, "apiKey": agentCredentials.APIKey,
+		})
+		if err != nil {
+			return nil, &hub.HubError{Status: 500, Message: "Save managed Parall Agent credentials: " + err.Error()}
+		}
 	}
 	externalClient := newParallClient(agentCredentials.APIURL, agentCredentials.APIKey)
 	verified, err := externalClient.GetAgentMe(ctx, orgID)
@@ -590,7 +590,9 @@ func (s *Server) setupParall(ctx context.Context, p parallSetupParams, hubURL st
 		return nil, &hub.HubError{Status: 409, Message: "Verify Parall WebSocket: " + err.Error()}
 	}
 
-	credentialRef := "keychain:" + parall.AgentCredentialService(orgID, externalID)
+	if credentialRef == "" {
+		return nil, &hub.HubError{Status: 409, Message: "Managed Parall Agent credentials are unavailable"}
+	}
 	addresses, err := s.hub.ListAddresses("")
 	if err != nil {
 		return nil, err
@@ -602,10 +604,10 @@ func (s *Server) setupParall(ctx context.Context, p parallSetupParams, hubURL st
 	connection := selection.Connection
 	capabilities := []string{"receive_events", "threads", "mentions", "attachments", "reading", "ack", "proactive_send"}
 	if connection.ID == "" {
-		connection, err = s.hub.CreateConnection(hub.ConnectionParams{Provider: "parall", AccountRef: orgID, CredentialRef: credentialRef, Capabilities: capabilities})
+		connection, err = s.hub.CreateConnection(hub.ConnectionParams{Provider: "parall", AccountRef: orgID, ScopeRef: externalID, CredentialRef: credentialRef, Capabilities: capabilities})
 	} else {
 		enabled := true
-		connection, err = s.hub.UpdateConnection(connection.ID, hub.ConnectionParams{AccountRef: orgID, CredentialRef: credentialRef, Capabilities: capabilities, Enabled: &enabled})
+		connection, err = s.hub.UpdateConnection(connection.ID, hub.ConnectionParams{AccountRef: orgID, ScopeRef: externalID, CredentialRef: credentialRef, Capabilities: capabilities, Enabled: &enabled})
 	}
 	if err != nil {
 		return nil, err
@@ -731,7 +733,7 @@ func (s *Server) repairParallGateway(ctx context.Context, connectionID, hubURL s
 	if orgID == "" || agentID == "" {
 		return nil, &hub.HubError{Status: 409, Message: "Parall Organization ID and external Agent ID are required"}
 	}
-	credentials, err := loadParallAgentCredentials(orgID, agentID)
+	_, credentials, err := s.loadParallAgentManaged(orgID, agentID)
 	if err != nil || credentials.APIURL == "" || credentials.APIKey == "" {
 		return nil, &hub.HubError{Status: 409, Message: "Parall Agent credentials are not stored in Keychain"}
 	}
@@ -908,4 +910,28 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func (s *Server) loadParallOwnerManaged(orgID string) (string, parall.Credentials, error) {
+	ref, values, err := s.loadOnboardingCredential("parall-owner", onboardingCredentialKey("parall-owner", orgID))
+	if err != nil {
+		return "", parall.Credentials{}, err
+	}
+	if ref != "" {
+		return ref, parall.Credentials{APIURL: values["apiUrl"], APIKey: values["apiKey"]}, nil
+	}
+	legacy, err := loadParallOwnerCredentials(orgID)
+	return "", legacy, err
+}
+
+func (s *Server) loadParallAgentManaged(orgID, agentID string) (string, parall.Credentials, error) {
+	ref, values, err := s.loadOnboardingCredential("parall", onboardingCredentialKey("parall", orgID, agentID))
+	if err != nil {
+		return "", parall.Credentials{}, err
+	}
+	if ref != "" {
+		return ref, parall.Credentials{APIURL: values["apiUrl"], APIKey: values["apiKey"]}, nil
+	}
+	legacy, err := loadParallAgentCredentials(orgID, agentID)
+	return "", legacy, err
 }

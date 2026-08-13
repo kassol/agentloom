@@ -864,6 +864,13 @@ func TestLarkRollbackRejectsThirdPartyBindingDrift(t *testing.T) {
 		if err := fixture.h.FinishLarkGatewayLaunchPlan(fixture.connection.ID); err != nil {
 			t.Fatal(err)
 		}
+		if strings.HasPrefix(third, "managed:") {
+			ref, putErr := fixture.h.PutManagedCredential("lark", map[string]string{"appSecret": "third-party-secret"})
+			if putErr != nil {
+				t.Fatal(putErr)
+			}
+			third = ref
+		}
 		if _, err := fixture.h.UpdateConnection(fixture.connection.ID, ConnectionParams{CredentialRef: third}); err != nil {
 			t.Fatal(err)
 		}

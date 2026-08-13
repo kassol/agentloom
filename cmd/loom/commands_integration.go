@@ -325,7 +325,7 @@ func cmdOutbox(a args) {
 
 func cmdIntegration(a args) {
 	if len(a.positional) == 0 {
-		usage("integration list|send|connect|import|bind|update-address|enable|disable|archive|restore|delete-address|transfer|rollback-transfer|operations|operation|status ...")
+		usage("integration list|send|connect|import|credential|bind|update-address|enable|disable|archive|restore|delete-address|transfer|rollback-transfer|operations|operation|status ...")
 	}
 	switch a.positional[0] {
 	case "list":
@@ -448,6 +448,8 @@ func cmdIntegration(a args) {
 		} else {
 			fmt.Println(dim("  Existing Keychain credential reused; no secret was read from a file."))
 		}
+	case "credential":
+		cmdIntegrationCredential(a)
 	case "bind":
 		if len(a.positional) < 3 || strings.TrimSpace(a.flags["identity"]) == "" {
 			usage("integration bind <agent> <connection-id> --identity EXTERNAL_ID [--display-name NAME] [--trigger mention] [--reply-policy final_answer] [--dm-policy managed] [--trust-domain NAME] [--enabled true|false] [allow/block flags]")
@@ -569,8 +571,69 @@ func cmdIntegration(a args) {
 			fmt.Println(string(out))
 		}
 	default:
-		usage("integration list|send|connect|import|bind|update-address|enable|disable|archive|restore|delete-address|transfer|rollback-transfer|operations|operation|status ...")
+		usage("integration list|send|connect|import|credential|bind|update-address|enable|disable|archive|restore|delete-address|transfer|rollback-transfer|operations|operation|status ...")
 	}
+}
+
+func cmdIntegrationCredential(a args) {
+	if len(a.positional) < 2 {
+		usage("integration credential preflight [CONNECTION_ID] [--json] | migrate CONNECTION_ID [--dry-run] [--confirm CONNECTION_ID] [--json] | rollback RECEIPT_ID [--dry-run] [--confirm RECEIPT_ID] [--json]")
+	}
+	action := strings.ToLower(strings.TrimSpace(a.positional[1]))
+	var response map[string]any
+	var err error
+	switch action {
+	case "preflight":
+		if len(a.positional) > 3 {
+			usage("integration credential preflight [CONNECTION_ID] [--json]")
+		}
+		path := "/api/integrations/credentials/preflight"
+		if len(a.positional) == 3 {
+			path += "?connectionId=" + url.QueryEscape(a.positional[2])
+		}
+		response, err = api("GET", path, nil)
+	case "migrate":
+		if len(a.positional) != 3 {
+			usage("integration credential migrate CONNECTION_ID [--dry-run] [--confirm CONNECTION_ID] [--json]")
+		}
+		response, err = api("POST", "/api/integrations/credentials/migrate", map[string]any{
+			"connectionId": a.positional[2], "dryRun": lifecycleDryRun(a.flags), "confirm": a.flags["confirm"],
+		})
+	case "rollback":
+		if len(a.positional) != 3 {
+			usage("integration credential rollback RECEIPT_ID [--dry-run] [--confirm RECEIPT_ID] [--json]")
+		}
+		response, err = api("POST", "/api/integrations/credentials/rollback", map[string]any{
+			"receiptId": a.positional[2], "dryRun": lifecycleDryRun(a.flags), "confirm": a.flags["confirm"],
+		})
+	default:
+		usage("integration credential preflight|migrate|rollback ...")
+	}
+	if err != nil {
+		fail(err)
+	}
+	if _, ok := a.flags["json"]; ok {
+		printJSON(response)
+		return
+	}
+	if action == "preflight" {
+		values := anySlice(response["connections"])
+		if len(values) == 0 {
+			fmt.Println("no enabled non-archived Keychain-backed connections")
+			return
+		}
+		for _, value := range values {
+			entry, _ := value.(map[string]any)
+			state := red("blocked")
+			if eligible, _ := entry["eligible"].(bool); eligible {
+				state = green("eligible")
+			}
+			fmt.Printf("%s %s  %s  %s\n", bold(str(entry, "connectionId")), str(entry, "provider"), state, dim(str(entry, "reason")))
+		}
+		return
+	}
+	receipt, _ := response["receipt"].(map[string]any)
+	fmt.Printf("%s %s  connection=%s  status=%s\n", green(action), bold(str(receipt, "id")), str(receipt, "connectionId"), str(receipt, "status"))
 }
 
 func cmdAddressLifecycle(a args) {

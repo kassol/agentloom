@@ -64,7 +64,23 @@ func (s *Server) discoverLark(ctx context.Context, requestedAppID string) larkDi
 	if appID == "" {
 		return result
 	}
-	secret, err := loadFeishuSecret(appID)
+	_, values, err := s.loadOnboardingCredential("lark", onboardingCredentialKey("lark", appID))
+	secret := values["appSecret"]
+	if secret == "" {
+		for _, connection := range s.hub.ListConnections() {
+			if connection.Provider != "lark" || connection.AccountRef != appID || !strings.HasPrefix(connection.CredentialRef, "managed:") {
+				continue
+			}
+			values, err = s.hub.ResolveManagedCredential(connection.CredentialRef, "lark")
+			if err == nil {
+				secret = values["appSecret"]
+			}
+			break
+		}
+	}
+	if secret == "" && err == nil {
+		secret, err = loadFeishuSecret(appID)
+	}
 	if err != nil {
 		result.Error = "Read Feishu credential: " + err.Error()
 		return result
@@ -109,8 +125,8 @@ func (s *Server) saveLarkCredentials(ctx context.Context, p larkCredentialParams
 	if _, err := discoverFeishu(ctx, appID, appSecret); err != nil {
 		return larkDiscovery{}, &hub.HubError{Status: 400, Message: "Feishu verification failed: " + err.Error()}
 	}
-	if err := saveFeishuSecret(appID, appSecret); err != nil {
-		return larkDiscovery{}, &hub.HubError{Status: 500, Message: "Save Feishu credential: " + err.Error()}
+	if _, err := s.storeOnboardingCredential("lark", onboardingCredentialKey("lark", appID), map[string]string{"appSecret": appSecret}); err != nil {
+		return larkDiscovery{}, &hub.HubError{Status: 500, Message: "Save managed Feishu credential: " + err.Error()}
 	}
 	return s.discoverLark(ctx, appID), nil
 }
@@ -149,7 +165,16 @@ func (s *Server) setupLark(ctx context.Context, p larkSetupParams, hubURL string
 		}
 	}
 	var err error
-	credentialRef := "keychain:" + feishu.CredentialService(discovery.AppID)
+	credentialRef, _, err := s.loadOnboardingCredential("lark", onboardingCredentialKey("lark", discovery.AppID))
+	if err == nil && credentialRef == "" {
+		secret, loadErr := loadFeishuSecret(discovery.AppID)
+		if loadErr == nil && secret != "" {
+			credentialRef, err = s.storeOnboardingCredential("lark", onboardingCredentialKey("lark", discovery.AppID), map[string]string{"appSecret": secret})
+		}
+	}
+	if err != nil || credentialRef == "" {
+		return nil, &hub.HubError{Status: 409, Message: "Managed Feishu credentials are unavailable"}
+	}
 	if connection.ID == "" {
 		connection, err = s.hub.CreateConnection(hub.ConnectionParams{
 			Provider: "lark", AccountRef: discovery.AppID, CredentialRef: credentialRef,

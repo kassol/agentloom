@@ -48,8 +48,12 @@ func TestSetupParallCreatesStableIdentityAndMembershipIdempotently(t *testing.T)
 	if firstConnection.ID != secondConnection.ID || firstAddress.ID != secondAddress.ID {
 		t.Fatalf("setup was not idempotent: first=%#v/%#v second=%#v/%#v", firstConnection, firstAddress, secondConnection, secondAddress)
 	}
-	if firstAddress.ExternalIdentity != "prll://usr_external" || firstConnection.CredentialRef != "keychain:"+parall.AgentCredentialService("org_test", "usr_external") {
+	if firstAddress.ExternalIdentity != "prll://usr_external" || !strings.HasPrefix(firstConnection.CredentialRef, "managed:") {
 		t.Fatalf("connection/address = %#v / %#v", firstConnection, firstAddress)
+	}
+	values, err := h.ResolveManagedCredential(firstConnection.CredentialRef, "parall")
+	if err != nil || values["apiKey"] != "agent-key" {
+		t.Fatalf("managed credential = %#v err=%v", values, err)
 	}
 	memberships, err := h.ListConversationMemberships("parall-agent", firstAddress.ID)
 	if err != nil {
@@ -164,7 +168,8 @@ func TestImportParallAgentWithoutOwnerIsIdempotent(t *testing.T) {
 	if firstConnection.ID != secondConnection.ID || firstAddress.ID != secondAddress.ID {
 		t.Fatalf("import duplicated resources: %#v/%#v then %#v/%#v", firstConnection, firstAddress, secondConnection, secondAddress)
 	}
-	if len(h.ListConnections()) != 1 || stored.APIKey != "agent-key" || firstConnection.CredentialRef != "keychain:"+parall.AgentCredentialService("org_test", "usr_external") {
+	values, resolveErr := h.ResolveManagedCredential(firstConnection.CredentialRef, "parall")
+	if len(h.ListConnections()) != 1 || resolveErr != nil || values["apiKey"] != "agent-key" || !strings.HasPrefix(firstConnection.CredentialRef, "managed:") {
 		t.Fatalf("import state: connections=%#v credentials=%#v", h.ListConnections(), *stored)
 	}
 }
@@ -245,7 +250,7 @@ func TestImportParallAgentMigratesSingleLegacyIdentityInPlace(t *testing.T) {
 	}
 	connection := result["connection"].(hub.PlatformConnection)
 	address := result["address"].(hub.AgentAddress)
-	if connection.ID != legacy.ID || address.ID != legacyAddress.ID || connection.AccountRef != "org_test" || !strings.HasPrefix(connection.CredentialRef, "keychain:") {
+	if connection.ID != legacy.ID || address.ID != legacyAddress.ID || connection.AccountRef != "org_test" || !strings.HasPrefix(connection.CredentialRef, "managed:") {
 		t.Fatalf("legacy identity was not migrated in place: connection=%#v address=%#v", connection, address)
 	}
 	if len(h.ListConnections()) != 1 {

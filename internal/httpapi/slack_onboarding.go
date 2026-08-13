@@ -64,7 +64,7 @@ func (s *Server) discoverSlack(ctx context.Context, connectionID, requestedAppID
 			if connection.ID == connectionID && connection.Provider == "slack" {
 				teamID = connection.AccountRef
 				if appID == "" {
-					appID = slackAppIDFromCredentialRef(connection.CredentialRef)
+					appID = firstNonEmpty(connection.ScopeRef, slackAppIDFromCredentialRef(connection.CredentialRef))
 				}
 				break
 			}
@@ -73,7 +73,7 @@ func (s *Server) discoverSlack(ctx context.Context, connectionID, requestedAppID
 	if appID == "" {
 		for _, connection := range s.hub.ListConnections() {
 			if connection.Provider == "slack" {
-				appID = slackAppIDFromCredentialRef(connection.CredentialRef)
+				appID = firstNonEmpty(connection.ScopeRef, slackAppIDFromCredentialRef(connection.CredentialRef))
 				teamID = connection.AccountRef
 				break
 			}
@@ -83,7 +83,11 @@ func (s *Server) discoverSlack(ctx context.Context, connectionID, requestedAppID
 	if appID == "" {
 		return result
 	}
-	tokens, err := loadSlackTokens(appID, teamID)
+	_, values, err := s.loadOnboardingCredential("slack", onboardingCredentialKey("slack", appID, teamID))
+	tokens := loomslack.Tokens{Bot: values["botToken"], App: values["appToken"]}
+	if tokens.Bot == "" && tokens.App == "" && err == nil {
+		tokens, err = loadSlackTokens(appID, teamID)
+	}
 	if err != nil {
 		result.Error = "Read Slack credentials: " + err.Error()
 		return result
@@ -111,8 +115,10 @@ func (s *Server) saveSlackCredentials(ctx context.Context, p slackCredentialPara
 	if discovery.Identity.AppID == "" {
 		return slackDiscovery{}, &hub.HubError{Status: 400, Message: "Slack verification did not return an App ID"}
 	}
-	if err := saveSlackTokens(discovery.Identity.AppID, botToken, appToken); err != nil {
-		return slackDiscovery{}, &hub.HubError{Status: 500, Message: "Save Slack credentials: " + err.Error()}
+	if _, err := s.storeOnboardingCredential("slack", onboardingCredentialKey("slack", discovery.Identity.AppID, discovery.Identity.TeamID), map[string]string{
+		"botToken": botToken, "appToken": appToken,
+	}); err != nil {
+		return slackDiscovery{}, &hub.HubError{Status: 500, Message: "Save managed Slack credentials: " + err.Error()}
 	}
 	return slackDiscoveryResult(discovery, err, true), nil
 }
@@ -134,9 +140,21 @@ func (s *Server) setupSlack(ctx context.Context, p slackSetupParams, hubURL stri
 	}
 	appID := strings.TrimSpace(p.AppID)
 	teamID := strings.TrimSpace(p.TeamID)
-	tokens, err := loadSlackTokens(appID, teamID)
+	credentialRef, values, err := s.loadOnboardingCredential("slack", onboardingCredentialKey("slack", appID, teamID))
+	tokens := loomslack.Tokens{Bot: values["botToken"], App: values["appToken"]}
+	if tokens.Bot == "" && tokens.App == "" && err == nil {
+		tokens, err = loadSlackTokens(appID, teamID)
+	}
 	if err != nil || tokens.Bot == "" || tokens.App == "" {
 		return nil, &hub.HubError{Status: 409, Message: "Slack credentials are not configured"}
+	}
+	if credentialRef == "" {
+		credentialRef, err = s.storeOnboardingCredential("slack", onboardingCredentialKey("slack", appID, teamID), map[string]string{
+			"botToken": tokens.Bot, "appToken": tokens.App,
+		})
+		if err != nil {
+			return nil, &hub.HubError{Status: 500, Message: "Save managed Slack credentials: " + err.Error()}
+		}
 	}
 	discovered, discoverErr := discoverSlackClient(ctx, tokens.Bot, tokens.App)
 	var apiErr *loomslack.APIError
@@ -148,22 +166,24 @@ func (s *Server) setupSlack(ctx context.Context, p slackSetupParams, hubURL stri
 	}
 	appID, teamID = discovered.Identity.AppID, discovered.Identity.TeamID
 
-	credentialRef := "keychain:" + loomslack.CredentialService(appID)
+	if credentialRef == "" {
+		return nil, &hub.HubError{Status: 409, Message: "Managed Slack credentials are unavailable; save the tokens again"}
+	}
 	var connection hub.PlatformConnection
 	for _, candidate := range s.hub.ListConnections() {
-		if candidate.Provider == "slack" && (candidate.CredentialRef == credentialRef || candidate.AccountRef == teamID) {
+		if candidate.Provider == "slack" && (candidate.CredentialRef == credentialRef || candidate.AccountRef == teamID || candidate.ScopeRef == appID) {
 			connection = candidate
 			break
 		}
 	}
 	if connection.ID == "" {
 		connection, err = s.hub.CreateConnection(hub.ConnectionParams{
-			Provider: "slack", AccountRef: teamID, CredentialRef: credentialRef,
+			Provider: "slack", AccountRef: teamID, ScopeRef: appID, CredentialRef: credentialRef,
 			Capabilities: []string{"receive_events", "threads", "mentions", "attachments", "reactions", "proactive_send"},
 		})
 	} else {
 		enabled := true
-		connection, err = s.hub.UpdateConnection(connection.ID, hub.ConnectionParams{AccountRef: teamID, CredentialRef: credentialRef, Enabled: &enabled})
+		connection, err = s.hub.UpdateConnection(connection.ID, hub.ConnectionParams{AccountRef: teamID, ScopeRef: appID, CredentialRef: credentialRef, Enabled: &enabled})
 	}
 	if err != nil {
 		return nil, err

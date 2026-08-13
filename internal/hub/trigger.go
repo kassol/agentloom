@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/credentials"
 	githubapi "github.com/yan5xu/codex-loom/internal/github"
 )
 
@@ -651,7 +652,7 @@ func (h *Hub) observeTriggerNow(id string) {
 	observer := h.observeTrigger
 	h.mu.Unlock()
 	if observer == nil {
-		observer = observeProviderTrigger
+		observer = h.observeProviderTrigger
 	}
 	ctx, cancel := h.triggerObservationContext()
 	observation, err := observer(ctx, connectionCopy, trigger)
@@ -914,6 +915,28 @@ func observeProviderTrigger(ctx context.Context, connection PlatformConnection, 
 	token, err := githubapi.LoadCredential(connection.CredentialRef)
 	if err != nil {
 		return TriggerObservation{}, err
+	}
+	client := githubapi.NewClient(token)
+	if value := strings.TrimSpace(os.Getenv("CODEX_LOOM_GITHUB_API_URL")); value != "" {
+		client.APIURL = value
+	}
+	return observeGitHubTrigger(ctx, client, trigger)
+}
+
+func (h *Hub) observeProviderTrigger(ctx context.Context, connection PlatformConnection, trigger Trigger) (TriggerObservation, error) {
+	if !credentials.IsManagedRef(connection.CredentialRef) {
+		return observeProviderTrigger(ctx, connection, trigger)
+	}
+	if trigger.Provider != "github" {
+		return TriggerObservation{Permanent: true}, fmt.Errorf("unsupported Trigger provider: %s", trigger.Provider)
+	}
+	values, err := h.ResolveManagedCredential(connection.CredentialRef, "github")
+	if err != nil {
+		return TriggerObservation{}, err
+	}
+	token := strings.TrimSpace(values["token"])
+	if token == "" {
+		return TriggerObservation{}, fmt.Errorf("managed GitHub credential is incomplete")
 	}
 	client := githubapi.NewClient(token)
 	if value := strings.TrimSpace(os.Getenv("CODEX_LOOM_GITHUB_API_URL")); value != "" {

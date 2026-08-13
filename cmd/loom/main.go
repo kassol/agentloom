@@ -382,6 +382,9 @@ Compatibility shortcuts:
   loom integration connect github [--public-only]
   loom integration connect github (--token-file PATH|--credential-ref env:NAME) --resource-owner OWNER
   chub integration connect <provider> [--account REF] [--credential-ref env:NAME]
+  loom integration credential preflight [CONNECTION_ID] [--json]
+  loom integration credential migrate CONNECTION_ID [--dry-run] [--confirm CONNECTION_ID] [--json]
+  loom integration credential rollback RECEIPT_ID [--dry-run] [--confirm RECEIPT_ID] [--json]
   chub integration import parall --agent AGENT --org-id ORG --external-agent-id USER [--agent-key-file PATH] [--api-url URL] [--trust-domain NAME]
   chub integration bind <agent> <connection-id> --identity EXTERNAL_ID [--display-name NAME] [--trigger mention] [--reply-policy final_answer] [--dm-policy managed] [--trust-domain NAME] [--enabled true|false] [allow/block flags]
   chub integration update-address <address-id> [--identity ID] [--display-name NAME] [--trigger mention] [--reply-policy final_answer] [--dm-policy managed] [--trust-domain NAME] [--enabled true|false] [allow/block flags]

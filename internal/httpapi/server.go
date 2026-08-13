@@ -39,6 +39,7 @@ type Server struct {
 	activeConnectors   map[string]struct{}
 	githubMu           sync.Mutex
 	githubDevices      map[string]*githubDeviceFlow
+	credentialMu       sync.Mutex
 	build              buildinfo.Info
 	readOnly           bool
 	claudeGenerations  *claudegen.Manager

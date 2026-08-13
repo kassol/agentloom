@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/credentials"
 )
 
 type PlatformConnection struct {
@@ -679,6 +681,11 @@ func (h *Hub) CreateConnection(p ConnectionParams) (PlatformConnection, error) {
 	if credentialRef != "" && !validCredentialRef(credentialRef) {
 		return PlatformConnection{}, errf(400, "credentialRef must use env:, keychain:, or managed:")
 	}
+	if credentials.IsManagedRef(credentialRef) {
+		if _, err := h.resolveManagedCredential(credentialRef); err != nil {
+			return PlatformConnection{}, errf(400, "managed credential reference is unavailable or insecure: %s", err)
+		}
+	}
 	enabled := true
 	if p.Enabled != nil {
 		enabled = *p.Enabled
@@ -1155,6 +1162,11 @@ func (h *Hub) UpdateConnection(id string, p ConnectionParams) (PlatformConnectio
 		value := strings.TrimSpace(p.CredentialRef)
 		if !validCredentialRef(value) {
 			return PlatformConnection{}, errf(400, "credentialRef must use env:, keychain:, or managed:")
+		}
+		if credentials.IsManagedRef(value) {
+			if _, err := h.resolveManagedCredential(value); err != nil {
+				return PlatformConnection{}, errf(400, "managed credential reference is unavailable or insecure: %s", err)
+			}
 		}
 		next.CredentialRef = value
 	}

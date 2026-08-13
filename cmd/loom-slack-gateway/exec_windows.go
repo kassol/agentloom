@@ -2,16 +2,8 @@
 
 package main
 
-import (
-	"os"
-	"os/exec"
-)
+import "fmt"
 
-func runNode(node string, arguments, environment []string) error {
-	cmd := exec.Command(node, arguments[1:]...)
-	cmd.Env = environment
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+func execWithCredentialPipe(_ string, _ []string, _ []string, _ map[string]string) error {
+	return fmt.Errorf("managed Slack gateway is unsupported on Windows")
 }

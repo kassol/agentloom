@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/yan5xu/codex-loom/internal/feishu"
@@ -59,8 +60,12 @@ func TestSetupLarkCreatesDurableAddressAndGroupRoleIdempotently(t *testing.T) {
 	if firstConnection.ID != secondConnection.ID || firstAddress.ID != secondAddress.ID {
 		t.Fatalf("setup was not idempotent: first=%#v/%#v second=%#v/%#v", firstConnection, firstAddress, secondConnection, secondAddress)
 	}
-	if firstConnection.CredentialRef != "keychain:"+feishu.CredentialService("cli_test") {
+	if !strings.HasPrefix(firstConnection.CredentialRef, "managed:") {
 		t.Fatalf("credential ref = %q", firstConnection.CredentialRef)
+	}
+	values, err := h.ResolveManagedCredential(firstConnection.CredentialRef, "lark")
+	if err != nil || values["appSecret"] != "secret-value" {
+		t.Fatalf("managed credential = %#v err=%v", values, err)
 	}
 	memberships, err := h.ListConversationMemberships("lark-agent", firstAddress.ID)
 	if err != nil {

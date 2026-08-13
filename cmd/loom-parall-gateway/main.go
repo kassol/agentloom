@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/yan5xu/codex-loom/internal/credentials"
 	"github.com/yan5xu/codex-loom/internal/parall"
 )
 
@@ -24,11 +26,17 @@ func main() {
 	stateFile := flag.String("state-file", "", "gateway state file")
 	flag.Parse()
 
-	credentials, err := parall.LoadAgentCredentials(*orgID, *agentID)
-	if err != nil {
-		fatalf("read Parall Agent credentials from keychain: %v", err)
+	values, err := credentials.ResolveConnectionPayload(dataDir(), *connectionID, "parall")
+	if errors.Is(err, credentials.ErrConnectionNotManaged) {
+		legacy, loadErr := parall.LoadAgentCredentials(*orgID, *agentID)
+		if loadErr != nil {
+			fatalf("read Parall Agent credentials from Keychain: %v", loadErr)
+		}
+		values = map[string]string{"apiUrl": legacy.APIURL, "apiKey": legacy.APIKey}
+	} else if err != nil {
+		fatalf("resolve managed Parall credential: %v", err)
 	}
-	if credentials.APIURL == "" || credentials.APIKey == "" {
+	if values["apiUrl"] == "" || values["apiKey"] == "" {
 		fatalf("Parall Agent credentials are missing for %s", *agentID)
 	}
 	if *node == "" {
@@ -51,14 +59,23 @@ func main() {
 		arguments = append(arguments, "--state-file", *stateFile)
 	}
 	environment := append(os.Environ(),
-		"PRLL_API_URL="+credentials.APIURL,
-		"PRLL_API_KEY="+credentials.APIKey,
 		"PRLL_ORG_ID="+strings.TrimSpace(*orgID),
 		"PRLL_AGENT_ID="+strings.TrimSpace(*agentID),
 	)
-	if err := runNode(*node, arguments, environment); err != nil {
+	if err := execWithCredentialPipe(*node, arguments, environment, values); err != nil {
 		fatalf("start Parall gateway: %v", err)
 	}
+}
+
+func dataDir() string {
+	if value := strings.TrimSpace(os.Getenv("CODEX_LOOM_DATA")); value != "" {
+		return value
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".codex-loom")
 }
 
 func findScript() (string, error) {

@@ -227,19 +227,13 @@ func (s *Server) connectGitHubToken(ctx context.Context, rawToken, rawResourceOw
 	if err != nil {
 		return hub.PlatformConnection{}, "", err
 	}
-	service := githubapi.ScopedCredentialService(user.Login, resourceOwner)
-	previousToken, previousErr := githubapi.LoadCredential("keychain:" + service)
-	credentialRef, err := githubapi.SaveScopedToken(user.Login, resourceOwner, token)
+	credentialRef, err := s.hub.PutManagedCredential("github", map[string]string{"token": token})
 	if err != nil {
-		return hub.PlatformConnection{}, "", &hub.HubError{Status: 500, Message: "Save GitHub credential: " + err.Error()}
+		return hub.PlatformConnection{}, "", &hub.HubError{Status: 500, Message: "Save managed GitHub credential: " + err.Error()}
 	}
 	connection, err := s.upsertGitHubConnection(user.Login, resourceOwner, credentialRef)
 	if err != nil {
-		if previousErr == nil && previousToken != "" {
-			_, _ = githubapi.SaveScopedToken(user.Login, resourceOwner, previousToken)
-		} else {
-			_ = githubapi.DeleteScopedToken(user.Login, resourceOwner)
-		}
+		_ = s.hub.DeleteManagedCredential(credentialRef)
 		return hub.PlatformConnection{}, "", err
 	}
 	return connection, user.Login, nil
@@ -247,10 +241,17 @@ func (s *Server) connectGitHubToken(ctx context.Context, rawToken, rawResourceOw
 
 func (s *Server) connectGitHubCredential(ctx context.Context, rawRef, rawResourceOwner string) (hub.PlatformConnection, string, error) {
 	credentialRef := strings.TrimSpace(rawRef)
-	if !strings.HasPrefix(credentialRef, "env:") && !strings.HasPrefix(credentialRef, "keychain:") {
-		return hub.PlatformConnection{}, "", &hub.HubError{Status: 400, Message: "GitHub credentialRef must use env: or keychain:"}
+	if !strings.HasPrefix(credentialRef, "env:") && !strings.HasPrefix(credentialRef, "keychain:") && !strings.HasPrefix(credentialRef, "managed:") {
+		return hub.PlatformConnection{}, "", &hub.HubError{Status: 400, Message: "GitHub credentialRef must use env:, keychain:, or managed:"}
 	}
-	token, err := githubapi.LoadCredential(credentialRef)
+	token := ""
+	var err error
+	if strings.HasPrefix(credentialRef, "managed:") {
+		values, resolveErr := s.hub.ResolveManagedCredential(credentialRef, "github")
+		err, token = resolveErr, values["token"]
+	} else {
+		token, err = githubapi.LoadCredential(credentialRef)
+	}
 	if err != nil {
 		return hub.PlatformConnection{}, "", &hub.HubError{Status: 400, Message: "Load GitHub credential: " + err.Error()}
 	}

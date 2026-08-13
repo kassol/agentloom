@@ -25,7 +25,10 @@ func newL2aFixture(t *testing.T) r0bFixture {
 	}
 	h := New(st)
 	seedInboxAgent(t, h, "agent-l2a", "l2a-agent")
-	credentialRef := "managed:" + strings.Repeat("a", 64)
+	credentialRef, err := h.PutManagedCredential("lark", map[string]string{"appSecret": "fixture-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	connection, err := h.CreateConnection(ConnectionParams{
 		Provider: "lark", AccountRef: "cli_l2a_app", CredentialRef: credentialRef,
 		Capabilities: []string{"receive_events", "proactive_send"},
@@ -38,9 +41,6 @@ func newL2aFixture(t *testing.T) r0bFixture {
 		TriggerPolicy: "mention", ReplyPolicy: "final_answer", TrustDomain: "lark:cli_l2a_app",
 	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.SaveCredentialFloor(); err != nil {
 		t.Fatal(err)
 	}
 	return r0bFixture{dir: dir, st: st, h: h, connection: connection, address: address}
@@ -266,7 +266,10 @@ func TestL2aBindingDriftReopensFailClosedWithoutDiscardingTypedPlan(t *testing.T
 	if _, err := fixture.h.configureLarkGatewayLaunch(l2aLaunchSpec(t, &fixture, gatewayServiceManagerFake)); err != nil {
 		t.Fatal(err)
 	}
-	newRef := "managed:" + strings.Repeat("b", 64)
+	newRef, err := fixture.h.PutManagedCredential("lark", map[string]string{"appSecret": "replacement-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fixture.h.UpdateConnection(fixture.connection.ID, ConnectionParams{CredentialRef: newRef}); err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +384,7 @@ func TestL2aFeishuUnitsUseRealFlagsAndFreezeAttemptProofIdentity(t *testing.T) {
 			text := string(unit)
 			for _, want := range []string{
 				"--hub", descriptor.HubURL, "--connection", descriptor.ConnectionID, "--address", descriptor.AddressID,
-				"--app-id", descriptor.AccountRef, "CODEX_LOOM_DATA", "CODEX_LOOM_MANAGED_CREDENTIAL_REF", ref,
+				"--app-id", descriptor.AccountRef, "CODEX_LOOM_DATA",
 				"CODEX_LOOM_GATEWAY_ATTEMPT_ID", "gattempt_l2a", "CODEX_LOOM_GATEWAY_GENERATION", "ggen_l2a",
 				"CODEX_LOOM_GATEWAY_BUILD", descriptor.Build, "CODEX_LOOM_GATEWAY_EXECUTABLE_DIGEST", descriptor.ExecutableDigest,
 			} {
@@ -389,7 +392,7 @@ func TestL2aFeishuUnitsUseRealFlagsAndFreezeAttemptProofIdentity(t *testing.T) {
 					t.Fatalf("%s unit omitted %q: %s", test.manager, want, text)
 				}
 			}
-			for _, forbidden := range []string{"--connection-id", "--data-dir", "--generation", "--build", "--executable-digest"} {
+			for _, forbidden := range []string{"--connection-id", "--data-dir", "--generation", "--build", "--executable-digest", "CODEX_LOOM_MANAGED_CREDENTIAL_REF", ref} {
 				if strings.Contains(text, forbidden) {
 					t.Fatalf("%s unit used a flag unsupported by loom-feishu-gateway: %q", test.manager, forbidden)
 				}

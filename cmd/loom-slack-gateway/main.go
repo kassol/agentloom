@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/yan5xu/codex-loom/internal/credentials"
 	loomslack "github.com/yan5xu/codex-loom/internal/slack"
 )
 
@@ -25,11 +27,17 @@ func main() {
 	stateFile := flag.String("state-file", "", "gateway state file")
 	flag.Parse()
 
-	tokens, err := loomslack.LoadTokens(*appID, *teamID)
-	if err != nil {
-		fatalf("read Slack tokens from keychain: %v", err)
+	values, err := credentials.ResolveConnectionPayload(dataDir(), *connectionID, "slack")
+	if errors.Is(err, credentials.ErrConnectionNotManaged) {
+		tokens, loadErr := loomslack.LoadTokens(*appID, *teamID)
+		if loadErr != nil {
+			fatalf("read Slack tokens from Keychain: %v", loadErr)
+		}
+		values = map[string]string{"botToken": tokens.Bot, "appToken": tokens.App}
+	} else if err != nil {
+		fatalf("resolve managed Slack credential: %v", err)
 	}
-	if tokens.Bot == "" || tokens.App == "" {
+	if values["botToken"] == "" || values["appToken"] == "" {
 		fatalf("Slack credentials are missing for App %s", *appID)
 	}
 	if *node == "" {
@@ -51,10 +59,20 @@ func main() {
 	if *stateFile != "" {
 		arguments = append(arguments, "--state-file", *stateFile)
 	}
-	environment := append(os.Environ(), "SLACK_BOT_TOKEN="+tokens.Bot, "SLACK_APP_TOKEN="+tokens.App)
-	if err := runNode(*node, arguments, environment); err != nil {
+	if err := execWithCredentialPipe(*node, arguments, os.Environ(), values); err != nil {
 		fatalf("start Slack gateway: %v", err)
 	}
+}
+
+func dataDir() string {
+	if value := strings.TrimSpace(os.Getenv("CODEX_LOOM_DATA")); value != "" {
+		return value
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".codex-loom")
 }
 
 func findScript() (string, error) {

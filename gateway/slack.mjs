@@ -8,6 +8,7 @@ import { slackDeliveryReceipts, slackEventToIngress, slackOutboxRequest, slackRe
 
 const args = parseArgs(process.argv.slice(2));
 const socketEnabled = args.socket !== 'false';
+const credential = readCredentialFD();
 const config = {
   hub: trimSlash(
     args.service || args.hub || process.env.CODEX_LOOM_URL || process.env.CHUB_URL || 'http://127.0.0.1:4870',
@@ -22,13 +23,22 @@ const config = {
   ),
   connectorToken: process.env.CODEX_LOOM_CONNECTOR_TOKEN || process.env.CODEX_HUB_CONNECTOR_TOKEN || '',
   apiUrl: trimSlash(process.env.SLACK_API_URL || 'https://slack.com/api'),
-  appToken: socketEnabled ? required(process.env.SLACK_APP_TOKEN, 'SLACK_APP_TOKEN') : '',
-  botToken: required(process.env.SLACK_BOT_TOKEN, 'SLACK_BOT_TOKEN'),
+  appToken: socketEnabled ? required(credential.appToken, 'managed Slack App token') : '',
+  botToken: required(credential.botToken, 'managed Slack Bot token'),
   botUserId: args['bot-user-id'] || process.env.SLACK_BOT_USER_ID || '',
   teamId: args['team-id'] || process.env.SLACK_TEAM_ID || '',
   stateFile: args['state-file'] || path.join(defaultDataDir(), 'gateway', `slack-${args.connection}.json`),
   socketEnabled,
 };
+
+function readCredentialFD() {
+  try {
+    const payload = JSON.parse(fs.readFileSync(3, 'utf8'));
+    return payload && typeof payload === 'object' ? payload : {};
+  } catch {
+    throw new Error('Slack credential descriptor is missing or invalid');
+  }
+}
 
 const controller = new AbortController();
 process.on('SIGINT', () => controller.abort());
