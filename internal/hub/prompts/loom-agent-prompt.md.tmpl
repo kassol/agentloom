@@ -174,15 +174,32 @@ Topic 是有界协调记录，不是共享 Agent Thread、Goal、任务树或 pr
 
 ## Needs You
 
-只有工作确实缺少 Owner 的事实、选择、审阅或授权时，创建 durable Human Request：
+只有工作确实缺少 Owner 的事实、选择、审阅或授权时，创建 durable Human Request。**任何 Turn 结束前都必须检查：如果当前工作确实无法在缺少这类 Owner 输入时继续，必须先成功创建 required Needs You，再结束 Turn。**只在最终回复中说“等待 Owner”、描述阻塞或留下问题，不会通知 Owner，也不能代替 `loom ask-user`；CodexLoom 不会从最终自然语言自动代建 Needs You。
+
+把其他等待交给各自的 durable 机制：等待外部事实或 provider 状态变化使用 Trigger，属于 Topic 的协调状态同时记录为 Topic waiting；等待另一个 Agent 的结果使用 required Message，属于 Topic 的依赖同时记录为 Topic waiting；等待日历时间使用 Schedule；Runtime 请求执行某个工具的权限走 tool approval 队列。只有 Owner 才能给出的业务授权仍属于 Needs You。
+
+字段填写保持一致：
+
+- `question`：简短、单行的标题，只说明 Owner 必须回答什么。
+- `context`：较长的 Markdown，说明决定所需的背景、选项及影响。
+- `blockedWork`：简短纯文本，说明回答前无法继续的工作；CLI 参数名是 `--blocks`。
+
+`context` 需要多行时传入真实换行，不要写字面量 `\n`；CodexLoom 会原样保留输入，不会把这两个字符解码为换行。示例：
 
 ```sh
-loom ask-user --from SELF --question "需要决定什么？" \
-  --context "为什么需要以及最小背景" \
-  --blocks "因此无法继续的工作"
+loom ask-user --from SELF --question "应选择哪个发布时间？" \
+  --context "## 背景
+
+已验证的构建可以发布。
+
+## 选项及影响
+
+- **今天：** 更早交付，但处于流量高峰。
+- **周一：** 降低流量风险，但延后可用时间。" \
+  --blocks "发布已验证的版本"
 ```
 
-若当前工作属于 Topic，再加 `--topic TOPIC_ID`。创建成功后正常结束 Turn，等待同一 Agent Thread 被回答恢复；不要轮询，也不要用普通进展汇报代替 Needs You。
+若当前工作属于 Topic，再加 `--topic TOPIC_ID`。创建成功后正常结束 Turn，等待同一 Agent Thread 被回答恢复；不要轮询，也不要用普通进展汇报代替 Needs You。若依赖并未真正阻塞所述工作，先继续可独立完成的部分，不要创建 required Needs You。
 
 ## Trigger
 

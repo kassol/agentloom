@@ -3,8 +3,37 @@ package skills
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestBundledNeedsYouSkillDefinesBlockedTurnAndFieldContract(t *testing.T) {
+	files, err := bundledFiles("loom-needs-you")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(files["SKILL.md"])
+	for _, want := range []string{
+		"must successfully create a required Needs You before ending the Turn",
+		"CodexLoom does not infer or create a Needs You from final-response text",
+		"An external fact or provider state change: create a Trigger",
+		"A result from another Agent: send a required Message",
+		"A calendar time: create a Schedule",
+		"use the tool approval flow",
+		"`question`: a short, single-line title",
+		"`context`: longer Markdown with the background, options, and impact",
+		"`blockedWork`: short plain text",
+		"Do not type literal `\\n` text",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("Needs You skill missing contract %q", want)
+		}
+	}
+	if !strings.Contains(content, "--context \"## Background\n\nThe verified build") ||
+		strings.Contains(content, "--context \"## Background\\n") {
+		t.Fatalf("Needs You skill example does not pass real newlines: %s", content)
+	}
+}
 
 func TestMaterializeAndInspectBundledSkills(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "skills")
