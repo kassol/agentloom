@@ -59,6 +59,7 @@ func cmdScheduleAdd(a args) {
 		usage(`schedule add <name> --to <agent> --subject <text> (--at RFC3339|--cron "M H D M W") [--body <text>|--body-file <path>]`)
 	}
 	payload := map[string]any{
+		"from":     a.flags["from"],
 		"name":     name,
 		"to":       a.flags["to"],
 		"subject":  a.flags["subject"],

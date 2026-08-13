@@ -493,17 +493,110 @@ func TestCmdCreateClaudeDoesNotInventOpenAIProvider(t *testing.T) {
 		if body["runtimeKind"] != "claude" {
 			t.Fatalf("body = %#v", body)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"agent": map[string]any{"id": "agent-claude", "name": "claude", "cwd": "/tmp/project", "threadId": "thread-loom", "runtimeBinding": map[string]any{"kind": "claude"}}})
+		configuration, _ := body["runtimeConfiguration"].(map[string]any)
+		authentication, _ := configuration["authentication"].(map[string]any)
+		if configuration["configured"] != true || strings.Join(stringValues(configuration["settingSources"]), ",") != "user,project" || authentication["category"] != "console" || authentication["source"] != "api_key" {
+			t.Fatalf("runtimeConfiguration = %#v", configuration)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"agent": map[string]any{"id": "agent-claude", "name": "claude", "cwd": "/tmp/project", "threadId": "thread-loom", "runtimeBinding": map[string]any{"kind": "claude"}, "runtimeConfiguration": configuration}})
 	}))
 	defer server.Close()
 	previousBase, previousColor := base, useColor
 	base, useColor = server.URL, false
 	defer func() { base, useColor = previousBase, previousColor }()
 	output := captureStdout(t, func() {
-		cmdCreate(args{positional: []string{"claude"}, flags: map[string]string{"cwd": "/tmp/project", "runtime": "claude"}, flagValues: map[string][]string{}})
+		cmdCreate(args{positional: []string{"claude"}, flags: map[string]string{"cwd": "/tmp/project", "runtime": "claude", "auth-category": "console", "auth-source": "api_key"}, flagValues: map[string][]string{"setting-source": {"user", "project"}}})
 	})
-	if strings.Contains(output, "openai") || !strings.Contains(output, "provider: —") || !strings.Contains(output, "model:    —") {
+	if strings.Contains(output, "openai") || !strings.Contains(output, "provider: —") || !strings.Contains(output, "model:    —") || !strings.Contains(output, "settings: user, project") || !strings.Contains(output, "auth:     console / api_key") {
 		t.Fatalf("output = %q", output)
+	}
+}
+
+func TestCreateRuntimeConfigurationRequiresExplicitClaudeChoices(t *testing.T) {
+	if _, err := createRuntimeConfiguration("claude", args{flags: map[string]string{}, flagValues: map[string][]string{}}); err == nil || !strings.Contains(err.Error(), "requires --setting-source") {
+		t.Fatalf("missing Claude configuration error = %v", err)
+	}
+	if _, err := createRuntimeConfiguration("codex", args{flags: map[string]string{"auth-category": "console"}, flagValues: map[string][]string{}}); err == nil || !strings.Contains(err.Error(), "apply only") {
+		t.Fatalf("cross-Runtime configuration error = %v", err)
+	}
+	if _, err := createRuntimeConfiguration("claude", args{flags: map[string]string{"auth-category": "console", "auth-source": "helper"}, flagValues: map[string][]string{"setting-source": {"project"}}}); err == nil || !strings.Contains(err.Error(), "unsupported Claude authentication pair") {
+		t.Fatalf("unsupported helper authentication error = %v", err)
+	}
+}
+
+func TestCmdAdoptSendsExplicitClaudeRuntimeConfiguration(t *testing.T) {
+	stableCwd := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/runtimes/claude/conversations/adopt" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		configuration, _ := body["runtimeConfiguration"].(map[string]any)
+		if body["candidateId"] != "conversation-1" || body["expectedRevision"] != "candidate-1" || body["cwd"] != stableCwd || strings.Join(stringValues(configuration["settingSources"]), ",") != "project,local" {
+			t.Fatalf("body = %#v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"agent": map[string]any{"id": "agent-adopted", "name": "adopted", "cwd": stableCwd, "sourceCwd": "/tmp/original", "threadId": "thread-adopted", "runtimeConfiguration": configuration}})
+	}))
+	defer server.Close()
+	previousBase, previousColor := base, useColor
+	base, useColor = server.URL, false
+	defer func() { base, useColor = previousBase, previousColor }()
+	output := captureStdout(t, func() {
+		cmdAdopt(args{positional: []string{"adopted"}, flags: map[string]string{"runtime": "claude", "candidate": "conversation-1", "revision": "candidate-1", "cwd": stableCwd, "auth-category": "gateway", "auth-source": "gateway"}, flagValues: map[string][]string{"setting-source": {"project", "local"}}})
+	})
+	if !strings.Contains(output, "adopted adopted") || !strings.Contains(output, stableCwd) || !strings.Contains(output, "/tmp/original") || !strings.Contains(output, "settings: project, local") || !strings.Contains(output, "auth:     gateway / gateway") {
+		t.Fatalf("output = %q", output)
+	}
+}
+
+func TestCmdAdoptAcceptsCodexThreadIDWithoutCatalogTokens(t *testing.T) {
+	stableCwd := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/runtimes/codex/conversations/adopt" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["threadId"] != "019f-thread" || body["cwd"] != stableCwd || body["candidateId"] != nil || body["expectedRevision"] != nil {
+			t.Fatalf("body = %#v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"agent": map[string]any{"id": "agent-adopted", "name": "promi-owner", "cwd": stableCwd, "sourceCwd": "/tmp/original", "threadId": "thread-adopted"}})
+	}))
+	defer server.Close()
+	previousBase, previousColor := base, useColor
+	base, useColor = server.URL, false
+	defer func() { base, useColor = previousBase, previousColor }()
+
+	output := captureStdout(t, func() {
+		cmdAdopt(args{positional: []string{"promi-owner"}, flags: map[string]string{"thread-id": "019f-thread", "cwd": stableCwd}})
+	})
+	if !strings.Contains(output, "adopted promi-owner") || !strings.Contains(output, stableCwd) {
+		t.Fatalf("output = %q", output)
+	}
+}
+
+func TestCmdAgentSkillsPrintsPathlessClaudeResourcesAndConfigurationEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"resources": map[string]any{
+			"agentId": "agent-claude", "agentName": "claude", "runtimeKind": "claude", "revision": "resources-claude", "semantics": "Claude native resources",
+			"resources":     []any{map[string]any{"id": "command:review", "kind": "command", "name": "review", "enabled": true, "status": "ready", "source": "project settings"}},
+			"configuration": map[string]any{"settingSources": []any{"user", "project"}, "authentication": map[string]any{"category": "console", "source": "api_key", "validation": "accepted", "evidence": []any{map[string]any{"kind": "native_ack", "summary": "API key accepted"}}}},
+			"policy":        map[string]any{"available": false, "mutable": false, "effective": false, "reason": "native policy", "alternative": "use Claude settings"},
+		}})
+	}))
+	defer server.Close()
+	previousBase, previousColor := base, useColor
+	base, useColor = server.URL, false
+	defer func() { base, useColor = previousBase, previousColor }()
+	output := captureStdout(t, func() {
+		cmdAgentSkills(args{positional: []string{"agent", "claude"}, flags: map[string]string{}, flagValues: map[string][]string{}})
+	})
+	if !strings.Contains(output, "ready") || !strings.Contains(output, "command") || !strings.Contains(output, "console / api_key · accepted") || !strings.Contains(output, "native_ack: API key accepted") {
+		t.Fatalf("output = %q", output)
+	}
+	if strings.Contains(output, "/Users/") || strings.Contains(output, ".claude") {
+		t.Fatalf("Claude resource output leaked a native path: %q", output)
 	}
 }
 

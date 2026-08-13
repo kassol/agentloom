@@ -135,14 +135,44 @@ func cmdAgentSkills(a args) {
 	fmt.Printf("  %s\n", dim(str(resources, "semantics")))
 	for _, value := range anySlice(resources["resources"]) {
 		resource, _ := value.(map[string]any)
-		state := green("enabled")
-		if !boolean(resource, "enabled") {
-			state = yellow("disabled")
+		status := str(resource, "status")
+		if status == "" {
+			status = "enabled"
+			if !boolean(resource, "enabled") {
+				status = "disabled"
+			}
 		}
-		fmt.Printf("  %-10s  %-10s  %-24s  %s\n", state, str(resource, "kind"), str(resource, "name"), dim(str(resource, "path")))
+		state := green(status)
+		if status != "enabled" && status != "connected" && status != "ready" {
+			state = yellow(status)
+		}
+		detail := str(resource, "source")
+		if str(resources, "runtimeKind") == "claude" {
+			detail = ""
+		} else if str(resource, "path") != "" {
+			detail = str(resource, "path")
+		}
+		fmt.Printf("  %-12s  %-10s  %-24s  %s\n", state, str(resource, "kind"), str(resource, "name"), dim(detail))
+	}
+	configuration, _ := resources["configuration"].(map[string]any)
+	if configuration != nil {
+		authentication, _ := configuration["authentication"].(map[string]any)
+		fmt.Printf("  %s %s\n", bold("Settings:"), strings.Join(stringValues(configuration["settingSources"]), ", "))
+		fmt.Printf("  %s %s / %s", bold("Authentication:"), str(authentication, "category"), str(authentication, "source"))
+		if validation := str(authentication, "validation"); validation != "" {
+			fmt.Printf(" · %s", validation)
+		}
+		fmt.Println()
+		for _, evidenceValue := range anySlice(authentication["evidence"]) {
+			evidence, _ := evidenceValue.(map[string]any)
+			fmt.Printf("    %s: %s\n", str(evidence, "kind"), str(evidence, "summary"))
+		}
 	}
 	policy, _ := resources["policy"].(map[string]any)
 	for _, value := range anySlice(policy["disabledPaths"]) {
+		if str(resources, "runtimeKind") == "claude" {
+			break
+		}
 		disabledPath, _ := value.(string)
 		found := false
 		for _, resourceValue := range anySlice(resources["resources"]) {
@@ -293,13 +323,18 @@ func printRemoteStatus(resp map[string]any) {
 
 func cmdCreate(a args) {
 	if len(a.positional) < 1 || a.flags["cwd"] == "" {
-		usage("create <name> --cwd <path>")
+		usage("create <name> --cwd <path> [--runtime codex|pi|claude] [--setting-source user|project|local ...] [--auth-category console|cloud|gateway --auth-source SOURCE]")
 	}
 	cwd, err := filepath.Abs(a.flags["cwd"])
 	if err != nil {
 		fail(err)
 	}
-	resp, err := api("POST", "/api/agents", map[string]any{
+	runtimeKind := defaultValue(a.flags["runtime"], "codex")
+	runtimeConfiguration, err := createRuntimeConfiguration(runtimeKind, a)
+	if err != nil {
+		fail(err)
+	}
+	payload := map[string]any{
 		"name":           a.positional[0],
 		"cwd":            cwd,
 		"approvalPolicy": a.flags["approval"],
@@ -307,8 +342,12 @@ func cmdCreate(a args) {
 		"providerId":     a.flags["provider"],
 		"model":          a.flags["model"],
 		"effort":         a.flags["effort"],
-		"runtimeKind":    defaultValue(a.flags["runtime"], "codex"),
-	})
+		"runtimeKind":    runtimeKind,
+	}
+	if runtimeConfiguration != nil {
+		payload["runtimeConfiguration"] = runtimeConfiguration
+	}
+	resp, err := api("POST", "/api/agents", payload)
 	if err != nil {
 		fail(err)
 	}
@@ -323,6 +362,95 @@ func cmdCreate(a args) {
 	}
 	fmt.Printf("%s %s (%s)\n  cwd:     %s\n  thread:  %s\n  provider: %s\n  model:    %s\n",
 		green("created"), bold(str(s, "name")), str(s, "id"), str(s, "cwd"), str(s, "threadId"), providerID, model)
+	printRuntimeConfigurationEvidence(s)
+}
+
+func cmdAdopt(a args) {
+	threadID := strings.TrimSpace(a.flags["thread-id"])
+	runtimeKind := strings.TrimSpace(a.flags["runtime"])
+	if threadID != "" && runtimeKind == "" {
+		runtimeKind = "codex"
+	}
+	if len(a.positional) != 1 || runtimeKind == "" || a.flags["cwd"] == "" || threadID == "" && (a.flags["candidate"] == "" || a.flags["revision"] == "") {
+		usage("agent adopt <name> --thread-id CODEX_THREAD_ID --cwd <stable-workspace> | agent adopt <name> --runtime codex|pi|claude --candidate ID --revision REVISION --cwd <stable-workspace>")
+	}
+	if threadID != "" && (runtimeKind != "codex" || a.flags["candidate"] != "" || a.flags["revision"] != "") {
+		usage("agent adopt <name> --thread-id CODEX_THREAD_ID --cwd <stable-workspace>")
+	}
+	cwd, err := filepath.Abs(a.flags["cwd"])
+	if err != nil {
+		fail(err)
+	}
+	runtimeConfiguration, err := createRuntimeConfiguration(runtimeKind, a)
+	if err != nil {
+		fail(err)
+	}
+	payload := map[string]any{
+		"name": a.positional[0], "candidateId": a.flags["candidate"], "expectedRevision": a.flags["revision"], "cwd": cwd,
+		"approvalPolicy": a.flags["approval"], "sandbox": a.flags["sandbox"], "providerId": a.flags["provider"], "model": a.flags["model"], "effort": a.flags["effort"],
+	}
+	if threadID != "" {
+		payload["threadId"] = threadID
+		delete(payload, "candidateId")
+		delete(payload, "expectedRevision")
+	}
+	if runtimeConfiguration != nil {
+		payload["runtimeConfiguration"] = runtimeConfiguration
+	}
+	resp, err := api("POST", "/api/runtimes/"+url.PathEscape(runtimeKind)+"/conversations/adopt", payload)
+	if err != nil {
+		fail(err)
+	}
+	agent, _ := resp["agent"].(map[string]any)
+	fmt.Printf("%s %s (%s)\n  cwd:       %s\n  source:    %s\n  thread:    %s\n", green("adopted"), bold(str(agent, "name")), str(agent, "id"), str(agent, "cwd"), str(agent, "sourceCwd"), str(agent, "threadId"))
+	printRuntimeConfigurationEvidence(agent)
+}
+
+func createRuntimeConfiguration(runtimeKind string, a args) (map[string]any, error) {
+	sources := a.flagValues["setting-source"]
+	category, source := strings.TrimSpace(a.flags["auth-category"]), strings.TrimSpace(a.flags["auth-source"])
+	if runtimeKind != "claude" {
+		if len(sources) > 0 || category != "" || source != "" {
+			return nil, fmt.Errorf("--setting-source, --auth-category, and --auth-source apply only to the Claude Runtime")
+		}
+		return nil, nil
+	}
+	if len(sources) == 0 || category == "" || source == "" {
+		return nil, fmt.Errorf("Claude Runtime requires --setting-source plus --auth-category and --auth-source")
+	}
+	seen := map[string]bool{}
+	for _, settingSource := range sources {
+		if settingSource != "user" && settingSource != "project" && settingSource != "local" {
+			return nil, fmt.Errorf("--setting-source must be user, project, or local")
+		}
+		if seen[settingSource] {
+			return nil, fmt.Errorf("--setting-source %s was provided more than once", settingSource)
+		}
+		seen[settingSource] = true
+	}
+	validAuthentication := map[string]map[string]bool{
+		"console": {"api_key": true},
+		"cloud":   {"bedrock": true, "vertex": true, "foundry": true, "anthropic_aws": true, "anthropic_google_cloud": true, "mantle": true},
+		"gateway": {"gateway": true},
+	}
+	if !validAuthentication[category][source] {
+		return nil, fmt.Errorf("unsupported Claude authentication pair %s/%s", category, source)
+	}
+	return map[string]any{
+		"configured":     true,
+		"settingSources": sources,
+		"authentication": map[string]any{"category": category, "source": source},
+	}, nil
+}
+
+func printRuntimeConfigurationEvidence(agent map[string]any) {
+	configuration, _ := agent["runtimeConfiguration"].(map[string]any)
+	if !boolean(configuration, "configured") {
+		return
+	}
+	authentication, _ := configuration["authentication"].(map[string]any)
+	fmt.Printf("  settings: %s\n", strings.Join(stringValues(configuration["settingSources"]), ", "))
+	fmt.Printf("  auth:     %s / %s\n", str(authentication, "category"), str(authentication, "source"))
 }
 
 func cmdList() {

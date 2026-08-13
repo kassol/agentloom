@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -114,6 +116,19 @@ func cmdDoctor(a args) {
 		fmt.Printf("status: %s\n", yellow(mismatch))
 	} else {
 		fmt.Printf("status: %s\n", green("CLI and running service match"))
+	}
+	if runtime.GOOS == "darwin" {
+		if home, err := os.UserHomeDir(); err != nil {
+			fmt.Printf("service proxy bypass: %s\n", yellow("cannot resolve LaunchAgent path: "+err.Error()))
+		} else {
+			unitPath := filepath.Join(home, "Library", "LaunchAgents", codexLoomLaunchAgentLabel+".plist")
+			diagnostic := launchAgentNoProxyDiagnostic(unitPath, resolveServiceNoProxy(""))
+			if diagnostic.State == "ok" {
+				fmt.Printf("service proxy bypass: %s\n", green(diagnostic.Message))
+			} else {
+				fmt.Printf("service proxy bypass: %s\n", yellow(diagnostic.Message))
+			}
+		}
 	}
 }
 

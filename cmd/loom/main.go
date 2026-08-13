@@ -213,7 +213,7 @@ func main() {
 		argv = argv[1:]
 		if cmd == "agent" {
 			switch subcommand {
-			case "create", "list", "ls", "get", "rename":
+			case "create", "adopt", "list", "ls", "get", "rename":
 				cmd = subcommand
 			case "provider":
 				cmd = "agent-provider"
@@ -222,7 +222,7 @@ func main() {
 			case "kill":
 				cmd = "kill"
 			default:
-				usage("agent create|list|get|rename|provider|archive ...")
+				usage("agent create|adopt|list|get|rename|provider|archive ...")
 			}
 		} else if cmd == "thread" {
 			switch subcommand {
@@ -245,6 +245,8 @@ func main() {
 	switch cmd {
 	case "create":
 		cmdCreate(a)
+	case "adopt":
+		cmdAdopt(a)
 	case "list", "ls":
 		cmdList()
 	case "get":
@@ -322,6 +324,8 @@ func main() {
 		cmdVersion(a)
 	case "doctor":
 		cmdDoctor(a)
+	case "service":
+		cmdService(a)
 	case "runtime":
 		cmdRuntime(a)
 	case "dev":
@@ -339,12 +343,14 @@ func main() {
 func printHelp() {
 	help := fmt.Sprintf(`chub — CodexLoom CLI (service: %s)
 
-  chub agent create|list|get|rename|provider|archive ...
+  chub agent create|adopt|list|get|rename|provider|archive ...
   chub thread send|watch|history|interrupt|compact ...
   chub turn get <turn-id> [--json]
 
 Compatibility shortcuts:
-  chub create <name> --cwd <path> [--runtime codex|pi|claude] [--approval never|on-request] [--sandbox MODE] [--provider PROVIDER] [--model MODEL] [--effort minimal|low|medium|high|xhigh|max|ultra]
+  chub create <name> --cwd <path> [--runtime codex|pi|claude] [--setting-source user|project|local ...] [--auth-category console|cloud|gateway --auth-source SOURCE] [--approval never|on-request] [--sandbox MODE] [--provider PROVIDER] [--model MODEL] [--effort minimal|low|medium|high|xhigh|max|ultra]
+  chub agent adopt <name> --thread-id CODEX_THREAD_ID --cwd <stable-workspace>
+  chub agent adopt <name> --runtime codex|pi|claude --candidate ID --revision REVISION --cwd <stable-workspace>
   chub list
   chub get <name|id>
   chub rename <name|id> <new-name>
@@ -452,6 +458,7 @@ Compatibility shortcuts:
   chub backups [prune]
   chub version [--running]
   chub doctor
+  loom service install [--no-proxy HOSTS] [--path PATH] [--cwd DIR]
   loom runtime claude status|install|verify|activate|rollback [--accept-terms]
   chub dev canary start [--agent NAME ...] [--port auto|N] [--from DATA_DIR]
   chub dev canary status|stop
