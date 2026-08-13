@@ -600,7 +600,10 @@ export default function App() {
   const [restarting, setRestarting] = useState(false);
 	const runtimeCatalogs = runtimeCatalogQuery.data?.runtimes || [];
 	const selectedRuntimeCatalog = runtimeCatalogs.find((runtime) => runtime.runtimeKind === newRuntimeKind);
-	const selectedRuntimeConfigurationSpec = runtimeConfigurationSpec(newRuntimeKind);
+	const selectedRuntimeConfigurationSpec = runtimeConfigurationSpec(selectedRuntimeCatalog);
+	useEffect(() => {
+	  setNewRuntimeConfiguration(defaultRuntimeConfiguration(selectedRuntimeConfigurationSpec ?? undefined));
+	}, [newRuntimeKind, selectedRuntimeCatalog?.revision]);
 	const adoptionAvailable = selectedRuntimeCatalog?.capabilities.some((capability) => capability.id === "conversation_adoption" && capability.available) || false;
 	const conversationCandidatesQuery = useQuery<{ candidates: RuntimeConversationCandidate[] }>({
 		queryKey: ["runtime-conversations", newRuntimeKind],
@@ -815,12 +818,16 @@ export default function App() {
 	  setNewAgentError("Inspect a compatible conversation first.");
 	  return;
 	}
+	if (!selectedRuntimeCatalog) {
+	  setNewAgentError("Runtime capabilities are still loading.");
+	  return;
+	}
 	if (newAgentMode === "create" && newRuntimeKind === "codex" && !creatableProviders.some((provider) => provider.id === newProviderId)) {
 	  setNewAgentError("Configure and verify a model Provider first.");
       return;
     }
 	if (selectedRuntimeConfigurationSpec && (!newRuntimeConfiguration?.settingSources.length || !newRuntimeConfiguration.authentication.category || !newRuntimeConfiguration.authentication.source)) {
-	  setNewAgentError("Select Claude settings and authentication.");
+	  setNewAgentError("Select Runtime settings and authentication.");
 	  return;
 	}
 	setNewAgentError("");
@@ -1543,12 +1550,12 @@ export default function App() {
 			</label> : null}
 			<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
 				Runtime
-				<select value={newRuntimeKind} onChange={(event) => { const kind = event.target.value as CreateRuntimeKind; setNewRuntimeKind(kind); setNewRuntimeConfiguration(defaultRuntimeConfiguration(kind)); setNewCandidateId(""); }} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px]">
+				<select value={newRuntimeKind} onChange={(event) => { const kind = event.target.value as CreateRuntimeKind; const catalog = runtimeCatalogs.find((runtime) => runtime.runtimeKind === kind); setNewRuntimeKind(kind); setNewRuntimeConfiguration(defaultRuntimeConfiguration(catalog?.configuration)); setNewCandidateId(""); }} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px]">
 					{createRuntimeOptions(runtimeCatalogs).map((runtime) => <option key={runtime.runtimeKind} value={runtime.runtimeKind}>{runtimeLabel(runtime.runtimeKind)}</option>)}
 				</select>
 			</label>
 			{selectedRuntimeConfigurationSpec && newRuntimeConfiguration ? <div className="space-y-3 border-y border-border py-3">
-				<div><div className="text-[11px] font-semibold text-foreground">Claude settings</div><p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">Choose every native settings layer this Agent may load.</p></div>
+				<div><div className="text-[11px] font-semibold text-foreground">Runtime settings</div><p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">Choose every native settings layer this Agent may load.</p></div>
 				<div className="grid gap-2 sm:grid-cols-3">
 					{selectedRuntimeConfigurationSpec.settingSources.map((source) => <label key={source.id} className="flex min-w-0 items-start gap-2 text-[10.5px]">
 						<input type="checkbox" checked={newRuntimeConfiguration.settingSources.includes(source.id)} onChange={(event) => setNewRuntimeConfiguration((current) => current && ({ ...current, settingSources: event.target.checked ? [...current.settingSources, source.id] : current.settingSources.filter((value) => value !== source.id) }))} className="mt-0.5 size-3.5 accent-primary" />
@@ -1626,7 +1633,7 @@ export default function App() {
                 </select>
               </label>;
             })()}
-			</> : <div className="rounded-md bg-muted/40 px-3 py-2 text-[11px] leading-4 text-muted-foreground">{runtimeConfigurationNote(newRuntimeKind)}</div>}
+			</> : <div className="rounded-md bg-muted/40 px-3 py-2 text-[11px] leading-4 text-muted-foreground">{runtimeConfigurationNote(selectedRuntimeCatalog?.configuration)}</div>}
             <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
               Domain <span className="font-normal text-muted-foreground/70">optional</span>
               <textarea value={newDomain} onChange={(event) => setNewDomain(event.target.value)} placeholder="The enduring subject this Agent will maintain" rows={3} className="w-full resize-y rounded-sm border border-input bg-background px-3 py-2 text-[12px] leading-5 outline-none focus:border-ring focus:ring-2 focus:ring-ring/15" />
@@ -1634,7 +1641,7 @@ export default function App() {
 			{newAgentError && !agentNameError(newName) ? <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">{newAgentError}</div> : null}
           </div>
           <DialogFooter showCloseButton>
-            <Button onClick={create} disabled={creatingAgent || Boolean(selectedRuntimeConfigurationSpec && !newRuntimeConfiguration?.settingSources.length) || (newAgentMode === "create" && newRuntimeKind === "codex" && creatableProviders.length === 0) || (newAgentMode === "adopt" && !inspectedCandidate?.compatible)}>{creatingAgent ? <span className="spinner size-3" /> : <Plus />}{creatingAgent ? (newAgentMode === "adopt" ? "Adopting" : "Creating") : (newAgentMode === "adopt" ? "Adopt conversation" : "Create agent")}</Button>
+            <Button onClick={create} disabled={creatingAgent || !selectedRuntimeCatalog || Boolean(selectedRuntimeConfigurationSpec && !newRuntimeConfiguration?.settingSources.length) || (newAgentMode === "create" && newRuntimeKind === "codex" && creatableProviders.length === 0) || (newAgentMode === "adopt" && !inspectedCandidate?.compatible)}>{creatingAgent ? <span className="spinner size-3" /> : <Plus />}{creatingAgent ? (newAgentMode === "adopt" ? "Adopting" : "Creating") : (newAgentMode === "adopt" ? "Adopt conversation" : "Create agent")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

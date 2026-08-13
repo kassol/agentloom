@@ -13,6 +13,19 @@ function renderApp() {
 	return render(<QueryClientProvider client={client}><App /></QueryClientProvider>);
 }
 
+const claudeConfiguration = {
+	settingSources: [
+		{ id: "user", label: "User", description: "User settings" },
+		{ id: "project", label: "Project", description: "Project settings" },
+		{ id: "local", label: "Local", description: "Local settings" },
+	],
+	authentication: [
+		{ category: "console", label: "Claude Console", sources: [{ id: "api_key", label: "API key" }] },
+		{ category: "gateway", label: "Gateway", sources: [{ id: "gateway", label: "Managed gateway" }] },
+	],
+	default: { configured: true, settingSources: ["user", "project", "local"], authentication: { category: "console", source: "api_key" } },
+};
+
 describe("Agent creation dialog", () => {
 	beforeEach(() => {
 		const storage = () => {
@@ -41,7 +54,7 @@ describe("Agent creation dialog", () => {
 			if (url.startsWith("/api/agents")) return jsonResponse({ agents: [] });
 			if (url === "/api/remote") return jsonResponse({ remote: null });
 			if (url === "/api/model-providers") return jsonResponse({ providers: [{ id: "openai", name: "OpenAI", configured: true, credentialConfigured: true, models: [], modelDetails: [] }] });
-			if (url === "/api/runtimes") return jsonResponse({ runtimes: [] });
+			if (url === "/api/runtimes") return jsonResponse({ runtimes: [{ runtimeKind: "codex", revision: "codex-1", capabilities: [] }] });
 			if (url.startsWith("/api/inbox")) return jsonResponse({ entries: [] });
 			if (url.startsWith("/api/human-requests")) return jsonResponse({ requests: [] });
 			if (url.startsWith("/api/topics")) return jsonResponse({ topics: [] });
@@ -80,6 +93,61 @@ describe("Agent creation dialog", () => {
 
 		expect(within(dialog).getByRole("alert")).toHaveTextContent("letters or numbers from any language");
 		expect(vi.mocked(fetch).mock.calls.some(([input, init]) => input === "/api/agents" && init?.method === "POST")).toBe(false);
+	});
+
+	it("initializes explicit Runtime configuration when a delayed catalog arrives", async () => {
+		let resolveRuntimes!: (response: Response) => void;
+		const runtimes = new Promise<Response>((resolve) => { resolveRuntimes = resolve; });
+		vi.mocked(fetch).mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+			if (url === "/api/runtimes") return runtimes;
+			if (init?.method === "POST" && url === "/api/agents") {
+				const request = JSON.parse(String(init.body));
+				return jsonResponse({ agent: {
+					id: "agent-claude", name: request.name, cwd: request.cwd, threadId: "thread-claude",
+					runtimeBinding: { kind: "claude" }, capabilitySnapshot: { revision: "", capabilities: [] },
+					runtimeConfiguration: request.runtimeConfiguration,
+					sandbox: "danger-full-access", approvalPolicy: "never", status: "idle", currentTask: "", currentTurnId: "", lastError: "",
+					createdAt: "2026-08-13T00:00:00Z", updatedAt: "2026-08-13T00:00:00Z", processAlive: false, pendingApprovals: [], lastSeq: 0,
+				} });
+			}
+			if (url.startsWith("/api/agents")) return jsonResponse({ agents: [] });
+			if (url === "/api/remote") return jsonResponse({ remote: null });
+			if (url === "/api/model-providers") return jsonResponse({ providers: [{ id: "openai", name: "OpenAI", configured: true, credentialConfigured: true, models: [], modelDetails: [] }] });
+			if (url.startsWith("/api/inbox")) return jsonResponse({ entries: [] });
+			if (url.startsWith("/api/human-requests")) return jsonResponse({ requests: [] });
+			if (url.startsWith("/api/topics")) return jsonResponse({ topics: [] });
+			if (url === "/api/admin/backups") return jsonResponse({ backups: [] });
+			return jsonResponse({});
+		});
+
+		const view = renderApp();
+		fireEvent.click(await view.findByRole("button", { name: "New agent" }));
+		const dialog = await view.findByRole("dialog");
+		fireEvent.change(within(dialog).getByLabelText("Runtime"), { target: { value: "claude" } });
+		expect(within(dialog).getByRole("button", { name: "Create agent" })).toBeDisabled();
+
+		resolveRuntimes(jsonResponse({ runtimes: [
+			{ runtimeKind: "codex", revision: "codex-1", capabilities: [] },
+			{ runtimeKind: "claude", revision: "claude-configuration-1", capabilities: [], configuration: claudeConfiguration },
+		] }));
+
+		expect(await within(dialog).findByText("Runtime settings")).toBeInTheDocument();
+		expect(within(dialog).getByRole("checkbox", { name: /User/ })).toBeChecked();
+		expect(within(dialog).getByRole("checkbox", { name: /Project/ })).toBeChecked();
+		expect(within(dialog).getByRole("checkbox", { name: /Local/ })).toBeChecked();
+		fireEvent.change(within(dialog).getByLabelText("Agent name"), { target: { value: "claude-owner" } });
+		fireEvent.change(within(dialog).getByLabelText("Working directory"), { target: { value: "/workspace/claude" } });
+		fireEvent.click(within(dialog).getByRole("button", { name: "Create agent" }));
+
+		await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input, init]) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+			if (url !== "/api/agents" || init?.method !== "POST") return false;
+			const body = JSON.parse(String(init.body));
+			return body.runtimeKind === "claude" &&
+				body.runtimeConfiguration?.settingSources?.join(",") === "user,project,local" &&
+				body.runtimeConfiguration?.authentication?.source === "api_key";
+		})).toBe(true));
 	});
 
 	it("adopts a discovered Codex Thread into an explicit stable workspace", async () => {

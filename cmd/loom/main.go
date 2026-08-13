@@ -215,6 +215,8 @@ func main() {
 			switch subcommand {
 			case "create", "adopt", "list", "ls", "get", "rename":
 				cmd = subcommand
+			case "configure":
+				cmd = "agent-configure"
 			case "provider":
 				cmd = "agent-provider"
 			case "archive", "delete":
@@ -222,7 +224,7 @@ func main() {
 			case "kill":
 				cmd = "kill"
 			default:
-				usage("agent create|adopt|list|get|rename|provider|archive ...")
+				usage("agent create|adopt|list|get|rename|configure|provider|archive ...")
 			}
 		} else if cmd == "thread" {
 			switch subcommand {
@@ -255,6 +257,8 @@ func main() {
 		cmdRename(a)
 	case "agent-provider":
 		cmdAgentProvider(a)
+	case "agent-configure":
+		cmdAgentConfigure(a)
 	case "send":
 		cmdSend(a)
 	case "artifact":
@@ -343,7 +347,7 @@ func main() {
 func printHelp() {
 	help := fmt.Sprintf(`chub — CodexLoom CLI (service: %s)
 
-  chub agent create|adopt|list|get|rename|provider|archive ...
+  chub agent create|adopt|list|get|rename|configure|provider|archive ...
   chub thread send|watch|history|interrupt|compact ...
   chub turn get <turn-id> [--json]
 

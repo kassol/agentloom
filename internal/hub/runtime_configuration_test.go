@@ -2,6 +2,8 @@ package hub
 
 import (
 	"encoding/json"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -33,6 +35,17 @@ func TestClaudeRuntimeConfigurationRejectsEmptySettingsAndUnsupportedHelper(t *t
 				t.Fatalf("normalize error = %v, want %q", err, test.want)
 			}
 		})
+	}
+	normalized, err := normalizeRuntimeConfiguration("claude", RuntimeConfiguration{
+		Configured: true, SettingSources: []string{" local ", "user"},
+		Authentication: RuntimeAuthentication{Category: " console ", Source: " api_key "},
+	})
+	if err != nil || !slices.Equal(normalized.SettingSources, []string{"user", "local"}) || normalized.Authentication != (RuntimeAuthentication{Category: RuntimeAuthConsole, Source: "api_key"}) {
+		t.Fatalf("normalized Claude configuration = %#v, err=%v", normalized, err)
+	}
+	console := claudeRuntimeConfigurationDescriptor().Authentication[0]
+	if console.Category != RuntimeAuthConsole || !strings.Contains(console.Description, "credential helpers") || !strings.Contains(console.Description, "unavailable") {
+		t.Fatalf("Console authentication descriptor = %#v", console)
 	}
 }
 
@@ -80,5 +93,91 @@ func TestOpenRejectsExplicitlyMalformedClaudeRuntimeConfiguration(t *testing.T) 
 	}
 	if _, err := Open(st); err == nil || !strings.Contains(err.Error(), "invalid Runtime configuration") {
 		t.Fatalf("Open malformed Claude owner configuration error = %v", err)
+	}
+}
+
+func TestClaudeRuntimeConfigurationTransactionPersistsAndRejectsStaleRevision(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
+	agent, err := h.CreateAgent(CreateParams{Name: "configurable-claude", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.GetRuntimeConfiguration(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := RuntimeConfiguration{
+		Configured: true, SettingSources: []string{"user", "local"},
+		Authentication: RuntimeAuthentication{Category: RuntimeAuthGateway, Source: "gateway"},
+	}
+	updated, err := h.UpdateRuntimeConfiguration(agent.ID, RuntimeConfigurationParams{Configuration: next, ExpectedRevision: before.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(updated.Configuration.SettingSources, []string{"user", "local"}) || updated.Configuration.Authentication != next.Authentication || updated.Evidence.Authentication.Validation != "accepted" {
+		t.Fatalf("updated configuration = %#v", updated)
+	}
+	if _, err := h.UpdateRuntimeConfiguration(agent.ID, RuntimeConfigurationParams{Configuration: testClaudeRuntimeConfiguration(), ExpectedRevision: before.Revision}); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("stale configuration update error = %v", err)
+	}
+	h.Shutdown()
+	if _, err := h.UpdateRuntimeConfiguration(agent.ID, RuntimeConfigurationParams{Configuration: next, ExpectedRevision: updated.Revision}); err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("configuration update after shutdown error = %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopenedStore, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedStore.Close()
+	reopened, err := Open(reopenedStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Shutdown()
+	view, err := reopened.GetAgent(agent.ID)
+	if err != nil || !slices.Equal(view.RuntimeConfiguration.SettingSources, []string{"user", "local"}) || view.RuntimeConfiguration.Authentication != next.Authentication {
+		t.Fatalf("reopened configuration = %#v, err=%v", view.RuntimeConfiguration, err)
+	}
+}
+
+func TestClaudeRuntimeConfigurationStoreFailureRestoresPreviousSelection(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
+	defer h.Shutdown()
+	agent, err := h.CreateAgent(CreateParams{Name: "config-store-failure", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.GetRuntimeConfiguration(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.saveAgentsForTest = func(any) error { return errors.New("disk full") }
+	_, err = h.UpdateRuntimeConfiguration(agent.ID, RuntimeConfigurationParams{
+		ExpectedRevision: before.Revision,
+		Configuration:    RuntimeConfiguration{Configured: true, SettingSources: []string{"user", "local"}, Authentication: RuntimeAuthentication{Category: RuntimeAuthGateway, Source: "gateway"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("Store failure = %v", err)
+	}
+	h.saveAgentsForTest = nil
+	view, err := h.GetAgent(agent.ID)
+	if err != nil || !slices.Equal(view.RuntimeConfiguration.SettingSources, testClaudeRuntimeConfiguration().SettingSources) || view.RuntimeConfiguration.Authentication != testClaudeRuntimeConfiguration().Authentication {
+		t.Fatalf("configuration after failed Store = %#v, err=%v", view.RuntimeConfiguration, err)
 	}
 }

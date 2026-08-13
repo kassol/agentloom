@@ -559,21 +559,22 @@ func (o Outcome) Validate() error {
 type FailurePhase string
 
 const (
-	FailurePhaseBindingCreate      FailurePhase = "binding_create"
-	FailurePhaseBindingResume      FailurePhase = "binding_resume"
-	FailurePhaseTurnStart          FailurePhase = "turn_start"
-	FailurePhaseTurnContinue       FailurePhase = "turn_continue"
-	FailurePhaseTurnInterrupt      FailurePhase = "turn_interrupt"
-	FailurePhaseHistory            FailurePhase = "history"
-	FailurePhaseClose              FailurePhase = "close"
-	FailurePhaseBindingName        FailurePhase = "binding_name"
-	FailurePhaseBindingArchive     FailurePhase = "binding_archive"
-	FailurePhaseContextDelivery    FailurePhase = "context_delivery"
-	FailurePhaseModelControl       FailurePhase = "model_control"
-	FailurePhaseResourceInventory  FailurePhase = "resource_inventory"
-	FailurePhaseResourcePolicy     FailurePhase = "resource_policy"
-	FailurePhaseUsageInspection    FailurePhase = "usage_inspection"
-	FailurePhaseContextMaintenance FailurePhase = "context_maintenance"
+	FailurePhaseBindingCreate        FailurePhase = "binding_create"
+	FailurePhaseBindingResume        FailurePhase = "binding_resume"
+	FailurePhaseTurnStart            FailurePhase = "turn_start"
+	FailurePhaseTurnContinue         FailurePhase = "turn_continue"
+	FailurePhaseTurnInterrupt        FailurePhase = "turn_interrupt"
+	FailurePhaseHistory              FailurePhase = "history"
+	FailurePhaseClose                FailurePhase = "close"
+	FailurePhaseBindingName          FailurePhase = "binding_name"
+	FailurePhaseBindingArchive       FailurePhase = "binding_archive"
+	FailurePhaseContextDelivery      FailurePhase = "context_delivery"
+	FailurePhaseModelControl         FailurePhase = "model_control"
+	FailurePhaseResourceInventory    FailurePhase = "resource_inventory"
+	FailurePhaseResourcePolicy       FailurePhase = "resource_policy"
+	FailurePhaseRuntimeConfiguration FailurePhase = "runtime_configuration"
+	FailurePhaseUsageInspection      FailurePhase = "usage_inspection"
+	FailurePhaseContextMaintenance   FailurePhase = "context_maintenance"
 )
 
 type Failure struct {
@@ -597,7 +598,7 @@ func (f Failure) Validate() error {
 		FailurePhaseTurnContinue, FailurePhaseTurnInterrupt, FailurePhaseHistory,
 		FailurePhaseClose, FailurePhaseBindingName, FailurePhaseBindingArchive,
 		FailurePhaseContextDelivery, FailurePhaseModelControl,
-		FailurePhaseResourceInventory, FailurePhaseResourcePolicy, FailurePhaseUsageInspection,
+		FailurePhaseResourceInventory, FailurePhaseResourcePolicy, FailurePhaseRuntimeConfiguration, FailurePhaseUsageInspection,
 		FailurePhaseContextMaintenance:
 		return nil
 	default:
@@ -676,6 +677,7 @@ const (
 	CapabilityApprovalPolicy       = "approval_policy"
 	CapabilityResourceInventory    = "resource_inventory"
 	CapabilityResourcePolicy       = "resource_policy"
+	CapabilityRuntimeConfiguration = "runtime_configuration"
 	CapabilityContextDelivery      = "context_delivery"
 	CapabilityNativeRename         = "native_rename"
 	CapabilityNativeArchive        = "native_archive"

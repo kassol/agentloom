@@ -76,6 +76,8 @@ func validateRuntimeCapabilityHooks(contract runtimecontract.Contract, snapshot 
 			_, configured := contract.(runtimeSkillsConfiguration)
 			_, governed := contract.(runtimecontract.ResourcePolicyCapability)
 			implemented = configured && governed
+		case runtimecontract.CapabilityRuntimeConfiguration:
+			_, implemented = contract.(runtimeOwnerConfigurationInspector)
 		case runtimecontract.CapabilityContextDelivery:
 			_, implemented = contract.(runtimecontract.ContextDeliveryPolicy)
 		case runtimecontract.CapabilityNativeRename:
@@ -244,6 +246,10 @@ var controlPlaneCapabilityAlternatives = map[string][2]string{
 		"this Runtime does not apply Loom resource policy",
 		"manage resources in the native Runtime settings",
 	},
+	runtimecontract.CapabilityRuntimeConfiguration: {
+		"this Runtime does not expose Loom owner configuration",
+		"manage configuration in the native Runtime",
+	},
 	runtimecontract.CapabilityContextDelivery: {
 		"this Runtime does not accept Loom context delivery",
 		"include the required context in the Turn input",
@@ -303,6 +309,7 @@ func controlPlaneCapabilitySnapshot(runtimeKind string) runtimecontract.Capabili
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityApprovalPolicy, false),
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityResourceInventory, false),
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityResourcePolicy, false),
+		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityRuntimeConfiguration, false),
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityContextDelivery, false),
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityNativeRename, false),
 		runtimeCapabilityDescriptor(runtimeKind, runtimecontract.CapabilityNativeArchive, false),
@@ -322,6 +329,7 @@ func codexControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Cap
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityApprovalPolicy, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityResourceInventory, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityResourcePolicy, true),
+		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityRuntimeConfiguration, false),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityContextDelivery, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityNativeRename, true),
 		runtimeCapabilityDescriptor("codex", runtimecontract.CapabilityNativeArchive, true),
@@ -341,6 +349,7 @@ func piControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Capabi
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityApprovalPolicy, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityResourceInventory, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityResourcePolicy, false),
+		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityRuntimeConfiguration, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityContextDelivery, true),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityNativeRename, false),
 		runtimeCapabilityDescriptor("pi", runtimecontract.CapabilityNativeArchive, false),
@@ -357,7 +366,12 @@ func claudeControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Ca
 	snapshot := controlPlaneCapabilitySnapshot("claude")
 	for index := range snapshot.Capabilities {
 		id := snapshot.Capabilities[index].ID
-		available := id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy || id == runtimecontract.CapabilityResourceInventory || id == runtimecontract.CapabilityUsageReporting || id == runtimecontract.CapabilityModelConfiguration || id == runtimecontract.CapabilityImageInput && len(imageInput) > 0 && imageInput[0]
+		if id == runtimecontract.CapabilityResourcePolicy {
+			snapshot.Capabilities[index].Reason = "Claude native resources are read-only and no Loom-explicit resources are attached to this Agent"
+			snapshot.Capabilities[index].Alternative = "change selected setting sources or manage native resources in Claude settings"
+			continue
+		}
+		available := id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy || id == runtimecontract.CapabilityResourceInventory || id == runtimecontract.CapabilityRuntimeConfiguration || id == runtimecontract.CapabilityUsageReporting || id == runtimecontract.CapabilityModelConfiguration || id == runtimecontract.CapabilityImageInput && len(imageInput) > 0 && imageInput[0]
 		if available {
 			snapshot.Capabilities[index] = runtimeCapabilityDescriptor("claude", id, true)
 		}

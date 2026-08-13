@@ -128,6 +128,27 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, 200, map[string]any{"agent": agent})
 	})
+	mux.HandleFunc("GET /api/agents/{key}/runtime/configuration", func(w http.ResponseWriter, r *http.Request) {
+		configuration, err := s.hub.GetRuntimeConfiguration(r.PathValue("key"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"configuration": configuration})
+	})
+	mux.HandleFunc("PATCH /api/agents/{key}/runtime/configuration", func(w http.ResponseWriter, r *http.Request) {
+		var body hub.RuntimeConfigurationParams
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		configuration, err := s.hub.UpdateRuntimeConfiguration(r.PathValue("key"), body)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"configuration": configuration})
+	})
 	mux.HandleFunc("GET /api/agents/{key}/runtime/models", func(w http.ResponseWriter, r *http.Request) {
 		models, err := s.hub.GetRuntimeModels(r.PathValue("key"))
 		if err != nil {

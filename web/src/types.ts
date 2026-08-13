@@ -123,6 +123,7 @@ export interface RuntimeConversationCapabilities {
   runtimeKind: string;
   revision: string;
   capabilities: Array<{ id: string; available: boolean; reason?: string }>;
+  configuration?: RuntimeConfigurationSpec;
 }
 
 export interface RuntimeAuthenticationSelection {
@@ -134,6 +135,22 @@ export interface RuntimeOwnerConfiguration {
   configured: boolean;
   settingSources: string[];
   authentication: RuntimeAuthenticationSelection;
+}
+
+export interface RuntimeConfigurationSpec {
+  settingSources: Array<{ id: string; label: string; description?: string }>;
+  authentication: Array<{ category: string; label: string; description?: string; sources: Array<{ id: string; label: string; description?: string }> }>;
+  default: RuntimeOwnerConfiguration;
+}
+
+export interface RuntimeConfigurationView {
+  configuration: RuntimeOwnerConfiguration;
+  descriptor: RuntimeConfigurationSpec;
+  evidence: {
+    settingSources: string[];
+    authentication: RuntimeAuthenticationSelection & { validation: string; evidence?: Array<{ kind: string; summary: string; observedAt?: string }> };
+  };
+  revision: string;
 }
 
 export interface RuntimeConversationCandidate {

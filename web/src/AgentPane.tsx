@@ -3,7 +3,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ContextEvidenceView, type ConversationMembership, type HumanRequest, type InboxEntry, type PlatformConnection, type RuntimeModel, type RuntimeResourceSnapshot, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
+import { api, uploadThreadArtifact, type Agent, type AgentAddress, type AgentProfile, type AgentTokenUsage, type Approval, type ContextEvidenceView, type ConversationMembership, type HumanRequest, type InboxEntry, type PlatformConnection, type RuntimeConfigurationView, type RuntimeModel, type RuntimeOwnerConfiguration, type RuntimeResourceSnapshot, type Schedule, type TeamView, type ThreadGoal, type Trigger } from "./types";
 import { emptyFeed, reduceFeed } from "./feed";
 import type { Block } from "./feed";
 import type { LoomEvent } from "./types";
@@ -108,6 +108,7 @@ export function AgentPane({
   const usageAvailable = capabilityAvailable(agent, "usage_reporting");
   const compactionAvailable = capabilityAvailable(agent, "manual_compaction");
   const resourceInventoryAvailable = capabilityAvailable(agent, "resource_inventory");
+  const runtimeConfigurationAvailable = capabilityAvailable(agent, "runtime_configuration");
   const snapshotImageInputAvailable = capabilityAvailable(agent, "image_input");
   const [feed, dispatch] = useReducer(reduceFeed, emptyFeed);
   const [input, setInput] = useState("");
@@ -134,6 +135,9 @@ export function AgentPane({
   const [savingConfig, setSavingConfig] = useState(false);
 	const [savingRuntimeModel, setSavingRuntimeModel] = useState(false);
 	const [runtimeModelSaveStatus, setRuntimeModelSaveStatus] = useState<"" | "saved" | "failed">("");
+  const [runtimeConfiguration, setRuntimeConfiguration] = useState<RuntimeConfigurationView | null>(null);
+  const [runtimeConfigurationDraft, setRuntimeConfigurationDraft] = useState<RuntimeOwnerConfiguration | null>(null);
+  const [savingRuntimeConfiguration, setSavingRuntimeConfiguration] = useState(false);
   const [runtimeResources, setRuntimeResources] = useState<RuntimeResourceSnapshot | null>(null);
   const [loadingRuntimeResources, setLoadingRuntimeResources] = useState(false);
   const [savingResourceID, setSavingResourceID] = useState("");
@@ -352,6 +356,20 @@ export function AgentPane({
 	  return () => { cancelled = true; };
 	}, [configOpen, configSection, agent.id, modelConfigurationAvailable, agent.capabilitySnapshot.revision]);
 
+	useEffect(() => {
+	  if (!configOpen || configSection !== "runtime" || !runtimeConfigurationAvailable) return;
+	  let cancelled = false;
+	  api("GET", `/api/agents/${agent.id}/runtime/configuration`)
+		.then((data) => {
+		  if (cancelled) return;
+		  const view = data.configuration as RuntimeConfigurationView;
+		  setRuntimeConfiguration(view);
+		  setRuntimeConfigurationDraft(view.configuration);
+		})
+		.catch((err: Error) => { if (!cancelled) onError(err.message); });
+	  return () => { cancelled = true; };
+	}, [configOpen, configSection, agent.id, runtimeConfigurationAvailable, agent.capabilitySnapshot.revision]);
+
   useEffect(() => {
     if (!configOpen || configSection !== "resources" || !resourceInventoryAvailable) return;
     let cancelled = false;
@@ -396,6 +414,26 @@ export function AgentPane({
     } finally {
       setSavingResourceID("");
     }
+  };
+
+  const saveRuntimeConfiguration = async () => {
+	if (!runtimeConfiguration || !runtimeConfigurationDraft || savingRuntimeConfiguration || running) return;
+	setSavingRuntimeConfiguration(true);
+	try {
+	  const data = await api("PATCH", `/api/agents/${agent.id}/runtime/configuration`, {
+		configuration: runtimeConfigurationDraft,
+		expectedRevision: runtimeConfiguration.revision,
+	  });
+	  const view = data.configuration as RuntimeConfigurationView;
+	  setRuntimeConfiguration(view);
+	  setRuntimeConfigurationDraft(view.configuration);
+	  const refreshed = await api("GET", `/api/agents/${agent.id}`);
+	  onAgentUpdated(refreshed.agent as Agent);
+	} catch (err: any) {
+	  onError(err.message);
+	} finally {
+	  setSavingRuntimeConfiguration(false);
+	}
   };
 
   const refreshConnections = async () => {
@@ -1182,6 +1220,32 @@ export function AgentPane({
 					  Context maintenance {agent.contextMaintenance.state}{agent.contextMaintenance.error ? ` · ${readableRuntimeError(agent.contextMaintenance.error)}` : ""}
 					</div> : null}
 				  </div>
+				  {runtimeConfiguration && runtimeConfigurationDraft ? <div className="mb-3 space-y-3 border-y border-border py-3">
+					<div className="text-[10px] font-semibold uppercase text-muted-foreground">Owner configuration</div>
+					<div className="grid gap-2 sm:grid-cols-3">
+					  {runtimeConfiguration.descriptor.settingSources.map((source) => <label key={source.id} className="flex items-start gap-2 text-[10.5px]">
+						<input type="checkbox" checked={runtimeConfigurationDraft.settingSources.includes(source.id)} disabled={running || savingRuntimeConfiguration} onChange={(event) => setRuntimeConfigurationDraft((current) => current && ({ ...current, settingSources: event.target.checked ? [...current.settingSources, source.id] : current.settingSources.filter((value) => value !== source.id) }))} className="mt-0.5 size-3.5 accent-primary" />
+						<span><span className="block font-medium">{source.label}</span>{source.description ? <span className="block text-muted-foreground">{source.description}</span> : null}</span>
+					  </label>)}
+					</div>
+					<div className="grid gap-3 sm:grid-cols-2">
+					  <label className="text-[10.5px] text-muted-foreground">Authentication category
+						<select value={runtimeConfigurationDraft.authentication.category} disabled={running || savingRuntimeConfiguration} onChange={(event) => { const category = event.target.value; const source = runtimeConfiguration.descriptor.authentication.find((item) => item.category === category)?.sources[0]?.id || ""; setRuntimeConfigurationDraft((current) => current && ({ ...current, authentication: { category, source } })); }} className="mt-1 h-8 w-full rounded-md bg-background px-2.5 text-[11px] ring-1 ring-border">
+						  {runtimeConfiguration.descriptor.authentication.map((item) => <option key={item.category} value={item.category}>{item.label}</option>)}
+						</select>
+					  </label>
+					  <label className="text-[10.5px] text-muted-foreground">Authentication source
+						<select value={runtimeConfigurationDraft.authentication.source} disabled={running || savingRuntimeConfiguration} onChange={(event) => setRuntimeConfigurationDraft((current) => current && ({ ...current, authentication: { ...current.authentication, source: event.target.value } }))} className="mt-1 h-8 w-full rounded-md bg-background px-2.5 text-[11px] ring-1 ring-border">
+						  {runtimeConfiguration.descriptor.authentication.find((item) => item.category === runtimeConfigurationDraft.authentication.category)?.sources.map((source) => <option key={source.id} value={source.id}>{source.label}</option>)}
+						</select>
+					  </label>
+					</div>
+					{runtimeConfiguration.descriptor.authentication.find((item) => item.category === runtimeConfigurationDraft.authentication.category)?.description ? <p className="text-[10px] text-muted-foreground">{runtimeConfiguration.descriptor.authentication.find((item) => item.category === runtimeConfigurationDraft.authentication.category)?.description}</p> : null}
+					<div className="flex items-center justify-between gap-3">
+					  <span className="text-[10px] text-muted-foreground">Verified {runtimeConfiguration.evidence.authentication.category} / {runtimeConfiguration.evidence.authentication.source} · {runtimeConfiguration.evidence.authentication.validation}</span>
+					  <button onClick={saveRuntimeConfiguration} disabled={running || savingRuntimeConfiguration || runtimeConfigurationDraft.settingSources.length === 0} className="rounded-md border border-border px-2.5 py-1.5 text-[10.5px] disabled:opacity-50">{savingRuntimeConfiguration ? "Applying" : "Apply Runtime Configuration"}</button>
+					</div>
+				  </div> : null}
 				  <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Name</span>
                     <input
@@ -1352,11 +1416,9 @@ export function AgentPane({
 						  <span className={`size-2 shrink-0 rounded-full ${resource.enabled ? "bg-success" : "bg-muted-foreground/40"}`} />
 						  <div className="min-w-0 flex-1">
 							<div className="flex items-center gap-2"><span className="truncate text-[12px] font-medium">{resource.name}</span><span className="font-mono text-[9px] uppercase text-muted-foreground">{resource.kind}</span></div>
-							{runtimeResources.runtimeKind !== "claude" && resource.path ? <div className="truncate font-mono text-[9px] text-muted-foreground" title={resource.path}>{resource.path}</div> : runtimeResources.runtimeKind !== "claude" && resource.source ? <div className="truncate text-[9px] text-muted-foreground">{resource.source}</div> : null}
-							{runtimeResources.runtimeKind !== "claude" && resource.description ? <div className="mt-0.5 text-[10.5px] text-muted-foreground">{resource.description}</div> : null}
 						  </div>
 						  <span className={`font-mono text-[9px] ${resource.enabled ? "text-success" : "text-muted-foreground"}`}>{resource.status || (resource.enabled ? "enabled" : "disabled")}</span>
-						  {resource.kind === "skill" && resource.path && runtimeResources.runtimeKind !== "claude" ? <button
+						  {resource.kind === "skill" && resource.path ? <button
 							onClick={() => setResourceEnabled(resource, !resource.enabled)}
 							disabled={!runtimeResources.policy.mutable || Boolean(savingResourceID)}
 							aria-label={`${resource.enabled ? "Disable" : "Enable"} ${resource.name}`}

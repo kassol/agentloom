@@ -550,6 +550,10 @@ func TestCmdAgentSkillsUsesOneRuntimeSnapshotAndExpectedRevision(t *testing.T) {
 
 func TestCmdCreateClaudeDoesNotInventOpenAIProvider(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/runtimes" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"runtimes": []any{map[string]any{"runtimeKind": "claude", "configuration": claudeRuntimeConfigurationTestDescriptor()}}})
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/api/agents" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
@@ -577,14 +581,25 @@ func TestCmdCreateClaudeDoesNotInventOpenAIProvider(t *testing.T) {
 	}
 }
 
+func claudeRuntimeConfigurationTestDescriptor() map[string]any {
+	return map[string]any{
+		"settingSources": []any{map[string]any{"id": "user"}, map[string]any{"id": "project"}, map[string]any{"id": "local"}},
+		"authentication": []any{
+			map[string]any{"category": "console", "sources": []any{map[string]any{"id": "api_key"}}},
+			map[string]any{"category": "gateway", "sources": []any{map[string]any{"id": "gateway"}}},
+		},
+	}
+}
+
 func TestCreateRuntimeConfigurationRequiresExplicitClaudeChoices(t *testing.T) {
-	if _, err := createRuntimeConfiguration("claude", args{flags: map[string]string{}, flagValues: map[string][]string{}}); err == nil || !strings.Contains(err.Error(), "requires --setting-source") {
+	descriptor := claudeRuntimeConfigurationTestDescriptor()
+	if _, err := createRuntimeConfiguration(descriptor, args{flags: map[string]string{}, flagValues: map[string][]string{}}); err == nil || !strings.Contains(err.Error(), "requires --setting-source") {
 		t.Fatalf("missing Claude configuration error = %v", err)
 	}
-	if _, err := createRuntimeConfiguration("codex", args{flags: map[string]string{"auth-category": "console"}, flagValues: map[string][]string{}}); err == nil || !strings.Contains(err.Error(), "apply only") {
+	if _, err := createRuntimeConfiguration(nil, args{flags: map[string]string{"auth-category": "console"}, flagValues: map[string][]string{}}); err == nil || !strings.Contains(err.Error(), "does not accept") {
 		t.Fatalf("cross-Runtime configuration error = %v", err)
 	}
-	if _, err := createRuntimeConfiguration("claude", args{flags: map[string]string{"auth-category": "console", "auth-source": "helper"}, flagValues: map[string][]string{"setting-source": {"project"}}}); err == nil || !strings.Contains(err.Error(), "unsupported Claude authentication pair") {
+	if _, err := createRuntimeConfiguration(descriptor, args{flags: map[string]string{"auth-category": "console", "auth-source": "helper"}, flagValues: map[string][]string{"setting-source": {"project"}}}); err == nil || !strings.Contains(err.Error(), "unsupported Runtime authentication pair") {
 		t.Fatalf("unsupported helper authentication error = %v", err)
 	}
 }
@@ -592,6 +607,10 @@ func TestCreateRuntimeConfigurationRequiresExplicitClaudeChoices(t *testing.T) {
 func TestCmdAdoptSendsExplicitClaudeRuntimeConfiguration(t *testing.T) {
 	stableCwd := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/runtimes" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"runtimes": []any{map[string]any{"runtimeKind": "claude", "configuration": claudeRuntimeConfigurationTestDescriptor()}}})
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/api/runtimes/claude/conversations/adopt" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
@@ -618,6 +637,10 @@ func TestCmdAdoptSendsExplicitClaudeRuntimeConfiguration(t *testing.T) {
 func TestCmdAdoptAcceptsCodexThreadIDWithoutCatalogTokens(t *testing.T) {
 	stableCwd := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/runtimes" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"runtimes": []any{map[string]any{"runtimeKind": "codex"}}})
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/api/runtimes/codex/conversations/adopt" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}

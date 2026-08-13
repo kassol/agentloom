@@ -128,6 +128,10 @@ func (d *claudeRuntimeHostDriver) CapabilitySnapshot(context.Context, runtimecon
 	return claudeControlPlaneCapabilitySnapshot()
 }
 
+func (d *claudeRuntimeHostDriver) RuntimeConfigurationDescriptor() RuntimeConfigurationDescriptor {
+	return claudeRuntimeConfigurationDescriptor()
+}
+
 func (d *claudeRuntimeHostDriver) CapabilitySnapshotWithModelImageEvidence(ctx context.Context, evidence runtimeModelImageEvidence) runtimecontract.CapabilitySnapshot {
 	available := false
 	if d != nil && d.activeGeneration != nil && evidence.Available && evidence.GenerationID != "" && evidence.ModelID != "" {
@@ -369,6 +373,35 @@ func (c *claudeRuntimeContract) rememberConfigurationEvidence(evidence RuntimeCo
 	c.configurationEvidence = &evidence
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *claudeRuntimeContract) InspectRuntimeOwnerConfiguration(ctx context.Context, _ runtimecontract.Binding, cwd string, configuration RuntimeConfiguration) (RuntimeConfigurationEvidence, *runtimecontract.Failure) {
+	response, outcome := c.command(ctx, "inspect_configuration", "", runtimecontract.FailurePhaseRuntimeConfiguration, map[string]any{
+		"cwd": cwd,
+		"configuration": map[string]any{
+			"settingSources": append([]string(nil), configuration.SettingSources...),
+			"authentication": configuration.Authentication,
+		},
+	})
+	if outcome.State != runtimecontract.LifecycleAccepted {
+		return RuntimeConfigurationEvidence{}, outcome.Failure
+	}
+	var evidence RuntimeConfigurationEvidence
+	if err := json.Unmarshal(response.Data, &evidence); err != nil {
+		return RuntimeConfigurationEvidence{}, runtimeConfigurationFailure(errors.New("Claude bridge returned malformed configuration evidence"))
+	}
+	evidence.Authentication.Evidence = nil
+	if err := validateRuntimeConfigurationEvidence(configuration, evidence); err != nil {
+		return RuntimeConfigurationEvidence{}, runtimeConfigurationFailure(err)
+	}
+	return evidence, nil
+}
+
+func runtimeConfigurationFailure(err error) *runtimecontract.Failure {
+	return &runtimecontract.Failure{
+		Code: "runtime_configuration_invalid", Phase: runtimecontract.FailurePhaseRuntimeConfiguration,
+		Message: "Claude Runtime configuration could not be validated", Diagnostic: err.Error(), Cause: err,
+	}
 }
 
 func (c *claudeRuntimeContract) SetRuntimeProvider(provider, model string) {

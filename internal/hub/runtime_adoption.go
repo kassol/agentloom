@@ -33,9 +33,10 @@ type RuntimeConversationCapability struct {
 }
 
 type RuntimeConversationCapabilities struct {
-	RuntimeKind  string                          `json:"runtimeKind"`
-	Revision     string                          `json:"revision"`
-	Capabilities []RuntimeConversationCapability `json:"capabilities"`
+	RuntimeKind   string                          `json:"runtimeKind"`
+	Revision      string                          `json:"revision"`
+	Capabilities  []RuntimeConversationCapability `json:"capabilities"`
+	Configuration *RuntimeConfigurationDescriptor `json:"configuration,omitempty"`
 }
 
 type RuntimeConversationCandidate struct {
@@ -98,7 +99,14 @@ func (h *Hub) RuntimeConversationCapabilities(kind string) (RuntimeConversationC
 		return RuntimeConversationCapabilities{}, err
 	}
 	_, available := driver.(runtimeConversationCatalog)
-	return conversationCapabilitySnapshot(kind, available), nil
+	snapshot := conversationCapabilitySnapshot(kind, available)
+	if provider, ok := driver.(runtimeConfigurationDescriptorProvider); ok {
+		descriptor := provider.RuntimeConfigurationDescriptor()
+		snapshot.Configuration = &descriptor
+		encoded, _ := json.Marshal(snapshot)
+		snapshot.Revision = "conversation:" + shortDigest(encoded)
+	}
+	return snapshot, nil
 }
 
 func (h *Hub) RuntimeConversationCatalogs() []RuntimeConversationCapabilities {

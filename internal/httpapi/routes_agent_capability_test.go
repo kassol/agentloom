@@ -102,3 +102,33 @@ func TestUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 		t.Fatalf("Pi Approval policy = %#v", agent["approvalPolicy"])
 	}
 }
+
+func TestRuntimeConfigurationRoutesPreserveCapabilityAndRevisionFailures(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := hub.New(st)
+	defer h.Shutdown()
+	if _, err := h.RestoreAgent(hub.RestoreAgentParams{
+		ID: "agent-pi-config", Name: "pi-config", Cwd: t.TempDir(), ThreadID: "loom-thread-pi-config",
+		RuntimeBinding: hub.RuntimeBinding{Kind: "pi", NativeRef: "/tmp/pi-session.jsonl"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := New(h, st, fstest.MapFS{"index.html": {Data: []byte("ok")}}).Handler()
+
+	request := httptest.NewRequest(http.MethodGet, "/api/agents/agent-pi-config/runtime/configuration", nil)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "owner configuration") {
+		t.Fatalf("GET Runtime configuration = %d %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPatch, "/api/agents/agent-pi-config/runtime/configuration", strings.NewReader(`{"configuration":{}}`))
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "expectedRevision") {
+		t.Fatalf("PATCH Runtime configuration without revision = %d %s", response.Code, response.Body.String())
+	}
+}

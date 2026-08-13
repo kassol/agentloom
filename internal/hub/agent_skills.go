@@ -468,6 +468,9 @@ func (h *Hub) runtimeMutationAllowedLocked(agentID string) error {
 	if h.resourcePolicyApplying[agentID] {
 		return errf(409, "Runtime resource policy is being applied; retry after it settles")
 	}
+	if h.runtimeConfigurationApplying[agentID] {
+		return errf(409, "Runtime configuration is being applied; retry after it settles")
+	}
 	if agent := h.agents[agentID]; agent != nil && agent.ContextMaintenance != nil && agent.ContextMaintenance.State == contextMaintenanceStarted {
 		return errf(409, "Runtime context maintenance is in progress; retry after it settles")
 	}

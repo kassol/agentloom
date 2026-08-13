@@ -427,6 +427,18 @@ async function handleCommand(frame) {
 	  } finally { control.close(); }
 	  return;
 	}
+	case "inspect_configuration": {
+	  const configuration = ownerConfiguration(payload);
+	  if (typeof payload.cwd !== "string") {
+		respond(frame, false, {}, "Claude Runtime configuration inspection has no working directory");
+		return;
+	  }
+	  const control = query({prompt: (async function* () { await new Promise(() => {}); })(), options: {cwd: payload.cwd, persistSession: false, settingSources: configuration.settingSources, env: selectedAuthenticationEnvironment(configuration)}});
+	  try {
+		respond(frame, true, await verifyAuthentication(control, configuration));
+	  } finally { control.close(); }
+	  return;
+	}
   case "resume_binding": {
 	const info = await getSessionInfo(payload.sessionRef, {dir: payload.cwd});
 	if (!info || info.sessionId !== payload.sessionRef || info.cwd !== payload.cwd) {

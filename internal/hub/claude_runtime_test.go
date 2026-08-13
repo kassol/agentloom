@@ -44,6 +44,13 @@ while IFS= read -r line; do
   turn_id=$(printf '%s' "$line" | sed -n 's/.*"turnId":"\([^"]*\)".*/\1/p')
   command=$(printf '%s' "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')
 	case "$command" in
+	inspect_configuration)
+	  if printf '%s' "$line" | grep -q '"category":"gateway"'; then
+		data='{"settingSources":["user","local"],"authentication":{"category":"gateway","source":"gateway","validation":"accepted"}}'
+	  else
+		data='{"settingSources":["project"],"authentication":{"category":"console","source":"api_key","validation":"accepted"}}'
+	  fi
+	  ;;
 	inspect_resources)
 	  data='{"resources":[{"id":"skill:review","name":"review","kind":"skill","path":"","source":"claude_agent_sdk_reload","enabled":true}],"configuration":{"settingSources":["project"],"authentication":{"category":"console","source":"api_key","validation":"accepted"}}}'
 	  ;;
@@ -74,6 +81,7 @@ while IFS= read -r line; do
 	  printf '%s' "$line" | grep -Eq '"model":"(default|sonnet|opus)"' || { printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":false,"error":"missing model"}\n' "$request_id" "$turn_id" "$operation"; continue; }
       data='{"runtimeTurnRef":"native-turn"}'
       printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":%s}\n' "$request_id" "$turn_id" "$operation" "$data"
+	  [ -n "$LOOM_TEST_CLAUDE_START_EVENT_DELAY" ] && sleep "$LOOM_TEST_CLAUDE_START_EVENT_DELAY"
       printf '{"kind":"event","class":"control","event":"turn_started","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-turn"}}\n' "$turn_id" "$operation"
 	  printf '{"kind":"event","class":"control","event":"content","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-turn","phase":"completed","content":{"id":"native-user","kind":"user_text","text":"work"}}}\n' "$turn_id" "$operation"
       printf '{"kind":"event","class":"control","event":"content","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-turn","phase":"completed","content":{"id":"native-answer","kind":"assistant_text","text":"done"}}}\n' "$turn_id" "$operation"
@@ -1120,6 +1128,10 @@ func TestClaudeCapabilitySnapshotAdvertisesApprovalOnce(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("available Approval descriptors = %d", count)
+	}
+	policy, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilityResourcePolicy)
+	if !ok || policy.Availability != runtimecontract.CapabilityUnavailable || !strings.Contains(policy.Reason, "native resources are read-only") || !strings.Contains(policy.Reason, "no Loom-explicit resources") || policy.Alternative == "" {
+		t.Fatalf("Claude resource policy descriptor = %#v", policy)
 	}
 }
 

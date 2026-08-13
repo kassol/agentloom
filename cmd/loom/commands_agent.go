@@ -147,11 +147,6 @@ func cmdAgentSkills(a args) {
 			state = yellow(status)
 		}
 		detail := str(resource, "source")
-		if str(resources, "runtimeKind") == "claude" {
-			detail = ""
-		} else if str(resource, "path") != "" {
-			detail = str(resource, "path")
-		}
 		fmt.Printf("  %-12s  %-10s  %-24s  %s\n", state, str(resource, "kind"), str(resource, "name"), dim(detail))
 	}
 	configuration, _ := resources["configuration"].(map[string]any)
@@ -170,9 +165,6 @@ func cmdAgentSkills(a args) {
 	}
 	policy, _ := resources["policy"].(map[string]any)
 	for _, value := range anySlice(policy["disabledPaths"]) {
-		if str(resources, "runtimeKind") == "claude" {
-			break
-		}
 		disabledPath, _ := value.(string)
 		found := false
 		for _, resourceValue := range anySlice(resources["resources"]) {
@@ -330,7 +322,7 @@ func cmdCreate(a args) {
 		fail(err)
 	}
 	runtimeKind := defaultValue(a.flags["runtime"], "codex")
-	runtimeConfiguration, err := createRuntimeConfiguration(runtimeKind, a)
+	runtimeConfiguration, err := createRuntimeConfiguration(runtimeConfigurationDescriptor(runtimeKind), a)
 	if err != nil {
 		fail(err)
 	}
@@ -381,7 +373,7 @@ func cmdAdopt(a args) {
 	if err != nil {
 		fail(err)
 	}
-	runtimeConfiguration, err := createRuntimeConfiguration(runtimeKind, a)
+	runtimeConfiguration, err := createRuntimeConfiguration(runtimeConfigurationDescriptor(runtimeKind), a)
 	if err != nil {
 		fail(err)
 	}
@@ -406,35 +398,61 @@ func cmdAdopt(a args) {
 	printRuntimeConfigurationEvidence(agent)
 }
 
-func createRuntimeConfiguration(runtimeKind string, a args) (map[string]any, error) {
+func runtimeConfigurationDescriptor(runtimeKind string) map[string]any {
+	response, err := api("GET", "/api/runtimes", nil)
+	if err != nil {
+		fail(err)
+	}
+	for _, value := range anySlice(response["runtimes"]) {
+		catalog, _ := value.(map[string]any)
+		if str(catalog, "runtimeKind") == runtimeKind {
+			descriptor, _ := catalog["configuration"].(map[string]any)
+			return descriptor
+		}
+	}
+	return nil
+}
+
+func createRuntimeConfiguration(descriptor map[string]any, a args) (map[string]any, error) {
 	sources := a.flagValues["setting-source"]
 	category, source := strings.TrimSpace(a.flags["auth-category"]), strings.TrimSpace(a.flags["auth-source"])
-	if runtimeKind != "claude" {
+	if descriptor == nil {
 		if len(sources) > 0 || category != "" || source != "" {
-			return nil, fmt.Errorf("--setting-source, --auth-category, and --auth-source apply only to the Claude Runtime")
+			return nil, fmt.Errorf("this Runtime does not accept --setting-source, --auth-category, or --auth-source")
 		}
 		return nil, nil
 	}
 	if len(sources) == 0 || category == "" || source == "" {
-		return nil, fmt.Errorf("Claude Runtime requires --setting-source plus --auth-category and --auth-source")
+		return nil, fmt.Errorf("this Runtime requires --setting-source plus --auth-category and --auth-source")
+	}
+	allowedSources := map[string]bool{}
+	for _, value := range anySlice(descriptor["settingSources"]) {
+		option, _ := value.(map[string]any)
+		allowedSources[str(option, "id")] = true
 	}
 	seen := map[string]bool{}
 	for _, settingSource := range sources {
-		if settingSource != "user" && settingSource != "project" && settingSource != "local" {
-			return nil, fmt.Errorf("--setting-source must be user, project, or local")
+		if !allowedSources[settingSource] {
+			return nil, fmt.Errorf("unsupported Runtime setting source %q", settingSource)
 		}
 		if seen[settingSource] {
 			return nil, fmt.Errorf("--setting-source %s was provided more than once", settingSource)
 		}
 		seen[settingSource] = true
 	}
-	validAuthentication := map[string]map[string]bool{
-		"console": {"api_key": true},
-		"cloud":   {"bedrock": true, "vertex": true, "foundry": true, "anthropic_aws": true, "anthropic_google_cloud": true, "mantle": true},
-		"gateway": {"gateway": true},
+	validAuthentication := false
+	for _, value := range anySlice(descriptor["authentication"]) {
+		option, _ := value.(map[string]any)
+		if str(option, "category") != category {
+			continue
+		}
+		for _, sourceValue := range anySlice(option["sources"]) {
+			sourceOption, _ := sourceValue.(map[string]any)
+			validAuthentication = validAuthentication || str(sourceOption, "id") == source
+		}
 	}
-	if !validAuthentication[category][source] {
-		return nil, fmt.Errorf("unsupported Claude authentication pair %s/%s", category, source)
+	if !validAuthentication {
+		return nil, fmt.Errorf("unsupported Runtime authentication pair %s/%s", category, source)
 	}
 	return map[string]any{
 		"configured":     true,
@@ -451,6 +469,66 @@ func printRuntimeConfigurationEvidence(agent map[string]any) {
 	authentication, _ := configuration["authentication"].(map[string]any)
 	fmt.Printf("  settings: %s\n", strings.Join(stringValues(configuration["settingSources"]), ", "))
 	fmt.Printf("  auth:     %s / %s\n", str(authentication, "category"), str(authentication, "source"))
+}
+
+func cmdAgentConfigure(a args) {
+	if len(a.positional) != 1 {
+		usage("agent configure <name|id> --setting-source SOURCE ... --auth-category CATEGORY --auth-source SOURCE")
+	}
+	path := "/api/agents/" + url.PathEscape(a.positional[0]) + "/runtime/configuration"
+	current, err := api("GET", path, nil)
+	if err != nil {
+		fail(err)
+	}
+	view, _ := current["configuration"].(map[string]any)
+	descriptor, _ := view["descriptor"].(map[string]any)
+	sources := append([]string(nil), a.flagValues["setting-source"]...)
+	category, source := strings.TrimSpace(a.flags["auth-category"]), strings.TrimSpace(a.flags["auth-source"])
+	if len(sources) == 0 || category == "" || source == "" {
+		usage("agent configure <name|id> --setting-source SOURCE ... --auth-category CATEGORY --auth-source SOURCE")
+	}
+	allowedSources := map[string]bool{}
+	for _, value := range anySlice(descriptor["settingSources"]) {
+		option, _ := value.(map[string]any)
+		allowedSources[str(option, "id")] = true
+	}
+	seen := map[string]bool{}
+	for _, value := range sources {
+		if !allowedSources[value] || seen[value] {
+			fail(fmt.Errorf("unsupported or duplicate Runtime setting source %q", value))
+		}
+		seen[value] = true
+	}
+	authAllowed := false
+	for _, value := range anySlice(descriptor["authentication"]) {
+		option, _ := value.(map[string]any)
+		if str(option, "category") != category {
+			continue
+		}
+		for _, sourceValue := range anySlice(option["sources"]) {
+			sourceOption, _ := sourceValue.(map[string]any)
+			authAllowed = authAllowed || str(sourceOption, "id") == source
+		}
+	}
+	if !authAllowed {
+		fail(fmt.Errorf("unsupported Runtime authentication pair %s/%s", category, source))
+	}
+	updated, err := api("PATCH", path, map[string]any{
+		"expectedRevision": str(view, "revision"),
+		"configuration": map[string]any{
+			"configured": true, "settingSources": sources,
+			"authentication": map[string]any{"category": category, "source": source},
+		},
+	})
+	if err != nil {
+		fail(err)
+	}
+	result, _ := updated["configuration"].(map[string]any)
+	evidence, _ := result["evidence"].(map[string]any)
+	authentication, _ := evidence["authentication"].(map[string]any)
+	fmt.Printf("%s %s\n  settings: %s\n  auth:     %s / %s · %s\n",
+		green("configured"), bold(a.positional[0]), strings.Join(stringValues(evidence["settingSources"]), ", "),
+		str(authentication, "category"), str(authentication, "source"), str(authentication, "validation"))
 }
 
 func cmdList() {

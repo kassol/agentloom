@@ -395,6 +395,65 @@ describe("AgentPane", () => {
 	expect(view.getByRole("button", { name: "Save Runtime Model" })).toBeDisabled();
   });
 
+  it("applies descriptor-driven Runtime configuration with the inspected revision", async () => {
+	const onAgentUpdated = vi.fn();
+	const runtimeAgent: Agent = {
+	  ...testAgent,
+	  runtimeBinding: { kind: "future-runtime" },
+	  capabilitySnapshot: capabilitySnapshot("runtime_configuration"),
+	};
+	const descriptor = {
+	  settingSources: [
+		{ id: "user", label: "User", description: "User settings" },
+		{ id: "project", label: "Project", description: "Project settings" },
+	  ],
+	  authentication: [
+		{ category: "console", label: "Console", sources: [{ id: "api_key", label: "API key" }] },
+		{ category: "gateway", label: "Gateway", description: "Managed gateway credentials", sources: [{ id: "gateway", label: "Managed gateway" }] },
+	  ],
+	  default: { configured: true, settingSources: ["project"], authentication: { category: "console", source: "api_key" } },
+	};
+	const viewFor = (revision: string, settingSources: string[], category: string, source: string) => ({
+	  configuration: { configured: true, settingSources, authentication: { category, source } },
+	  descriptor,
+	  evidence: { settingSources, authentication: { category, source, validation: "accepted" } },
+	  revision,
+	});
+	vi.mocked(fetch).mockImplementation(async (input, init) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  if (url.endsWith("/runtime/configuration")) {
+		if (init?.method === "PATCH") {
+		  expect(JSON.parse(String(init.body))).toEqual({
+			expectedRevision: "configuration-1",
+			configuration: { configured: true, settingSources: ["project", "user"], authentication: { category: "gateway", source: "gateway" } },
+		  });
+		  return new Response(JSON.stringify({ configuration: viewFor("configuration-2", ["user", "project"], "gateway", "gateway") }), { status: 200, headers: { "Content-Type": "application/json" } });
+		}
+		return new Response(JSON.stringify({ configuration: viewFor("configuration-1", ["project"], "console", "api_key") }), { status: 200, headers: { "Content-Type": "application/json" } });
+	  }
+	  if (url === `/api/agents/${runtimeAgent.id}`) {
+		return new Response(JSON.stringify({ agent: runtimeAgent }), { status: 200, headers: { "Content-Type": "application/json" } });
+	  }
+	  const body = url.includes("/thread/history")
+		? { total: 0, turns: [] }
+		: url.endsWith("/profile")
+		  ? { profile: { identity: "", domain: "", scope: "", version: 1 } }
+		  : { artifacts: [] };
+	  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+
+	const view = render(<AgentPane {...props} agent={runtimeAgent} onAgentUpdated={onAgentUpdated} active configRequestNonce={1} />);
+	expect(await view.findByText("Owner configuration")).toBeInTheDocument();
+	fireEvent.click(view.getByRole("checkbox", { name: /User/ }));
+	fireEvent.change(view.getByLabelText("Authentication category"), { target: { value: "gateway" } });
+	expect(view.getByLabelText("Authentication source")).toHaveValue("gateway");
+	fireEvent.click(view.getByRole("button", { name: "Apply Runtime Configuration" }));
+
+	expect(await view.findByText("Verified gateway / gateway · accepted")).toBeInTheDocument();
+	expect(view.getByText("Managed gateway credentials")).toBeInTheDocument();
+	await waitFor(() => expect(onAgentUpdated).toHaveBeenCalledWith(runtimeAgent));
+  });
+
   it("shows Runtime-specific resources and patches policy with the inspected revision", async () => {
 	const resourceAgent: Agent = {
 	  ...testAgent,
