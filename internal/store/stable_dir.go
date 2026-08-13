@@ -815,12 +815,13 @@ func requireJSONEOF(dec *json.Decoder) error {
 }
 
 func (d *stableDataDir) claimWriter(afterWriterLock func()) (err error) {
+	claimKey := d.writerClaimKey()
 	processWriters.Lock()
-	if _, exists := processWriters.held[d.identity]; exists {
+	if _, exists := processWriters.held[claimKey]; exists {
 		processWriters.Unlock()
 		return fmt.Errorf("data directory already has a writable CodexLoom process: %s", d.canonical)
 	}
-	processWriters.held[d.identity] = struct{}{}
+	processWriters.held[claimKey] = struct{}{}
 	processWriters.Unlock()
 	claimComplete := false
 	var lock *os.File
@@ -838,7 +839,7 @@ func (d *stableDataDir) claimWriter(afterWriterLock func()) (err error) {
 		}
 		d.lock = nil
 		processWriters.Lock()
-		delete(processWriters.held, d.identity)
+		delete(processWriters.held, claimKey)
 		processWriters.Unlock()
 		if cleanupErr != nil {
 			err = errors.Join(err, fmt.Errorf("release failed data directory writer claim: %w", cleanupErr))
@@ -868,6 +869,10 @@ func (d *stableDataDir) claimWriter(afterWriterLock func()) (err error) {
 	}
 	claimComplete = true
 	return nil
+}
+
+func (d *stableDataDir) writerClaimKey() string {
+	return d.identity + "\x00" + d.canonical
 }
 
 func (d *stableDataDir) verifyIdentity() error {
@@ -913,7 +918,7 @@ func (d *stableDataDir) close() error {
 				d.err = err
 			}
 			processWriters.Lock()
-			delete(processWriters.held, d.identity)
+			delete(processWriters.held, d.writerClaimKey())
 			processWriters.Unlock()
 		}
 		if err := d.root.Close(); d.err == nil {

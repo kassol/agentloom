@@ -5,6 +5,8 @@ package main
 import (
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func reexecWithCredentialPipe(payload []byte) error {
@@ -20,7 +22,7 @@ func reexecWithCredentialPipe(payload []byte) error {
 	if err := writer.Close(); err != nil {
 		return err
 	}
-	if err := syscall.Dup2(int(reader.Fd()), 3); err != nil {
+	if err := unix.Dup2(int(reader.Fd()), 3); err != nil {
 		return err
 	}
 	executable, err := os.Executable()

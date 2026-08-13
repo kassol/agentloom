@@ -20,6 +20,16 @@ func TestLarkMigrateCLIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	canonicalDir := st.Dir()
+	const agentName = "lark-test-agent"
+	if err := st.SaveAgents(map[string]*hub.Agent{
+		"agent-lark-test": {
+			ID: "agent-lark-test", Name: agentName, Cwd: dir, ThreadID: "thread-lark-test",
+			RuntimeBinding: hub.RuntimeBinding{SchemaVersion: hub.RuntimeBindingSchemaVersion, Kind: "codex", NativeRef: "thread-native-lark-test"},
+			Sandbox:        "danger-full-access", ApprovalPolicy: "never", Status: "idle",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	h, err := hub.Open(st)
 	if err != nil {
 		t.Fatal(err)
@@ -30,12 +40,8 @@ func TestLarkMigrateCLIEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := h.CreateAgent(hub.CreateParams{Name: "lark-test-agent", Cwd: dir, RuntimeKind: "codex"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	address, err := h.CreateAddress(hub.AddressParams{
-		Agent: agent.Name, ConnectionID: connection.ID, ExternalIdentity: "lark://cli_test_app",
+		Agent: agentName, ConnectionID: connection.ID, ExternalIdentity: "lark://cli_test_app",
 		TriggerPolicy: "mention", ReplyPolicy: "final_answer", TrustDomain: "lark:cli_test_app",
 	})
 	if err != nil {
@@ -142,14 +148,18 @@ func writeLarkAnchorUnit(t *testing.T, home, dataDir, connectionID, addressID, a
 		if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
 			return err
 		}
+		arguments := []string{executable, "--hub", hubURL, "--connection", connectionID, "--address", addressID, "--app-id", appID}
+		for index := range arguments {
+			arguments[index] = systemdQuoteForTest(arguments[index])
+		}
 		unit := `[Unit]
 Description=CodexLoom native Feishu gateway (` + connectionID + `)
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=` + executable + ` --hub ` + hubURL + ` --connection ` + connectionID + ` --address ` + addressID + ` --app-id ` + appID + `
-Environment=CODEX_LOOM_DATA=` + dataDir + `
+ExecStart=` + strings.Join(arguments, " ") + `
+Environment=CODEX_LOOM_DATA=` + systemdQuoteForTest(dataDir) + `
 Restart=always
 RestartSec=2
 StandardOutput=append:` + logPath + `
@@ -163,6 +173,10 @@ WantedBy=default.target
 		t.Skipf("typed Lark launch anchor rehearsal is unsupported on %s", runtime.GOOS)
 		return nil
 	}
+}
+
+func systemdQuoteForTest(value string) string {
+	return `"` + strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`) + `"`
 }
 
 func openConnectionRef(t *testing.T, dir, connectionID string) string {

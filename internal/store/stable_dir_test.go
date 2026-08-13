@@ -104,6 +104,18 @@ func TestS0SingleWriterCoversAliasesAndReleases(t *testing.T) {
 	_ = reopened.Close()
 }
 
+func TestS0ProcessWriterKeySeparatesReusedIdentityAtAnotherPath(t *testing.T) {
+	first := &stableDataDir{identity: "device:inode", canonical: "/tmp/first"}
+	reused := &stableDataDir{identity: first.identity, canonical: "/tmp/second"}
+	alias := &stableDataDir{identity: first.identity, canonical: first.canonical}
+	if first.writerClaimKey() == reused.writerClaimKey() {
+		t.Fatal("reused filesystem identity at another canonical path collided")
+	}
+	if first.writerClaimKey() != alias.writerClaimKey() {
+		t.Fatal("same canonical directory identity did not collide")
+	}
+}
+
 func TestS0FailedWriterClaimReleasesOwnershipForRetry(t *testing.T) {
 	parent := t.TempDir()
 	firstDir := filepath.Join(parent, "first")

@@ -39,6 +39,9 @@ func TestCBackupExcludesCaseAliasedCredentialDirectoryByIdentity(t *testing.T) {
 		t.Skipf("case alias unavailable: %v", err)
 	}
 	exact, err := os.Stat(filepath.Join(dataDir, credentials.DirectoryName))
+	if os.IsNotExist(err) {
+		t.Skip("test volume is case-sensitive")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

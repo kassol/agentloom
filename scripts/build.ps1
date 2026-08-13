@@ -49,7 +49,12 @@ try {
         [pscustomobject]@{ Name = "loom-parall-gateway.exe"; Package = "./cmd/loom-parall-gateway" }
     )
     foreach ($binary in $binaries) {
-        Invoke-Checked go build -ldflags $ldflags -o (Join-Path "bin" $binary.Name) $binary.Package
+        Invoke-Checked -Command "go" -Arguments @(
+            "build",
+            "-ldflags", $ldflags,
+            "-o", (Join-Path "bin" $binary.Name),
+            $binary.Package
+        )
     }
 
     Copy-Item -Force "bin/codex-loom.exe" "bin/codex-hub.exe"

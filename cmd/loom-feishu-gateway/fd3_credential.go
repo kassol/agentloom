@@ -14,12 +14,9 @@ func readInheritedCredentialFD() ([]byte, bool) {
 		return nil, false
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || info.Size() <= 0 || info.Size() > 1<<20 {
-		return nil, false
-	}
-	data, err := io.ReadAll(file)
-	if err != nil || len(data) == 0 {
+	const maxCredentialBytes = 1 << 20
+	data, err := io.ReadAll(io.LimitReader(file, maxCredentialBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxCredentialBytes {
 		return nil, false
 	}
 	return data, true

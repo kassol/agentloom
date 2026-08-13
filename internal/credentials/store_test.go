@@ -255,6 +255,9 @@ func TestVPutRejectsCaseAliasedFixedDirectory(t *testing.T) {
 		t.Skipf("case alias unavailable: %v", err)
 	}
 	exact, err := os.Stat(filepath.Join(fixture.st.Dir(), DirectoryName))
+	if os.IsNotExist(err) {
+		t.Skip("test volume is case-sensitive")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

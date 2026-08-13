@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"strings"
 	"testing"
 )
 
@@ -250,14 +251,18 @@ func writeL2aAnchorUnit(t *testing.T, fixture r0bFixture, executable, home strin
 		if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
 			return err
 		}
+		arguments := []string{executable, "--hub", hubURL, "--connection", fixture.connection.ID, "--address", fixture.address.ID, "--app-id", fixture.connection.AccountRef}
+		for index := range arguments {
+			arguments[index] = feishuSystemdQuote(arguments[index])
+		}
 		unit := `[Unit]
 Description=CodexLoom native Feishu gateway (` + fixture.connection.ID + `)
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=` + executable + ` --hub ` + hubURL + ` --connection ` + fixture.connection.ID + ` --address ` + fixture.address.ID + ` --app-id ` + fixture.connection.AccountRef + `
-Environment=CODEX_LOOM_DATA=` + fixture.st.Dir() + `
+ExecStart=` + strings.Join(arguments, " ") + `
+Environment=CODEX_LOOM_DATA=` + feishuSystemdQuote(fixture.st.Dir()) + `
 Restart=always
 RestartSec=2
 StandardOutput=append:` + logPath + `
