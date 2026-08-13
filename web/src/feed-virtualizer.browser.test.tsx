@@ -3,6 +3,7 @@ import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentPane } from "./AgentPane";
+import { BlockView } from "./Blocks";
 import { publishThreadEvent } from "./thread-events";
 import type { Agent } from "./types";
 import "./i18n";
@@ -236,5 +237,36 @@ describe("AgentPane feed layout", () => {
     await act(() => root.render(<AgentPane {...props} active />));
     window.dispatchEvent(new Event("resize"));
     await expect.poll(assertNoFeedOverlap).toBe(true);
+  });
+});
+
+describe("tool purpose presentation", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  afterEach(async () => {
+    if (root) await act(() => root.unmount());
+    container?.remove();
+  });
+
+  it("shows the natural-language purpose while keeping the command expandable", async () => {
+    container = document.createElement("div");
+    document.body.replaceChildren(container);
+    root = createRoot(container);
+    await act(() => root.render(<BlockView block={{
+      kind: "command",
+      id: "tool-1",
+      command: "git status --short",
+      description: "Confirm whether the workspace has uncommitted changes",
+      status: "completed",
+      exitCode: 0,
+      durationMs: 12,
+      output: "",
+    }} />));
+
+    const details = container.querySelector("details");
+    expect(details?.querySelector("summary")?.textContent).toContain("Confirm whether the workspace has uncommitted changes");
+    details?.setAttribute("open", "");
+    expect(details?.textContent).toContain("git status --short");
   });
 });
