@@ -2370,7 +2370,7 @@ func projectRuntimeContentBlock(view *AgentView, turnID string, source runtimeco
 		toolCall := *content.ToolCall
 		var arguments any
 		if json.Unmarshal(toolCall.Arguments, &arguments) == nil {
-			toolCall.Arguments, _ = json.Marshal(projectRuntimePublicToolArguments(arguments))
+			toolCall.Arguments, _ = json.Marshal(projectRuntimePublicToolArguments(toolCall.Name, arguments))
 		} else {
 			toolCall.Arguments = nil
 		}
@@ -2445,14 +2445,16 @@ func publicInlineImageRef(ref string) bool {
 	}
 }
 
-func projectRuntimePublicToolArguments(value any) any {
+func projectRuntimePublicToolArguments(toolName string, value any) any {
 	switch typed := value.(type) {
 	case map[string]any:
 		result := map[string]any{}
 		for key, nested := range typed {
 			normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(key))
 			if runtimeDiagnosticSecretKey(key) || strings.Contains(normalized, "native") || strings.Contains(normalized, "session") ||
-				normalized == "cwd" || strings.Contains(normalized, "filepath") || normalized == "path" {
+				strings.Contains(normalized, "subagent") || normalized == "teamid" || normalized == "teamname" ||
+				normalized == "cwd" || strings.Contains(normalized, "filepath") || normalized == "path" ||
+				privateRuntimeCollaborationArgument(toolName, key) {
 				continue
 			}
 			if normalized == "url" || strings.HasSuffix(normalized, "url") {
@@ -2461,13 +2463,13 @@ func projectRuntimePublicToolArguments(value any) any {
 				}
 				continue
 			}
-			result[key] = projectRuntimePublicToolArguments(nested)
+			result[key] = projectRuntimePublicToolArguments(toolName, nested)
 		}
 		return result
 	case []any:
 		result := make([]any, len(typed))
 		for index, nested := range typed {
-			result[index] = projectRuntimePublicToolArguments(nested)
+			result[index] = projectRuntimePublicToolArguments(toolName, nested)
 		}
 		return result
 	case string:

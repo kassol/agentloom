@@ -31,10 +31,11 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 		t.Fatal(err)
 	}
 	if err := st.SaveAgents(map[string]*hub.Agent{
-		"codex-participant": {
-			ID: "codex-participant", Name: "codex-reviewer", Cwd: workDir, ThreadID: "loom-thread-codex",
-			RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "native-codex-thread-secret"},
-			Source:         "edge", Status: "running", CreatedAt: nowForTest(), UpdatedAt: nowForTest(),
+		"claude-participant": {
+			ID: "claude-participant", Name: "claude-reviewer", Cwd: workDir, ThreadID: "loom-thread-claude",
+			RuntimeBinding:       hub.RuntimeBinding{SchemaVersion: hub.RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "native-claude-session-secret"},
+			RuntimeConfiguration: hub.RuntimeConfiguration{Configured: true, SettingSources: []string{"project"}, Authentication: hub.RuntimeAuthentication{Category: hub.RuntimeAuthConsole, Source: "api_key"}},
+			Source:               "edge", Status: "running", CreatedAt: nowForTest(), UpdatedAt: nowForTest(),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -51,7 +52,7 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	piAgentID := createdAgent["id"].(string)
 	loomThreadID := createdAgent["threadId"].(string)
 	nativePiPathFragment := "/pi/" + piAgentID + "/"
-	assertRuntimeNeutralJSON(t, createdAgent, nativePiPathFragment, "native-codex-thread-secret", "native-user-", "native-assistant-")
+	assertRuntimeNeutralJSON(t, createdAgent, nativePiPathFragment, "native-claude-session-secret", "native-user-", "native-assistant-")
 	if binding := createdAgent["runtimeBinding"].(map[string]any); binding["kind"] != "pi" || binding["nativeRef"] != nil {
 		t.Fatalf("created Pi Runtime Binding projection = %#v", binding)
 	}
@@ -67,10 +68,21 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 		"title": "Mixed Runtime acceptance", "purpose": "Integrate participant evidence with one Owner decision",
 		"completionBoundary": "The Responsible Agent publishes the integrated result",
 		"responsibleAgent":   piAgentID, "createdBy": piAgentID,
-		"participants": []map[string]any{{"agent": "codex-participant", "responsibility": "Validate the bounded compatibility evidence"}},
+		"participants": []map[string]any{{"agent": "claude-participant", "responsibility": "Validate the bounded compatibility evidence"}},
 		"initialBrief": map[string]any{"summary": "Participant evidence and Owner rollout choice are pending"},
 	}, http.StatusCreated)["topic"].(map[string]any)
 	topicID := createdTopic["id"].(string)
+	claudeLedTopic := topicRequest(t, handler, http.MethodPost, "/api/topics", map[string]any{
+		"title": "Claude-owned follow-up", "purpose": "Prove Runtime-neutral responsibility assignment",
+		"completionBoundary": "The Claude Agent publishes the follow-up decision",
+		"responsibleAgent":   "claude-participant", "createdBy": piAgentID,
+		"participants": []map[string]any{{"agent": piAgentID, "responsibility": "Supply the integrated evidence"}},
+		"initialBrief": map[string]any{"summary": "Responsibility is assigned through Loom state"},
+	}, http.StatusCreated)["topic"].(map[string]any)
+	claudeLedTopicID := claudeLedTopic["id"].(string)
+	if claudeLedTopic["responsibleAgentId"] != "claude-participant" {
+		t.Fatalf("Claude Topic responsibility = %#v", claudeLedTopic)
+	}
 
 	started := topicRequest(t, handler, http.MethodPost, "/api/topics/"+topicID+"/send", map[string]any{
 		"text": "Coordinate the participant review, obtain the rollout choice, and publish one integrated result.", "timeoutSec": 3,
@@ -79,7 +91,7 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	waitForStoryFile(t, paths.firstActive)
 
 	requestMessage := topicRequest(t, handler, http.MethodPost, "/api/comms/messages", map[string]any{
-		"from": piAgentID, "to": "codex-participant", "topicId": topicID,
+		"from": piAgentID, "to": "claude-participant", "topicId": topicID,
 		"subject": "Validate participant boundary", "body": "Return the bounded compatibility evidence.", "response": "required",
 	}, http.StatusAccepted)["message"].(map[string]any)
 	requestMessageID := requestMessage["id"].(string)
@@ -88,7 +100,7 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	}
 
 	replyMessage := topicRequest(t, handler, http.MethodPost, "/api/comms/messages", map[string]any{
-		"from": "codex-participant", "replyTo": requestMessageID,
+		"from": "claude-participant", "replyTo": requestMessageID,
 		"body": "Compatibility evidence is verified; retain the conservative fallback.",
 	}, http.StatusAccepted)["message"].(map[string]any)
 	replyMessageID := replyMessage["id"].(string)
@@ -99,7 +111,7 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	if answeredMessage["status"] != "answered" || answeredMessage["resolution"] != "reply" {
 		t.Fatalf("required Message after participant reply = %#v", answeredMessage)
 	}
-	assertRuntimeNeutralJSON(t, []any{requestMessage, replyMessage, answeredMessage}, nativePiPathFragment, "native-codex-thread-secret", "native-user-", "native-assistant-")
+	assertRuntimeNeutralJSON(t, []any{requestMessage, replyMessage, answeredMessage}, nativePiPathFragment, "native-claude-session-secret", "native-user-", "native-assistant-")
 	if requests := topicRequest(t, handler, http.MethodGet, "/api/human-requests?state=all", nil, http.StatusOK)["requests"].([]any); len(requests) != 0 {
 		t.Fatalf("participant reply entered Needs You: %#v", requests)
 	}
@@ -136,7 +148,12 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	if restoredAgent["id"] != piAgentID || restoredAgent["threadId"] != loomThreadID || restoredAgent["runtimeBinding"].(map[string]any)["kind"] != "pi" {
 		t.Fatalf("restarted Pi Agent identity = %#v", restoredAgent)
 	}
-	assertRuntimeNeutralJSON(t, restoredAgent, nativePiPathFragment, "native-codex-thread-secret", "native-user-", "native-assistant-")
+	assertRuntimeNeutralJSON(t, restoredAgent, nativePiPathFragment, "native-claude-session-secret", "native-user-", "native-assistant-")
+	reopenedClaudeTopic := topicRequest(t, restartHandler, http.MethodGet, "/api/topics/"+claudeLedTopicID, nil, http.StatusOK)["topic"].(map[string]any)
+	if reopenedClaudeTopic["responsibleAgentId"] != "claude-participant" {
+		t.Fatalf("reopened Claude Topic responsibility = %#v", reopenedClaudeTopic)
+	}
+	assertRuntimeNeutralJSON(t, reopenedClaudeTopic, "native-claude-session-secret")
 
 	topicRequest(t, restartHandler, http.MethodPost, "/api/human-requests/"+humanRequestID+"/answer", map[string]any{
 		"answer": "Recommend the conservative rollout and retain the verified fallback.",
@@ -177,7 +194,7 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 			}
 		}
 	}
-	assertRuntimeNeutralJSON(t, json.RawMessage(historyResponse), nativePiPathFragment, "native-codex-thread-secret", "native-user-", "native-assistant-")
+	assertRuntimeNeutralJSON(t, json.RawMessage(historyResponse), nativePiPathFragment, "native-claude-session-secret", "native-user-", "native-assistant-")
 
 	for _, eventPath := range []string{"/api/agents/" + piAgentID + "/thread/events?tail=200", "/api/agents/events?since=0"} {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -189,7 +206,7 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 		if response.Code != http.StatusOK || !strings.Contains(body, `"type":"loom/runtime-event"`) {
 			t.Fatalf("canonical SSE %s = %d %s", eventPath, response.Code, body)
 		}
-		assertRuntimeNeutralJSON(t, body, nativePiPathFragment, "native-codex-thread-secret", "native-user-", "native-assistant-", `"compatibility":true`, `"type":"item/`)
+		assertRuntimeNeutralJSON(t, body, nativePiPathFragment, "native-claude-session-secret", "native-user-", "native-assistant-", `"compatibility":true`, `"type":"item/`)
 	}
 
 	resumePath, err := os.ReadFile(paths.resumeSession)
@@ -216,7 +233,7 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	if len(promptParts) < 3 {
 		t.Fatalf("Pi prompt history = %q", prompts)
 	}
-	for _, want := range []string{"Release integration lead", "codex-reviewer", "Validate the bounded compatibility evidence", "Coordinate the participant review"} {
+	for _, want := range []string{"Release integration lead", "claude-reviewer", "Validate the bounded compatibility evidence", "Coordinate the participant review"} {
 		if !strings.Contains(promptParts[1], want) {
 			t.Fatalf("initial Pi prompt did not discover governed context %q:\n%s", want, promptParts[1])
 		}
@@ -236,14 +253,14 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 		"brief": map[string]any{
 			"summary":      "Integrated result: compatibility is verified and the conservative rollout retains the fallback.",
 			"currentState": "Ready for Owner review",
-			"evidence":     []map[string]any{{"type": "message", "id": replyMessageID, "label": "Codex participant evidence"}},
+			"evidence":     []map[string]any{{"type": "message", "id": replyMessageID, "label": "Claude participant evidence"}},
 		},
 	}, http.StatusOK)["topic"].(map[string]any)
 	if finalTopic["resultsReady"] != true || finalTopic["responsibleAgentId"] != piAgentID {
 		t.Fatalf("final Topic result = %#v", finalTopic)
 	}
 	assertStoryTopicAudit(t, finalTopic, requestMessageID, replyMessageID, humanRequestID)
-	assertRuntimeNeutralJSON(t, []any{humanRequest, deliveredRequest, finalTopic}, nativePiPathFragment, "native-codex-thread-secret", "native-user-", "native-assistant-")
+	assertRuntimeNeutralJSON(t, []any{humanRequest, deliveredRequest, finalTopic}, nativePiPathFragment, "native-claude-session-secret", "native-user-", "native-assistant-")
 }
 
 func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *testing.T) {

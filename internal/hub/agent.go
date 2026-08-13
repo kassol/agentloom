@@ -149,6 +149,8 @@ type RestoreAgentParams struct {
 	Cwd                  string               `json:"cwd"`
 	ThreadID             string               `json:"threadId"`
 	RuntimeBinding       RuntimeBinding       `json:"runtimeBinding"`
+	HistoryBoundary      *HistoryBoundary     `json:"historyBoundary,omitempty"`
+	RuntimeTurnBindings  map[string]string    `json:"runtimeTurnBindings,omitempty"`
 	Sandbox              string               `json:"sandbox"`
 	ApprovalPolicy       string               `json:"approvalPolicy"`
 	ProviderID           string               `json:"providerId"`
@@ -338,6 +340,23 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	if p.CreatedAt == "" {
 		p.CreatedAt = now()
 	}
+	historyBoundary := cloneHistoryBoundary(p.HistoryBoundary)
+	if historyBoundary != nil {
+		historyBoundary.Kind = strings.TrimSpace(historyBoundary.Kind)
+		historyBoundary.CreatedAt = strings.TrimSpace(historyBoundary.CreatedAt)
+		historyBoundary.Disclosure = strings.TrimSpace(historyBoundary.Disclosure)
+		historyBoundary.NativeRevision = strings.TrimSpace(historyBoundary.NativeRevision)
+		if p.RuntimeBinding.Kind != "claude" || historyBoundary.Kind != "history_boundary" || historyBoundary.CreatedAt == "" ||
+			historyBoundary.ImportedTurns != 0 || historyBoundary.Disclosure == "" || historyBoundary.NativeRevision == "" {
+			return AgentView{}, errf(400, "a restored History Boundary requires complete private Claude boundary evidence")
+		}
+	}
+	runtimeTurnBindings := cloneRuntimeTurnBindings(p.RuntimeTurnBindings)
+	for turnID, runtimeTurnRef := range runtimeTurnBindings {
+		if strings.TrimSpace(turnID) == "" || strings.TrimSpace(runtimeTurnRef) == "" {
+			return AgentView{}, errf(400, "restored Runtime Turn bindings must contain non-empty Loom and native Turn references")
+		}
+	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -354,6 +373,7 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	}
 	meta := &Agent{
 		ID: p.ID, Name: p.Name, Cwd: p.Cwd, ThreadID: p.ThreadID, RuntimeBinding: p.RuntimeBinding,
+		HistoryBoundary: historyBoundary, RuntimeTurnBindings: runtimeTurnBindings,
 		Sandbox: p.Sandbox, ApprovalPolicy: p.ApprovalPolicy,
 		ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort, RuntimeConfiguration: configuration,
 		Status: "idle", CreatedAt: p.CreatedAt, UpdatedAt: now(),
@@ -374,6 +394,25 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 		h.startWorkerLocked(func() { h.resumeGoalAfterOpen(p.ID) })
 	}
 	return view, nil
+}
+
+func cloneHistoryBoundary(boundary *HistoryBoundary) *HistoryBoundary {
+	if boundary == nil {
+		return nil
+	}
+	cloned := *boundary
+	return &cloned
+}
+
+func cloneRuntimeTurnBindings(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return map[string]string{}
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {

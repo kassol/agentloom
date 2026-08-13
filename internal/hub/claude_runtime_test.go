@@ -381,6 +381,27 @@ func TestClaudeRestoreCannotSupplyImageCapabilityEvidence(t *testing.T) {
 	}
 }
 
+func TestClaudeRestoreRejectsRedactedHistoryBoundary(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	_, err = h.RestoreAgent(RestoreAgentParams{
+		ID: "agent-redacted", Name: "redacted", Cwd: t.TempDir(), ThreadID: "loom-thread",
+		RuntimeBinding:       RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"},
+		RuntimeConfiguration: testClaudeRuntimeConfiguration(),
+		HistoryBoundary: &HistoryBoundary{
+			Kind: "history_boundary", CreatedAt: now(), ImportedTurns: 0,
+			Disclosure: "Existing native content remains outside Loom history.",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "complete private Claude boundary evidence") {
+		t.Fatalf("redacted History Boundary restore error = %v", err)
+	}
+}
+
 func TestClaudeLedgerSanitizesBeforeWritingDisk(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -398,6 +419,32 @@ func TestClaudeLedgerSanitizesBeforeWritingDisk(t *testing.T) {
 	for _, secret := range []string{"native-turn", "native-item", "native-result", "session-secret", "/Users/owner/private", "super-secret"} {
 		if bytes.Contains(disk, []byte(secret)) {
 			t.Fatalf("ledger contains private value %q: %s", secret, disk)
+		}
+	}
+}
+
+func TestClaudeNativeSubagentActivityStaysInsideOneCanonicalTurn(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newClaudeRuntimeContract("agent-parent", st, nil)
+	c.handleBridgeEvent(claudebridge.Event{Kind: "turn_started", TurnID: "turn-parent", Data: json.RawMessage(`{"runtimeTurnRef":"native-parent-turn"}`)})
+	c.handleBridgeEvent(claudebridge.Event{Kind: "content", TurnID: "turn-parent", Data: json.RawMessage(`{"runtimeTurnRef":"native-parent-turn","phase":"completed","content":{"id":"native-subagent-tool","kind":"tool_call","toolCall":{"name":"Agent","arguments":{"subagentId":"native-child","teamName":"native-team","sessionId":"native-session","name":"native-child-name","resume":"native-resume"}}}}`)})
+	c.handleBridgeEvent(claudebridge.Event{Kind: "content", TurnID: "turn-parent", Data: json.RawMessage(`{"runtimeTurnRef":"native-parent-turn","phase":"completed","content":{"id":"native-subagent-output","kind":"assistant_text","text":"delegated result"}}`)})
+	c.handleBridgeEvent(claudebridge.Event{Kind: "turn_completed", TurnID: "turn-parent", Data: json.RawMessage(`{"runtimeTurnRef":"native-parent-turn"}`)})
+
+	history, err := st.LoadCanonicalTurnLedger("agent-parent", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history.Total != 1 || len(history.Turns) != 1 || history.Turns[0].TurnID != "turn-parent" || len(history.Turns[0].Content) != 2 {
+		t.Fatalf("native subagent activity escaped its parent Turn: %#v", history)
+	}
+	encoded, _ := json.Marshal(history)
+	for _, private := range []string{"native-parent-turn", "native-subagent-tool", "native-subagent-output", "native-child", "native-team", "native-session", "native-child-name", "native-resume"} {
+		if bytes.Contains(encoded, []byte(private)) {
+			t.Fatalf("native subagent identifier %q reached canonical History: %s", private, encoded)
 		}
 	}
 }
@@ -658,7 +705,16 @@ func TestClaudeArchiveRestorePreservesLedgerAndAgentIdentity(t *testing.T) {
 	}
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = newClaudeRuntimeHostDriver(st, claudebridge.DriverOptions{ResolveActive: func(context.Context) (claudebridge.LaunchSpec, error) { return claudebridge.LaunchSpec{}, nil }})
-	params := RestoreAgentParams{ID: "agent-archive", Name: "claude-archive", Cwd: t.TempDir(), ThreadID: "loom-thread", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, RuntimeConfiguration: testClaudeRuntimeConfiguration()}
+	params := RestoreAgentParams{
+		ID: "agent-archive", Name: "claude-archive", Cwd: t.TempDir(), ThreadID: "loom-thread",
+		RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"},
+		HistoryBoundary: &HistoryBoundary{
+			Kind: "history_boundary", CreatedAt: now(), ImportedTurns: 0,
+			Disclosure: "Existing native content remains outside Loom history.", NativeRevision: "native-boundary-private",
+		},
+		RuntimeTurnBindings:  map[string]string{"turn-stable": "native-turn-private"},
+		RuntimeConfiguration: testClaudeRuntimeConfiguration(),
+	}
 	if _, err := h.RestoreAgent(params); err != nil {
 		t.Fatal(err)
 	}
@@ -672,12 +728,30 @@ func TestClaudeArchiveRestorePreservesLedgerAndAgentIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	params.HistoryBoundary.NativeRevision = "caller-mutated-boundary"
+	params.RuntimeTurnBindings["turn-stable"] = "caller-mutated-turn"
 	history, err := h.CanonicalHistory(restored.ID, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if restored.ID != params.ID || restored.ThreadID != params.ThreadID || history.Total != 1 || history.Turns[0].TurnID != "turn-stable" || history.Turns[0].Content[0].Text != "preserved" {
+	diagnostics, err := h.GetRuntimeDiagnostics(restored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := map[string]*Agent{}
+	if err := st.LoadAgents(&persisted); err != nil || persisted[restored.ID].HistoryBoundary.NativeRevision != "native-boundary-private" {
+		t.Fatalf("restored History Boundary aliased caller input: %#v err=%v", persisted[restored.ID], err)
+	}
+	if restored.ID != params.ID || restored.ThreadID != params.ThreadID || restored.RuntimeBinding.Kind != "claude" ||
+		restored.HistoryBoundary == nil || restored.HistoryBoundary.Kind != params.HistoryBoundary.Kind ||
+		restored.HistoryBoundary.Disclosure != params.HistoryBoundary.Disclosure || restored.HistoryBoundary.NativeRevision != "" ||
+		diagnostics.NativeRef != params.RuntimeBinding.NativeRef || diagnostics.TurnBindings["turn-stable"] != "native-turn-private" ||
+		history.HistoryBoundary == nil || history.HistoryBoundary.NativeRevision != "" ||
+		history.Total != 1 || history.Turns[0].TurnID != "turn-stable" || history.Turns[0].Content[0].Text != "preserved" {
 		t.Fatalf("restore lost stable identity or ledger: agent=%#v history=%#v", restored.Agent, history)
+	}
+	if params.HistoryBoundary.NativeRevision != "caller-mutated-boundary" || params.RuntimeTurnBindings["turn-stable"] != "caller-mutated-turn" {
+		t.Fatal("restore mutated caller-owned boundary or Turn bindings")
 	}
 }
 
@@ -1162,6 +1236,34 @@ func TestClaudeCapabilitySnapshotAdvertisesApprovalOnce(t *testing.T) {
 	policy, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilityResourcePolicy)
 	if !ok || policy.Availability != runtimecontract.CapabilityUnavailable || !strings.Contains(policy.Reason, "native resources are read-only") || !strings.Contains(policy.Reason, "no Loom-explicit resources") || policy.Alternative == "" {
 		t.Fatalf("Claude resource policy descriptor = %#v", policy)
+	}
+}
+
+func TestClaudeCapabilitySnapshotTruthfullyRejectsUnavailableLifecycleFeatures(t *testing.T) {
+	snapshot := claudeControlPlaneCapabilitySnapshot()
+	goal, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilityGoal)
+	if !ok || goal.Availability != runtimecontract.CapabilityAvailable {
+		t.Fatalf("Loom-owned Claude Goal capability = %#v", goal)
+	}
+	for _, id := range []string{
+		runtimecontract.CapabilityNativeArchive,
+		runtimecontract.CapabilityRemote,
+		runtimecontract.CapabilityManualCompaction,
+		runtimecontract.CapabilitySandboxConfiguration,
+	} {
+		descriptor, ok := capabilityDescriptor(snapshot, id)
+		if !ok || descriptor.Availability != runtimecontract.CapabilityUnavailable ||
+			strings.TrimSpace(descriptor.Reason) == "" || strings.TrimSpace(descriptor.Alternative) == "" {
+			t.Fatalf("Claude unavailable capability %q = %#v", id, descriptor)
+		}
+	}
+	sandbox, _ := capabilityDescriptor(snapshot, runtimecontract.CapabilitySandboxConfiguration)
+	if !strings.Contains(sandbox.Reason, "whole-process sandbox isolation") || !strings.Contains(sandbox.Alternative, "Approval policy") {
+		t.Fatalf("Claude sandbox guidance = %#v", sandbox)
+	}
+	archive, _ := capabilityDescriptor(snapshot, runtimecontract.CapabilityNativeArchive)
+	if !strings.Contains(archive.Alternative, "Loom Agent") {
+		t.Fatalf("Claude archive alternative = %#v", archive)
 	}
 }
 

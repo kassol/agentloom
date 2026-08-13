@@ -193,7 +193,8 @@ subagent/MCP/hook 不新增 Loom 核心接口；先作为 adapter 私有事件�
 
 第一版应诚实标记：
 
-- `goal`、`remote`、`sandbox_configuration`：unavailable；
+- `goal`：available，但仅表示 Loom-owned Goal；Claude-native Goal 同步不存在；
+- `remote`、`sandbox_configuration`：unavailable；
 - `manual_compaction`：直到找到并验证公开 headless 入口前 unavailable；
 - `resource_inventory/policy`：可先 unavailable，避免解析 `.claude` 私有布局；
 - `native rename/archive`：只有 CLI/SDK 正式 API 通过 conformance 后才 available。

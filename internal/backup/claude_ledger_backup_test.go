@@ -9,13 +9,14 @@ import (
 	"testing"
 )
 
-func TestCanonicalTurnLedgerSurvivesBackup(t *testing.T) {
+func TestClaudeIdentityBindingBoundaryAndCanonicalLedgerSurviveBackup(t *testing.T) {
 	dataDir := t.TempDir()
 	ledger := []byte(`{"version":1,"agents":{"agent-stable":[{"turnId":"turn-stable","state":"completed","content":[]}]}}`)
+	agents := []byte(`{"agent-stable":{"id":"agent-stable","name":"claude-stable","cwd":"/tmp/work","threadId":"loom-thread-stable","runtimeBinding":{"schemaVersion":2,"kind":"claude","nativeRef":"native-session-private"},"historyBoundary":{"kind":"history_boundary","createdAt":"2026-08-13T00:00:00Z","importedTurns":0,"disclosure":"Native content is not imported.","nativeRevision":"native-revision-private"},"runtimeTurnBindings":{"turn-stable":"native-turn-private"},"sandbox":"danger-full-access","approvalPolicy":"never","status":"idle","currentTask":"","currentTurnId":"","lastError":"","lastTurn":null,"createdAt":"2026-08-13T00:00:00Z","updatedAt":"2026-08-13T00:00:00Z"}}`)
 	if err := os.WriteFile(filepath.Join(dataDir, "canonical-turn-ledger.json"), ledger, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dataDir, "agents.json"), agents, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := Create(Options{Reason: "claude-ledger", DataDir: dataDir, CodexSessionsDir: t.TempDir()})
@@ -32,7 +33,11 @@ func TestCanonicalTurnLedgerSurvivesBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	reader := tar.NewReader(gz)
-	for {
+	expected := map[string][]byte{
+		"codex-loom/agents.json":                agents,
+		"codex-loom/canonical-turn-ledger.json": ledger,
+	}
+	for len(expected) > 0 {
 		header, err := reader.Next()
 		if err == io.EOF {
 			break
@@ -40,17 +45,20 @@ func TestCanonicalTurnLedgerSurvivesBackup(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if header.Name != "codex-loom/canonical-turn-ledger.json" {
+		want, ok := expected[header.Name]
+		if !ok {
 			continue
 		}
 		got, err := io.ReadAll(reader)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(got) != string(ledger) {
-			t.Fatalf("ledger changed in backup: %s", got)
+		if string(got) != string(want) {
+			t.Fatalf("%s changed in backup: %s", header.Name, got)
 		}
-		return
+		delete(expected, header.Name)
 	}
-	t.Fatal("Canonical Turn Ledger was not included in backup")
+	if len(expected) != 0 {
+		t.Fatalf("Claude durable state was not included in backup: %v", expected)
+	}
 }

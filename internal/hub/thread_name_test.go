@@ -61,33 +61,41 @@ func TestUpdateConfigSyncsRenamedThread(t *testing.T) {
 	}
 }
 
-func TestRenamePiAgentCommitsLoomNameWithoutInvokingCodex(t *testing.T) {
-	logPath := installFakeCodexNameServer(t)
-	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	h := testHub(st)
-	h.agents["pi-agent"] = &Agent{
-		ID: "pi-agent", Name: "old-name", ThreadID: "loom-thread-1",
-		RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "pi", NativeRef: "/private/pi/session.jsonl"},
-		Status:         "idle", CreatedAt: now(), UpdatedAt: now(),
-	}
-	name := "new-name"
+func TestRenameWithoutNativeNamingCommitsAuthoritativeLoomName(t *testing.T) {
+	for _, kind := range []string{"pi", "claude"} {
+		t.Run(kind, func(t *testing.T) {
+			logPath := installFakeCodexNameServer(t)
+			if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			st, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			h := testHub(st)
+			h.agents[kind+"-agent"] = &Agent{
+				ID: kind + "-agent", Name: "old-name", ThreadID: "loom-thread-1",
+				RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: kind, NativeRef: "/private/" + kind + "/session"},
+				Status:         "idle", CreatedAt: now(), UpdatedAt: now(),
+			}
+			name := "new-name"
 
-	view, err := h.UpdateAgentConfig("pi-agent", ConfigParams{Name: &name})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if view.Name != name {
-		t.Fatalf("Agent name = %q, want %q", view.Name, name)
-	}
-	if requests := readThreadNameRequests(t, logPath); len(requests) != 0 {
-		t.Fatalf("Pi rename invoked Codex native naming: %#v", requests)
+			view, err := h.UpdateAgentConfig(kind+"-agent", ConfigParams{Name: &name})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if view.Name != name {
+				t.Fatalf("Agent name = %q, want %q", view.Name, name)
+			}
+			persisted := map[string]*Agent{}
+			if err := st.LoadAgents(&persisted); err != nil || persisted[kind+"-agent"].Name != name {
+				t.Fatalf("persisted Loom name = %#v, err=%v", persisted[kind+"-agent"], err)
+			}
+			if requests := readThreadNameRequests(t, logPath); len(requests) != 0 {
+				t.Fatalf("%s rename invoked Codex native naming: %#v", kind, requests)
+			}
+		})
 	}
 }
 

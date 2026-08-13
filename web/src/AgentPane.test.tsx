@@ -350,6 +350,35 @@ describe("AgentPane", () => {
 	});
   });
 
+  it("shows Claude native lifecycle limits from the capability snapshot", () => {
+	const claudeAgent: Agent = {
+	  ...testAgent,
+	  runtimeBinding: { kind: "claude" },
+	  processAlive: false,
+	  capabilitySnapshot: {
+		revision: "claude-snapshot",
+		capabilities: [
+		  ...["approval_policy", "context_delivery", "goal", "model_configuration"].map((id) => ({ id, availability: "available" as const, revision: "test", scope: { ...testScope, runtimeKind: "claude" } })),
+		  ...[
+			["native_archive", "Claude has no native archive", "Archive the Loom Agent"],
+			["remote", "Claude has no Remote", "Use a Loom binding"],
+			["manual_compaction", "Claude compacts automatically", "Allow automatic compaction"],
+			["sandbox_configuration", "Claude has no whole-process sandbox isolation", "Use Approval policy"],
+		  ].map(([id, reason, alternative]) => ({ id, availability: "unavailable" as const, reason, alternative, revision: "test", scope: { ...testScope, runtimeKind: "claude" } })),
+		],
+	  },
+	};
+	const view = render(<AgentPane {...props} agent={claudeAgent} active configRequestNonce={1} />);
+
+	expect(view.getByText("Native archive").nextElementSibling).toHaveTextContent("Unavailable");
+	expect(view.getByText("Remote").nextElementSibling).toHaveTextContent("Unavailable");
+	expect(view.getByText("Manual compaction").nextElementSibling).toHaveTextContent("Unavailable");
+	expect(view.getByText("Sandbox configuration").nextElementSibling).toHaveTextContent("Unavailable");
+	expect(view.getByRole("button", { name: "Set a Goal" })).toBeEnabled();
+	expect(view.queryByText("Goal is unavailable for the claude Runtime.")).toBeNull();
+	expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
+  });
+
   it("rejects unsupported images when they are attached but keeps other files", () => {
 	const onError = vi.fn();
 	const piAgent: Agent = {

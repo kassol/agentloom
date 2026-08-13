@@ -608,8 +608,8 @@ func TestLegacyMigrationEvidenceDoesNotCrossRuntimeBinding(t *testing.T) {
 	}
 }
 
-func TestLoomGoalConformanceAcrossCodexAndPiStoreDriverRestart(t *testing.T) {
-	for _, kind := range []string{"codex", "pi"} {
+func TestLoomGoalConformanceAcrossCodexPiAndClaudeStoreDriverRestart(t *testing.T) {
+	for _, kind := range []string{"codex", "pi", "claude"} {
 		t.Run(kind, func(t *testing.T) {
 			dir := t.TempDir()
 			st, err := store.Open(dir)
@@ -621,6 +621,9 @@ func TestLoomGoalConformanceAcrossCodexAndPiStoreDriverRestart(t *testing.T) {
 				ID: "agent-" + kind, Name: "worker-" + kind, Cwd: t.TempDir(), ThreadID: "loom-thread-" + kind,
 				RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: kind, NativeRef: "native-" + kind},
 				Status:         "idle", CreatedAt: stamp, UpdatedAt: stamp,
+			}
+			if kind == "claude" {
+				agent.RuntimeConfiguration = testClaudeRuntimeConfiguration()
 			}
 			if err := st.SaveAgents(map[string]*Agent{agent.ID: agent}); err != nil {
 				t.Fatal(err)
@@ -672,7 +675,13 @@ func TestLoomGoalConformanceAcrossCodexAndPiStoreDriverRestart(t *testing.T) {
 				h.finishTurnLocked(h.agents[agent.ID], rt, "completed", "")
 			}
 			h.mu.Unlock()
+			complete := GoalStatusComplete
 			revision = pausedGoal.Version
+			completedGoal, err := h.UpdateGoal(agent.ID, GoalUpdateParams{Status: &complete, ExpectedVersion: &revision})
+			if err != nil {
+				t.Fatal(err)
+			}
+			revision = completedGoal.Version
 			if cleared, err := h.ClearGoalVersion(agent.ID, &revision); err != nil || !cleared {
 				t.Fatalf("clear = %v, %v", cleared, err)
 			}
@@ -703,10 +712,10 @@ func TestLoomGoalConformanceAcrossCodexAndPiStoreDriverRestart(t *testing.T) {
 				return RuntimeContextEvidence{EpochID: "initial:" + threadID}, nil
 			}
 			reopened.mu.Unlock()
-			if goal, gotRevision, err := reopened.GetGoalState(agent.ID); err != nil || goal != nil || gotRevision != 4 {
+			if goal, gotRevision, err := reopened.GetGoalState(agent.ID); err != nil || goal != nil || gotRevision != 5 {
 				t.Fatalf("reopened tombstone goal=%#v revision=%d err=%v", goal, gotRevision, err)
 			}
-			revision = 4
+			revision = 5
 			recreated, err := reopened.UpdateGoal(agent.ID, GoalUpdateParams{Objective: &objective, ExpectedVersion: &revision})
 			if err != nil {
 				t.Fatal(err)
@@ -716,7 +725,7 @@ func TestLoomGoalConformanceAcrossCodexAndPiStoreDriverRestart(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("recreated Goal continuation did not start")
 			}
-			if recreated.Version != 5 || (kind == "codex" && (recreated.NativeSyncState != goalNativeSyncFailed || recreated.NativeMigrationBlocked)) || (kind == "pi" && recreated.NativeSyncState != goalNativeSyncNotApplicable) {
+			if recreated.Version != 6 || (kind == "codex" && (recreated.NativeSyncState != goalNativeSyncFailed || recreated.NativeMigrationBlocked)) || (kind != "codex" && recreated.NativeSyncState != goalNativeSyncNotApplicable) {
 				t.Fatalf("recreated Goal = %#v", recreated)
 			}
 			if reopenedContract.startCalls != 1 {
@@ -748,7 +757,17 @@ func newGoalConformanceRuntime(kind string, failNativeSync bool) (*controlPlaneC
 		}
 		return contract, &goalConformanceDriver{host: &goalConformanceHost{contract: syncContract, alive: true}}, started
 	}
-	contract.snapshot = piControlPlaneCapabilitySnapshot()
+	if kind == "claude" {
+		contract.snapshot = controlPlaneCapabilitySnapshot("claude")
+		for index := range contract.snapshot.Capabilities {
+			id := contract.snapshot.Capabilities[index].ID
+			if id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityGoal {
+				contract.snapshot.Capabilities[index] = runtimeCapabilityDescriptor("claude", id, true)
+			}
+		}
+	} else {
+		contract.snapshot = piControlPlaneCapabilitySnapshot()
+	}
 	return contract, &goalConformanceDriver{host: &goalConformanceHost{contract: contract, alive: true}}, started
 }
 

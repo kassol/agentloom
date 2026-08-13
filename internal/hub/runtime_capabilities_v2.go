@@ -371,7 +371,7 @@ func claudeControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Ca
 			snapshot.Capabilities[index].Alternative = "change selected setting sources or manage native resources in Claude settings"
 			continue
 		}
-		available := id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy || id == runtimecontract.CapabilityResourceInventory || id == runtimecontract.CapabilityRuntimeConfiguration || id == runtimecontract.CapabilityUsageReporting || id == runtimecontract.CapabilityModelConfiguration || id == runtimecontract.CapabilityImageInput && len(imageInput) > 0 && imageInput[0]
+		available := id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy || id == runtimecontract.CapabilityResourceInventory || id == runtimecontract.CapabilityRuntimeConfiguration || id == runtimecontract.CapabilityGoal || id == runtimecontract.CapabilityUsageReporting || id == runtimecontract.CapabilityModelConfiguration || id == runtimecontract.CapabilityImageInput && len(imageInput) > 0 && imageInput[0]
 		if available {
 			snapshot.Capabilities[index] = runtimeCapabilityDescriptor("claude", id, true)
 		}

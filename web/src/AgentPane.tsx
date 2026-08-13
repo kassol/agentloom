@@ -104,6 +104,7 @@ export function AgentPane({
   const approvalPolicyAvailable = capabilityAvailable(agent, "approval_policy");
   const modelConfigurationAvailable = capabilityAvailable(agent, "model_configuration");
   const goalAvailable = capabilityAvailable(agent, "goal");
+  const nativeArchiveAvailable = capabilityAvailable(agent, "native_archive");
   const remoteAvailable = capabilityAvailable(agent, "remote");
   const usageAvailable = capabilityAvailable(agent, "usage_reporting");
   const compactionAvailable = capabilityAvailable(agent, "manual_compaction");
@@ -1221,6 +1222,7 @@ export function AgentPane({
 						["Image input", imageInputAvailable],
 						["History", true],
 						["Goal support", goalAvailable],
+						["Native archive", nativeArchiveAvailable],
 						["Remote", remoteAvailable],
 						["Usage reporting", usageAvailable],
 						["Sandbox configuration", sandboxConfigurationAvailable],

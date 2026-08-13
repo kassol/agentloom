@@ -20,9 +20,11 @@ func TestMixedRuntimeMessagesShareDurableHTTPAndSSEControlPlaneAcrossRestart(t *
 		t.Fatal(err)
 	}
 	agents := map[string]*hub.Agent{
-		"agent-codex": {
-			ID: "agent-codex", Name: "codex-owner", Source: "edge", Status: "running", ThreadID: "loom-thread-codex",
-			RuntimeBinding: hub.RuntimeBinding{Kind: "codex", NativeRef: "codex-thread"}, CreatedAt: nowForTest(), UpdatedAt: nowForTest(),
+		"agent-claude": {
+			ID: "agent-claude", Name: "claude-owner", Source: "edge", Status: "running", ThreadID: "loom-thread-claude",
+			RuntimeBinding:       hub.RuntimeBinding{SchemaVersion: hub.RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "claude-session-private"},
+			RuntimeConfiguration: hub.RuntimeConfiguration{Configured: true, SettingSources: []string{"project"}, Authentication: hub.RuntimeAuthentication{Category: hub.RuntimeAuthConsole, Source: "api_key"}},
+			CreatedAt:            nowForTest(), UpdatedAt: nowForTest(),
 		},
 		"agent-pi": {
 			ID: "agent-pi", Name: "pi-worker", Source: "edge", Status: "running", ThreadID: "loom-thread-pi",
@@ -40,17 +42,17 @@ func TestMixedRuntimeMessagesShareDurableHTTPAndSSEControlPlaneAcrossRestart(t *
 	server := httptest.NewServer(New(h, st, web).Handler())
 
 	root := postComm(t, server.URL, map[string]any{
-		"from": "agent-pi", "to": "agent-codex", "subject": "Need Domain decision",
+		"from": "agent-pi", "to": "agent-claude", "subject": "Need Domain decision",
 		"body": "Please decide the contract.", "response": "required",
 	})
-	if root.FromAgentID != "agent-pi" || root.ToAgentID != "agent-codex" || root.Status != "open" || root.DeliveryStatus != "queued" {
-		t.Fatalf("Pi to Codex root = %#v", root)
+	if root.FromAgentID != "agent-pi" || root.ToAgentID != "agent-claude" || root.Status != "open" || root.DeliveryStatus != "queued" {
+		t.Fatalf("Pi to Claude root = %#v", root)
 	}
 	reply := postComm(t, server.URL, map[string]any{
-		"from": "agent-codex", "replyTo": root.ID, "body": "Use the narrow Loom contract.",
+		"from": "agent-claude", "replyTo": root.ID, "body": "Use the narrow Loom contract.",
 	})
-	if reply.FromAgentID != "agent-codex" || reply.ToAgentID != "agent-pi" || reply.ReplyTo != root.ID || reply.DeliveryStatus != "queued" {
-		t.Fatalf("Codex to Pi reply = %#v", reply)
+	if reply.FromAgentID != "agent-claude" || reply.ToAgentID != "agent-pi" || reply.ReplyTo != root.ID || reply.DeliveryStatus != "queued" {
+		t.Fatalf("Claude to Pi reply = %#v", reply)
 	}
 
 	events := readGlobalSSE(t, h, "/api/agents/events?since=0", 4)
@@ -91,10 +93,10 @@ func TestMixedRuntimeMessagesShareDurableHTTPAndSSEControlPlaneAcrossRestart(t *
 	defer restartServer.Close()
 	gotRoot := getComm(t, restartServer.URL, root.ID)
 	gotReply := getComm(t, restartServer.URL, reply.ID)
-	if gotRoot.ID != root.ID || gotRoot.FromAgentID != "agent-pi" || gotRoot.ToAgentID != "agent-codex" || gotRoot.Status != "open" {
+	if gotRoot.ID != root.ID || gotRoot.FromAgentID != "agent-pi" || gotRoot.ToAgentID != "agent-claude" || gotRoot.Status != "open" {
 		t.Fatalf("restarted root = %#v", gotRoot)
 	}
-	if gotReply.ID != reply.ID || gotReply.ReplyTo != root.ID || gotReply.FromAgentID != "agent-codex" || gotReply.ToAgentID != "agent-pi" {
+	if gotReply.ID != reply.ID || gotReply.ReplyTo != root.ID || gotReply.FromAgentID != "agent-claude" || gotReply.ToAgentID != "agent-pi" {
 		t.Fatalf("restarted reply = %#v", gotReply)
 	}
 }

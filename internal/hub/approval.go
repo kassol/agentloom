@@ -107,8 +107,8 @@ func canonicalApprovalParams(meta *Agent, turnID string, proposal runtimecontrac
 	if len(proposal.Arguments) > 0 {
 		arguments := make(map[string]any, len(proposal.Arguments))
 		for _, argument := range proposal.Arguments {
-			if approvalActionKey(argument.Name) {
-				arguments[argument.Name] = projectApprovalAction(argument.Value)
+			if approvalActionKey(argument.Name) && !privateRuntimeCollaborationArgument(proposal.ToolName, argument.Name) {
+				arguments[argument.Name] = projectApprovalAction(proposal.ToolName, argument.Value)
 			}
 		}
 		public["arguments"] = arguments
@@ -120,20 +120,33 @@ func canonicalApprovalParams(meta *Agent, turnID string, proposal runtimecontrac
 	return encoded
 }
 
-func projectApprovalAction(value any) any {
+func privateRuntimeCollaborationArgument(toolName, argumentName string) bool {
+	normalize := func(value string) string {
+		return strings.NewReplacer("_", "", "-", "", " ", "", "/", "").Replace(strings.ToLower(strings.TrimSpace(value)))
+	}
+	argument := normalize(argumentName)
+	if strings.Contains(argument, "native") || strings.Contains(argument, "session") || argument == "subagentid" ||
+		argument == "teamid" || argument == "teamname" || argument == "resume" {
+		return true
+	}
+	tool := normalize(toolName)
+	return argument == "name" && (strings.Contains(tool, "agent") || strings.Contains(tool, "team") || strings.Contains(tool, "task"))
+}
+
+func projectApprovalAction(toolName string, value any) any {
 	switch typed := value.(type) {
 	case map[string]any:
 		projected := map[string]any{}
 		for key, nested := range typed {
-			if approvalActionKey(key) {
-				projected[key] = projectApprovalAction(nested)
+			if approvalActionKey(key) && !privateRuntimeCollaborationArgument(toolName, key) {
+				projected[key] = projectApprovalAction(toolName, nested)
 			}
 		}
 		return projected
 	case []any:
 		projected := make([]any, len(typed))
 		for index, nested := range typed {
-			projected[index] = projectApprovalAction(nested)
+			projected[index] = projectApprovalAction(toolName, nested)
 		}
 		return projected
 	case string:

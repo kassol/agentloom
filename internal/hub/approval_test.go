@@ -15,6 +15,28 @@ func testApprovalProposal(toolName string, arguments ...runtimecontract.Approval
 	return runtimecontract.ApprovalProposal{ID: "runtime-proposal-1", ToolName: toolName, Action: toolName, Arguments: arguments}
 }
 
+func TestClaudeApprovalProjectionHidesNativeCollaborationIdentifiers(t *testing.T) {
+	meta := &Agent{ID: "agent-1", ThreadID: "loom-thread-1", RuntimeBinding: RuntimeBinding{Kind: "claude"}}
+	projected := canonicalApprovalParams(meta, "turn-1", testApprovalProposal("Agent",
+		runtimecontract.ApprovalArgument{Name: "subagent_type", Value: "Explore"},
+		runtimecontract.ApprovalArgument{Name: "model", Value: "sonnet"},
+		runtimecontract.ApprovalArgument{Name: "prompt", Value: "Inspect the repository"},
+		runtimecontract.ApprovalArgument{Name: "name", Value: "native-child"},
+		runtimecontract.ApprovalArgument{Name: "team_name", Value: "native-team"},
+		runtimecontract.ApprovalArgument{Name: "resume", Value: "native-session"},
+	))
+	for _, private := range []string{"native-child", "native-team", "native-session"} {
+		if strings.Contains(string(projected), private) {
+			t.Fatalf("Claude Approval leaked private identifier %q: %s", private, projected)
+		}
+	}
+	for _, visible := range []string{"Explore", "sonnet", "Inspect the repository"} {
+		if !strings.Contains(string(projected), visible) {
+			t.Fatalf("Claude Approval omitted useful action context %q: %s", visible, projected)
+		}
+	}
+}
+
 func TestRuntimeApprovalRequestIsDurableAndVisibleInAgentSnapshot(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
