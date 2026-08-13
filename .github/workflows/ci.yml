@@ -51,3 +51,9 @@ jobs:
 
       - name: Run frontend tests
         run: npm --prefix web test
+
+      - name: Install Chromium for browser regressions
+        run: cd web && npx playwright install --with-deps chromium
+
+      - name: Run frontend browser tests
+        run: npm --prefix web run test:browser
