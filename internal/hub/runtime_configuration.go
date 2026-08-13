@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	RuntimeAuthConsole = "console"
-	RuntimeAuthCloud   = "cloud"
-	RuntimeAuthGateway = "gateway"
+	RuntimeAuthConsole      = "console"
+	RuntimeAuthSubscription = "subscription"
+	RuntimeAuthCloud        = "cloud"
+	RuntimeAuthGateway      = "gateway"
 )
 
 type RuntimeAuthentication struct {
@@ -92,6 +93,12 @@ func claudeRuntimeConfigurationDescriptor() RuntimeConfigurationDescriptor {
 		},
 		Authentication: []RuntimeAuthenticationOption{
 			{
+				Category:    RuntimeAuthSubscription,
+				Label:       "Claude subscription",
+				Description: "Uses this Owner's existing local Claude.ai login for development. CodexLoom does not copy or store the OAuth credential.",
+				Sources:     []RuntimeConfigurationOption{{ID: "claude_ai", Label: "Local Claude.ai login (OAuth)"}},
+			},
+			{
 				Category: RuntimeAuthConsole,
 				Label:    "Claude Console",
 				Description: "API keys are supported. Claude credential helpers cannot be selected or verified through the public Agent SDK, " +
@@ -165,6 +172,10 @@ func normalizeRuntimeConfiguration(runtimeKind string, configuration RuntimeConf
 	auth := configuration.Authentication
 	auth.Category, auth.Source = strings.TrimSpace(auth.Category), strings.TrimSpace(auth.Source)
 	switch auth.Category {
+	case RuntimeAuthSubscription:
+		if auth.Source != "claude_ai" {
+			return RuntimeConfiguration{}, errf(400, "Claude subscription authentication source must be claude_ai")
+		}
 	case RuntimeAuthConsole:
 		if auth.Source != "api_key" {
 			return RuntimeConfiguration{}, errf(400, "Claude Console authentication source must be api_key")
@@ -180,7 +191,7 @@ func normalizeRuntimeConfiguration(runtimeKind string, configuration RuntimeConf
 			return RuntimeConfiguration{}, errf(400, "Claude gateway authentication source must be gateway")
 		}
 	default:
-		return RuntimeConfiguration{}, errf(400, "Claude authentication category must be console, cloud, or gateway")
+		return RuntimeConfiguration{}, errf(400, "Claude authentication category must be subscription, console, cloud, or gateway")
 	}
 	return RuntimeConfiguration{Configured: true, SettingSources: sources, Authentication: auth}, nil
 }

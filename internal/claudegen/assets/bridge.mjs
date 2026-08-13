@@ -108,7 +108,8 @@ function ownerConfiguration(payload) {
   }
   const category = String(raw.authentication.category || "");
   const source = String(raw.authentication.source || "");
-  const supported = category === "console" && source === "api_key"
+  const supported = category === "subscription" && source === "claude_ai"
+    || category === "console" && source === "api_key"
     || category === "gateway" && source === "gateway"
     || category === "cloud" && ["bedrock", "vertex", "foundry", "anthropic_aws", "anthropic_google_cloud", "mantle"].includes(source);
   if (!supported) throw new Error("Claude Runtime authentication source cannot be safely verified");
@@ -148,7 +149,9 @@ async function verifyAuthentication(control, configuration) {
     bedrock: "bedrock", vertex: "vertex", foundry: "foundry", anthropic_aws: "anthropicAws",
     anthropic_google_cloud: "anthropicGoogleCloud", mantle: "mantle", gateway: "gateway"
   };
-  const accepted = source === "api_key"
+  const accepted = source === "claude_ai"
+    ? provider === "firstParty" && typeof account?.subscriptionType === "string" && account.subscriptionType.trim().length > 0
+    : source === "api_key"
     ? provider === "firstParty" && typeof account?.apiKeySource === "string" && account.apiKeySource !== "oauth"
     : provider === providerBySource[source];
   if (!accepted) throw new Error("Claude Runtime authentication did not match the selected source");
@@ -309,6 +312,14 @@ function certificationOptions(policy) {
   };
 }
 
+function preInitHookEvent(message) {
+  return message?.type === "system" && ["hook_started", "hook_progress", "hook_response"].includes(message.subtype);
+}
+
+function preInitInputReplay(message, resume, sessionRef) {
+  return message?.session_id === sessionRef && (message?.type === "user" || (resume && message?.type === "assistant"));
+}
+
 function assistantContent(message) {
   const blocks = Array.isArray(message?.message?.content) ? message.message.content : [];
   return blocks.flatMap((block, index) => {
@@ -353,15 +364,22 @@ async function runTurn(frame) {
 		return;
 	  }
 	}
-	if (!payload.resume && await getSessionInfo(sessionRef, {dir: payload.cwd})) {
-	  respond(frame, false, {}, "Claude Runtime cannot create the reserved session");
-	  return;
+	let resume = Boolean(payload.resume);
+	if (!resume) {
+	  const existing = await getSessionInfo(sessionRef, {dir: payload.cwd});
+	  if (existing) {
+		if (existing.sessionId !== sessionRef || existing.cwd !== payload.cwd) {
+		  respond(frame, false, {}, "Claude Runtime cannot recover the reserved session");
+		  return;
+		}
+		resume = true;
+	  }
 	}
     const options = {
       cwd: payload.cwd,
       settingSources: configuration.settingSources,
       env: selectedAuthenticationEnvironment(configuration),
-      ...(payload.resume ? {resume: sessionRef} : {sessionId: sessionRef}),
+      ...(resume ? {resume: sessionRef} : {sessionId: sessionRef}),
       ...(developer ? {systemPrompt: {type: "preset", preset: "claude_code", append: developer}} : {}),
       canUseTool: (toolName, input, callbackOptions) => requestPermission(turn, toolName, input, callbackOptions),
       ...certificationOptions(payload.certificationPolicy)
@@ -375,7 +393,7 @@ async function runTurn(frame) {
 	  const available = await sdkQuery.supportedModels();
 	  const rawCurrent = available.find((model) => model?.value === payload.model);
 	  const state = modelState(modelCatalog(available), {provider: "anthropic", model: payload.model, thinkingLevel: payload.thinkingLevel || "default"});
-	  expectedModel = rawCurrent?.resolvedModel || rawCurrent?.value || "";
+	  expectedModel = payload.model === "default" ? "" : rawCurrent?.resolvedModel || rawCurrent?.value || "";
 	  await sdkQuery.setModel(state.current.id === "default" ? undefined : state.current.id);
 	  await sdkQuery.applyFlagSettings({effortLevel: state.thinkingLevel === "default" ? null : state.thinkingLevel});
 	  if ((Array.isArray(payload.input) ? payload.input : []).some((block) => block?.kind === "image") && !state.current.imageInput) {
@@ -390,6 +408,7 @@ async function runTurn(frame) {
         throw new Error("Claude SDK initialized a different session");
       }
 	  if (!turn.accepted) {
+		if (preInitHookEvent(message) || preInitInputReplay(message, resume, sessionRef)) continue;
 		if (message?.type !== "system" || message.subtype !== "init" || message.session_id !== sessionRef) {
           throw new Error("Claude SDK did not initialize the reserved session");
         }

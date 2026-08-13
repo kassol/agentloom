@@ -34,6 +34,104 @@ func TestEmbeddedBridgeHasValidJavaScriptSyntax(t *testing.T) {
 	}
 }
 
+func TestEmbeddedBridgeAcceptsOnlyExplicitLocalClaudeSubscriptionEvidence(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	app := t.TempDir()
+	module := filepath.Join(app, "node_modules", "@anthropic-ai", "claude-agent-sdk")
+	if err := os.MkdirAll(module, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "bridge.mjs"), currentAssets().Bridge, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(module, "package.json"), []byte(`{"type":"module","exports":"./index.js","version":"0.3.228","claudeCodeVersion":"2.1.228"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := `
+export async function getSessionInfo() { return undefined; }
+export function query() {
+  return {
+    async accountInfo() {
+      return process.env.LOOM_TEST_SUBSCRIPTION === "missing"
+        ? {apiProvider:"firstParty"}
+        : {apiProvider:"firstParty",subscriptionType:"Claude Max",email:"must-not-escape@example.com"};
+    },
+    close() {}
+  };
+}`
+	if err := os.WriteFile(filepath.Join(module, "index.js"), []byte(fake), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := func(t *testing.T, missing bool) map[string]any {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, node, filepath.Join(app, "bridge.mjs"))
+		if missing {
+			cmd.Env = append(os.Environ(), "LOOM_TEST_SUBSCRIPTION=missing")
+		}
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+		scanner := bufio.NewScanner(stdout)
+		read := func() map[string]any {
+			t.Helper()
+			if !scanner.Scan() {
+				t.Fatalf("bridge output ended: %v", scanner.Err())
+			}
+			var frame map[string]any
+			if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+				t.Fatalf("bridge frame = %s: %v", scanner.Bytes(), err)
+			}
+			return frame
+		}
+		write := func(frame any) {
+			encoded, _ := json.Marshal(frame)
+			if _, err := stdin.Write(append(encoded, '\n')); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_ = read()
+		write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
+		_ = read()
+		write(map[string]any{
+			"kind": "command", "command": "inspect_configuration", "requestId": "inspect", "operation": "op-inspect",
+			"payload": map[string]any{"cwd": app, "configuration": map[string]any{
+				"settingSources": []string{"user"}, "authentication": map[string]any{"category": "subscription", "source": "claude_ai"},
+			}},
+		})
+		return read()
+	}
+	t.Run("accepted without identity leakage", func(t *testing.T) {
+		frame := run(t, false)
+		encoded, _ := json.Marshal(frame)
+		if frame["accepted"] != true || bytes.Contains(encoded, []byte("must-not-escape")) {
+			t.Fatalf("subscription evidence = %s", encoded)
+		}
+		auth := frame["data"].(map[string]any)["authentication"].(map[string]any)
+		if auth["category"] != "subscription" || auth["source"] != "claude_ai" || auth["validation"] != "accepted" || len(auth) != 3 {
+			t.Fatalf("safe subscription evidence = %#v", auth)
+		}
+	})
+	t.Run("missing subscription rejected", func(t *testing.T) {
+		if frame := run(t, true); frame["accepted"] != false {
+			t.Fatalf("missing subscription accepted = %#v", frame)
+		}
+	})
+}
+
 func TestReadActiveGenerationIDDoesNotRequireInstalledRuntime(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "state.json"), []byte(`{"version":1,"active":"generation-static"}`), 0o600); err != nil {
@@ -105,6 +203,8 @@ export function query({prompt, options}) {
       const first = await prompt[Symbol.asyncIterator]().next();
 	  const firstContent = first.value.message.content;
 	  const configured = selectedModel === "sonnet" && selectedEffort === "high" && firstContent.some((part) => part.type === "image" && part.source.media_type === "image/png" && part.source.data === "aW1hZ2U=");
+	  yield {type:"system", subtype:"hook_started", hook_id:"startup", hook_name:"SessionStart", hook_event:"SessionStart", uuid:"hook-started", session_id:options.sessionId};
+	  yield {type:"system", subtype:"hook_response", hook_id:"startup", hook_name:"SessionStart", hook_event:"SessionStart", output:"ready", stdout:"", stderr:"", outcome:"success", uuid:"hook-response", session_id:options.sessionId};
 	  yield {type:"system", subtype:"init", session_id:options.sessionId, model:"claude-sonnet-4-6"};
       await delay(80);
 	  yield {type:"assistant", uuid:"first", session_id:options.sessionId, message:{model:"claude-sonnet-4-6",content:[{type:"text",text:configured?"configured-image-observed":"missing-configuration"}]}};
@@ -357,6 +457,182 @@ export function query({prompt, options}) {
 		t.Fatal("exact Approval input did not reach the SDK callback")
 	}
 	write(map[string]any{"kind": "close"})
+}
+
+func TestEmbeddedBridgeRecoversAReservedSessionCreatedBeforeInitAck(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	app := t.TempDir()
+	module := filepath.Join(app, "node_modules", "@anthropic-ai", "claude-agent-sdk")
+	if err := os.MkdirAll(module, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "bridge.mjs"), currentAssets().Bridge, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(module, "package.json"), []byte(`{"type":"module","exports":"./index.js","version":"0.3.228","claudeCodeVersion":"2.1.228"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := `
+export async function getSessionInfo(sessionId, options) { return {sessionId, cwd:options.dir}; }
+export async function getSessionMessages() { return []; }
+export async function listSessions() { return []; }
+export function query({prompt, options}) {
+  if (!options.resume || options.sessionId) throw new Error("existing reserved session was not resumed");
+  return {
+    async accountInfo() { return {apiProvider:"firstParty",subscriptionType:"Claude Max"}; },
+    async supportedModels() { return [{value:"haiku",resolvedModel:"claude-haiku-4-5-20251001",displayName:"Haiku"}]; },
+    async setModel() {}, async applyFlagSettings() {}, close() {},
+    async *[Symbol.asyncIterator]() {
+      await prompt[Symbol.asyncIterator]().next();
+	  yield {type:"user",uuid:"replayed-user",session_id:options.resume,message:{role:"user",content:[{type:"text",text:"previous interrupted input"}]}};
+      yield {type:"system",subtype:"init",session_id:options.resume,model:"claude-haiku-4-5-20251001"};
+      yield {type:"assistant",uuid:"answer",session_id:options.resume,message:{model:"claude-haiku-4-5-20251001",content:[{type:"text",text:"recovered"}]}};
+      yield {type:"result",subtype:"success",session_id:options.resume,usage:{input_tokens:1,output_tokens:1},num_turns:1,total_cost_usd:0};
+    }
+  };
+}`
+	if err := os.WriteFile(filepath.Join(module, "index.js"), []byte(fake), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, node, filepath.Join(app, "bridge.mjs"))
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	scanner := bufio.NewScanner(stdout)
+	read := func() map[string]any {
+		t.Helper()
+		if !scanner.Scan() {
+			t.Fatalf("bridge output ended: %v", scanner.Err())
+		}
+		var frame map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+			t.Fatalf("bridge frame = %s: %v", scanner.Bytes(), err)
+		}
+		return frame
+	}
+	write := func(frame any) {
+		encoded, _ := json.Marshal(frame)
+		if _, err := stdin.Write(append(encoded, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = read()
+	write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
+	_ = read()
+	session := "11111111-1111-4111-8111-111111111111"
+	write(map[string]any{
+		"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start",
+		"payload": map[string]any{
+			"sessionRef": session, "cwd": app, "resume": false, "model": "haiku", "thinkingLevel": "default",
+			"configuration": map[string]any{"settingSources": []string{"user"}, "authentication": map[string]any{"category": "subscription", "source": "claude_ai"}},
+			"input":         []any{map[string]any{"kind": "text", "role": "user", "text": "work"}},
+		},
+	})
+	accepted, completed := false, false
+	for !completed {
+		frame := read()
+		accepted = accepted || frame["kind"] == "response" && frame["requestId"] == "start" && frame["accepted"] == true
+		completed = frame["kind"] == "event" && frame["event"] == "turn_completed"
+	}
+	if !accepted {
+		t.Fatal("recovered reserved session did not accept the Turn")
+	}
+}
+
+func TestEmbeddedBridgeLetsTheSDKResolveTheDefaultModel(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	app := t.TempDir()
+	module := filepath.Join(app, "node_modules", "@anthropic-ai", "claude-agent-sdk")
+	if err := os.MkdirAll(module, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "bridge.mjs"), currentAssets().Bridge, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(module, "package.json"), []byte(`{"type":"module","exports":"./index.js","version":"0.3.228","claudeCodeVersion":"2.1.228"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := `
+export async function getSessionInfo() { return undefined; }
+export async function getSessionMessages() { return []; }
+export async function listSessions() { return []; }
+export function query({prompt, options}) {
+  return {
+    async accountInfo() { return {apiProvider:"firstParty",subscriptionType:"Claude Max"}; },
+    async supportedModels() { return [{value:"default",resolvedModel:"catalog-snapshot",displayName:"Default"}]; },
+    async setModel(model) { if (model !== undefined) throw new Error("default model was pinned"); },
+    async applyFlagSettings() {}, close() {},
+    async *[Symbol.asyncIterator]() {
+      await prompt[Symbol.asyncIterator]().next();
+	  yield {type:"user",session_id:options.sessionId,message:{role:"user",content:[{type:"text",text:"work"}]}};
+      yield {type:"system",subtype:"init",session_id:options.sessionId,model:"subscription-routed-model"};
+      yield {type:"assistant",uuid:"answer",session_id:options.sessionId,message:{model:"subscription-routed-model",content:[{type:"text",text:"done"}]}};
+      yield {type:"result",subtype:"success",session_id:options.sessionId,usage:{input_tokens:1,output_tokens:1},num_turns:1,total_cost_usd:0};
+    }
+  };
+}`
+	if err := os.WriteFile(filepath.Join(module, "index.js"), []byte(fake), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, node, filepath.Join(app, "bridge.mjs"))
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	scanner := bufio.NewScanner(stdout)
+	read := func() map[string]any {
+		t.Helper()
+		if !scanner.Scan() {
+			t.Fatalf("bridge output ended: %v", scanner.Err())
+		}
+		var frame map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+			t.Fatal(err)
+		}
+		return frame
+	}
+	write := func(frame any) { encoded, _ := json.Marshal(frame); _, _ = stdin.Write(append(encoded, '\n')) }
+	_ = read()
+	write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
+	_ = read()
+	write(map[string]any{
+		"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start",
+		"payload": map[string]any{
+			"sessionRef": "11111111-1111-4111-8111-111111111111", "cwd": app, "model": "default", "thinkingLevel": "default",
+			"configuration": map[string]any{"settingSources": []string{"user"}, "authentication": map[string]any{"category": "subscription", "source": "claude_ai"}},
+			"input":         []any{map[string]any{"kind": "text", "role": "user", "text": "work"}},
+		},
+	})
+	accepted, completed := false, false
+	for !completed {
+		frame := read()
+		accepted = accepted || frame["kind"] == "response" && frame["accepted"] == true
+		completed = frame["kind"] == "event" && frame["event"] == "turn_completed"
+	}
+	if !accepted {
+		t.Fatal("SDK-routed default model Turn was not accepted")
+	}
 }
 
 func TestEmbeddedBridgeCertificationStreamsBeforeInterruptAndClassifiesTerminal(t *testing.T) {
@@ -667,7 +943,7 @@ func TestStatusReportsUnreadableStateAsBroken(t *testing.T) {
 
 func TestCurrentCompatibilityRowAndSupportedPlatformsAreExact(t *testing.T) {
 	manifest := CurrentManifest()
-	if manifest.ID != "claude-runtime-v9-node24.19.0-sdk0.3.228" ||
+	if manifest.ID != "claude-runtime-v14-node24.19.0-sdk0.3.228" ||
 		manifest.NodeVersion != "24.19.0" || manifest.SDKVersion != "0.3.228" || manifest.ClaudeCodeVersion != "2.1.228" || len(manifest.Platforms) != 4 {
 		t.Fatalf("current manifest = %#v", manifest)
 	}

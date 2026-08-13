@@ -1576,6 +1576,7 @@ export default function App() {
 						</select>
 					</label>
 				</div>
+				{selectedRuntimeConfigurationSpec.authentication.find((category) => category.category === newRuntimeConfiguration.authentication.category)?.description ? <p className="text-[10px] leading-4 text-muted-foreground">{selectedRuntimeConfigurationSpec.authentication.find((category) => category.category === newRuntimeConfiguration.authentication.category)?.description}</p> : null}
 				{newRuntimeConfiguration.settingSources.length === 0 ? <p className="text-[10px] text-destructive">Select at least one settings source.</p> : null}
 			</div> : null}
 			{newAgentMode === "adopt" ? <>

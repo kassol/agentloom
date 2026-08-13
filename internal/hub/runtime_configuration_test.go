@@ -44,8 +44,19 @@ func TestClaudeRuntimeConfigurationRejectsEmptySettingsAndUnsupportedHelper(t *t
 		t.Fatalf("normalized Claude configuration = %#v, err=%v", normalized, err)
 	}
 	console := claudeRuntimeConfigurationDescriptor().Authentication[0]
+	if console.Category != RuntimeAuthSubscription || console.Sources[0].ID != "claude_ai" || !strings.Contains(console.Description, "existing local Claude.ai login") {
+		t.Fatalf("Subscription authentication descriptor = %#v", console)
+	}
+	console = claudeRuntimeConfigurationDescriptor().Authentication[1]
 	if console.Category != RuntimeAuthConsole || !strings.Contains(console.Description, "credential helpers") || !strings.Contains(console.Description, "unavailable") {
 		t.Fatalf("Console authentication descriptor = %#v", console)
+	}
+	subscription, err := normalizeRuntimeConfiguration("claude", RuntimeConfiguration{
+		Configured: true, SettingSources: []string{"user"},
+		Authentication: RuntimeAuthentication{Category: RuntimeAuthSubscription, Source: "claude_ai"},
+	})
+	if err != nil || subscription.Authentication != (RuntimeAuthentication{Category: RuntimeAuthSubscription, Source: "claude_ai"}) {
+		t.Fatalf("normalized Claude subscription configuration = %#v, err=%v", subscription, err)
 	}
 }
 

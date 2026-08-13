@@ -20,6 +20,7 @@ const claudeConfiguration = {
 		{ id: "local", label: "Local", description: "Local settings" },
 	],
 	authentication: [
+		{ category: "subscription", label: "Claude subscription", description: "Uses this Owner's existing local Claude.ai login for development. CodexLoom does not copy or store the OAuth credential.", sources: [{ id: "claude_ai", label: "Local Claude.ai login (OAuth)" }] },
 		{ category: "console", label: "Claude Console", sources: [{ id: "api_key", label: "API key" }] },
 		{ category: "gateway", label: "Gateway", sources: [{ id: "gateway", label: "Managed gateway" }] },
 	],
@@ -136,6 +137,10 @@ describe("Agent creation dialog", () => {
 		expect(within(dialog).getByRole("checkbox", { name: /User/ })).toBeChecked();
 		expect(within(dialog).getByRole("checkbox", { name: /Project/ })).toBeChecked();
 		expect(within(dialog).getByRole("checkbox", { name: /Local/ })).toBeChecked();
+		fireEvent.change(within(dialog).getByLabelText("Authentication category"), { target: { value: "subscription" } });
+		expect(within(dialog).getByLabelText("Authentication source")).toHaveValue("claude_ai");
+		expect(within(dialog).getByRole("option", { name: "Local Claude.ai login (OAuth)" })).toBeInTheDocument();
+		expect(within(dialog).getByText(/does not copy or store the OAuth credential/)).toBeInTheDocument();
 		fireEvent.change(within(dialog).getByLabelText("Agent name"), { target: { value: "claude-owner" } });
 		fireEvent.change(within(dialog).getByLabelText("Working directory"), { target: { value: "/workspace/claude" } });
 		fireEvent.click(within(dialog).getByRole("button", { name: "Create agent" }));
@@ -146,7 +151,8 @@ describe("Agent creation dialog", () => {
 			const body = JSON.parse(String(init.body));
 			return body.runtimeKind === "claude" &&
 				body.runtimeConfiguration?.settingSources?.join(",") === "user,project,local" &&
-				body.runtimeConfiguration?.authentication?.source === "api_key";
+				body.runtimeConfiguration?.authentication?.category === "subscription" &&
+				body.runtimeConfiguration?.authentication?.source === "claude_ai";
 		})).toBe(true));
 	});
 
