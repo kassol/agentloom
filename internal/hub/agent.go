@@ -129,31 +129,33 @@ func (h *Hub) ActiveAgents() []ActiveAgent {
 }
 
 type CreateParams struct {
-	Name           string `json:"name"`
-	Cwd            string `json:"cwd"`
-	RuntimeKind    string `json:"runtimeKind"`
-	Sandbox        string `json:"sandbox"`
-	ApprovalPolicy string `json:"approvalPolicy"`
-	ProviderID     string `json:"providerId"`
-	Model          string `json:"model"`
-	Effort         string `json:"effort"`
+	Name                 string               `json:"name"`
+	Cwd                  string               `json:"cwd"`
+	RuntimeKind          string               `json:"runtimeKind"`
+	Sandbox              string               `json:"sandbox"`
+	ApprovalPolicy       string               `json:"approvalPolicy"`
+	ProviderID           string               `json:"providerId"`
+	Model                string               `json:"model"`
+	Effort               string               `json:"effort"`
+	RuntimeConfiguration RuntimeConfiguration `json:"runtimeConfiguration"`
 }
 
 // RestoreAgentParams re-registers a previously archived Agent without
 // creating a replacement identity or starting a Turn. Profiles and team
 // relationships are stored independently and reconnect through the stable ID.
 type RestoreAgentParams struct {
-	ID             string         `json:"id"`
-	Name           string         `json:"name"`
-	Cwd            string         `json:"cwd"`
-	ThreadID       string         `json:"threadId"`
-	RuntimeBinding RuntimeBinding `json:"runtimeBinding"`
-	Sandbox        string         `json:"sandbox"`
-	ApprovalPolicy string         `json:"approvalPolicy"`
-	ProviderID     string         `json:"providerId"`
-	Model          string         `json:"model"`
-	Effort         string         `json:"effort"`
-	CreatedAt      string         `json:"createdAt"`
+	ID                   string               `json:"id"`
+	Name                 string               `json:"name"`
+	Cwd                  string               `json:"cwd"`
+	ThreadID             string               `json:"threadId"`
+	RuntimeBinding       RuntimeBinding       `json:"runtimeBinding"`
+	Sandbox              string               `json:"sandbox"`
+	ApprovalPolicy       string               `json:"approvalPolicy"`
+	ProviderID           string               `json:"providerId"`
+	Model                string               `json:"model"`
+	Effort               string               `json:"effort"`
+	RuntimeConfiguration RuntimeConfiguration `json:"runtimeConfiguration"`
+	CreatedAt            string               `json:"createdAt"`
 }
 
 type ConfigParams struct {
@@ -167,6 +169,8 @@ type ConfigParams struct {
 }
 
 func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
+	p.Name = strings.TrimSpace(p.Name)
+	p.Cwd = strings.TrimSpace(p.Cwd)
 	if p.Name == "" || p.Cwd == "" {
 		return AgentView{}, errf(400, "name and cwd are required")
 	}
@@ -181,8 +185,8 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 	); err != nil {
 		return AgentView{}, err
 	}
-	if !nameRe.MatchString(p.Name) {
-		return AgentView{}, errf(400, "name must match [a-zA-Z0-9_-]+")
+	if !validAgentName(p.Name) {
+		return AgentView{}, errf(400, "name may contain Unicode letters, marks, numbers, hyphens, and underscores")
 	}
 	if p.Sandbox == "" {
 		p.Sandbox = "danger-full-access"
@@ -218,6 +222,10 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 		return AgentView{}, err
 	}
 	defaultClaudeModelConfiguration(p.RuntimeKind, &p.ProviderID, &p.Model, &p.Effort)
+	configuration, err := normalizeRuntimeConfiguration(p.RuntimeKind, p.RuntimeConfiguration)
+	if err != nil {
+		return AgentView{}, err
+	}
 	idBytes := make([]byte, 4)
 	_, _ = rand.Read(idBytes)
 	id := hex.EncodeToString(idBytes)
@@ -231,7 +239,7 @@ func (h *Hub) CreateAgent(p CreateParams) (AgentView, error) {
 		ID: id, Name: p.Name, Cwd: p.Cwd, ThreadID: newIntegrationID("thr"),
 		RuntimeBinding:      RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: p.RuntimeKind},
 		RuntimeTurnBindings: map[string]string{},
-		Sandbox:             p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort,
+		Sandbox:             p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort, RuntimeConfiguration: configuration,
 		Status: "idle", CreatedAt: now(), UpdatedAt: now(),
 	}
 	h.agents[id] = meta
@@ -298,8 +306,8 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	); err != nil {
 		return AgentView{}, err
 	}
-	if !nameRe.MatchString(p.Name) {
-		return AgentView{}, errf(400, "name must match [a-zA-Z0-9_-]+")
+	if !validAgentName(p.Name) {
+		return AgentView{}, errf(400, "name may contain Unicode letters, marks, numbers, hyphens, and underscores")
 	}
 	if p.Sandbox == "" {
 		p.Sandbox = "danger-full-access"
@@ -311,6 +319,10 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	p.ProviderID = normalizeProviderID(p.ProviderID)
 	p.Model = strings.TrimSpace(p.Model)
 	defaultClaudeModelConfiguration(p.RuntimeBinding.Kind, &p.ProviderID, &p.Model, &p.Effort)
+	configuration, err := normalizeRuntimeConfiguration(p.RuntimeBinding.Kind, p.RuntimeConfiguration)
+	if err != nil {
+		return AgentView{}, err
+	}
 	if p.ProviderID != "" && !nameRe.MatchString(p.ProviderID) {
 		return AgentView{}, errf(400, "providerId must match [a-zA-Z0-9_-]+")
 	}
@@ -343,7 +355,7 @@ func (h *Hub) RestoreAgent(p RestoreAgentParams) (AgentView, error) {
 	meta := &Agent{
 		ID: p.ID, Name: p.Name, Cwd: p.Cwd, ThreadID: p.ThreadID, RuntimeBinding: p.RuntimeBinding,
 		Sandbox: p.Sandbox, ApprovalPolicy: p.ApprovalPolicy,
-		ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort,
+		ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort, RuntimeConfiguration: configuration,
 		Status: "idle", CreatedAt: p.CreatedAt, UpdatedAt: now(),
 	}
 	h.agents[p.ID] = meta
@@ -435,9 +447,9 @@ func (h *Hub) UpdateAgentConfig(key string, p ConfigParams) (AgentView, error) {
 			h.mu.Unlock()
 			return AgentView{}, errf(400, "name is required")
 		}
-		if !nameRe.MatchString(name) {
+		if !validAgentName(name) {
 			h.mu.Unlock()
-			return AgentView{}, errf(400, "name must match [a-zA-Z0-9_-]+")
+			return AgentView{}, errf(400, "name may contain Unicode letters, marks, numbers, hyphens, and underscores")
 		}
 		for _, existing := range h.agents {
 			if existing.ID == meta.ID {
@@ -871,6 +883,7 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 	meta.CurrentTask = taskText
 	meta.CurrentTurnID = turn.turnID
 	meta.LastError = ""
+	meta.WorkDisposition = nil
 	meta.UpdatedAt = now()
 	if err := h.persistAgentsLocked(); err != nil {
 		*meta = previous

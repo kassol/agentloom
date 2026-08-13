@@ -318,6 +318,23 @@ func TestCanonicalHistoryPreservesManagedImagesAndAttachmentsWithoutLocalPaths(t
 	}
 }
 
+func TestCodexHistoryPreservesBoundedExecCommandDescription(t *testing.T) {
+	content := codexHistoryContent([]map[string]any{{
+		"id": "tool-1", "type": "commandExecution", "command": "git status --short", "cwd": "/workspace",
+		"description": "Confirm whether the workspace has uncommitted changes", "status": "completed", "exitCode": 0,
+	}})
+	if len(content) != 2 || content[0].ToolCall == nil || content[0].ToolCall.Description != "Confirm whether the workspace has uncommitted changes" {
+		t.Fatalf("history content = %#v", content)
+	}
+
+	content = codexHistoryContent([]map[string]any{{
+		"id": "tool-long", "type": "commandExecution", "command": "pwd", "description": strings.Repeat("界", 251),
+	}})
+	if len(content) != 1 || content[0].ToolCall == nil || content[0].ToolCall.Description != "" {
+		t.Fatalf("overlong description was exposed: %#v", content)
+	}
+}
+
 func TestHistoryManagedAttachmentsPreservesDistinctIDsWithSameNameAndMIME(t *testing.T) {
 	_, attachments := historyManagedAttachments(`<loom_attachments version="1"><attachment id="art-one" name="screen.png" mime_type="image/png" /><attachment id="art-two" name="screen.png" mime_type="image/png" /></loom_attachments>`, map[string]any{})
 	if len(attachments) != 2 || attachments[0].ID != "art-one" || attachments[1].ID != "art-two" {

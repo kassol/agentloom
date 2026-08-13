@@ -88,6 +88,20 @@ type runtimeModelImageEvidenceProvider interface {
 	RuntimeModelImageEvidence() runtimeModelImageEvidence
 }
 type runtimeContextTimeoutConfiguration interface{ SetRuntimeDeveloperContextTimeout(time.Duration) }
+type runtimeOwnerConfiguration interface{ SetRuntimeOwnerConfiguration(RuntimeConfiguration) }
+type runtimeWorkspaceConfiguration interface{ SetRuntimeWorkspace(string) }
+
+func configureRuntimeWorkspace(contract runtimecontract.Contract, cwd string) {
+	if capability, ok := contract.(runtimeWorkspaceConfiguration); ok {
+		capability.SetRuntimeWorkspace(cwd)
+	}
+}
+
+func configureRuntimeOwnerConfiguration(contract runtimecontract.Contract, configuration RuntimeConfiguration) {
+	if capability, ok := contract.(runtimeOwnerConfiguration); ok {
+		capability.SetRuntimeOwnerConfiguration(configuration)
+	}
+}
 
 type runtimeGoalCapability interface {
 	RuntimeGoal(context.Context, runtimecontract.Binding) (*ThreadGoal, error)

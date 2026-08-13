@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,8 +20,48 @@ import (
 type adoptionTestDriver struct {
 	*controlPlaneDriver
 	candidate   nativeConversationCandidate
+	inspected   *nativeConversationCandidate
 	discoverErr error
 	inspectErr  error
+	acquire     AgentHostRequest
+}
+
+type adoptionGoalContract struct {
+	*controlPlaneContract
+	goal        *ThreadGoal
+	goalReads   int
+	goalUpdates int
+	goalClears  int
+}
+
+func (c *adoptionGoalContract) RuntimeGoal(context.Context, runtimecontract.Binding) (*ThreadGoal, error) {
+	c.goalReads++
+	return cloneGoalRecord(c.goal), nil
+}
+
+func (c *adoptionGoalContract) UpdateRuntimeGoal(context.Context, runtimecontract.Binding, GoalUpdateParams) (*ThreadGoal, error) {
+	c.goalUpdates++
+	return nil, errors.New("adoption must not mutate the source Goal")
+}
+
+func (c *adoptionGoalContract) ClearRuntimeGoal(context.Context, runtimecontract.Binding) (bool, error) {
+	c.goalClears++
+	return false, errors.New("adoption must not mutate the source Goal")
+}
+
+type adoptionGoalHost struct {
+	contract runtimecontract.Contract
+	alive    bool
+}
+
+func (h *adoptionGoalHost) Alive() bool                        { return h.alive }
+func (h *adoptionGoalHost) Contract() runtimecontract.Contract { return h.contract }
+func (h *adoptionGoalHost) SetFailureHandler(func(error))      {}
+func (h *adoptionGoalHost) Close()                             { h.alive = false }
+
+func (d *adoptionTestDriver) Acquire(ctx context.Context, request AgentHostRequest) (AgentHost, error) {
+	d.acquire = request
+	return d.controlPlaneDriver.Acquire(ctx, request)
 }
 
 type blockingAdoptionDriver struct {
@@ -52,6 +93,9 @@ func (d *adoptionTestDriver) DiscoverConversations(context.Context) ([]nativeCon
 func (d *adoptionTestDriver) InspectConversation(context.Context, string) (nativeConversationCandidate, error) {
 	if d.inspectErr != nil {
 		return nativeConversationCandidate{}, d.inspectErr
+	}
+	if d.inspected != nil {
+		return *d.inspected, nil
 	}
 	return d.candidate, nil
 }
@@ -107,6 +151,83 @@ func TestCodexConversationCandidateUsesOpaqueIdentityAndRejectsEphemeralThreads(
 	if ephemeral.Compatible || ephemeral.Compatibility == "" {
 		t.Fatalf("ephemeral = %#v", ephemeral)
 	}
+	activeThread := codexConversationThread{ID: "active", Cwd: "/workspace", UpdatedAt: 150}
+	activeThread.Turns = append(activeThread.Turns, struct {
+		Status string `json:"status"`
+	}{Status: "inProgress"})
+	active := codexConversationCandidate(activeThread)
+	if active.Compatible || !strings.Contains(active.Compatibility, "active Turn") || active.Revision == candidateRevision(activeThread.ID, activeThread.Name, activeThread.Preview, activeThread.Cwd, fmt.Sprint(activeThread.CreatedAt), fmt.Sprint(activeThread.UpdatedAt), fmt.Sprint(activeThread.UpdatedAt), fmt.Sprint(activeThread.Ephemeral), "false") {
+		t.Fatalf("active candidate = %#v", active)
+	}
+}
+
+func TestAdoptConversationRejectsCandidateThatBecomesActiveWithoutMutation(t *testing.T) {
+	h, st, driver, host := adoptionFixture(t)
+	defer st.Close()
+	stableCwd := t.TempDir()
+	params := AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "active-race", Cwd: stableCwd}
+	active := driver.candidate
+	active.Compatible = false
+	active.Compatibility = "Codex Thread has an active Turn"
+	driver.inspected = &active
+
+	if _, err := h.AdoptRuntimeConversation("fake", params); err == nil || !strings.Contains(err.Error(), "active Turn") {
+		t.Fatalf("active final inspection error = %v", err)
+	}
+	if len(h.ListAgents()) != 0 || len(h.runtimes) != 0 || host.Alive() == false {
+		t.Fatalf("active rejection mutated state: agents=%#v runtimes=%#v hostAlive=%t", h.ListAgents(), h.runtimes, host.Alive())
+	}
+	var persisted map[string]*Agent
+	if err := st.LoadAgents(&persisted); err != nil || len(persisted) != 0 {
+		t.Fatalf("active rejection persisted state=%#v err=%v", persisted, err)
+	}
+	if events, err := st.ReadEvents(globalEventLogID, 0, 10); err != nil || len(events) != 0 {
+		t.Fatalf("active rejection published events=%#v err=%v", events, err)
+	}
+}
+
+func TestCodexCatalogDiscoveryAndInspectionRejectActiveTurns(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "codex")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.1'; exit 0; fi
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"active-test"}}\n' "$id" ;;
+    *'"method":"remoteControl/status/read"'*) printf '{"id":%s,"result":{"status":"disabled","serverName":"local","installationId":"test","environmentId":null}}\n' "$id" ;;
+    *'"method":"thread/list"'*) printf '{"id":%s,"result":{"data":[{"id":"thr-active","name":"active","cwd":"/tmp/source","updatedAt":200,"turns":[{"id":"turn-active","status":"inProgress"}]}],"nextCursor":null}}\n' "$id" ;;
+    *'"method":"thread/read"'*) printf '{"id":%s,"result":{"thread":{"id":"thr-active","name":"active","cwd":"/tmp/source","updatedAt":200,"turns":[{"id":"turn-active","status":"running"}]}}}\n' "$id" ;;
+    *) printf '{"id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+`
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_REMOTE_BIN", bin)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	defer func() { h.Shutdown(); _ = st.Close() }()
+
+	candidates, err := h.DiscoverRuntimeConversations("codex")
+	if err != nil || len(candidates) != 1 || candidates[0].Compatible || !strings.Contains(candidates[0].Compatibility, "active Turn") {
+		t.Fatalf("active discovery candidates=%#v err=%v", candidates, err)
+	}
+	inspected, err := h.InspectRuntimeConversation("codex", candidates[0].ID)
+	if err != nil || inspected.Compatible || !strings.Contains(inspected.Compatibility, "active Turn") {
+		t.Fatalf("active inspection candidate=%#v err=%v", inspected, err)
+	}
+	if len(h.ListAgents()) != 0 {
+		t.Fatalf("read-only active checks mutated Agents=%#v", h.ListAgents())
+	}
+	if events, err := st.ReadEvents(globalEventLogID, 0, 10); err != nil || len(events) != 0 {
+		t.Fatalf("read-only active checks published events=%#v err=%v", events, err)
+	}
 }
 
 func TestPiConversationInspectionReportsMalformedHistoryAsIncompatible(t *testing.T) {
@@ -125,12 +246,14 @@ func TestPiConversationInspectionReportsMalformedHistoryAsIncompatible(t *testin
 func TestAdoptConversationCommitsOnceAndRetriesIdempotently(t *testing.T) {
 	h, st, driver, host := adoptionFixture(t)
 	defer st.Close()
-	params := AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "adopted"}
+	stableCwd := filepath.Join(t.TempDir(), "stable", "..", "stable")
+	params := AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "adopted", Cwd: stableCwd}
 	created, err := h.AdoptRuntimeConversation("fake", params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.ID == "" || created.ThreadID == "" || created.RuntimeBinding.Kind != "fake" || created.RuntimeBinding.NativeRef != "" || !host.Alive() {
+	stableCwd = filepath.Clean(stableCwd)
+	if created.ID == "" || created.ThreadID == "" || created.RuntimeBinding.Kind != "fake" || created.RuntimeBinding.NativeRef != "" || created.Cwd != stableCwd || created.SourceCwd != driver.candidate.Cwd || driver.acquire.Cwd != stableCwd || !host.Alive() {
 		t.Fatalf("created = %#v, alive=%t", created, host.Alive())
 	}
 	driver.discoverErr = errors.New("catalog offline after native resume")
@@ -138,12 +261,15 @@ func TestAdoptConversationCommitsOnceAndRetriesIdempotently(t *testing.T) {
 	if err != nil || retried.ID != created.ID || retried.ThreadID != created.ThreadID {
 		t.Fatalf("retry = %#v, err=%v", retried, err)
 	}
-	if _, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "different"}); err == nil || !strings.Contains(err.Error(), "different Agent configuration") {
+	if _, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "different", Cwd: stableCwd}); err == nil || !strings.Contains(err.Error(), "different Agent configuration") {
 		t.Fatalf("different intent err = %v", err)
+	}
+	if _, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "adopted", Cwd: filepath.Join(t.TempDir(), "other")}); err == nil || !strings.Contains(err.Error(), "different Agent configuration") {
+		t.Fatalf("different stable workspace err = %v", err)
 	}
 
 	var persisted map[string]*Agent
-	if err := st.LoadAgents(&persisted); err != nil || persisted[created.ID] == nil || persisted[created.ID].RuntimeBinding.NativeRef != driver.candidate.nativeRef {
+	if err := st.LoadAgents(&persisted); err != nil || persisted[created.ID] == nil || persisted[created.ID].RuntimeBinding.NativeRef != driver.candidate.nativeRef || persisted[created.ID].Cwd != stableCwd || persisted[created.ID].SourceCwd != driver.candidate.Cwd {
 		t.Fatalf("persisted = %#v, err=%v", persisted, err)
 	}
 	if events, err := st.ReadEvents(created.ID, 0, 10); err != nil || len(events) == 0 || events[0].Type != "loom/agent-adopted" {
@@ -156,10 +282,122 @@ func TestAdoptConversationCommitsOnceAndRetriesIdempotently(t *testing.T) {
 	}
 }
 
+func TestAdoptConversationAcceptsUnicodeAgentName(t *testing.T) {
+	h, st, driver, _ := adoptionFixture(t)
+	defer st.Close()
+	created, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{
+		CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision,
+		Name: "已有会话", Cwd: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Name != "已有会话" {
+		t.Fatalf("Agent name = %q", created.Name)
+	}
+}
+
+func TestCodexAdoptionImportsNativeGoalWithoutMutatingSource(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	nativeBudget := int64(9000)
+	nativeGoal := &ThreadGoal{
+		ID: "native-goal-private", Version: 7, ThreadID: "native-thread-private", Objective: "Preserve the release intent", Status: GoalStatusPaused,
+		TokenBudget: &nativeBudget, TokensUsed: 1234, TimeUsedSeconds: 56, CreatedAt: 1700000000000, UpdatedAt: 1700000005000,
+	}
+	contract := &adoptionGoalContract{controlPlaneContract: &controlPlaneContract{history: runtimecontract.History{Turns: []runtimecontract.HistoryTurn{}}}, goal: nativeGoal}
+	host := &adoptionGoalHost{contract: contract, alive: true}
+	const nativeRef = "native-thread-private"
+	candidate := nativeConversationCandidate{RuntimeConversationCandidate: RuntimeConversationCandidate{
+		ID: candidateToken("codex", nativeRef), Revision: "candidate:goal", RuntimeKind: "codex", Name: "Goal thread", Cwd: "/source/workspace", UpdatedAt: "2026-08-12T00:00:00Z", Compatible: true,
+	}, nativeRef: nativeRef}
+	driver := &adoptionTestDriver{controlPlaneDriver: &controlPlaneDriver{acquireHost: host}, candidate: candidate}
+	h.runtimeHostDrivers["codex"] = driver
+
+	created, err := h.AdoptRuntimeConversation("codex", AdoptConversationParams{CandidateID: candidate.ID, ExpectedRevision: candidate.Revision, Name: "goal-adopted", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Goal == nil || created.Goal.ID == "" || created.Goal.ID == nativeGoal.ID || created.Goal.ThreadID != created.ThreadID || created.Goal.Version != 1 || created.Goal.Objective != nativeGoal.Objective || created.Goal.Status != nativeGoal.Status || created.Goal.TokensUsed != nativeGoal.TokensUsed || created.Goal.TimeUsedSeconds != nativeGoal.TimeUsedSeconds || created.Goal.CreatedAt != nativeGoal.CreatedAt || created.Goal.UpdatedAt != nativeGoal.UpdatedAt || created.Goal.TokenBudget == nil || *created.Goal.TokenBudget != nativeBudget {
+		t.Fatalf("immediate imported Goal = %#v", created.Goal)
+	}
+	if contract.goalReads != 1 || contract.goalUpdates != 0 || contract.goalClears != 0 {
+		t.Fatalf("native Goal calls reads=%d updates=%d clears=%d", contract.goalReads, contract.goalUpdates, contract.goalClears)
+	}
+	var persisted map[string]*ThreadGoal
+	if err := st.LoadGoals(&persisted); err != nil || persisted[created.ID] == nil || persisted[created.ID].ThreadID != created.ThreadID || persisted[created.ID].Objective != nativeGoal.Objective || persisted[created.ID].CreatedAt != nativeGoal.CreatedAt || persisted[created.ID].UpdatedAt != nativeGoal.UpdatedAt {
+		t.Fatalf("persisted imported Goal = %#v, err=%v", persisted, err)
+	}
+}
+
+func TestCodexAdoptionGoalStoreFailureLeavesNoAgentOrEvent(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	contract := &adoptionGoalContract{
+		controlPlaneContract: &controlPlaneContract{history: runtimecontract.History{Turns: []runtimecontract.HistoryTurn{}}},
+		goal:                 &ThreadGoal{Objective: "Preserve me", Status: GoalStatusPaused},
+	}
+	host := &adoptionGoalHost{contract: contract, alive: true}
+	const nativeRef = "native-goal-store-failure"
+	candidate := nativeConversationCandidate{RuntimeConversationCandidate: RuntimeConversationCandidate{
+		ID: candidateToken("codex", nativeRef), Revision: "candidate:goal-store", RuntimeKind: "codex", Name: "Goal store", Cwd: "/source/workspace", UpdatedAt: "2026-08-12T00:00:00Z", Compatible: true,
+	}, nativeRef: nativeRef}
+	h.runtimeHostDrivers["codex"] = &adoptionTestDriver{controlPlaneDriver: &controlPlaneDriver{acquireHost: host}, candidate: candidate}
+	goalsPath := filepath.Join(st.Dir(), "goals.json")
+	if err := os.Mkdir(goalsPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = h.AdoptRuntimeConversation("codex", AdoptConversationParams{CandidateID: candidate.ID, ExpectedRevision: candidate.Revision, Name: "goal-store-failure", Cwd: t.TempDir()})
+	if err == nil || len(h.ListAgents()) != 0 || len(h.goals) != 0 || host.Alive() {
+		t.Fatalf("Goal Store failure err=%v agents=%#v goals=%#v hostAlive=%t", err, h.ListAgents(), h.goals, host.Alive())
+	}
+	var persisted map[string]*Agent
+	if err := st.LoadAgents(&persisted); err != nil || len(persisted) != 0 {
+		t.Fatalf("Goal Store failure persisted Agents=%#v err=%v", persisted, err)
+	}
+	if events, err := st.ReadEvents(globalEventLogID, 0, 10); err != nil || len(events) != 0 {
+		t.Fatalf("Goal Store failure published events=%#v err=%v", events, err)
+	}
+}
+
+func TestAdoptConversationWithoutWorkspaceUsesSourceWorkspace(t *testing.T) {
+	h, st, driver, _ := adoptionFixture(t)
+	defer st.Close()
+	created, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{
+		CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "source-workspace",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Cwd != driver.candidate.Cwd || created.SourceCwd != driver.candidate.Cwd || driver.acquire.Cwd != driver.candidate.Cwd {
+		t.Fatalf("default workspace Agent=%#v acquire=%#v candidate=%#v", created.Agent, driver.acquire, driver.candidate.RuntimeConversationCandidate)
+	}
+}
+
+func TestAdoptConversationRejectsRelativeStableWorkspace(t *testing.T) {
+	h, st, driver, _ := adoptionFixture(t)
+	defer st.Close()
+	_, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{
+		CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "relative-workspace", Cwd: "relative/path",
+	})
+	if err == nil || !strings.Contains(err.Error(), "absolute path") {
+		t.Fatalf("relative workspace error = %v", err)
+	}
+}
+
 func TestAdoptConversationConcurrentRetriesReturnOneAgent(t *testing.T) {
 	h, st, driver, _ := adoptionFixture(t)
 	defer st.Close()
-	params := AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "concurrent"}
+	params := AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "concurrent", Cwd: t.TempDir()}
 
 	const callers = 8
 	results := make([]AgentView, callers)
@@ -195,7 +433,7 @@ func TestShutdownWaitsForBlockedAdoptionAndRejectsItsCommit(t *testing.T) {
 		}
 		return nil
 	}
-	params := AdoptConversationParams{CandidateID: base.candidate.ID, ExpectedRevision: base.candidate.Revision, Name: "shutdown-race"}
+	params := AdoptConversationParams{CandidateID: base.candidate.ID, ExpectedRevision: base.candidate.Revision, Name: "shutdown-race", Cwd: t.TempDir()}
 	adoptDone := make(chan error, 1)
 	go func() {
 		_, err := h.AdoptRuntimeConversation("fake", params)
@@ -239,7 +477,7 @@ func TestAdoptConversationFailureLeavesNoAgentEventOrLiveHandle(t *testing.T) {
 	h, st, driver, host := adoptionFixture(t)
 	defer st.Close()
 	driver.acquireHost.(*controlPlaneHost).contract.resumeOutcome = runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: &runtimecontract.Failure{Code: runtimecontract.FailureCodeBindingNotFound, Phase: runtimecontract.FailurePhaseBindingResume, Message: "private /native/path"}}
-	_, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "failed"})
+	_, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "failed", Cwd: t.TempDir()})
 	if err == nil || strings.Contains(err.Error(), "/native/") {
 		t.Fatalf("safe adoption error = %v", err)
 	}
@@ -252,13 +490,14 @@ func TestAdoptConversationFailureLeavesNoAgentEventOrLiveHandle(t *testing.T) {
 	host.alive = true
 	driver.acquireHost.(*controlPlaneHost).contract.resumeOutcome = runtimecontract.Outcome{}
 	h.saveAgentsForTest = func(any) error { return errors.New("disk full") }
-	_, err = h.AdoptRuntimeConversation("fake", AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "failed-save"})
+	stableCwd := t.TempDir()
+	_, err = h.AdoptRuntimeConversation("fake", AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "failed-save", Cwd: stableCwd})
 	if err == nil || len(h.ListAgents()) != 0 || host.Alive() {
 		t.Fatalf("persistence failure err=%v agents=%#v alive=%t", err, h.ListAgents(), host.Alive())
 	}
 	h.saveAgentsForTest = nil
 	host.alive = true // acquisition returns a new equivalent handle in production
-	retried, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "failed-save"})
+	retried, err := h.AdoptRuntimeConversation("fake", AdoptConversationParams{CandidateID: driver.candidate.ID, ExpectedRevision: driver.candidate.Revision, Name: "failed-save", Cwd: stableCwd})
 	if err != nil || retried.ID == "" || len(h.ListAgents()) != 1 || !host.Alive() {
 		t.Fatalf("retry after persistence failure=%#v err=%v agents=%#v alive=%t", retried, err, h.ListAgents(), host.Alive())
 	}
@@ -295,13 +534,14 @@ done
 		t.Fatal(err)
 	}
 	h := testHub(st)
-	candidates, err := h.DiscoverRuntimeConversations("codex")
-	if err != nil || len(candidates) != 1 {
-		t.Fatalf("Codex candidates=%#v err=%v", candidates, err)
-	}
-	created, err := h.AdoptRuntimeConversation("codex", AdoptConversationParams{CandidateID: candidates[0].ID, ExpectedRevision: candidates[0].Revision, Name: "codex-adopted"})
+	stableCwd := t.TempDir()
+	created, err := h.AdoptRuntimeConversation("codex", AdoptConversationParams{ThreadID: "thr-adopt", Name: "codex-adopted", Cwd: stableCwd})
 	if err != nil {
 		t.Fatal(err)
+	}
+	diagnostics, err := h.GetRuntimeDiagnostics(created.ID)
+	if err != nil || diagnostics.NativeRef != "thr-adopt" {
+		t.Fatalf("native Thread diagnostics = %#v, err=%v", diagnostics, err)
 	}
 	if history, err := h.CanonicalHistory(created.ID, 10, 0); err != nil || history.Total != 1 {
 		t.Fatalf("history=%#v err=%v", history, err)
@@ -321,7 +561,7 @@ done
 	}
 	defer reopened.Shutdown()
 	restarted, err := reopened.GetAgent(created.ID)
-	if err != nil || restarted.ID != created.ID || restarted.ThreadID != created.ThreadID {
+	if err != nil || restarted.ID != created.ID || restarted.ThreadID != created.ThreadID || restarted.Cwd != stableCwd || restarted.SourceCwd != "/tmp/adopt-work" {
 		t.Fatalf("restarted=%#v err=%v", restarted, err)
 	}
 	if history, err := reopened.CanonicalHistory(created.ID, 10, 0); err != nil || history.Total != 1 {
@@ -351,13 +591,17 @@ func TestPiConversationAdoptionUsesExistingSessionWithoutCopyingIt(t *testing.T)
 	if err != nil || len(candidates) != 1 {
 		t.Fatalf("Pi candidates=%#v err=%v", candidates, err)
 	}
-	created, err := h.AdoptRuntimeConversation("pi", AdoptConversationParams{CandidateID: candidates[0].ID, ExpectedRevision: candidates[0].Revision, Name: "pi-adopted"})
+	stableCwd := t.TempDir()
+	created, err := h.AdoptRuntimeConversation("pi", AdoptConversationParams{CandidateID: candidates[0].ID, ExpectedRevision: candidates[0].Revision, Name: "pi-adopted", Cwd: stableCwd})
 	if err != nil {
 		t.Fatal(err)
 	}
 	diagnostics, err := h.GetRuntimeDiagnostics(created.ID)
 	if err != nil || diagnostics.NativeRef != sessionPath {
 		t.Fatalf("diagnostics=%#v err=%v", diagnostics, err)
+	}
+	if created.Cwd != stableCwd || created.SourceCwd != "/tmp/work" {
+		t.Fatalf("Pi workspace distinction = %#v", created.Agent)
 	}
 	resumed, err := os.ReadFile(os.Getenv("FAKE_PI_RESUME_FILE"))
 	if err != nil || !strings.Contains(string(resumed), sessionPath) {

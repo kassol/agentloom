@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	gort "runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,14 @@ import (
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
+
+func testClaudeRuntimeConfiguration() RuntimeConfiguration {
+	return RuntimeConfiguration{
+		Configured:     true,
+		SettingSources: []string{"project"},
+		Authentication: RuntimeAuthentication{Category: RuntimeAuthConsole, Source: "api_key"},
+	}
+}
 
 func fakeClaudeBridgeDriver(t *testing.T, st *store.Store) *claudeRuntimeHostDriver {
 	t.Helper()
@@ -34,7 +43,10 @@ while IFS= read -r line; do
   operation=$(printf '%s' "$line" | sed -n 's/.*"operation":"\([^"]*\)".*/\1/p')
   turn_id=$(printf '%s' "$line" | sed -n 's/.*"turnId":"\([^"]*\)".*/\1/p')
   command=$(printf '%s' "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')
-  case "$command" in
+	case "$command" in
+	inspect_resources)
+	  data='{"resources":[{"id":"skill:review","name":"review","kind":"skill","path":"","source":"claude_agent_sdk_reload","enabled":true}],"configuration":{"settingSources":["project"],"authentication":{"category":"console","source":"api_key","validation":"accepted"}}}'
+	  ;;
 	inspect_model_control|select_model)
 	  if printf '%s' "$line" | grep -q '"selection":{"provider":"anthropic","model":"opus"'; then
 		current='{"provider":"anthropic","id":"opus","thinkingLevels":["default","high"],"defaultThinkingLevel":"default","imageInput":false}'
@@ -94,7 +106,8 @@ func TestClaudeCanonicalHistoryIsColdAndLedgerOnly(t *testing.T) {
 	h := New(st)
 	if _, err := h.RestoreAgent(RestoreAgentParams{
 		ID: "agent-claude", Name: "claude", Cwd: t.TempDir(), ThreadID: "thread-loom",
-		RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "session-private"},
+		RuntimeBinding:       RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "session-private"},
+		RuntimeConfiguration: testClaudeRuntimeConfiguration(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +143,7 @@ func TestClaudeRuntimeRunsAndReopensFromCanonicalTurnLedger(t *testing.T) {
 	}
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
-	agent, err := h.CreateAgent(CreateParams{Name: "claude-worker", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-worker", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +225,7 @@ func TestClaudeNonDefaultModelReopensAndDrivesNextTurn(t *testing.T) {
 	}
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
-	agent, err := h.CreateAgent(CreateParams{Name: "claude-model", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-model", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +274,7 @@ func TestClaudeImageCapableSelectionReopensAndAcceptsPNG(t *testing.T) {
 	}
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
-	agent, err := h.CreateAgent(CreateParams{Name: "claude-image-model", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-image-model", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,6 +346,7 @@ func TestClaudeRestoreCannotSupplyImageCapabilityEvidence(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{
 		"id":"restored", "name":"restored", "cwd":"/tmp", "threadId":"loom-thread",
 		"runtimeBinding":{"schemaVersion":2,"kind":"claude","nativeRef":"11111111-1111-4111-8111-111111111111"},
+		"runtimeConfiguration":{"configured":true,"settingSources":["project"],"authentication":{"category":"console","source":"api_key"}},
 		"providerId":"anthropic", "model":"sonnet", "effort":"default",
 		"modelImageInput":true, "modelImageGeneration":"forged", "modelImageModel":"sonnet"
 	}`), &params); err != nil {
@@ -402,7 +416,7 @@ func TestClaudeStartupRepairsCommittedTerminalBeforeInterruptedProjection(t *tes
 		t.Fatal(err)
 	}
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
-	meta := &Agent{ID: "agent-crash", Name: "claude-crash", Cwd: t.TempDir(), ThreadID: "loom-thread", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "running", CurrentTurnID: "turn-crash", CurrentTask: "work", CreatedAt: stamp, UpdatedAt: stamp}
+	meta := &Agent{ID: "agent-crash", Name: "claude-crash", Cwd: t.TempDir(), ThreadID: "loom-thread", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, RuntimeConfiguration: testClaudeRuntimeConfiguration(), Sandbox: "danger-full-access", ApprovalPolicy: "never", Status: "running", CurrentTurnID: "turn-crash", CurrentTask: "work", CreatedAt: stamp, UpdatedAt: stamp}
 	if err := st.SaveAgents(map[string]*Agent{meta.ID: meta}); err != nil {
 		t.Fatal(err)
 	}
@@ -580,7 +594,7 @@ func TestOpenMigratesLegacyClaudeModelToSDKDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent := &Agent{ID: "agent-legacy-open", Name: "legacy", Cwd: t.TempDir(), ThreadID: "thread-legacy", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	agent := &Agent{ID: "agent-legacy-open", Name: "legacy", Cwd: t.TempDir(), ThreadID: "thread-legacy", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, RuntimeConfiguration: testClaudeRuntimeConfiguration(), Status: "idle", CreatedAt: now(), UpdatedAt: now()}
 	if err := st.SaveAgents(map[string]*Agent{agent.ID: agent}); err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +620,7 @@ func TestClaudeArchiveRestorePreservesLedgerAndAgentIdentity(t *testing.T) {
 	}
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = newClaudeRuntimeHostDriver(st, claudebridge.DriverOptions{ResolveActive: func(context.Context) (claudebridge.LaunchSpec, error) { return claudebridge.LaunchSpec{}, nil }})
-	params := RestoreAgentParams{ID: "agent-archive", Name: "claude-archive", Cwd: t.TempDir(), ThreadID: "loom-thread", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}}
+	params := RestoreAgentParams{ID: "agent-archive", Name: "claude-archive", Cwd: t.TempDir(), ThreadID: "loom-thread", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, RuntimeConfiguration: testClaudeRuntimeConfiguration()}
 	if _, err := h.RestoreAgent(params); err != nil {
 		t.Fatal(err)
 	}
@@ -636,7 +650,7 @@ func TestClaudeLedgerFailureSuppressesCanonicalRuntimeEvent(t *testing.T) {
 	}
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
-	agent, err := h.CreateAgent(CreateParams{Name: "claude-failure", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-failure", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -862,7 +876,7 @@ done
 		return claudebridge.LaunchSpec{NodePath: "/bin/sh", BridgePath: path, Manifest: claudegen.CurrentManifest()}, nil
 	}})
 	t.Cleanup(func() { h.Shutdown(); _ = st.Close() })
-	agent, err := h.CreateAgent(CreateParams{Name: "claude-interrupt-race", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-interrupt-race", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -947,7 +961,7 @@ func TestClaudeTurnPersistenceFailureSendsNoNativeCommandOrExecutionEvent(t *tes
 	}
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
-	agent, err := h.CreateAgent(CreateParams{Name: "claude-prefence", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-prefence", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -993,8 +1007,9 @@ func TestClaudeIndeterminateRecoveryCreatesOneNeedsYouWithoutReplay(t *testing.T
 	agentID, turnID := "agent-claude-recovery", "turn-uncertain"
 	if err := st.SaveAgents(map[string]*Agent{agentID: {
 		ID: agentID, Name: "claude-recovery", Cwd: t.TempDir(), ThreadID: "thread-claude",
-		RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"},
-		Status:         "interrupted", LastTurn: &TurnSummary{TurnID: turnID, Task: "write once", Status: "interrupted", CompletedAt: stamp},
+		RuntimeBinding:       RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"},
+		RuntimeConfiguration: testClaudeRuntimeConfiguration(),
+		Status:               "interrupted", LastTurn: &TurnSummary{TurnID: turnID, Task: "write once", Status: "interrupted", CompletedAt: stamp},
 		TurnRecoveryMarkers: map[string]TurnRecoveryMarker{turnID: {PredecessorTurnID: turnID, RuntimeKind: "claude", Cause: "command_indeterminate", FailurePhase: string(runtimecontract.FailurePhaseTurnStart), FailureCode: "transport_indeterminate", State: TurnRecoveryObserved, Summary: "Runtime command outcome is indeterminate", CreatedAt: stamp, UpdatedAt: stamp}},
 		CreatedAt:           stamp, UpdatedAt: stamp,
 	}}); err != nil {
@@ -1105,6 +1120,73 @@ func TestClaudeCapabilitySnapshotAdvertisesApprovalOnce(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("available Approval descriptors = %d", count)
+	}
+}
+
+func TestClaudeOwnerConfigurationEvidenceIsSafeAndCopied(t *testing.T) {
+	c := newClaudeRuntimeContract("agent-claude", nil, nil)
+	configuration := RuntimeConfiguration{Configured: true, SettingSources: []string{"project", "local"}, Authentication: RuntimeAuthentication{Category: RuntimeAuthConsole, Source: "api_key"}}
+	c.SetRuntimeOwnerConfiguration(configuration)
+	configuration.SettingSources[0] = "user"
+	c.mu.Lock()
+	payload := c.runtimeConfigurationPayloadLocked()
+	c.mu.Unlock()
+	sources := payload["settingSources"].([]string)
+	if !slices.Equal(sources, []string{"project", "local"}) {
+		t.Fatalf("owner setting sources aliased caller memory: %#v", sources)
+	}
+	if err := c.rememberConfigurationEvidence(RuntimeConfigurationEvidence{SettingSources: sources, Authentication: RuntimeAuthenticationEvidence{
+		Category: RuntimeAuthConsole, Source: "api_key", Validation: "accepted",
+		Evidence: []runtimecontract.CapabilityEvidence{{Kind: "unsafe", Summary: "/native/path helper output account@example.com"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	evidence, ok := c.RuntimeConfigurationEvidence()
+	if !ok || evidence.Authentication.Category != RuntimeAuthConsole || evidence.Authentication.Source != "api_key" || evidence.Authentication.Validation != "accepted" || len(evidence.Authentication.Evidence) != 0 {
+		t.Fatalf("safe configuration evidence = %#v, %v", evidence, ok)
+	}
+	if _, ok := any(c).(runtimecontract.ResourceInventoryCapability); !ok {
+		t.Fatal("Claude contract does not implement typed ResourceInventoryCapability")
+	}
+}
+
+func TestClaudeResourceSnapshotIncludesOnlyMatchingVerifiedConfigurationEvidence(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
+	defer h.Shutdown()
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-resources", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := h.GetRuntimeResources(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Configuration == nil || !slices.Equal(snapshot.Configuration.SettingSources, []string{"project"}) || snapshot.Configuration.Authentication.Category != RuntimeAuthConsole || snapshot.Configuration.Authentication.Source != "api_key" || snapshot.Configuration.Authentication.Validation != "accepted" {
+		t.Fatalf("configuration evidence = %#v", snapshot.Configuration)
+	}
+	if len(snapshot.Resources) != 1 || snapshot.Resources[0].Path != "" || snapshot.Resources[0].Source != "claude_agent_sdk_reload" {
+		t.Fatalf("safe Claude resources = %#v", snapshot.Resources)
+	}
+}
+
+func TestClaudeConfigurationEvidenceRejectsSelectedConfigurationMismatch(t *testing.T) {
+	c := newClaudeRuntimeContract("agent-claude", nil, nil)
+	c.SetRuntimeOwnerConfiguration(testClaudeRuntimeConfiguration())
+	err := c.rememberConfigurationEvidence(RuntimeConfigurationEvidence{
+		SettingSources: []string{"user"},
+		Authentication: RuntimeAuthenticationEvidence{Category: RuntimeAuthConsole, Source: "api_key", Validation: "accepted"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "setting source evidence does not match") {
+		t.Fatalf("mismatched configuration evidence error = %v", err)
+	}
+	if _, ok := c.RuntimeConfigurationEvidence(); ok {
+		t.Fatal("mismatched configuration evidence was retained")
 	}
 }
 
@@ -1347,7 +1429,7 @@ func TestClaudeNeedsYouInterruptsSourceAndAnswerResumesOnceAcrossReopen(t *testi
 		t.Fatal(err)
 	}
 	h := testHub(st)
-	meta := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, Status: "running", CurrentTurnID: "turn-source", CurrentTask: "ship release"}
+	meta := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, RuntimeConfiguration: testClaudeRuntimeConfiguration(), Status: "running", CurrentTurnID: "turn-source", CurrentTask: "ship release"}
 	rt := &runtime{agentID: meta.ID, approvals: map[string]*approval{}, activeTurn: &turnState{turnID: "turn-source", task: "ship release", startedAt: time.Now(), stopWatchdog: make(chan struct{})}}
 	h.agents[meta.ID], h.runtimes[meta.ID] = meta, rt
 	if err := h.onRuntimeNeedsYouProposal(rt, runtimecontract.NeedsYouProposal{ID: "hrq_claude_question", TurnID: "turn-source", Question: "Ship now?", Options: []runtimecontract.NeedsYouOption{{Label: "Yes"}, {Label: "No"}}}); err != nil {
@@ -1474,7 +1556,8 @@ func TestClaudeNeedsYouHumanRequestOnlyReopenRepairsWaitingMarker(t *testing.T) 
 	stamp := now()
 	agent := &Agent{
 		ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"},
-		Status: "running", CurrentTurnID: "turn-source", CurrentTask: "ship release", CreatedAt: stamp, UpdatedAt: stamp,
+		RuntimeConfiguration: testClaudeRuntimeConfiguration(),
+		Status:               "running", CurrentTurnID: "turn-source", CurrentTask: "ship release", CreatedAt: stamp, UpdatedAt: stamp,
 	}
 	if err := st.SaveAgents(map[string]*Agent{agent.ID: agent}); err != nil {
 		t.Fatal(err)
@@ -1545,7 +1628,7 @@ sleep 60
 	}})
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = driver
-	agent, err := h.CreateAgent(CreateParams{Name: "claude-ledger-fence", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-ledger-fence", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1621,7 +1704,7 @@ exit 70
 	}})
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = driver
-	agent, err := h.CreateAgent(CreateParams{Name: "claude-terminal-response", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	agent, err := h.CreateAgent(CreateParams{Name: "claude-terminal-response", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
 	if err != nil {
 		t.Fatal(err)
 	}

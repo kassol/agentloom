@@ -26,14 +26,14 @@ func TestContextHTTPPromptAndCoverageRoundTrip(t *testing.T) {
 	server := New(h, st, fstest.MapFS{"index.html": {Data: []byte("ok")}}).Handler()
 
 	builtin := topicRequest(t, server, http.MethodGet, "/api/context/agent-prompt", nil, http.StatusOK)["prompt"].(map[string]any)
-	if builtin["source"] != "builtin" || builtin["version"] != float64(2) {
+	if builtin["source"] != "builtin" || builtin["version"] != float64(3) {
 		t.Fatalf("builtin prompt = %#v", builtin)
 	}
 	owner := topicRequest(t, server, http.MethodPut, "/api/context/agent-prompt", map[string]any{
 		"content":         httpTestLoomPromptTemplate("Stable Owner-managed Loom semantics."),
-		"expectedVersion": 2,
+		"expectedVersion": 3,
 	}, http.StatusOK)["prompt"].(map[string]any)
-	if owner["source"] != "owner" || owner["version"] != float64(3) {
+	if owner["source"] != "owner" || owner["version"] != float64(4) {
 		t.Fatalf("owner prompt = %#v", owner)
 	}
 	explain := topicRequest(t, server, http.MethodGet, "/api/agents/one/context/explain", nil, http.StatusOK)["context"].(map[string]any)
@@ -48,8 +48,8 @@ func TestContextHTTPPromptAndCoverageRoundTrip(t *testing.T) {
 	if coverage["threadId"] != "loom-thread-one" || coverage["epoch"].(map[string]any)["id"] != "initial:thread-one" {
 		t.Fatalf("coverage = %#v", coverage)
 	}
-	cleared := topicRequest(t, server, http.MethodDelete, "/api/context/agent-prompt?expectedVersion=3", nil, http.StatusOK)["prompt"].(map[string]any)
-	if cleared["source"] != "builtin" || cleared["version"] != float64(2) {
+	cleared := topicRequest(t, server, http.MethodDelete, "/api/context/agent-prompt?expectedVersion=4", nil, http.StatusOK)["prompt"].(map[string]any)
+	if cleared["source"] != "builtin" || cleared["version"] != float64(3) {
 		t.Fatalf("cleared prompt = %#v", cleared)
 	}
 }

@@ -26,6 +26,7 @@ type piRuntimeContract struct {
 	model                   string
 	approvalPolicy          string
 	effort                  string
+	cwd                     string
 	developerContextTimeout time.Duration
 	handler                 func(runtimecontract.Event)
 	release                 func()
@@ -63,6 +64,12 @@ func (c *piRuntimeContract) InspectResources(ctx context.Context, request runtim
 func (c *piRuntimeContract) SetRuntimeSandbox(value string) {
 	c.mu.Lock()
 	c.sandbox = value
+	c.mu.Unlock()
+}
+
+func (c *piRuntimeContract) SetRuntimeWorkspace(value string) {
+	c.mu.Lock()
+	c.cwd = value
 	c.mu.Unlock()
 }
 
@@ -108,6 +115,9 @@ func (c *piRuntimeContract) contextDeliveryTimeout() time.Duration {
 func (c *piRuntimeContract) nativeBindingRequest(name, cwd, nativeRef string) nativeBindingRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if cwd == "" {
+		cwd = c.cwd
+	}
 	return nativeBindingRequest{NativeRef: nativeRef, Name: name, Cwd: cwd, Sandbox: c.sandbox, ProviderID: c.providerID, Model: c.model}
 }
 

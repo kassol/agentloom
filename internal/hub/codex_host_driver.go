@@ -91,6 +91,9 @@ type codexConversationThread struct {
 	UpdatedAt int64  `json:"updatedAt"`
 	RecencyAt *int64 `json:"recencyAt"`
 	Ephemeral bool   `json:"ephemeral"`
+	Turns     []struct {
+		Status string `json:"status"`
+	} `json:"turns,omitempty"`
 }
 
 func (d *codexRuntimeHostDriver) DiscoverConversations(ctx context.Context) ([]nativeConversationCandidate, error) {
@@ -156,13 +159,24 @@ func codexConversationCandidate(thread codexConversationThread) nativeConversati
 	if len([]rune(name)) > 80 {
 		name = string([]rune(name)[:80]) + "…"
 	}
-	compatible, reason := !thread.Ephemeral && thread.ID != "" && strings.TrimSpace(thread.Cwd) != "", ""
+	active := false
+	for _, turn := range thread.Turns {
+		switch strings.ToLower(strings.TrimSpace(turn.Status)) {
+		case "running", "inprogress", "in_progress", "active":
+			active = true
+		}
+	}
+	compatible, reason := !thread.Ephemeral && thread.ID != "" && strings.TrimSpace(thread.Cwd) != "" && !active, ""
 	if !compatible {
-		reason = "ephemeral or incomplete Codex Thread"
+		if active {
+			reason = "Codex Thread has an active Turn"
+		} else {
+			reason = "ephemeral or incomplete Codex Thread"
+		}
 	}
 	updated := time.Unix(updatedAt, 0).UTC().Format(time.RFC3339)
 	return nativeConversationCandidate{RuntimeConversationCandidate: RuntimeConversationCandidate{
-		ID: candidateToken("codex", thread.ID), Revision: candidateRevision(thread.ID, thread.Name, thread.Preview, thread.Cwd, fmt.Sprint(thread.CreatedAt), fmt.Sprint(thread.UpdatedAt), fmt.Sprint(updatedAt), fmt.Sprint(thread.Ephemeral)),
+		ID: candidateToken("codex", thread.ID), Revision: candidateRevision(thread.ID, thread.Name, thread.Preview, thread.Cwd, fmt.Sprint(thread.CreatedAt), fmt.Sprint(thread.UpdatedAt), fmt.Sprint(updatedAt), fmt.Sprint(thread.Ephemeral), fmt.Sprint(active)),
 		RuntimeKind: "codex", Name: name, Cwd: thread.Cwd, UpdatedAt: updated, Compatible: compatible, Compatibility: reason,
 	}, nativeRef: thread.ID}
 }

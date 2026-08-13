@@ -96,7 +96,7 @@ func TestClaudeObservabilityAPIPreservesPartialTruthWithoutNativeRefs(t *testing
 		t.Fatal(err)
 	}
 	privateSession := "/Users/owner/.claude/projects/private-session.jsonl"
-	if err := st.SaveAgents(map[string]*hub.Agent{"claude-api": {ID: "claude-api", Name: "claude-api", Cwd: t.TempDir(), ThreadID: "loom-claude-api", RuntimeBinding: hub.RuntimeBinding{SchemaVersion: 2, Kind: "claude", NativeRef: privateSession}, RuntimeTurnBindings: map[string]string{"turn-claude-api": "native-secret"}, Status: "idle", CreatedAt: nowForTest(), UpdatedAt: nowForTest()}}); err != nil {
+	if err := st.SaveAgents(map[string]*hub.Agent{"claude-api": {ID: "claude-api", Name: "claude-api", Cwd: t.TempDir(), ThreadID: "loom-claude-api", RuntimeBinding: hub.RuntimeBinding{SchemaVersion: 2, Kind: "claude", NativeRef: privateSession}, RuntimeTurnBindings: map[string]string{"turn-claude-api": "native-secret"}, RuntimeConfiguration: hub.RuntimeConfiguration{Configured: true, SettingSources: []string{"project"}, Authentication: hub.RuntimeAuthentication{Category: hub.RuntimeAuthConsole, Source: "api_key"}}, Status: "idle", CreatedAt: nowForTest(), UpdatedAt: nowForTest()}}); err != nil {
 		t.Fatal(err)
 	}
 	h := hub.New(st)

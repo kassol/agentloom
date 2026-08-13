@@ -41,16 +41,17 @@ type RuntimeResourcePolicyView struct {
 }
 
 type RuntimeResourceSnapshot struct {
-	AgentID               string                     `json:"agentId"`
-	AgentName             string                     `json:"agentName"`
-	Cwd                   string                     `json:"cwd"`
-	RuntimeKind           string                     `json:"runtimeKind"`
-	BindingRevision       string                     `json:"bindingRevision"`
-	ConfigurationRevision string                     `json:"configurationRevision"`
-	Revision              string                     `json:"revision"`
-	Semantics             string                     `json:"semantics"`
-	Resources             []runtimecontract.Resource `json:"resources"`
-	Policy                RuntimeResourcePolicyView  `json:"policy"`
+	AgentID               string                        `json:"agentId"`
+	AgentName             string                        `json:"agentName"`
+	Cwd                   string                        `json:"cwd"`
+	RuntimeKind           string                        `json:"runtimeKind"`
+	BindingRevision       string                        `json:"bindingRevision"`
+	ConfigurationRevision string                        `json:"configurationRevision"`
+	Revision              string                        `json:"revision"`
+	Semantics             string                        `json:"semantics"`
+	Resources             []runtimecontract.Resource    `json:"resources"`
+	Policy                RuntimeResourcePolicyView     `json:"policy"`
+	Configuration         *RuntimeConfigurationEvidence `json:"configuration,omitempty"`
 
 	generationRevision string
 }
@@ -67,6 +68,8 @@ func (h *Hub) GetRuntimeResources(key string) (RuntimeResourceSnapshot, error) {
 		return RuntimeResourceSnapshot{}, errf(409, "Runtime resource policy is being applied; retry after it settles")
 	}
 	agentID, name, cwd, binding := meta.ID, meta.Name, meta.Cwd, runtimeContractBinding(meta)
+	configuration := meta.RuntimeConfiguration
+	configuration.SettingSources = append([]string(nil), configuration.SettingSources...)
 	providerID, model := effectiveProviderBinding(meta)
 	sandbox, effort, imageEvidence := meta.Sandbox, meta.Effort, agentModelImageEvidence(meta)
 	disabled := h.disabledSkillPathsLocked(agentID)
@@ -92,6 +95,7 @@ func (h *Hub) GetRuntimeResources(key string) (RuntimeResourceSnapshot, error) {
 			return RuntimeResourceSnapshot{}, err
 		}
 		configureRuntimeBinding(contract, sandbox, providerID, model, effort, imageEvidence, disabled)
+		configureRuntimeOwnerConfiguration(contract, configuration)
 	} else {
 		if rt == nil {
 			h.mu.Lock()
@@ -142,6 +146,21 @@ func (h *Hub) GetRuntimeResources(key string) (RuntimeResourceSnapshot, error) {
 	}
 	if err := inventory.Validate(); err != nil {
 		return RuntimeResourceSnapshot{}, errf(500, "invalid Runtime resource inventory: %s", err)
+	}
+	var configurationEvidence *RuntimeConfigurationEvidence
+	if binding.RuntimeKind == "claude" {
+		provider, ok := contract.(runtimeConfigurationEvidenceProvider)
+		if !ok {
+			return RuntimeResourceSnapshot{}, errf(500, "Claude Runtime configuration evidence hook is unavailable")
+		}
+		evidence, ok := provider.RuntimeConfigurationEvidence()
+		if !ok {
+			return RuntimeResourceSnapshot{}, errf(500, "Claude Runtime did not return verified configuration evidence")
+		}
+		if err := validateRuntimeConfigurationEvidence(configuration, evidence); err != nil {
+			return RuntimeResourceSnapshot{}, errf(500, "invalid Claude Runtime configuration evidence: %s", err)
+		}
+		configurationEvidence = &evidence
 	}
 	policy := RuntimeResourcePolicyView{}
 	if descriptor, found := capabilityDescriptor(snapshot, runtimecontract.CapabilityResourcePolicy); found {
@@ -205,7 +224,7 @@ func (h *Hub) GetRuntimeResources(key string) (RuntimeResourceSnapshot, error) {
 	return RuntimeResourceSnapshot{
 		AgentID: agentID, AgentName: name, Cwd: cwd, RuntimeKind: binding.RuntimeKind, BindingRevision: query.scope.BindingRevision, ConfigurationRevision: configurationRevision,
 		Revision: "resources:" + sha256Hex(encoded)[:16], Semantics: inventory.Semantics,
-		Resources: inventory.Resources, Policy: policy, generationRevision: nativeGeneration,
+		Resources: inventory.Resources, Policy: policy, Configuration: configurationEvidence, generationRevision: nativeGeneration,
 	}, nil
 }
 

@@ -495,7 +495,7 @@ func TestOpenMarksPersistedTerminalPendingDeliveryIndeterminate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	agent := &Agent{ID: "agent-1", Name: "claude", ThreadID: "thread-1", RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "11111111-1111-4111-8111-111111111111"}, RuntimeConfiguration: testClaudeRuntimeConfiguration(), Status: "idle", CreatedAt: now(), UpdatedAt: now()}
 	if err := st.SaveAgents(map[string]*Agent{agent.ID: agent}); err != nil {
 		t.Fatal(err)
 	}

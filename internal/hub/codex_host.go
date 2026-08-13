@@ -523,7 +523,7 @@ func (h *Hub) adoptThreadLocked(threadID, threadName, cwd string) *runtime {
 		return rt
 	}
 	name := strings.TrimSpace(threadName)
-	if !nameRe.MatchString(name) {
+	if !validAgentName(name) {
 		short := strings.ReplaceAll(threadID, "-", "")
 		if len(short) > 8 {
 			short = short[len(short)-8:]
@@ -727,7 +727,7 @@ func (h *Hub) hydrateAdoptedAgent(generation uint64, agentID, threadID string) {
 		agent.Cwd = cwd
 		changed = true
 	}
-	if name := strings.TrimSpace(result.Thread.Name); nameRe.MatchString(name) && strings.HasPrefix(agent.Name, "remote-") {
+	if name := strings.TrimSpace(result.Thread.Name); validAgentName(name) && strings.HasPrefix(agent.Name, "remote-") {
 		if existing := h.resolveLocked(name); existing == nil || existing.ID == agent.ID {
 			agent.Name = name
 			changed = true

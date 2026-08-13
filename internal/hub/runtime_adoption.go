@@ -60,14 +60,17 @@ type runtimeConversationCatalog interface {
 }
 
 type AdoptConversationParams struct {
-	CandidateID      string `json:"candidateId"`
-	ExpectedRevision string `json:"expectedRevision"`
-	Name             string `json:"name"`
-	Sandbox          string `json:"sandbox"`
-	ApprovalPolicy   string `json:"approvalPolicy"`
-	ProviderID       string `json:"providerId"`
-	Model            string `json:"model"`
-	Effort           string `json:"effort"`
+	CandidateID          string               `json:"candidateId"`
+	ExpectedRevision     string               `json:"expectedRevision"`
+	ThreadID             string               `json:"threadId,omitempty"`
+	Name                 string               `json:"name"`
+	Cwd                  string               `json:"cwd"`
+	Sandbox              string               `json:"sandbox"`
+	ApprovalPolicy       string               `json:"approvalPolicy"`
+	ProviderID           string               `json:"providerId"`
+	Model                string               `json:"model"`
+	Effort               string               `json:"effort"`
+	RuntimeConfiguration RuntimeConfiguration `json:"runtimeConfiguration"`
 }
 
 func conversationCapabilitySnapshot(kind string, available bool) RuntimeConversationCapabilities {
@@ -149,12 +152,28 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 		return AgentView{}, errf(503, "CodexLoom is shutting down")
 	}
 	h.mu.Unlock()
-	p.CandidateID, p.ExpectedRevision, p.Name = strings.TrimSpace(p.CandidateID), strings.TrimSpace(p.ExpectedRevision), strings.TrimSpace(p.Name)
-	if p.CandidateID == "" || p.ExpectedRevision == "" || p.Name == "" {
-		return AgentView{}, errf(400, "candidateId, expectedRevision, and name are required")
+	p.CandidateID, p.ExpectedRevision, p.ThreadID, p.Name = strings.TrimSpace(p.CandidateID), strings.TrimSpace(p.ExpectedRevision), strings.TrimSpace(p.ThreadID), strings.TrimSpace(p.Name)
+	if p.Name == "" || p.ThreadID == "" && (p.CandidateID == "" || p.ExpectedRevision == "") {
+		return AgentView{}, errf(400, "name and either threadId or candidateId with expectedRevision are required")
 	}
-	if !nameRe.MatchString(p.Name) {
-		return AgentView{}, errf(400, "name must match [a-zA-Z0-9_-]+")
+	if p.ThreadID != "" {
+		if kind != "codex" {
+			return AgentView{}, errf(400, "threadId adoption is supported only for the Codex Runtime")
+		}
+		if p.CandidateID != "" || p.ExpectedRevision != "" {
+			return AgentView{}, errf(400, "threadId cannot be combined with candidateId or expectedRevision")
+		}
+		p.CandidateID = candidateToken(kind, p.ThreadID)
+	}
+	if strings.TrimSpace(p.Cwd) != "" {
+		stableCwd, cwdErr := normalizeAdoptionCwd(p.Cwd)
+		if cwdErr != nil {
+			return AgentView{}, cwdErr
+		}
+		p.Cwd = stableCwd
+	}
+	if !validAgentName(p.Name) {
+		return AgentView{}, errf(400, "name may contain Unicode letters, marks, numbers, hyphens, and underscores")
 	}
 	approvalRequested := strings.TrimSpace(p.ApprovalPolicy) != ""
 	providerRequested := strings.TrimSpace(p.ProviderID) != "" || strings.TrimSpace(p.Model) != "" || strings.TrimSpace(p.Effort) != ""
@@ -169,6 +188,11 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 	p.ProviderID = normalizeProviderID(p.ProviderID)
 	p.Model = strings.TrimSpace(p.Model)
 	p.Effort = normalizeEffort(strings.TrimSpace(p.Effort))
+	configuration, configurationErr := normalizeRuntimeConfiguration(kind, p.RuntimeConfiguration)
+	if configurationErr != nil {
+		return AgentView{}, configurationErr
+	}
+	p.RuntimeConfiguration = configuration
 	if err := h.validateRequestedRuntimeConfiguration(kind, p.Sandbox, providerRequested, approvalRequested); err != nil {
 		return AgentView{}, err
 	}
@@ -189,7 +213,7 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 		if existing.RuntimeBinding.Kind != kind || candidateToken(kind, existing.RuntimeBinding.NativeRef) != p.CandidateID {
 			continue
 		}
-		if adoptionIntentMatches(existing, existing.Cwd, p) {
+		if adoptionIntentMatches(existing, existing.SourceCwd, p) {
 			view := h.viewLocked(existing)
 			h.mu.Unlock()
 			return view, nil
@@ -199,12 +223,28 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 	}
 	h.mu.Unlock()
 
-	candidate, catalog, err := h.resolveRuntimeConversation(kind, p.CandidateID)
-	if err != nil {
-		return AgentView{}, err
-	}
-	if candidate.Revision != p.ExpectedRevision {
-		return AgentView{}, errf(409, "conversation candidate changed; inspect it again")
+	var candidate nativeConversationCandidate
+	var catalog runtimeConversationCatalog
+	var err error
+	if p.ThreadID != "" {
+		catalog, err = h.runtimeConversationCatalog(kind)
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			candidate, err = catalog.InspectConversation(ctx, p.ThreadID)
+			cancel()
+		}
+		if err != nil || candidate.nativeRef != p.ThreadID || candidate.ID != p.CandidateID {
+			return AgentView{}, errf(404, "Codex Thread %q was not found or is not available for adoption", p.ThreadID)
+		}
+		p.ExpectedRevision = candidate.Revision
+	} else {
+		candidate, catalog, err = h.resolveRuntimeConversation(kind, p.CandidateID)
+		if err != nil {
+			return AgentView{}, err
+		}
+		if candidate.Revision != p.ExpectedRevision {
+			return AgentView{}, errf(409, "conversation candidate changed; inspect it again")
+		}
 	}
 	if !candidate.Compatible {
 		return AgentView{}, errf(409, "conversation candidate is incompatible: %s", candidate.Compatibility)
@@ -223,6 +263,13 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 	candidate = inspected
 	if !candidate.Compatible {
 		return AgentView{}, errf(409, "conversation candidate is incompatible: %s", candidate.Compatibility)
+	}
+	if p.Cwd == "" {
+		stableCwd, cwdErr := normalizeAdoptionCwd(candidate.Cwd)
+		if cwdErr != nil {
+			return AgentView{}, errf(409, "conversation candidate has no stable workspace")
+		}
+		p.Cwd = stableCwd
 	}
 
 	h.mu.Lock()
@@ -254,7 +301,7 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 		return AgentView{}, errf(500, "create Agent identity")
 	}
 	agentID := hex.EncodeToString(idBytes)
-	host, err := driver.Acquire(context.Background(), AgentHostRequest{AgentID: agentID})
+	host, err := driver.Acquire(context.Background(), AgentHostRequest{AgentID: agentID, Cwd: p.Cwd})
 	if err != nil {
 		return AgentView{}, errf(502, "prepare %s Runtime adoption: %s", kind, publicConversationCatalogError(err))
 	}
@@ -269,6 +316,8 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 		return AgentView{}, errf(500, "Runtime Contract is unavailable for adoption")
 	}
 	configureRuntimeBinding(contract, p.Sandbox, p.ProviderID, p.Model, p.Effort, runtimeModelImageEvidence{}, nil)
+	configureRuntimeWorkspace(contract, p.Cwd)
+	configureRuntimeOwnerConfiguration(contract, p.RuntimeConfiguration)
 	binding := runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: kind, NativeRef: candidate.nativeRef}
 	ctx, cancel = context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 	outcome := contract.ResumeBinding(ctx, binding)
@@ -283,7 +332,12 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 		return AgentView{}, errf(409, "Runtime conversation history could not be verified")
 	}
 
-	meta := &Agent{ID: agentID, Name: p.Name, Cwd: candidate.Cwd, ThreadID: newIntegrationID("thr"), RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: kind, NativeRef: candidate.nativeRef}, RuntimeTurnBindings: map[string]string{}, Sandbox: p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	threadID := newIntegrationID("thr")
+	importedGoal, goalErr := readAdoptedRuntimeGoal(contract, binding, threadID)
+	if goalErr != nil {
+		return AgentView{}, goalErr
+	}
+	meta := &Agent{ID: agentID, Name: p.Name, Cwd: p.Cwd, SourceCwd: candidate.Cwd, ThreadID: threadID, RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: kind, NativeRef: candidate.nativeRef}, RuntimeTurnBindings: map[string]string{}, Sandbox: p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort, RuntimeConfiguration: p.RuntimeConfiguration, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
 	rt := &runtime{agentID: agentID, agentHost: host, runtimeContract: contract, binding: binding, ready: make(chan struct{}), approvals: map[string]*approval{}}
 	close(rt.ready)
 	h.mu.Lock()
@@ -310,14 +364,67 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 		h.mu.Unlock()
 		return AgentView{}, errf(500, "save adopted Agent: %s", err)
 	}
+	if importedGoal != nil {
+		h.goals[agentID] = importedGoal
+		if err := h.persistGoalsLocked(); err != nil {
+			delete(h.goals, agentID)
+			delete(h.agents, agentID)
+			delete(h.seqs, agentID)
+			delete(h.runtimes, agentID)
+			compensationErr := h.persistAgentsLocked()
+			h.mu.Unlock()
+			if compensationErr != nil {
+				return AgentView{}, errf(500, "save adopted Goal: %s; remove failed Agent: %s", err, compensationErr)
+			}
+			return AgentView{}, errf(500, "save adopted Goal: %s", err)
+		}
+	}
 	committed = true
 	host.SetFailureHandler(func(err error) { h.onRuntimeFailure(rt, err) })
 	contract.SetEventHandler(func(event runtimecontract.Event) { h.onCanonicalRuntimeEvent(rt, event) })
-	h.emitLocked(agentID, "loom/agent-adopted", map[string]any{"id": agentID, "name": p.Name, "cwd": candidate.Cwd, "threadId": meta.ThreadID, "runtimeKind": kind})
+	h.emitLocked(agentID, "loom/agent-adopted", map[string]any{"id": agentID, "name": p.Name, "cwd": p.Cwd, "sourceCwd": candidate.Cwd, "threadId": meta.ThreadID, "runtimeKind": kind})
 	h.emitStatusLocked(meta, meta.Status)
 	view := h.viewLocked(meta)
 	h.mu.Unlock()
 	return view, nil
+}
+
+func readAdoptedRuntimeGoal(contract runtimecontract.Contract, binding runtimecontract.Binding, loomThreadID string) (*ThreadGoal, error) {
+	if binding.RuntimeKind != "codex" {
+		return nil, nil
+	}
+	capability, ok := contract.(runtimeGoalCapability)
+	if !ok {
+		return nil, errf(500, "Codex Runtime Goal inspection is unavailable during adoption")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	nativeGoal, err := capability.RuntimeGoal(ctx, binding)
+	cancel()
+	if err != nil {
+		return nil, errf(409, "Codex Runtime Goal could not be inspected during adoption")
+	}
+	if nativeGoal == nil {
+		return nil, nil
+	}
+	goal := cloneGoalRecord(nativeGoal)
+	goal.Objective = strings.TrimSpace(goal.Objective)
+	if goal.Objective == "" || len(goal.Objective) > 4000 || !validGoalStatus(goal.Status) || goal.TokenBudget != nil && *goal.TokenBudget <= 0 {
+		return nil, errf(409, "Codex Runtime returned an invalid Goal during adoption")
+	}
+	stamp := time.Now().UnixMilli()
+	goal.ID, goal.Version, goal.ThreadID = newIntegrationID("goal"), 1, loomThreadID
+	if goal.CreatedAt == 0 {
+		goal.CreatedAt = stamp
+	}
+	if goal.UpdatedAt == 0 {
+		goal.UpdatedAt = stamp
+	}
+	goal.NativeSyncState = goalNativeSyncPending
+	goal.NativeSyncedAt, goal.NativeSyncError = 0, ""
+	goal.NativeSyncBindingRevision = goalBindingRevision(binding)
+	goal.NativeMigrationBlocked = false
+	goal.NativeMigrationBindingRevision = ""
+	return goal, nil
 }
 
 func (h *Hub) runtimeConversationCatalog(kind string) (runtimeConversationCatalog, error) {
@@ -367,7 +474,16 @@ func (h *Hub) agentByNativeBindingLocked(kind, nativeRef string) *Agent {
 }
 
 func adoptionIntentMatches(agent *Agent, cwd string, p AdoptConversationParams) bool {
-	return agent != nil && agent.Name == p.Name && agent.Cwd == cwd && agent.Sandbox == p.Sandbox && agent.ApprovalPolicy == p.ApprovalPolicy && agent.ProviderID == p.ProviderID && agent.Model == p.Model && agent.Effort == p.Effort
+	return agent != nil && agent.Name == p.Name && agent.Cwd == p.Cwd && agent.SourceCwd == cwd && agent.Sandbox == p.Sandbox && agent.ApprovalPolicy == p.ApprovalPolicy && agent.ProviderID == p.ProviderID && agent.Model == p.Model && agent.Effort == p.Effort &&
+		strings.Join(agent.RuntimeConfiguration.SettingSources, "\x00") == strings.Join(p.RuntimeConfiguration.SettingSources, "\x00") && agent.RuntimeConfiguration.Authentication == p.RuntimeConfiguration.Authentication
+}
+
+func normalizeAdoptionCwd(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !filepath.IsAbs(value) {
+		return "", errf(400, "cwd must be an absolute path")
+	}
+	return filepath.Clean(value), nil
 }
 
 func candidateToken(kind, nativeRef string) string {

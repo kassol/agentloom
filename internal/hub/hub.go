@@ -45,6 +45,11 @@ const (
 )
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+var agentNameRe = regexp.MustCompile(`^[\p{L}\p{M}\p{N}_-]+$`)
+
+func validAgentName(name string) bool {
+	return agentNameRe.MatchString(name)
+}
 
 type HubError struct {
 	Status  int
@@ -77,37 +82,56 @@ const RuntimeBindingSchemaVersion = runtimecontract.BindingSchemaVersion
 // Agent is CodexLoom's stable governance entity. ThreadID is owned by Loom;
 // RuntimeBinding is the durable association to a Runtime-native conversation.
 type Agent struct {
-	ID                    string                        `json:"id"`
-	Name                  string                        `json:"name"`
-	Cwd                   string                        `json:"cwd"`
-	ThreadID              string                        `json:"threadId"`
-	RuntimeBinding        RuntimeBinding                `json:"runtimeBinding"`
-	RuntimeTurnBindings   map[string]string             `json:"runtimeTurnBindings,omitempty"`
-	TurnRecoveryMarkers   map[string]TurnRecoveryMarker `json:"turnRecoveryMarkers,omitempty"`
-	Sandbox               string                        `json:"sandbox"`
-	ApprovalPolicy        string                        `json:"approvalPolicy"`
-	ProviderID            string                        `json:"providerId,omitempty"`
-	Model                 string                        `json:"model,omitempty"`
-	Effort                string                        `json:"effort,omitempty"`
-	ModelImageInput       bool                          `json:"modelImageInput,omitempty"`
-	ModelImageGeneration  string                        `json:"modelImageGeneration,omitempty"`
-	ModelImageModel       string                        `json:"modelImageModel,omitempty"`
-	Status                string                        `json:"status"`
-	CurrentTask           string                        `json:"currentTask"`
-	CurrentTurnID         string                        `json:"currentTurnId"`
-	LastError             string                        `json:"lastError"`
-	LastTurn              *TurnSummary                  `json:"lastTurn"`
-	CreatedAt             string                        `json:"createdAt"`
-	UpdatedAt             string                        `json:"updatedAt"`
-	PendingProviderSwitch *ProviderSwitchBinding        `json:"pendingProviderSwitch,omitempty"`
-	ProviderHistory       []ProviderBindingChange       `json:"providerHistory,omitempty"`
-	ContextMaintenance    *ContextMaintenanceOperation  `json:"contextMaintenance,omitempty"`
+	ID                          string                        `json:"id"`
+	Name                        string                        `json:"name"`
+	Cwd                         string                        `json:"cwd"`
+	SourceCwd                   string                        `json:"sourceCwd,omitempty"`
+	ThreadID                    string                        `json:"threadId"`
+	RuntimeBinding              RuntimeBinding                `json:"runtimeBinding"`
+	RuntimeTurnBindings         map[string]string             `json:"runtimeTurnBindings,omitempty"`
+	TurnRecoveryMarkers         map[string]TurnRecoveryMarker `json:"turnRecoveryMarkers,omitempty"`
+	Sandbox                     string                        `json:"sandbox"`
+	ApprovalPolicy              string                        `json:"approvalPolicy"`
+	ProviderID                  string                        `json:"providerId,omitempty"`
+	Model                       string                        `json:"model,omitempty"`
+	Effort                      string                        `json:"effort,omitempty"`
+	RuntimeConfiguration        RuntimeConfiguration          `json:"runtimeConfiguration,omitempty"`
+	runtimeConfigurationPresent bool
+	ModelImageInput             bool                         `json:"modelImageInput,omitempty"`
+	ModelImageGeneration        string                       `json:"modelImageGeneration,omitempty"`
+	ModelImageModel             string                       `json:"modelImageModel,omitempty"`
+	Status                      string                       `json:"status"`
+	CurrentTask                 string                       `json:"currentTask"`
+	CurrentTurnID               string                       `json:"currentTurnId"`
+	LastError                   string                       `json:"lastError"`
+	LastTurn                    *TurnSummary                 `json:"lastTurn"`
+	WorkDisposition             *WorkDisposition             `json:"workDisposition,omitempty"`
+	CreatedAt                   string                       `json:"createdAt"`
+	UpdatedAt                   string                       `json:"updatedAt"`
+	PendingProviderSwitch       *ProviderSwitchBinding       `json:"pendingProviderSwitch,omitempty"`
+	ProviderHistory             []ProviderBindingChange      `json:"providerHistory,omitempty"`
+	ContextMaintenance          *ContextMaintenanceOperation `json:"contextMaintenance,omitempty"`
 	// Source is "edge" for Agents mirrored read-only from pinix-edge's
 	// registry (they are re-imported each startup and never persisted here);
 	// empty for Agents CodexLoom owns. Starting a Turn promotes an edge mirror
 	// to a native Agent (Source cleared, then persisted).
 	Source             string `json:"source,omitempty"`
 	capabilitySnapshot runtimecontract.CapabilitySnapshot
+}
+
+func (a *Agent) UnmarshalJSON(data []byte) error {
+	type agentAlias Agent
+	var decoded agentAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*a = Agent(decoded)
+	_, a.runtimeConfigurationPresent = fields["runtimeConfiguration"]
+	return nil
 }
 
 // AgentView is what the canonical API returns: governance metadata plus live
@@ -240,6 +264,10 @@ type Schedule struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	To            string `json:"to"`
+	AgentID       string `json:"agentId,omitempty"`
+	ThreadID      string `json:"threadId,omitempty"`
+	SourceTurnID  string `json:"sourceTurnId,omitempty"`
+	TopicID       string `json:"topicId,omitempty"`
 	Subject       string `json:"subject"`
 	Body          string `json:"body"`
 	Response      string `json:"response"`
@@ -256,6 +284,7 @@ type Schedule struct {
 }
 
 type ScheduleParams struct {
+	From     string `json:"from,omitempty"`
 	Name     string `json:"name"`
 	To       string `json:"to"`
 	Subject  string `json:"subject"`
@@ -580,6 +609,17 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 			meta.UpdatedAt = now()
 			agentRegistryRecovered = true
 		}
+		if meta.RuntimeBinding.Kind == "claude" && !meta.runtimeConfigurationPresent {
+			meta.RuntimeConfiguration = legacyClaudeRuntimeConfiguration()
+			meta.UpdatedAt = now()
+			agentRegistryRecovered = true
+		}
+		configuration, configurationErr := normalizeRuntimeConfiguration(meta.RuntimeBinding.Kind, meta.RuntimeConfiguration)
+		if configurationErr != nil {
+			return nil, fmt.Errorf("load agents: Agent %s has invalid Runtime configuration: %w", id, configurationErr)
+		}
+		meta.RuntimeConfiguration = configuration
+		meta.runtimeConfigurationPresent = true
 		if meta.ContextMaintenance != nil {
 			if err := meta.ContextMaintenance.Validate(meta); err != nil {
 				return nil, fmt.Errorf("load agents: Agent %s has invalid context maintenance state: %w", id, err)
@@ -1628,6 +1668,8 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 	persistedBinding := runtimeContractBinding(meta)
 	h.mu.Unlock()
 	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, effort, imageEvidence, disabledSkillPaths)
+	configureRuntimeWorkspace(rt.runtimeContract, cwd)
+	configureRuntimeOwnerConfiguration(rt.runtimeContract, meta.RuntimeConfiguration)
 	startBinding := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 		defer cancel()
@@ -1792,6 +1834,8 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, effort, imageEvidence, disabledSkillPaths)
+	configureRuntimeWorkspace(rt.runtimeContract, meta.Cwd)
+	configureRuntimeOwnerConfiguration(rt.runtimeContract, meta.RuntimeConfiguration)
 	outcome := rt.runtimeContract.ResumeBinding(ctx, rt.binding)
 	cancel()
 	err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false)
@@ -2694,6 +2738,7 @@ func (h *Hub) finishTurnWithPendingLocked(meta *Agent, rt *runtime, status, errM
 		meta.LastError = status
 	}
 	meta.LastTurn = &TurnSummary{TurnID: turn.turnID, Task: turn.task, Status: status, CompletedAt: now()}
+	meta.WorkDisposition = h.terminalWorkDispositionLocked(meta, turn, status)
 	if turn.humanRequestID != "" {
 		h.bindRecoveryHumanTurnMarkerLocked(meta, turn.humanRequestID, turn.turnID)
 	}

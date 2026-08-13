@@ -34,10 +34,115 @@ write({kind: "hello", ...identity, os: process.platform, arch: process.arch === 
 let initialized = false;
 let active;
 
+const authenticationEnvironmentKeys = new Set([
+  "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+  "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE",
+  "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE",
+  "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME", "AWS_REGION", "AWS_DEFAULT_REGION",
+  "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_QUOTA_PROJECT"
+]);
+const authenticationEnvironmentPrefixes = [
+  "CLAUDE_CODE_USE_", "CLAUDE_CODE_SKIP_", "ANTHROPIC_AWS_", "ANTHROPIC_BEDROCK_",
+  "ANTHROPIC_VERTEX_", "ANTHROPIC_GOOGLE_CLOUD_", "ANTHROPIC_FOUNDRY_", "AWS_CONTAINER_"
+];
+const hostAuthenticationEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+  authenticationEnvironmentKeys.has(key) || authenticationEnvironmentPrefixes.some((prefix) => key.startsWith(prefix))
+));
+for (const key of Object.keys(hostAuthenticationEnvironment)) delete process.env[key];
+
 function stableJSON(value) {
   if (Array.isArray(value)) return `[${value.map(stableJSON).join(",")}]`;
   if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJSON(value[key])}`).join(",")}}`;
   return JSON.stringify(value);
+}
+
+function ownerConfiguration(payload) {
+  const raw = payload?.configuration;
+  if (!raw || !Array.isArray(raw.settingSources) || !raw.authentication || typeof raw.authentication !== "object") {
+    throw new Error("Claude Runtime owner configuration is required");
+  }
+  const settingSources = raw.settingSources.map((source) => String(source));
+  if (settingSources.length === 0 || new Set(settingSources).size !== settingSources.length || settingSources.some((source) => !["user", "project", "local"].includes(source))) {
+    throw new Error("Claude Runtime setting sources are invalid");
+  }
+  const category = String(raw.authentication.category || "");
+  const source = String(raw.authentication.source || "");
+  const supported = category === "console" && source === "api_key"
+    || category === "gateway" && source === "gateway"
+    || category === "cloud" && ["bedrock", "vertex", "foundry", "anthropic_aws", "anthropic_google_cloud", "mantle"].includes(source);
+  if (!supported) throw new Error("Claude Runtime authentication source cannot be safely verified");
+  return {settingSources, authentication: {category, source}};
+}
+
+function selectedAuthenticationEnvironment(configuration) {
+  const source = configuration.authentication.source;
+  const allowed = source === "api_key" ? ["ANTHROPIC_API_KEY"]
+    : source === "bedrock" ? ["AWS_", "ANTHROPIC_BEDROCK_"]
+    : source === "vertex" ? ["GOOGLE_", "ANTHROPIC_VERTEX_"]
+    : source === "foundry" ? ["ANTHROPIC_FOUNDRY_"]
+    : source === "anthropic_aws" ? ["AWS_", "ANTHROPIC_AWS_"]
+    : source === "anthropic_google_cloud" ? ["GOOGLE_", "ANTHROPIC_GOOGLE_CLOUD_"]
+    : source === "mantle" ? ["AWS_", "ANTHROPIC_BEDROCK_MANTLE_"]
+    : source === "gateway" ? ["ANTHROPIC_AUTH_TOKEN"]
+    : [];
+  const env = {...process.env};
+  for (const [key, value] of Object.entries(hostAuthenticationEnvironment)) {
+    if (allowed.some((prefix) => key === prefix || key.startsWith(prefix))) env[key] = value;
+  }
+  const selector = {
+    bedrock: "CLAUDE_CODE_USE_BEDROCK", vertex: "CLAUDE_CODE_USE_VERTEX",
+    foundry: "CLAUDE_CODE_USE_FOUNDRY", anthropic_aws: "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    anthropic_google_cloud: "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    mantle: "CLAUDE_CODE_USE_MANTLE", gateway: "CLAUDE_CODE_USE_GATEWAY"
+  }[source];
+  if (selector) env[selector] = "1";
+  return env;
+}
+
+async function verifyAuthentication(control, configuration) {
+  const account = await control.accountInfo();
+  const provider = account?.apiProvider;
+  const source = configuration.authentication.source;
+  const providerBySource = {
+    bedrock: "bedrock", vertex: "vertex", foundry: "foundry", anthropic_aws: "anthropicAws",
+    anthropic_google_cloud: "anthropicGoogleCloud", mantle: "mantle", gateway: "gateway"
+  };
+  const accepted = source === "api_key"
+    ? provider === "firstParty" && typeof account?.apiKeySource === "string" && account.apiKeySource !== "oauth"
+    : provider === providerBySource[source];
+  if (!accepted) throw new Error("Claude Runtime authentication did not match the selected source");
+  return {settingSources: [...configuration.settingSources], authentication: {...configuration.authentication, validation: "accepted"}};
+}
+
+function safeName(value) {
+  if (typeof value !== "string") return "";
+  const normalized = value.trim();
+  return normalized && normalized.length <= 256 && !/[\r\n\0/\\]/.test(normalized) ? normalized : "";
+}
+
+function resource(kind, name, extra = {}) {
+  const safe = safeName(name);
+  return safe ? {id: `${kind}:${safe}`, name: safe, kind, path: "", source: "claude_agent_sdk_reload", enabled: true, ...extra} : undefined;
+}
+
+function resourceInventory(skillState, pluginState) {
+  const skills = new Set((Array.isArray(skillState?.skills) ? skillState.skills : []).map((skill) => safeName(skill?.name)).filter(Boolean));
+  const resources = [];
+  for (const name of [...skills].sort()) resources.push(resource("skill", name));
+  for (const command of Array.isArray(pluginState?.commands) ? pluginState.commands : []) {
+    const name = safeName(command?.name);
+    if (name && !skills.has(name)) resources.push(resource("command", name));
+  }
+  for (const plugin of Array.isArray(pluginState?.plugins) ? pluginState.plugins : []) {
+    const item = resource("extension", plugin?.name);
+    if (item) resources.push(item);
+  }
+  for (const server of Array.isArray(pluginState?.mcpServers) ? pluginState.mcpServers : []) {
+    const status = ["connected", "failed", "needs-auth", "pending", "disabled"].includes(server?.status) ? server.status : "unknown";
+    const item = resource("mcp", server?.name, {enabled: status !== "disabled", status});
+    if (item) resources.push(item);
+  }
+  return resources.filter(Boolean).sort((left, right) => left.id.localeCompare(right.id));
 }
 
 function requestPermission(turn, toolName, input, options) {
@@ -174,6 +279,7 @@ function toolResultContent(message) {
 
 async function runTurn(frame) {
   const payload = frame.payload || {};
+  const configuration = ownerConfiguration(payload);
   const sessionRef = payload.sessionRef;
   const runtimeTurnRef = randomUUID();
   const developer = developerInput(payload.input);
@@ -185,6 +291,8 @@ async function runTurn(frame) {
 	}
     const options = {
       cwd: payload.cwd,
+      settingSources: configuration.settingSources,
+      env: selectedAuthenticationEnvironment(configuration),
       ...(payload.resume ? {resume: sessionRef} : {sessionId: sessionRef}),
       ...(developer ? {systemPrompt: {type: "preset", preset: "claude_code", append: developer}} : {}),
       canUseTool: (toolName, input, callbackOptions) => requestPermission(turn, toolName, input, callbackOptions)
@@ -192,6 +300,7 @@ async function runTurn(frame) {
 	let releaseInput;
 	const inputReady = new Promise((resolve) => { releaseInput = resolve; });
     sdkQuery = query({prompt: initialInput(payload.input, sessionRef, inputReady), options});
+	await verifyAuthentication(sdkQuery, configuration);
 	let expectedModel = "";
 	if (payload.model) {
 	  const available = await sdkQuery.supportedModels();
@@ -261,25 +370,29 @@ async function handleCommand(frame) {
   const payload = frame.payload || {};
   switch (frame.command) {
 	case "inspect_model_control": {
+	  const configuration = ownerConfiguration(payload);
 	  const requested = {provider: payload.provider || "anthropic", model: payload.model, thinkingLevel: payload.thinkingLevel || "default"};
 	  if (!requested.model) {
 		respond(frame, false, {}, "Claude model selection is not committed");
 		return;
 	  }
-	  const control = query({prompt: (async function* () { await new Promise(() => {}); })(), options: {persistSession: false, settingSources: []}});
+	  const control = query({prompt: (async function* () { await new Promise(() => {}); })(), options: {persistSession: false, settingSources: configuration.settingSources, env: selectedAuthenticationEnvironment(configuration)}});
 	  try {
+		await verifyAuthentication(control, configuration);
 		const models = modelCatalog(await control.supportedModels());
 		respond(frame, true, modelState(models, requested));
 	  } finally { control.close(); }
 	  return;
 	}
 	case "select_model": {
+	  const configuration = ownerConfiguration(payload);
 	  if (typeof payload.sessionRef !== "string" || typeof payload.cwd !== "string") {
 		respond(frame, false, {}, "Claude Runtime model selection has no exact binding");
 		return;
 	  }
-	  const control = query({prompt: (async function* () { await new Promise(() => {}); })(), options: {cwd: payload.cwd, persistSession: false, settingSources: [], ...(payload.resume ? {resume: payload.sessionRef} : {sessionId: payload.sessionRef})}});
+	  const control = query({prompt: (async function* () { await new Promise(() => {}); })(), options: {cwd: payload.cwd, persistSession: false, settingSources: configuration.settingSources, env: selectedAuthenticationEnvironment(configuration), ...(payload.resume ? {resume: payload.sessionRef} : {sessionId: payload.sessionRef})}});
 	  try {
+		await verifyAuthentication(control, configuration);
 		const models = modelCatalog(await control.supportedModels());
 		const previous = modelState(models, payload.current || {});
 		const selected = modelState(models, payload.selection || {});
@@ -295,6 +408,22 @@ async function handleCommand(frame) {
 		  return;
 		}
 		respond(frame, true, {...selected, effectEvidence: {binding: "exact", model: "sdk_ack", thinking: "sdk_ack"}});
+	  } finally { control.close(); }
+	  return;
+	}
+	case "inspect_resources": {
+	  const configuration = ownerConfiguration(payload);
+	  if (typeof payload.cwd !== "string") {
+		respond(frame, false, {}, "Claude Runtime resource inspection has no working directory");
+		return;
+	  }
+	  const control = query({prompt: (async function* () { await new Promise(() => {}); })(), options: {cwd: payload.cwd, persistSession: false, settingSources: configuration.settingSources, env: selectedAuthenticationEnvironment(configuration)}});
+	  try {
+		const verified = await verifyAuthentication(control, configuration);
+		const [skillState, pluginState] = await Promise.all([
+		  control.reloadSkills(), control.reloadPlugins()
+		]);
+		respond(frame, true, {resources: resourceInventory(skillState, pluginState), configuration: verified});
 	  } finally { control.close(); }
 	  return;
 	}

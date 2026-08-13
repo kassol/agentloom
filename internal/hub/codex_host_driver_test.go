@@ -526,9 +526,9 @@ func TestCodexContractPreservesStreamingAndToolLifecycle(t *testing.T) {
 		{"item/agentMessage/delta", `{"threadId":"thread-native","turnId":"turn-native","itemId":"answer","delta":"hi"}`},
 		{"item/completed", `{"threadId":"thread-native","turnId":"turn-native","item":{"id":"answer","type":"agentMessage","content":[{"type":"output_text","text":"done"}]}}`},
 		{"item/completed", `{"threadId":"thread-native","turnId":"turn-native","item":{"id":"reasoning","type":"reasoning","summary":[{"type":"summary_text","text":"checked"}]}}`},
-		{"item/started", `{"threadId":"thread-native","turnId":"turn-native","item":{"id":"tool-1","type":"commandExecution","command":"pwd"}}`},
-		{"item/updated", `{"threadId":"thread-native","turnId":"turn-native","item":{"id":"tool-1","type":"commandExecution","command":"pwd","aggregatedOutput":"/repo"}}`},
-		{"item/completed", `{"threadId":"thread-native","turnId":"turn-native","item":{"id":"tool-1","type":"commandExecution","command":"pwd","output":"/repo\n","status":"completed","exitCode":0,"durationMs":12}}`},
+		{"item/started", `{"threadId":"thread-native","turnId":"turn-native","item":{"id":"tool-1","type":"commandExecution","command":"pwd","description":"Locate the workspace root"}}`},
+		{"item/updated", `{"threadId":"thread-native","turnId":"turn-native","item":{"id":"tool-1","type":"commandExecution","command":"pwd","description":"Locate the workspace root","aggregatedOutput":"/repo"}}`},
+		{"item/completed", `{"threadId":"thread-native","turnId":"turn-native","item":{"id":"tool-1","type":"commandExecution","command":"pwd","description":"Locate the workspace root","output":"/repo\n","status":"completed","exitCode":0,"durationMs":12}}`},
 	}
 	for _, fixture := range fixtures {
 		contract.handleNativeEvent(fixture.method, json.RawMessage(fixture.params))
@@ -552,7 +552,7 @@ func TestCodexContractPreservesStreamingAndToolLifecycle(t *testing.T) {
 	if events[0].Content == nil || events[0].Content.Kind != runtimecontract.ContentAssistantText || events[0].Content.Text != "hi" {
 		t.Fatalf("assistant delta = %#v", events[0])
 	}
-	if events[3].Content == nil || events[3].Content.Kind != runtimecontract.ContentToolCall || events[3].Content.ToolCall == nil || events[3].Content.ToolCall.Name != "commandExecution" {
+	if events[3].Content == nil || events[3].Content.Kind != runtimecontract.ContentToolCall || events[3].Content.ToolCall == nil || events[3].Content.ToolCall.Name != "commandExecution" || events[3].Content.ToolCall.Description != "Locate the workspace root" {
 		t.Fatalf("tool call = %#v", events[3])
 	}
 	if events[5].Content == nil || events[5].Content.Kind != runtimecontract.ContentToolResult || events[5].Content.ToolResult == nil ||

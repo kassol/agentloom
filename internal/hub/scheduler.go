@@ -57,8 +57,27 @@ func (h *Hub) CreateSchedule(p ScheduleParams) (Schedule, error) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.resolveLocked(s.To) == nil {
+	target := h.resolveLocked(s.To)
+	if target == nil {
 		return Schedule{}, errf(404, "target agent not found: %s", s.To)
+	}
+	source := target
+	if strings.TrimSpace(p.From) != "" {
+		source = h.resolveLocked(p.From)
+		if source == nil {
+			return Schedule{}, errf(404, "source agent not found: %s", p.From)
+		}
+	}
+	// A Schedule is a wake source only when it resumes the same Agent that
+	// created it during a live Turn. Cross-Agent schedules remain valid but do
+	// not pretend to be the creator's return path.
+	if source.ID == target.ID {
+		if rt := h.runtimes[source.ID]; rt != nil && rt.activeTurn != nil && !rt.activeTurn.finished {
+			s.AgentID = source.ID
+			s.ThreadID = source.ThreadID
+			s.SourceTurnID = rt.activeTurn.turnID
+			s.TopicID = rt.activeTurn.topicID
+		}
 	}
 	for _, existing := range h.schedules {
 		if existing.Name == s.Name {

@@ -89,9 +89,13 @@ func TestEmbeddedBridgeWaitsForAcceptedCausalInputBeforeTerminal(t *testing.T) {
 export async function getSessionInfo() { return undefined; }
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export function query({prompt, options}) {
+  if (JSON.stringify(options.settingSources) !== JSON.stringify(["project","local"])) throw new Error("settingSources not explicit");
   const queued = [];
 	let selectedModel = "", selectedEffort;
   return {
+	async accountInfo() { return {apiProvider:"firstParty",apiKeySource:"project",email:"must-not-escape@example.com"}; },
+		async reloadSkills() { return {skills:[{name:"ship",description:"skill",argumentHint:""}]}; },
+		async reloadPlugins() { return {commands:[{name:"ship",description:"skill",argumentHint:""},{name:"review",description:"command",argumentHint:""}],agents:[],plugins:[{name:"safe-plugin",path:"/private/native/plugin"}],mcpServers:[{name:"safe-mcp",status:"connected",config:{command:"secret-helper",args:["--token","secret"]}}],error_count:0}; },
 	async supportedModels() { return [{value:"sonnet",resolvedModel:"claude-sonnet-4-6",displayName:"Sonnet",supportsEffort:true,supportedEffortLevels:["low","high"],supportsAdaptiveThinking:true},{value:"legacy",resolvedModel:"claude-3-7-sonnet-20250219",displayName:"Legacy"},{value:"unknown",displayName:"Unknown"}]; },
 	async setModel(model) { selectedModel = model; },
 	async applyFlagSettings(settings) { selectedEffort = settings.effortLevel; },
@@ -154,24 +158,55 @@ export function query({prompt, options}) {
 	_ = read()
 	write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
 	_ = read()
-	write(map[string]any{"kind": "command", "command": "inspect_model_control", "requestId": "inspect", "operation": "op-inspect", "payload": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "default"}})
+	configuration := map[string]any{"settingSources": []string{"project", "local"}, "authentication": map[string]any{"category": "console", "source": "api_key"}}
+	write(map[string]any{"kind": "command", "command": "inspect_resources", "requestId": "empty-resources", "operation": "op-empty-resources", "payload": map[string]any{"cwd": app, "configuration": map[string]any{"settingSources": []string{}, "authentication": map[string]any{"category": "console", "source": "api_key"}}}})
+	emptyResources := read()
+	if emptyResources["accepted"] != false {
+		t.Fatalf("empty settingSources accepted = %#v", emptyResources)
+	}
+	write(map[string]any{"kind": "command", "command": "inspect_resources", "requestId": "helper-resources", "operation": "op-helper-resources", "payload": map[string]any{"cwd": app, "configuration": map[string]any{"settingSources": []string{"project"}, "authentication": map[string]any{"category": "console", "source": "helper"}}}})
+	helperResources := read()
+	if helperResources["accepted"] != false {
+		t.Fatalf("unsupported helper authentication accepted = %#v", helperResources)
+	}
+	write(map[string]any{"kind": "command", "command": "inspect_model_control", "requestId": "inspect", "operation": "op-inspect", "payload": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "default", "configuration": configuration}})
 	inspected := read()
 	state := inspected["data"].(map[string]any)
 	catalogModels := state["models"].([]any)
 	if state["thinkingLevel"] != "default" || catalogModels[0].(map[string]any)["id"] != "default" || catalogModels[0].(map[string]any)["imageInput"] != false || catalogModels[1].(map[string]any)["imageInput"] != true || catalogModels[2].(map[string]any)["imageInput"] != true || catalogModels[3].(map[string]any)["imageInput"] != false {
 		t.Fatalf("generation model evidence = %#v", state)
 	}
-	write(map[string]any{"kind": "command", "command": "select_model", "requestId": "select", "operation": "op-select", "payload": map[string]any{"sessionRef": "11111111-1111-4111-8111-111111111111", "cwd": app, "current": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "default"}, "selection": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "high"}}})
+	write(map[string]any{"kind": "command", "command": "select_model", "requestId": "select", "operation": "op-select", "payload": map[string]any{"sessionRef": "11111111-1111-4111-8111-111111111111", "cwd": app, "current": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "default"}, "selection": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "high"}, "configuration": configuration}})
 	selected := read()
 	if selected["accepted"] != true || selected["data"].(map[string]any)["thinkingLevel"] != "high" {
 		t.Fatalf("selected model evidence = %#v", selected)
+	}
+	write(map[string]any{"kind": "command", "command": "inspect_resources", "requestId": "resources", "operation": "op-resources", "payload": map[string]any{"cwd": app, "configuration": configuration}})
+	resources := read()
+	encodedResources, _ := json.Marshal(resources)
+	if resources["accepted"] != true || bytes.Contains(encodedResources, []byte("must-not-escape")) || bytes.Contains(encodedResources, []byte("private/native")) || bytes.Contains(encodedResources, []byte("secret-helper")) || bytes.Contains(encodedResources, []byte("--token")) {
+		t.Fatalf("unsafe Claude resource evidence = %s", encodedResources)
+	}
+	resourceData := resources["data"].(map[string]any)
+	items := resourceData["resources"].([]any)
+	wantIDs := []string{"command:review", "extension:safe-plugin", "mcp:safe-mcp", "skill:ship"}
+	gotIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		gotIDs = append(gotIDs, item.(map[string]any)["id"].(string))
+	}
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Fatalf("Claude resource kinds = %#v, want %#v", gotIDs, wantIDs)
+	}
+	auth := resourceData["configuration"].(map[string]any)["authentication"].(map[string]any)
+	if auth["category"] != "console" || auth["source"] != "api_key" || auth["validation"] != "accepted" || len(auth) != 3 {
+		t.Fatalf("Claude authentication evidence = %#v", auth)
 	}
 	session := "11111111-1111-4111-8111-111111111111"
 	imagePath := filepath.Join(app, "screen.png")
 	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "model": "sonnet", "thinkingLevel": "high", "input": []any{map[string]any{"kind": "text", "role": "developer", "text": "first-dev"}, map[string]any{"kind": "text", "role": "user", "text": "first-user"}, map[string]any{"kind": "image", "role": "user", "ref": imagePath, "mimeType": "image/png"}}}})
+	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "model": "sonnet", "thinkingLevel": "high", "configuration": configuration, "input": []any{map[string]any{"kind": "text", "role": "developer", "text": "first-dev"}, map[string]any{"kind": "text", "role": "user", "text": "first-user"}, map[string]any{"kind": "image", "role": "user", "ref": imagePath, "mimeType": "image/png"}}}})
 	sentContinue := false
 	terminalCount := 0
 	texts := []string{}
@@ -246,8 +281,10 @@ func TestEmbeddedBridgeResolvesApprovalAndReleasesNeedsYou(t *testing.T) {
 	fake := `
 export async function getSessionInfo() { return undefined; }
 export function query({prompt, options}) {
+  if (JSON.stringify(options.settingSources) !== JSON.stringify(["project","local"])) throw new Error("settingSources not explicit");
   let interrupted = false;
   return {
+    async accountInfo() { return {apiProvider:"firstParty",apiKeySource:"project"}; },
     async streamInput() {}, async interrupt() { interrupted = true; }, close() {},
     async *[Symbol.asyncIterator]() {
       await prompt[Symbol.asyncIterator]().next();
@@ -288,7 +325,8 @@ export function query({prompt, options}) {
 	write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
 	_ = read()
 	session := "11111111-1111-4111-8111-111111111111"
-	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "input": []any{map[string]any{"kind": "text", "role": "user", "text": "work"}}}})
+	configuration := map[string]any{"settingSources": []string{"project", "local"}, "authentication": map[string]any{"category": "console", "source": "api_key"}}
+	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "configuration": configuration, "input": []any{map[string]any{"kind": "text", "role": "user", "text": "work"}}}})
 	for {
 		frame := read()
 		if frame["event"] == "approval" {
@@ -342,7 +380,9 @@ export async function getSessionInfo() { return undefined; }
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let interruptRequested = false;
 export function query({prompt, options}) {
+  if (JSON.stringify(options.settingSources) !== JSON.stringify(["project","local"])) throw new Error("settingSources not explicit");
   return {
+    async accountInfo() { return {apiProvider:"firstParty",apiKeySource:"project"}; },
     async streamInput() {},
     async interrupt() { interruptRequested = true; await delay(80); },
     close() {},
@@ -393,7 +433,8 @@ export function query({prompt, options}) {
 	write(map[string]any{"kind": "initialize", "requestId": "init", "agentId": "agent"})
 	_ = read()
 	session := "11111111-1111-4111-8111-111111111111"
-	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "input": []any{map[string]any{"kind": "text", "role": "user", "text": "work"}}}})
+	configuration := map[string]any{"settingSources": []string{"project", "local"}, "authentication": map[string]any{"category": "console", "source": "api_key"}}
+	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "configuration": configuration, "input": []any{map[string]any{"kind": "text", "role": "user", "text": "work"}}}})
 	var runtimeTurnRef any
 	for runtimeTurnRef == nil {
 		frame := read()

@@ -143,7 +143,7 @@ func TestClaudeAcceptedTurnPersistsContextEvidenceAcrossReopen(t *testing.T) {
 	}
 	h := New(st)
 	h.runtimeHostDrivers["claude"] = fakeClaudeBridgeDriver(t, st)
-	agent, err := h.CreateAgent(CreateParams{Name: "context-claude", Cwd: t.TempDir(), RuntimeKind: "claude"})
+	agent, err := h.CreateAgent(CreateParams{Name: "context-claude", Cwd: t.TempDir(), RuntimeKind: "claude", RuntimeConfiguration: testClaudeRuntimeConfiguration()})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -43,6 +43,7 @@ type codexRuntimeContract struct {
 	modelCompensation         *codexModelCompensation
 	contextMaintenance        *codexContextMaintenanceWaiter
 	bindingRef                string
+	cwd                       string
 	release                   func()
 	pendingTurn               runtimeTurnCorrelation
 	turnsByNative             map[string]runtimeTurnCorrelation
@@ -139,6 +140,12 @@ func (c *codexRuntimeContract) SetRuntimeSandbox(value string) {
 	c.mu.Unlock()
 }
 
+func (c *codexRuntimeContract) SetRuntimeWorkspace(value string) {
+	c.mu.Lock()
+	c.cwd = value
+	c.mu.Unlock()
+}
+
 func (c *codexRuntimeContract) SetRuntimeProvider(providerID, model string) {
 	c.mu.Lock()
 	c.providerID, c.model = normalizePublicProviderID(providerID), model
@@ -216,6 +223,9 @@ func (c *codexRuntimeContract) SetRuntimeDeveloperContextTimeout(value time.Dura
 func (c *codexRuntimeContract) nativeBindingRequest(name, cwd, nativeRef string) nativeBindingRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if cwd == "" {
+		cwd = c.cwd
+	}
 	return nativeBindingRequest{NativeRef: nativeRef, Name: name, Cwd: cwd, Sandbox: c.sandbox, ProviderID: normalizeProviderID(c.providerID), Model: c.model, DisabledSkillPaths: append([]string(nil), c.disabledSkillPaths...)}
 }
 
@@ -1123,7 +1133,7 @@ func codexHistoryContent(items []map[string]any) []runtimecontract.ContentBlock 
 			arguments, _ := json.Marshal(map[string]any{"command": item["command"], "cwd": item["cwd"]})
 			block.Kind = runtimecontract.ContentToolCall
 			block.Text = ""
-			block.ToolCall = &runtimecontract.ToolCall{Name: "exec_command", Arguments: arguments}
+			block.ToolCall = &runtimecontract.ToolCall{Name: "exec_command", Description: codexCommandDescription(item), Arguments: arguments}
 			content = append(content, block)
 			if runtimeHistoryToolSettled(item) {
 				content = append(content, runtimecontract.ContentBlock{
@@ -1252,6 +1262,15 @@ func codexToolResult(toolCallID string, item map[string]any) *runtimecontract.To
 	return &runtimecontract.ToolResult{ToolCallID: toolCallID, Text: text, Success: success}
 }
 
+func codexCommandDescription(item map[string]any) string {
+	description, _ := item["description"].(string)
+	description = strings.TrimSpace(description)
+	if len([]rune(description)) > 250 {
+		return ""
+	}
+	return description
+}
+
 func codexHistoryText(item map[string]any) string {
 	for _, key := range []string{"text", "message"} {
 		if text, _ := item[key].(string); text != "" {
@@ -1345,7 +1364,7 @@ func runtimeContractEvent(event nativeEvent, correlation runtimeTurnCorrelation)
 			name, _ := event.Item["type"].(string)
 			content.Kind = runtimecontract.ContentToolCall
 			content.Text = ""
-			content.ToolCall = &runtimecontract.ToolCall{Name: name, Arguments: arguments}
+			content.ToolCall = &runtimecontract.ToolCall{Name: name, Description: codexCommandDescription(event.Item), Arguments: arguments}
 		}
 		canonical.Content = &content
 	}

@@ -357,7 +357,7 @@ func claudeControlPlaneCapabilitySnapshot(imageInput ...bool) runtimecontract.Ca
 	snapshot := controlPlaneCapabilitySnapshot("claude")
 	for index := range snapshot.Capabilities {
 		id := snapshot.Capabilities[index].ID
-		available := id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy || id == runtimecontract.CapabilityUsageReporting || id == runtimecontract.CapabilityModelConfiguration || id == runtimecontract.CapabilityImageInput && len(imageInput) > 0 && imageInput[0]
+		available := id == runtimecontract.CapabilityContextDelivery || id == runtimecontract.CapabilityApprovalPolicy || id == runtimecontract.CapabilityResourceInventory || id == runtimecontract.CapabilityUsageReporting || id == runtimecontract.CapabilityModelConfiguration || id == runtimecontract.CapabilityImageInput && len(imageInput) > 0 && imageInput[0]
 		if available {
 			snapshot.Capabilities[index] = runtimeCapabilityDescriptor("claude", id, true)
 		}

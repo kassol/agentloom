@@ -258,6 +258,8 @@ type claudeRuntimeContract struct {
 	imageInput                bool
 	generationID              string
 	modelRevision             uint64
+	runtimeConfiguration      RuntimeConfiguration
+	configurationEvidence     *RuntimeConfigurationEvidence
 	release                   func()
 	ops                       atomic.Uint64
 	opPhases                  map[string]runtimecontract.FailurePhase
@@ -308,6 +310,65 @@ func (c *claudeRuntimeContract) SetRuntimeApprovalPolicy(policy string) {
 	c.mu.Lock()
 	c.approvalPolicy = policy
 	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) SetRuntimeOwnerConfiguration(configuration RuntimeConfiguration) {
+	c.mu.Lock()
+	changed := c.runtimeConfiguration.Configured != configuration.Configured ||
+		c.runtimeConfiguration.Authentication != configuration.Authentication ||
+		strings.Join(c.runtimeConfiguration.SettingSources, "\x00") != strings.Join(configuration.SettingSources, "\x00")
+	c.runtimeConfiguration = configuration
+	c.runtimeConfiguration.SettingSources = append([]string(nil), configuration.SettingSources...)
+	if changed {
+		c.configurationEvidence = nil
+		c.modelState = nil
+		c.modelRevision++
+	}
+	c.mu.Unlock()
+}
+
+// RuntimeConfigurationEvidence returns only the safe, bridge-verified shape.
+// In particular it never exposes account identity, credential values, helper
+// output, native paths, or raw Claude configuration.
+func (c *claudeRuntimeContract) RuntimeConfigurationEvidence() (RuntimeConfigurationEvidence, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.configurationEvidence == nil {
+		return RuntimeConfigurationEvidence{}, false
+	}
+	evidence := *c.configurationEvidence
+	evidence.SettingSources = append([]string(nil), evidence.SettingSources...)
+	evidence.Authentication.Evidence = append([]runtimecontract.CapabilityEvidence(nil), evidence.Authentication.Evidence...)
+	return evidence, true
+}
+
+func (c *claudeRuntimeContract) runtimeConfigurationPayloadLocked() map[string]any {
+	return map[string]any{
+		"settingSources": append([]string(nil), c.runtimeConfiguration.SettingSources...),
+		"authentication": c.runtimeConfiguration.Authentication,
+	}
+}
+
+func (c *claudeRuntimeContract) rememberConfigurationEvidence(evidence RuntimeConfigurationEvidence) error {
+	if evidence.Authentication.Category == "" || evidence.Authentication.Source == "" || evidence.Authentication.Validation != "accepted" {
+		return errors.New("Claude bridge returned invalid configuration evidence")
+	}
+	for _, source := range evidence.SettingSources {
+		if source != "user" && source != "project" && source != "local" {
+			return errors.New("Claude bridge returned an invalid setting source")
+		}
+	}
+	// The bridge contract permits only these three safe evidence fields. Drop
+	// any future optional evidence rather than accidentally widening output.
+	evidence.Authentication.Evidence = nil
+	c.mu.Lock()
+	if err := validateRuntimeConfigurationEvidence(c.runtimeConfiguration, evidence); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	c.configurationEvidence = &evidence
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *claudeRuntimeContract) SetRuntimeProvider(provider, model string) {
@@ -445,11 +506,12 @@ func (c *claudeRuntimeContract) InspectUsage(ctx context.Context, _ runtimecontr
 func (c *claudeRuntimeContract) InspectModelControl(ctx context.Context, binding runtimecontract.Binding) (runtimecontract.ModelControlState, *runtimecontract.Failure) {
 	c.mu.Lock()
 	provider, model, effort, cached, revision := c.provider, c.model, c.effort, c.modelState, c.modelRevision
+	configuration := c.runtimeConfigurationPayloadLocked()
 	c.mu.Unlock()
 	if cached != nil {
 		return cloneClaudeModelState(*cached), nil
 	}
-	response, outcome := c.command(ctx, "inspect_model_control", "", runtimecontract.FailurePhaseModelControl, map[string]any{"provider": provider, "model": model, "thinkingLevel": effort})
+	response, outcome := c.command(ctx, "inspect_model_control", "", runtimecontract.FailurePhaseModelControl, map[string]any{"provider": provider, "model": model, "thinkingLevel": effort, "configuration": configuration})
 	if outcome.State != runtimecontract.LifecycleAccepted {
 		return runtimecontract.ModelControlState{}, outcome.Failure
 	}
@@ -487,13 +549,15 @@ func (c *claudeRuntimeContract) SelectModel(ctx context.Context, binding runtime
 	c.mu.Lock()
 	cwd := c.cwd
 	resume := len(c.turns) > 0 || c.observed
+	configuration := c.runtimeConfigurationPayloadLocked()
 	c.mu.Unlock()
 	response, outcome := c.command(ctx, "select_model", "", runtimecontract.FailurePhaseModelControl, map[string]any{
-		"sessionRef": binding.NativeRef,
-		"cwd":        cwd,
-		"resume":     resume,
-		"current":    runtimecontract.ModelSelection{Provider: preview.Current.Provider, Model: preview.Current.ID, ThinkingLevel: preview.ThinkingLevel},
-		"selection":  selection,
+		"sessionRef":    binding.NativeRef,
+		"cwd":           cwd,
+		"resume":        resume,
+		"current":       runtimecontract.ModelSelection{Provider: preview.Current.Provider, Model: preview.Current.ID, ThinkingLevel: preview.ThinkingLevel},
+		"selection":     selection,
+		"configuration": configuration,
 	})
 	if outcome.State != runtimecontract.LifecycleAccepted {
 		if outcome.State == runtimecontract.LifecycleIndeterminate && outcome.Failure != nil {
@@ -518,6 +582,55 @@ func (c *claudeRuntimeContract) SelectModel(ctx context.Context, binding runtime
 	c.modelState = &copy
 	c.mu.Unlock()
 	return state, nil
+}
+
+func (c *claudeRuntimeContract) InspectResources(ctx context.Context, request runtimecontract.ResourceInventoryRequest) (runtimecontract.ResourceInventory, *runtimecontract.Failure) {
+	c.mu.Lock()
+	configuration := c.runtimeConfigurationPayloadLocked()
+	c.mu.Unlock()
+	response, outcome := c.command(ctx, "inspect_resources", "", runtimecontract.FailurePhaseResourceInventory, map[string]any{
+		"cwd": request.Cwd, "configuration": configuration,
+	})
+	if outcome.State != runtimecontract.LifecycleAccepted {
+		return runtimecontract.ResourceInventory{}, outcome.Failure
+	}
+	var data struct {
+		Resources     []runtimecontract.Resource   `json:"resources"`
+		Configuration RuntimeConfigurationEvidence `json:"configuration"`
+	}
+	if err := json.Unmarshal(response.Data, &data); err != nil {
+		return runtimecontract.ResourceInventory{}, claudeResourceFailure("resource_inventory_invalid", errors.New("Claude bridge returned malformed resource evidence"))
+	}
+	if err := c.rememberConfigurationEvidence(data.Configuration); err != nil {
+		return runtimecontract.ResourceInventory{}, claudeResourceFailure("resource_inventory_invalid", err)
+	}
+	for index := range data.Resources {
+		resource := &data.Resources[index]
+		switch resource.Kind {
+		case runtimecontract.ResourceSkill, runtimecontract.ResourceCommand, runtimecontract.ResourceExtension, runtimecontract.ResourceMCP:
+		default:
+			return runtimecontract.ResourceInventory{}, claudeResourceFailure("resource_inventory_invalid", fmt.Errorf("Claude bridge returned unsupported resource kind %q", resource.Kind))
+		}
+		// Native paths and source-specific configuration are deliberately not
+		// part of the Claude resource contract, even if a future bridge emits
+		// them accidentally.
+		resource.Path = ""
+		resource.Source = "claude_agent_sdk_reload"
+	}
+	encoded, _ := json.Marshal(data.Resources)
+	inventory := runtimecontract.ResourceInventory{
+		Revision:  "claude-sdk-init:" + fmt.Sprintf("%x", sha256.Sum256(encoded))[:16],
+		Semantics: "Claude resources observed from the public SDK reload contracts; native resources are read-only and paths are intentionally withheld",
+		Resources: data.Resources,
+	}
+	if err := inventory.Validate(); err != nil {
+		return runtimecontract.ResourceInventory{}, claudeResourceFailure("resource_inventory_invalid", err)
+	}
+	return inventory, nil
+}
+
+func claudeResourceFailure(code string, err error) *runtimecontract.Failure {
+	return &runtimecontract.Failure{Code: code, Phase: runtimecontract.FailurePhaseResourceInventory, Message: "Claude Runtime resource inventory is unavailable", Diagnostic: err.Error(), Cause: err}
 }
 
 func (c *claudeRuntimeContract) ValidateInput(ctx context.Context, binding runtimecontract.Binding, input []runtimecontract.InputBlock) *runtimecontract.Failure {
@@ -625,8 +738,9 @@ func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimeco
 	}
 	resume := len(c.turns) > 0 || c.observed
 	model, effort := c.model, c.effort
+	configuration := c.runtimeConfigurationPayloadLocked()
 	c.mu.Unlock()
-	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input, "model": model, "thinkingLevel": effort})
+	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input, "model": model, "thinkingLevel": effort, "configuration": configuration})
 	if outcome.State != runtimecontract.LifecycleAccepted {
 		c.mu.Lock()
 		delete(c.pendingContext, request.TurnID)

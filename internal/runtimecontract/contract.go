@@ -318,6 +318,9 @@ const (
 	ResourceSkill     ResourceKind = "skill"
 	ResourcePrompt    ResourceKind = "prompt"
 	ResourceExtension ResourceKind = "extension"
+	ResourceMCP       ResourceKind = "mcp"
+	ResourceCommand   ResourceKind = "command"
+	ResourceAgent     ResourceKind = "agent"
 )
 
 type Resource struct {
@@ -329,6 +332,7 @@ type Resource struct {
 	Scope       string       `json:"scope,omitempty"`
 	Source      string       `json:"source,omitempty"`
 	Enabled     bool         `json:"enabled"`
+	Status      string       `json:"status,omitempty"`
 }
 
 type ResourceInventoryRequest struct {
@@ -351,15 +355,15 @@ func (i ResourceInventory) Validate() error {
 	}
 	seen := make(map[string]struct{}, len(i.Resources))
 	for _, resource := range i.Resources {
-		if resource.ID == "" || resource.Name == "" || resource.Path == "" {
-			return fmt.Errorf("Runtime resource identity, name, and path are required")
+		if resource.ID == "" || resource.Name == "" {
+			return fmt.Errorf("Runtime resource identity and name are required")
 		}
 		if _, exists := seen[resource.ID]; exists {
 			return fmt.Errorf("duplicate Runtime resource %q", resource.ID)
 		}
 		seen[resource.ID] = struct{}{}
 		switch resource.Kind {
-		case ResourceSkill, ResourcePrompt, ResourceExtension:
+		case ResourceSkill, ResourcePrompt, ResourceExtension, ResourceMCP, ResourceCommand, ResourceAgent:
 		default:
 			return fmt.Errorf("Runtime resource %q has unknown kind %q", resource.ID, resource.Kind)
 		}
@@ -735,6 +739,9 @@ func (b ContentBlock) Validate() error {
 		if b.ToolCall == nil || payloads != 1 {
 			return fmt.Errorf("tool_call content requires only a tool call")
 		}
+		if len([]rune(b.ToolCall.Description)) > 250 {
+			return fmt.Errorf("tool_call description exceeds 250 characters")
+		}
 	case ContentToolResult:
 		if b.ToolResult == nil || payloads != 1 {
 			return fmt.Errorf("tool_result content requires only a tool result")
@@ -760,8 +767,9 @@ func (b ContentBlock) Validate() error {
 }
 
 type ToolCall struct {
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Arguments   json.RawMessage `json:"arguments,omitempty"`
 }
 
 type ToolResult struct {

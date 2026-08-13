@@ -117,6 +117,7 @@ func writePiMaintenanceFixture(t *testing.T, dir string) string {
 
 func TestCompactAgentThreadUsesPiNativeMaintenance(t *testing.T) {
 	configureFakePiHubRPC(t, "happy")
+	workspace := t.TempDir()
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -125,7 +126,7 @@ func TestCompactAgentThreadUsesPiNativeMaintenance(t *testing.T) {
 	defer h.Shutdown()
 	session := writePiMaintenanceFixture(t, st.Dir())
 	h.agents["agent-pi"] = &Agent{
-		ID: "agent-pi", Name: "pi-worker", Cwd: "/tmp/work", ThreadID: "loom-pi",
+		ID: "agent-pi", Name: "pi-worker", Cwd: workspace, ThreadID: "loom-pi",
 		RuntimeBinding: RuntimeBinding{Kind: "pi", NativeRef: session}, Status: "idle", CreatedAt: now(), UpdatedAt: now(),
 	}
 	if err := h.persistAgentsLocked(); err != nil {

@@ -95,11 +95,37 @@ func TestGoalContextRevisionAndClearTombstoneAreDelivered(t *testing.T) {
 	h.runtimes[agent.ID] = &runtime{runtimeContract: &controlPlaneContract{contextMode: runtimecontract.ContextDeliveryFullPerTurn}}
 	pi, err := h.prepareTurnContext(agent.ID, authenticatedOwnerContext("direct_input", "", "", ""), nil)
 	if err != nil || !strings.Contains(pi.InputContext, `cleared="true"`) ||
-		!strings.Contains(pi.DeveloperContext, `prompt_revision="builtin:2"`) ||
+		!strings.Contains(pi.DeveloperContext, `prompt_revision="builtin:3"`) ||
 		!strings.Contains(pi.DeveloperContext, `prompt_hash="`) ||
 		!strings.Contains(pi.DeveloperContext, `profile_revision="profile:0"`) ||
 		!strings.Contains(pi.DeveloperContext, `profile_hash="`) {
 		t.Fatalf("Pi full-per-turn Goal tombstone = %#v, err=%v", pi, err)
+	}
+}
+
+func TestBuiltinLoomAgentPromptDefinesNeedsYouBlockedTurnAndFieldContract(t *testing.T) {
+	if builtinLoomAgentPromptVersion != 3 {
+		t.Fatalf("builtin Loom Agent Prompt version = %d, want 3", builtinLoomAgentPromptVersion)
+	}
+	for _, want := range []string{
+		"必须先成功创建 required Needs You，再结束 Turn",
+		"CodexLoom 不会从最终自然语言自动代建 Needs You",
+		"等待外部事实或 provider 状态变化使用 Trigger",
+		"等待另一个 Agent 的结果使用 required Message",
+		"等待日历时间使用 Schedule",
+		"走 tool approval 队列",
+		"`question`：简短、单行的标题",
+		"`context`：较长的 Markdown，说明决定所需的背景、选项及影响",
+		"`blockedWork`：简短纯文本",
+		"不要写字面量 `\\n`",
+	} {
+		if !strings.Contains(builtinLoomAgentPrompt, want) {
+			t.Fatalf("builtin Loom Agent Prompt missing contract %q", want)
+		}
+	}
+	if !strings.Contains(builtinLoomAgentPrompt, "--context \"## 背景\n\n已验证的构建") ||
+		strings.Contains(builtinLoomAgentPrompt, "--context \"## 背景\\n") {
+		t.Fatalf("builtin Loom Agent Prompt example does not pass real newlines")
 	}
 }
 

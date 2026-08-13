@@ -148,6 +148,7 @@ func TestContractV2RejectsContradictoryContentAndLifecycleStates(t *testing.T) {
 	for _, invalid := range []runtimecontract.ContentBlock{
 		{ID: "empty-image", Kind: runtimecontract.ContentImage, Image: &runtimecontract.Image{MIMEType: "image/png"}},
 		{ID: "empty-attachment", Kind: runtimecontract.ContentAttachment, Attachment: &runtimecontract.Attachment{Name: "notes.txt"}},
+		{ID: "long-description", Kind: runtimecontract.ContentToolCall, ToolCall: &runtimecontract.ToolCall{Name: "exec_command", Description: strings.Repeat("界", 251)}},
 	} {
 		if err := invalid.Validate(); err == nil {
 			t.Fatalf("payload without public reference validated: %#v", invalid)
@@ -244,6 +245,17 @@ func TestResourceInventoryValidateRejectsNativeResourceAmbiguity(t *testing.T) {
 	if err := valid.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	pathless := runtimecontract.ResourceInventory{
+		Revision:  "claude-reload-1",
+		Semantics: "Claude-native resources are read-only and their filesystem paths are intentionally withheld",
+		Resources: []runtimecontract.Resource{{
+			ID: "skill:review", Name: "review", Kind: runtimecontract.ResourceSkill,
+			Source: "claude_agent_sdk_reload", Enabled: true,
+		}},
+	}
+	if err := pathless.Validate(); err != nil {
+		t.Fatalf("pathless native resource inventory: %v", err)
+	}
 	for name, mutate := range map[string]func(*runtimecontract.ResourceInventory){
 		"revision":  func(value *runtimecontract.ResourceInventory) { value.Revision = "" },
 		"semantics": func(value *runtimecontract.ResourceInventory) { value.Semantics = "" },
@@ -251,7 +263,6 @@ func TestResourceInventoryValidateRejectsNativeResourceAmbiguity(t *testing.T) {
 			value.Resources = append(value.Resources, value.Resources[0])
 		},
 		"kind": func(value *runtimecontract.ResourceInventory) { value.Resources[0].Kind = "builtin" },
-		"path": func(value *runtimecontract.ResourceInventory) { value.Resources[0].Path = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			value := valid

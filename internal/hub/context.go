@@ -20,7 +20,7 @@ import (
 
 const (
 	contextCoverageSchemaVersion  = 2
-	builtinLoomAgentPromptVersion = 2
+	builtinLoomAgentPromptVersion = 3
 	maxDeveloperContextBytes      = 128 << 10
 )
 
