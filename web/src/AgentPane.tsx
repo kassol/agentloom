@@ -848,6 +848,19 @@ export function AgentPane({
     }
   };
 
+  const recoverNativeConversation = async () => {
+    if (interruptedAction) return;
+    setInterruptedAction("continue");
+    try {
+      const data = await api("POST", `/api/agents/${agent.id}/runtime/conversation/recover`, {});
+      if (data.agent) onAgentUpdated(data.agent);
+    } catch (err: any) {
+      onError(err.message);
+    } finally {
+      setInterruptedAction("");
+    }
+  };
+
   const continueHeldMessage = async (entry: InboxEntry) => {
     const messageID = entry.internalMessage?.id;
     if (!messageID || heldActionID) return;
@@ -1607,6 +1620,13 @@ export function AgentPane({
 
       <div className="relative shrink-0 border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] md:px-6 md:py-3 md:pb-3">
         <div className="mx-auto max-w-[880px]">
+		  {agent.nativeConversationDivergence ? (
+			<div className="mb-2 flex flex-wrap items-center gap-2 border-l-2 border-destructive bg-destructive/5 px-3 py-2 text-[11.5px]" role="alert">
+			  <div className="min-w-0 flex-1"><span className="font-semibold text-destructive">Native Conversation Divergence:</span> <span className="text-muted-foreground">{agent.nativeConversationDivergence.summary} No native content was imported.</span></div>
+			  <button type="button" onClick={recoverNativeConversation} disabled={Boolean(interruptedAction)} className="h-7 rounded-sm bg-primary px-2 text-[10px] font-medium text-primary-foreground disabled:opacity-50">{interruptedAction ? "Recovering" : "Accept current context"}</button>
+			</div>
+		  ) : null}
+		  {agent.historyBoundary ? <div className="mb-2 border-l-2 border-warning bg-warning/5 px-3 py-2 text-[10.5px] text-muted-foreground"><span className="font-semibold text-warning">History Boundary:</span> {agent.historyBoundary.disclosure}</div> : null}
 		  {agent.status === "interrupted" && agent.lastTurn?.status === "interrupted" ? (
 			agent.recovery ? (
 			  <div className="mb-2 border-l-2 border-warning bg-warning/5 px-3 py-2 text-[11.5px] text-warning" role="status">

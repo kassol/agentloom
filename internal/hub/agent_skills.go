@@ -465,6 +465,9 @@ func (h *Hub) UpdateRuntimeResourcePolicy(key string, params AgentSkillConfigPar
 }
 
 func (h *Hub) runtimeMutationAllowedLocked(agentID string) error {
+	if agent := h.agents[agentID]; agent != nil && agent.NativeConversationDivergence != nil {
+		return errf(409, "Native Conversation Divergence fences this Agent until Owner recovery")
+	}
 	if h.resourcePolicyApplying[agentID] {
 		return errf(409, "Runtime resource policy is being applied; retry after it settles")
 	}

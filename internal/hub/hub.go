@@ -82,35 +82,37 @@ const RuntimeBindingSchemaVersion = runtimecontract.BindingSchemaVersion
 // Agent is CodexLoom's stable governance entity. ThreadID is owned by Loom;
 // RuntimeBinding is the durable association to a Runtime-native conversation.
 type Agent struct {
-	ID                          string                        `json:"id"`
-	Name                        string                        `json:"name"`
-	Cwd                         string                        `json:"cwd"`
-	SourceCwd                   string                        `json:"sourceCwd,omitempty"`
-	ThreadID                    string                        `json:"threadId"`
-	RuntimeBinding              RuntimeBinding                `json:"runtimeBinding"`
-	RuntimeTurnBindings         map[string]string             `json:"runtimeTurnBindings,omitempty"`
-	TurnRecoveryMarkers         map[string]TurnRecoveryMarker `json:"turnRecoveryMarkers,omitempty"`
-	Sandbox                     string                        `json:"sandbox"`
-	ApprovalPolicy              string                        `json:"approvalPolicy"`
-	ProviderID                  string                        `json:"providerId,omitempty"`
-	Model                       string                        `json:"model,omitempty"`
-	Effort                      string                        `json:"effort,omitempty"`
-	RuntimeConfiguration        RuntimeConfiguration          `json:"runtimeConfiguration,omitempty"`
-	runtimeConfigurationPresent bool
-	ModelImageInput             bool                         `json:"modelImageInput,omitempty"`
-	ModelImageGeneration        string                       `json:"modelImageGeneration,omitempty"`
-	ModelImageModel             string                       `json:"modelImageModel,omitempty"`
-	Status                      string                       `json:"status"`
-	CurrentTask                 string                       `json:"currentTask"`
-	CurrentTurnID               string                       `json:"currentTurnId"`
-	LastError                   string                       `json:"lastError"`
-	LastTurn                    *TurnSummary                 `json:"lastTurn"`
-	WorkDisposition             *WorkDisposition             `json:"workDisposition,omitempty"`
-	CreatedAt                   string                       `json:"createdAt"`
-	UpdatedAt                   string                       `json:"updatedAt"`
-	PendingProviderSwitch       *ProviderSwitchBinding       `json:"pendingProviderSwitch,omitempty"`
-	ProviderHistory             []ProviderBindingChange      `json:"providerHistory,omitempty"`
-	ContextMaintenance          *ContextMaintenanceOperation `json:"contextMaintenance,omitempty"`
+	ID                           string                        `json:"id"`
+	Name                         string                        `json:"name"`
+	Cwd                          string                        `json:"cwd"`
+	SourceCwd                    string                        `json:"sourceCwd,omitempty"`
+	ThreadID                     string                        `json:"threadId"`
+	RuntimeBinding               RuntimeBinding                `json:"runtimeBinding"`
+	HistoryBoundary              *HistoryBoundary              `json:"historyBoundary,omitempty"`
+	NativeConversationDivergence *NativeConversationDivergence `json:"nativeConversationDivergence,omitempty"`
+	RuntimeTurnBindings          map[string]string             `json:"runtimeTurnBindings,omitempty"`
+	TurnRecoveryMarkers          map[string]TurnRecoveryMarker `json:"turnRecoveryMarkers,omitempty"`
+	Sandbox                      string                        `json:"sandbox"`
+	ApprovalPolicy               string                        `json:"approvalPolicy"`
+	ProviderID                   string                        `json:"providerId,omitempty"`
+	Model                        string                        `json:"model,omitempty"`
+	Effort                       string                        `json:"effort,omitempty"`
+	RuntimeConfiguration         RuntimeConfiguration          `json:"runtimeConfiguration,omitempty"`
+	runtimeConfigurationPresent  bool
+	ModelImageInput              bool                         `json:"modelImageInput,omitempty"`
+	ModelImageGeneration         string                       `json:"modelImageGeneration,omitempty"`
+	ModelImageModel              string                       `json:"modelImageModel,omitempty"`
+	Status                       string                       `json:"status"`
+	CurrentTask                  string                       `json:"currentTask"`
+	CurrentTurnID                string                       `json:"currentTurnId"`
+	LastError                    string                       `json:"lastError"`
+	LastTurn                     *TurnSummary                 `json:"lastTurn"`
+	WorkDisposition              *WorkDisposition             `json:"workDisposition,omitempty"`
+	CreatedAt                    string                       `json:"createdAt"`
+	UpdatedAt                    string                       `json:"updatedAt"`
+	PendingProviderSwitch        *ProviderSwitchBinding       `json:"pendingProviderSwitch,omitempty"`
+	ProviderHistory              []ProviderBindingChange      `json:"providerHistory,omitempty"`
+	ContextMaintenance           *ContextMaintenanceOperation `json:"contextMaintenance,omitempty"`
 	// Source is "edge" for Agents mirrored read-only from pinix-edge's
 	// registry (they are re-imported each startup and never persisted here);
 	// empty for Agents CodexLoom owns. Starting a Turn promotes an edge mirror
@@ -1344,6 +1346,18 @@ func (h *Hub) emitStatusLocked(meta *Agent, status string) {
 	if recovery := recoveryView(meta); recovery != nil {
 		data["recovery"] = recovery
 	}
+	if meta.HistoryBoundary != nil {
+		boundary := *meta.HistoryBoundary
+		boundary.NativeRevision = ""
+		data["historyBoundary"] = &boundary
+	}
+	if meta.NativeConversationDivergence != nil {
+		divergence := *meta.NativeConversationDivergence
+		divergence.NativeRevision = ""
+		data["nativeConversationDivergence"] = &divergence
+	} else {
+		data["nativeConversationDivergence"] = nil
+	}
 	if goal := h.goals[meta.ID]; goal != nil {
 		data["goalRevision"] = goal.Version
 		data["goal"] = cloneGoalForAgent(goal, meta)
@@ -1676,6 +1690,11 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 	configureRuntimeBinding(rt.runtimeContract, sandbox, providerID, model, effort, imageEvidence, disabledSkillPaths)
 	configureRuntimeWorkspace(rt.runtimeContract, cwd)
 	configureRuntimeOwnerConfiguration(rt.runtimeContract, meta.RuntimeConfiguration)
+	if configured, ok := rt.runtimeContract.(runtimeHistoryBoundaryConfiguration); ok && meta.HistoryBoundary != nil {
+		configured.SetRuntimeHistoryBoundary(meta.HistoryBoundary, func(revision string) error {
+			return h.commitHistoryBoundaryRevision(agentID, revision)
+		})
+	}
 	startBinding := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 		defer cancel()
@@ -1723,6 +1742,18 @@ func (h *Hub) initRuntime(agentID string, rt *runtime) {
 	outcome := rt.runtimeContract.ResumeBinding(ctx, persistedBinding)
 	cancel()
 	if err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false); err != nil {
+		if outcome.State == runtimecontract.LifecycleRejected && outcome.Failure != nil && outcome.Failure.Code == runtimecontract.FailureCodeNativeConversationDivergence {
+			revision := ""
+			if evidence, ok := rt.runtimeContract.(runtimeNativeDivergenceEvidence); ok {
+				revision = evidence.NativeDivergenceRevision()
+			}
+			if fenceErr := h.fenceNativeConversationDivergence(agentID, revision); fenceErr != nil {
+				rt.initErr = fenceErr
+			} else {
+				rt.initErr = errf(409, "Native Conversation Divergence fences this Agent until Owner recovery")
+			}
+			return
+		}
 		if outcome.State == runtimecontract.LifecycleRejected && outcome.Failure != nil &&
 			outcome.Failure.Code == runtimecontract.FailureCodeBindingNotFound && outcome.Failure.Phase == runtimecontract.FailurePhaseBindingResume {
 			rt.initErr = startBinding()
@@ -1844,6 +1875,16 @@ func (h *Hub) resumeAgentThread(agentID string, rt *runtime) error {
 	configureRuntimeOwnerConfiguration(rt.runtimeContract, meta.RuntimeConfiguration)
 	outcome := rt.runtimeContract.ResumeBinding(ctx, rt.binding)
 	cancel()
+	if outcome.State == runtimecontract.LifecycleRejected && outcome.Failure != nil && outcome.Failure.Code == runtimecontract.FailureCodeNativeConversationDivergence {
+		revision := ""
+		if evidence, ok := rt.runtimeContract.(runtimeNativeDivergenceEvidence); ok {
+			revision = evidence.NativeDivergenceRevision()
+		}
+		if fenceErr := h.fenceNativeConversationDivergence(agentID, revision); fenceErr != nil {
+			return errf(500, "persist Native Conversation Divergence fence: %s", fenceErr)
+		}
+		return errf(409, "Native Conversation Divergence fences this Agent until Owner recovery")
+	}
 	err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false)
 	if err != nil {
 		if isRuntimeIndeterminate(err) {
@@ -2910,6 +2951,16 @@ func (h *Hub) viewLocked(meta *Agent) AgentView {
 	view.RuntimeBinding.SchemaVersion = 0
 	view.RuntimeTurnBindings = nil
 	view.TurnRecoveryMarkers = nil
+	if view.HistoryBoundary != nil {
+		boundary := *view.HistoryBoundary
+		boundary.NativeRevision = ""
+		view.HistoryBoundary = &boundary
+	}
+	if view.NativeConversationDivergence != nil {
+		divergence := *view.NativeConversationDivergence
+		divergence.NativeRevision = ""
+		view.NativeConversationDivergence = &divergence
+	}
 	view.CapabilitySnapshot = meta.capabilitySnapshot
 	if view.LastError != "" {
 		turnID := view.CurrentTurnID

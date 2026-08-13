@@ -606,7 +606,10 @@ func (f Failure) Validate() error {
 	}
 }
 
-const FailureCodeBindingNotFound = "native_binding_not_found"
+const (
+	FailureCodeBindingNotFound              = "native_binding_not_found"
+	FailureCodeNativeConversationDivergence = "native_conversation_divergence"
+)
 
 type CapabilityAvailability string
 

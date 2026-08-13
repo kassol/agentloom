@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -25,10 +26,99 @@ type claudeRuntimeHostDriver struct {
 	preflight        func(context.Context) error
 	activeGeneration func() (string, error)
 
-	mu        sync.Mutex
-	handles   map[string]*claudeAgentHost
-	shutdown  bool
-	closeOnce sync.Once
+	mu         sync.Mutex
+	handles    map[string]*claudeAgentHost
+	shutdown   bool
+	closeOnce  sync.Once
+	catalogMu  sync.Mutex
+	catalogOps atomic.Uint64
+}
+
+type claudeConversationEvidence struct {
+	SessionRef string `json:"sessionRef"`
+	Name       string `json:"name"`
+	Cwd        string `json:"cwd"`
+	UpdatedAt  string `json:"updatedAt"`
+	Revision   string `json:"revision"`
+	Compatible bool   `json:"compatible"`
+}
+
+func (d *claudeRuntimeHostDriver) catalogRequest(ctx context.Context, command string, payload any) (claudebridge.Response, error) {
+	if err := d.Preflight(ctx); err != nil {
+		return claudebridge.Response{}, err
+	}
+	// Passive catalog calls share a short-lived bridge identity. Serialize the
+	// acquire/request/close sequence so one caller cannot close that shared
+	// bridge while another request is still using it.
+	d.catalogMu.Lock()
+	defer d.catalogMu.Unlock()
+	bridge, err := d.bridge.Acquire(ctx, "claude-passive-catalog")
+	if err != nil {
+		return claudebridge.Response{}, err
+	}
+	defer bridge.Close()
+	return bridge.Request(ctx, claudebridge.Command{
+		Kind: command, Operation: fmt.Sprintf("catalog-%d", d.catalogOps.Add(1)), Payload: payload,
+	})
+}
+
+func (d *claudeRuntimeHostDriver) DiscoverConversations(ctx context.Context) ([]nativeConversationCandidate, error) {
+	response, err := d.catalogRequest(ctx, "discover_sessions", nil)
+	if err != nil || !response.Accepted {
+		if err == nil {
+			err = errors.New("Claude passive session discovery was rejected")
+		}
+		return nil, err
+	}
+	var data struct {
+		Candidates []claudeConversationEvidence `json:"candidates"`
+	}
+	if json.Unmarshal(response.Data, &data) != nil {
+		return nil, errors.New("Claude passive session discovery returned malformed evidence")
+	}
+	result := make([]nativeConversationCandidate, 0, len(data.Candidates))
+	for _, evidence := range data.Candidates {
+		candidate, candidateErr := claudeConversationCandidate(evidence)
+		if candidateErr == nil {
+			result = append(result, candidate)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].UpdatedAt > result[j].UpdatedAt })
+	return result, nil
+}
+
+func (d *claudeRuntimeHostDriver) InspectConversation(ctx context.Context, nativeRef string) (nativeConversationCandidate, error) {
+	response, err := d.catalogRequest(ctx, "inspect_session", map[string]any{"sessionRef": nativeRef})
+	if err != nil || !response.Accepted {
+		if err == nil {
+			err = errors.New("Claude passive session inspection was rejected")
+		}
+		return nativeConversationCandidate{}, err
+	}
+	var evidence claudeConversationEvidence
+	if json.Unmarshal(response.Data, &evidence) != nil {
+		return nativeConversationCandidate{}, errors.New("Claude passive session inspection returned malformed evidence")
+	}
+	return claudeConversationCandidate(evidence)
+}
+
+func claudeConversationCandidate(evidence claudeConversationEvidence) (nativeConversationCandidate, error) {
+	if strings.TrimSpace(evidence.SessionRef) == "" || strings.TrimSpace(evidence.Revision) == "" {
+		return nativeConversationCandidate{}, errors.New("Claude passive session identity evidence is incomplete")
+	}
+	compatible := evidence.Compatible && filepath.IsAbs(evidence.Cwd)
+	reason := ""
+	if !compatible {
+		reason = "Claude session is not a compatible top-level workspace conversation"
+	}
+	return nativeConversationCandidate{
+		RuntimeConversationCandidate: RuntimeConversationCandidate{
+			ID: candidateToken("claude", evidence.SessionRef), Revision: candidateRevision(evidence.Revision),
+			RuntimeKind: "claude", Name: evidence.Name, Cwd: evidence.Cwd, UpdatedAt: evidence.UpdatedAt,
+			Compatible: compatible, Compatibility: reason,
+		},
+		nativeRef: evidence.SessionRef, nativeRevision: evidence.Revision,
+	}, nil
 }
 
 func newClaudeRuntimeHostDriver(st *store.Store, options claudebridge.DriverOptions) *claudeRuntimeHostDriver {
@@ -271,6 +361,9 @@ type claudeRuntimeContract struct {
 	pendingContext            map[string]*runtimecontract.ContextEvidence
 	afterLedgerCommitForTest  func()
 	beforeLedgerCommitForTest func()
+	historyBoundary           *HistoryBoundary
+	historyBoundaryCommit     func(string) error
+	divergenceRevision        string
 }
 
 type claudeCallback struct {
@@ -329,6 +422,24 @@ func (c *claudeRuntimeContract) SetRuntimeOwnerConfiguration(configuration Runti
 		c.modelRevision++
 	}
 	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) SetRuntimeHistoryBoundary(boundary *HistoryBoundary, commit func(string) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if boundary == nil {
+		c.historyBoundary, c.historyBoundaryCommit = nil, nil
+		return
+	}
+	copy := *boundary
+	c.historyBoundary, c.historyBoundaryCommit = &copy, commit
+	c.observed = true
+}
+
+func (c *claudeRuntimeContract) NativeDivergenceRevision() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.divergenceRevision
 }
 
 // RuntimeConfigurationEvidence returns only the safe, bridge-verified shape.
@@ -734,6 +845,11 @@ func (c *claudeRuntimeContract) CreateBinding(ctx context.Context, request runti
 func (c *claudeRuntimeContract) ResumeBinding(ctx context.Context, binding runtimecontract.Binding) runtimecontract.Outcome {
 	c.mu.Lock()
 	unstarted, ledgerErr := len(c.turns) == 0 && !c.observed, c.ledgerErr
+	boundaryRevision := ""
+	if c.historyBoundary != nil {
+		boundaryRevision = c.historyBoundary.NativeRevision
+		unstarted = false
+	}
 	c.mu.Unlock()
 	if ledgerErr != nil {
 		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseBindingResume, "ledger_unavailable", ledgerErr)
@@ -744,7 +860,22 @@ func (c *claudeRuntimeContract) ResumeBinding(ctx context.Context, binding runti
 		}
 		return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
 	}
-	_, outcome := c.command(ctx, "resume_binding", "", runtimecontract.FailurePhaseBindingResume, map[string]any{"sessionRef": binding.NativeRef, "cwd": c.cwd})
+	response, outcome := c.command(ctx, "resume_binding", "", runtimecontract.FailurePhaseBindingResume, map[string]any{"sessionRef": binding.NativeRef, "cwd": c.cwd, "expectedRevision": boundaryRevision})
+	if outcome.State != runtimecontract.LifecycleAccepted {
+		var rejected struct {
+			Code           string `json:"code"`
+			ActualRevision string `json:"actualRevision"`
+		}
+		if json.Unmarshal(response.Data, &rejected) == nil && rejected.Code == runtimecontract.FailureCodeNativeConversationDivergence {
+			c.mu.Lock()
+			c.divergenceRevision = rejected.ActualRevision
+			c.mu.Unlock()
+			return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: &runtimecontract.Failure{
+				Code: runtimecontract.FailureCodeNativeConversationDivergence, Phase: runtimecontract.FailurePhaseBindingResume,
+				Message: "Native Conversation Divergence: Claude context changed outside Loom; Owner recovery is required",
+			}}
+		}
+	}
 	if outcome.State == runtimecontract.LifecycleAccepted {
 		outcome.State = runtimecontract.LifecycleCompleted
 	}
@@ -771,10 +902,29 @@ func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimeco
 	}
 	resume := len(c.turns) > 0 || c.observed
 	model, effort := c.model, c.effort
+	boundaryRevision := ""
+	if c.historyBoundary != nil {
+		boundaryRevision = c.historyBoundary.NativeRevision
+	}
 	configuration := c.runtimeConfigurationPayloadLocked()
 	c.mu.Unlock()
-	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input, "model": model, "thinkingLevel": effort, "configuration": configuration})
+	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input, "model": model, "thinkingLevel": effort, "configuration": configuration, "boundaryRevision": boundaryRevision})
 	if outcome.State != runtimecontract.LifecycleAccepted {
+		var rejected struct {
+			Code           string `json:"code"`
+			ActualRevision string `json:"actualRevision"`
+		}
+		if json.Unmarshal(response.Data, &rejected) == nil && rejected.Code == runtimecontract.FailureCodeNativeConversationDivergence {
+			c.mu.Lock()
+			c.fenced[request.TurnID] = true
+			delete(c.pendingContext, request.TurnID)
+			c.divergenceRevision = rejected.ActualRevision
+			c.mu.Unlock()
+			return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: &runtimecontract.Failure{
+				Code: runtimecontract.FailureCodeNativeConversationDivergence, Phase: runtimecontract.FailurePhaseTurnStart,
+				Message: "Native Conversation Divergence: Claude context changed outside Loom; Owner recovery is required",
+			}}
+		}
 		c.mu.Lock()
 		delete(c.pendingContext, request.TurnID)
 		c.mu.Unlock()
@@ -1029,6 +1179,15 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 		return
 	}
 	c.mu.Lock()
+	nativeRevision := ""
+	if event.Kind == runtimecontract.EventTerminal {
+		var terminal struct {
+			NativeRevision string `json:"nativeRevision"`
+		}
+		if json.Unmarshal(source.Data, &terminal) == nil {
+			nativeRevision = terminal.NativeRevision
+		}
+	}
 	beforeCommit := c.beforeLedgerCommitForTest
 	c.mu.Unlock()
 	if beforeCommit != nil {
@@ -1110,6 +1269,25 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 			Message: "Claude Runtime Turn outcome is indeterminate", Diagnostic: err.Error(), Cause: err,
 		}})
 		return
+	}
+	if nativeRevision != "" && c.historyBoundary != nil {
+		if c.historyBoundaryCommit == nil {
+			boundaryErr := errors.New("History Boundary persistence is unavailable")
+			c.ledgerErr = boundaryErr
+			c.mu.Unlock()
+			go c.fail(boundaryErr)
+			return
+		}
+		if err := c.historyBoundaryCommit(nativeRevision); err != nil {
+			c.ledgerErr = err
+			c.mu.Unlock()
+			go c.fail(&runtimeIndeterminateError{failure: &runtimecontract.Failure{
+				Code: "history_boundary_commit_indeterminate", Phase: runtimecontract.FailurePhaseTurnStart,
+				Message: "Claude Runtime History Boundary update is indeterminate", Diagnostic: err.Error(), Cause: err,
+			}})
+			return
+		}
+		c.historyBoundary.NativeRevision = nativeRevision
 	}
 	c.turns, c.terminal = nextTurns, nextTerminal
 	if event.Kind == runtimecontract.EventTerminal {

@@ -395,6 +395,9 @@ func cmdAdopt(a args) {
 	}
 	agent, _ := resp["agent"].(map[string]any)
 	fmt.Printf("%s %s (%s)\n  cwd:       %s\n  source:    %s\n  thread:    %s\n", green("adopted"), bold(str(agent, "name")), str(agent, "id"), str(agent, "cwd"), str(agent, "sourceCwd"), str(agent, "threadId"))
+	if boundary, _ := agent["historyBoundary"].(map[string]any); boundary != nil {
+		fmt.Printf("  history:   %s\n", str(boundary, "disclosure"))
+	}
 	printRuntimeConfigurationEvidence(agent)
 }
 

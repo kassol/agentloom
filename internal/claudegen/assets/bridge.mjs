@@ -1,8 +1,9 @@
-import { getSessionInfo, query } from "@anthropic-ai/claude-agent-sdk";
+import * as ClaudeAgentSDK from "@anthropic-ai/claude-agent-sdk";
 import { readFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
+const {getSessionInfo, getSessionMessages, listSessions, query} = ClaudeAgentSDK;
 const pkg = JSON.parse(await readFile(new URL("./node_modules/@anthropic-ai/claude-agent-sdk/package.json", import.meta.url), "utf8"));
 const capabilities = ["interrupt", "approval", "hooks", "mcp", "session_resume"];
 const identity = {
@@ -54,6 +55,46 @@ function stableJSON(value) {
   if (Array.isArray(value)) return `[${value.map(stableJSON).join(",")}]`;
   if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJSON(value[key])}`).join(",")}}`;
   return JSON.stringify(value);
+}
+
+function safeSessionName(value) {
+  const name = safeName(value);
+  return name ? name.slice(0, 120) : "";
+}
+
+function sessionRevision(info, messages) {
+  const publicMessages = (Array.isArray(messages) ? messages : []).map((message) => ({
+    type: message?.type === "user" || message?.type === "assistant" ? message.type : "",
+    uuid: typeof message?.uuid === "string" ? message.uuid : "",
+    sessionId: typeof message?.session_id === "string" ? message.session_id : "",
+    parentToolUseId: typeof message?.parent_tool_use_id === "string" ? message.parent_tool_use_id : null,
+    parentAgentId: typeof message?.parent_agent_id === "string" ? message.parent_agent_id : null
+  }));
+  return "claude-session:" + createHash("sha256").update(stableJSON({
+    sessionId: String(info?.sessionId || ""),
+    cwd: String(info?.cwd || ""),
+    lastModified: Number(info?.lastModified || 0),
+    fileSize: Number(info?.fileSize || 0),
+    createdAt: Number(info?.createdAt || 0),
+    messages: publicMessages
+  })).digest("hex");
+}
+
+async function inspectSession(sessionRef, dir) {
+  const info = await getSessionInfo(sessionRef, dir ? {dir} : undefined);
+  if (!info || info.sessionId !== sessionRef) return undefined;
+  const messages = await getSessionMessages(sessionRef, dir ? {dir} : undefined);
+  if (!Array.isArray(messages) || messages.some((message) => message?.session_id !== sessionRef || typeof message?.uuid !== "string")) {
+    throw new Error("Claude session returned invalid passive identity evidence");
+  }
+  return {
+    sessionRef,
+    name: safeSessionName(info.customTitle) || "Claude session",
+    cwd: typeof info.cwd === "string" ? info.cwd : "",
+    updatedAt: new Date(Number(info.lastModified || 0)).toISOString(),
+    revision: sessionRevision(info, messages),
+    compatible: Boolean(info.cwd)
+  };
 }
 
 function ownerConfiguration(payload) {
@@ -285,6 +326,17 @@ async function runTurn(frame) {
   const developer = developerInput(payload.input);
   let sdkQuery, turn;
   try {
+	if (payload.boundaryRevision) {
+	  const boundary = await inspectSession(sessionRef, payload.cwd);
+	  if (!boundary) {
+		respond(frame, false, {}, "Claude session was not found");
+		return;
+	  }
+	  if (boundary.revision !== payload.boundaryRevision) {
+		respond(frame, false, {code: "native_conversation_divergence", actualRevision: boundary.revision}, "Claude native conversation changed outside Loom");
+		return;
+	  }
+	}
 	if (!payload.resume && await getSessionInfo(sessionRef, {dir: payload.cwd})) {
 	  respond(frame, false, {}, "Claude Runtime cannot create the reserved session");
 	  return;
@@ -345,10 +397,15 @@ async function runTurn(frame) {
         emit(frame, "usage", {runtimeTurnRef, ...observedUsage});
 		if (turn.observedResults < turn.expectedResults) continue;
 		turn.terminal = true;
+		const boundary = payload.boundaryRevision ? await inspectSession(sessionRef, payload.cwd) : undefined;
+		if (payload.boundaryRevision && !boundary) {
+		  throw new Error("Claude session boundary was unavailable after the Turn");
+		}
 		const interrupted = message.subtype !== "success" && turn.interruptRequested && ["aborted_streaming", "aborted_tools"].includes(message.terminal_reason);
 		const terminal = message.subtype === "success" ? "turn_completed" : interrupted ? "turn_interrupted" : "turn_failed";
 		emit(turn.frame, terminal, {
-		  runtimeTurnRef, ...(terminal === "turn_failed" ? {message: "Claude Runtime Turn failed"} : {})
+		  runtimeTurnRef, ...(boundary ? {nativeRevision: boundary.revision} : {}),
+		  ...(terminal === "turn_failed" ? {message: "Claude Runtime Turn failed"} : {})
 		});
 		break;
       }
@@ -369,6 +426,27 @@ async function runTurn(frame) {
 async function handleCommand(frame) {
   const payload = frame.payload || {};
   switch (frame.command) {
+	case "discover_sessions": {
+	  const sessions = await listSessions({limit: 200});
+	  const candidates = [];
+	  for (let index = 0; index < sessions.length; index += 8) {
+		const inspected = await Promise.all(sessions.slice(index, index + 8).map((session) =>
+		  session?.sessionId ? inspectSession(session.sessionId, session.cwd).catch(() => undefined) : undefined
+		));
+		candidates.push(...inspected.filter(Boolean));
+	  }
+	  respond(frame, true, {candidates});
+	  return;
+	}
+	case "inspect_session": {
+	  const inspected = await inspectSession(payload.sessionRef, payload.cwd);
+	  if (!inspected) {
+		respond(frame, false, {}, "Claude session was not found");
+		return;
+	  }
+	  respond(frame, true, inspected);
+	  return;
+	}
 	case "inspect_model_control": {
 	  const configuration = ownerConfiguration(payload);
 	  const requested = {provider: payload.provider || "anthropic", model: payload.model, thinkingLevel: payload.thinkingLevel || "default"};
@@ -440,12 +518,16 @@ async function handleCommand(frame) {
 	  return;
 	}
   case "resume_binding": {
-	const info = await getSessionInfo(payload.sessionRef, {dir: payload.cwd});
-	if (!info || info.sessionId !== payload.sessionRef || info.cwd !== payload.cwd) {
+	const inspected = await inspectSession(payload.sessionRef, payload.cwd);
+	if (inspected && payload.expectedRevision && inspected.revision !== payload.expectedRevision) {
+      respond(frame, false, {code: "native_conversation_divergence", actualRevision: inspected.revision}, "Claude native conversation changed outside Loom");
+      return;
+    }
+	if (!inspected || inspected.cwd !== payload.cwd) {
       respond(frame, false, {}, "Claude session was not found");
       return;
     }
-    respond(frame, true);
+    respond(frame, true, {revision: inspected.revision});
     emit(frame, "binding_resumed", {sessionRef: payload.sessionRef});
     return;
   }

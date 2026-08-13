@@ -44,6 +44,39 @@ func TestAgentDetailUsesCapabilitySnapshotAsOnlyRuntimeCapabilitySurface(t *test
 	}
 }
 
+func TestNativeConversationDivergenceRecoveryRouteAdvancesPublicBoundary(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &hub.Agent{
+		ID: "agent-claude-diverged", Name: "claude-diverged", Cwd: t.TempDir(), ThreadID: "loom-thread-claude",
+		RuntimeBinding:  hub.RuntimeBinding{SchemaVersion: hub.RuntimeBindingSchemaVersion, Kind: "claude", NativeRef: "private-session"},
+		HistoryBoundary: &hub.HistoryBoundary{Kind: "history_boundary", CreatedAt: nowForTest(), ImportedTurns: 0, Disclosure: "Existing native content remains outside Loom history.", NativeRevision: "private-old"},
+		NativeConversationDivergence: &hub.NativeConversationDivergence{
+			Code: "native_conversation_divergence", DetectedAt: nowForTest(), Summary: "Native context changed.", Recovery: "Accept current context.", NativeRevision: "private-new",
+		},
+		RuntimeConfiguration: hub.RuntimeConfiguration{Configured: true, SettingSources: []string{"project"}, Authentication: hub.RuntimeAuthentication{Category: hub.RuntimeAuthConsole, Source: "api_key"}},
+		RuntimeTurnBindings:  map[string]string{}, Status: "fenced", CreatedAt: nowForTest(), UpdatedAt: nowForTest(),
+	}
+	if err := st.SaveAgents(map[string]*hub.Agent{agent.ID: agent}); err != nil {
+		t.Fatal(err)
+	}
+	h := hub.New(st)
+	defer h.Shutdown()
+	server := New(h, st, fstest.MapFS{"index.html": {Data: []byte("ok")}}).Handler()
+
+	response := topicRequest(t, server, http.MethodPost, "/api/agents/"+agent.ID+"/runtime/conversation/recover", map[string]any{}, http.StatusOK)
+	public := response["agent"].(map[string]any)
+	if public["status"] != "idle" || public["nativeConversationDivergence"] != nil {
+		t.Fatalf("recovered Agent = %#v", public)
+	}
+	boundary := public["historyBoundary"].(map[string]any)
+	if boundary["nativeRevision"] != nil {
+		t.Fatalf("public boundary leaked private revision: %#v", boundary)
+	}
+}
+
 func TestUnsupportedAgentOperationsReturnConflict(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

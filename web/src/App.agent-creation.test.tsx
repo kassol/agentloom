@@ -184,6 +184,7 @@ describe("Agent creation dialog", () => {
 		await within(dialog).findByRole("option", { name: /Existing release/ });
 		fireEvent.change(select, { target: { value: candidate.id } });
 		await within(dialog).findByText("Source conversation workspace");
+		await within(dialog).findByText(/History Boundary: existing native content/);
 		fireEvent.change(within(dialog).getByLabelText("Agent name"), { target: { value: "release-owner" } });
 		fireEvent.change(within(dialog).getByPlaceholderText("/absolute/path/used-for-future-turns"), { target: { value: "/stable/workspace" } });
 		fireEvent.click(within(dialog).getByRole("button", { name: "Adopt conversation" }));

@@ -44,6 +44,12 @@ while IFS= read -r line; do
   turn_id=$(printf '%s' "$line" | sed -n 's/.*"turnId":"\([^"]*\)".*/\1/p')
   command=$(printf '%s' "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')
 	case "$command" in
+	discover_sessions)
+	  data='{"candidates":[{"sessionRef":"native-session-private","name":"Existing Claude session","cwd":"/tmp/claude-workspace","updatedAt":"2026-08-13T00:00:00.000Z","revision":"native-revision-private","compatible":true}]}'
+	  ;;
+	inspect_session)
+	  data='{"sessionRef":"native-session-private","name":"Existing Claude session","cwd":"/tmp/claude-workspace","updatedAt":"2026-08-13T00:00:00.000Z","revision":"native-revision-private","compatible":true}'
+	  ;;
 	inspect_configuration)
 	  if printf '%s' "$line" | grep -q '"category":"gateway"'; then
 		data='{"settingSources":["user","local"],"authentication":{"category":"gateway","source":"gateway","validation":"accepted"}}'
@@ -557,12 +563,36 @@ func TestClaudeConversationCatalogIsTruthful(t *testing.T) {
 		if catalog.RuntimeKind != "claude" {
 			continue
 		}
-		if len(catalog.Capabilities) != 4 || catalog.Capabilities[0].Available || !catalog.Capabilities[3].Available {
+		if len(catalog.Capabilities) != 4 || !catalog.Capabilities[0].Available || !catalog.Capabilities[1].Available || !catalog.Capabilities[2].Available || !catalog.Capabilities[3].Available {
 			t.Fatalf("Claude catalog = %#v", catalog)
 		}
 		return
 	}
 	t.Fatal("Claude Runtime missing from catalog")
+}
+
+func TestClaudeConversationCatalogProjectsOpaquePassiveEvidence(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	driver := fakeClaudeBridgeDriver(t, st)
+	candidates, failure := driver.DiscoverConversations(context.Background())
+	if failure != nil || len(candidates) != 1 {
+		t.Fatalf("discover = %#v, failure=%#v", candidates, failure)
+	}
+	candidate := candidates[0]
+	if candidate.ID == "native-session-private" || candidate.Revision == "native-revision-private" || candidate.Cwd != "/tmp/claude-workspace" || !candidate.Compatible {
+		t.Fatalf("public candidate = %#v", candidate)
+	}
+	inspected, failure := driver.InspectConversation(context.Background(), candidate.nativeRef)
+	if failure != nil || inspected.ID != candidate.ID || inspected.Revision != candidate.Revision {
+		t.Fatalf("inspect = %#v, failure=%#v", inspected, failure)
+	}
+	if err := driver.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestClaudeInputValidationUsesCommittedModelAndExactImageTypes(t *testing.T) {

@@ -34,6 +34,49 @@ type adoptionGoalContract struct {
 	goalClears  int
 }
 
+type adoptionBoundaryContract struct {
+	*controlPlaneContract
+	boundary             *HistoryBoundary
+	commit               func(string) error
+	configurationFailure *runtimecontract.Failure
+	startDivergence      string
+}
+
+func (c *adoptionBoundaryContract) SetRuntimeHistoryBoundary(boundary *HistoryBoundary, commit func(string) error) {
+	if boundary == nil {
+		c.boundary, c.commit = nil, nil
+		return
+	}
+	copy := *boundary
+	c.boundary, c.commit = &copy, commit
+}
+
+func (c *adoptionBoundaryContract) InspectRuntimeOwnerConfiguration(_ context.Context, _ runtimecontract.Binding, _ string, configuration RuntimeConfiguration) (RuntimeConfigurationEvidence, *runtimecontract.Failure) {
+	if c.configurationFailure != nil {
+		return RuntimeConfigurationEvidence{}, c.configurationFailure
+	}
+	return RuntimeConfigurationEvidence{
+		SettingSources: append([]string(nil), configuration.SettingSources...),
+		Authentication: RuntimeAuthenticationEvidence{
+			Category: configuration.Authentication.Category, Source: configuration.Authentication.Source, Validation: "accepted",
+		},
+	}, nil
+}
+
+func (c *adoptionBoundaryContract) StartTurn(ctx context.Context, request runtimecontract.TurnRequest) runtimecontract.Outcome {
+	if c.startDivergence != "" {
+		return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: &runtimecontract.Failure{
+			Code: runtimecontract.FailureCodeNativeConversationDivergence, Phase: runtimecontract.FailurePhaseTurnStart,
+			Message: "Native Conversation Divergence",
+		}}
+	}
+	return c.controlPlaneContract.StartTurn(ctx, request)
+}
+
+func (c *adoptionBoundaryContract) NativeDivergenceRevision() string {
+	return c.startDivergence
+}
+
 func (c *adoptionGoalContract) RuntimeGoal(context.Context, runtimecontract.Binding) (*ThreadGoal, error) {
 	c.goalReads++
 	return cloneGoalRecord(c.goal), nil
@@ -279,6 +322,138 @@ func TestAdoptConversationCommitsOnceAndRetriesIdempotently(t *testing.T) {
 	globalJSON, _ := json.Marshal(global)
 	if err != nil || !strings.Contains(string(globalJSON), "loom/agent-adopted") || strings.Contains(string(globalJSON), driver.candidate.nativeRef) {
 		t.Fatalf("global adoption SSE rows = %s, err=%v", globalJSON, err)
+	}
+}
+
+func TestClaudeAdoptionCommitsPublicHistoryBoundaryAndOwnerRecovery(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	cwd := t.TempDir()
+	contract := &adoptionBoundaryContract{controlPlaneContract: &controlPlaneContract{
+		contextMode: runtimecontract.ContextDeliveryFullPerTurn,
+		history:     runtimecontract.History{Turns: []runtimecontract.HistoryTurn{}},
+	}}
+	host := &adoptionGoalHost{contract: contract, alive: true}
+	candidate := nativeConversationCandidate{
+		RuntimeConversationCandidate: RuntimeConversationCandidate{
+			ID: candidateToken("claude", "native-session"), Revision: "candidate:one", RuntimeKind: "claude",
+			Name: "Existing", Cwd: cwd, UpdatedAt: "2026-08-13T00:00:00Z", Compatible: true,
+		},
+		nativeRef: "native-session", nativeRevision: "private-revision-one",
+	}
+	h.runtimeHostDrivers["claude"] = &adoptionTestDriver{controlPlaneDriver: &controlPlaneDriver{acquireHost: host}, candidate: candidate}
+
+	created, err := h.AdoptRuntimeConversation("claude", AdoptConversationParams{
+		CandidateID: candidate.ID, ExpectedRevision: candidate.Revision, Name: "claude-adopted", Cwd: cwd,
+		RuntimeConfiguration: testClaudeRuntimeConfiguration(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.HistoryBoundary == nil || created.HistoryBoundary.ImportedTurns != 0 || created.HistoryBoundary.NativeRevision != "" || !strings.Contains(created.HistoryBoundary.Disclosure, "not imported") {
+		t.Fatalf("public History Boundary = %#v", created.HistoryBoundary)
+	}
+	if contract.boundary == nil || contract.boundary.NativeRevision != "private-revision-one" || contract.commit == nil {
+		t.Fatalf("private boundary configuration = %#v commit=%t", contract.boundary, contract.commit != nil)
+	}
+	history, err := h.CanonicalHistory(created.ID, 10, 0)
+	if err != nil || history.Total != 0 || history.HistoryBoundary == nil || history.HistoryBoundary.NativeRevision != "" {
+		t.Fatalf("boundary History = %#v err=%v", history, err)
+	}
+	if err := contract.commit("private-revision-after-turn"); err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]*Agent
+	if err := st.LoadAgents(&persisted); err != nil || persisted[created.ID].HistoryBoundary.NativeRevision != "private-revision-after-turn" {
+		t.Fatalf("persisted advanced boundary = %#v err=%v", persisted[created.ID], err)
+	}
+	if err := h.fenceNativeConversationDivergence(created.ID, "private-external-change"); err != nil {
+		t.Fatal(err)
+	}
+	fenced, _ := h.GetAgent(created.ID)
+	if fenced.Status != "fenced" || fenced.NativeConversationDivergence == nil || fenced.NativeConversationDivergence.NativeRevision != "" {
+		t.Fatalf("public divergence fence = %#v", fenced.Agent)
+	}
+	recovered, err := h.RecoverNativeConversationDivergence(created.ID)
+	if err != nil || recovered.Status != "idle" || recovered.NativeConversationDivergence != nil {
+		t.Fatalf("Owner recovery = %#v err=%v", recovered.Agent, err)
+	}
+	if h.agents[created.ID].HistoryBoundary.NativeRevision != "private-external-change" {
+		t.Fatalf("private recovered boundary = %#v", h.agents[created.ID].HistoryBoundary)
+	}
+	h.Shutdown()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(st.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	var reloaded map[string]*Agent
+	if err := reopened.LoadAgents(&reloaded); err != nil || reloaded[created.ID] == nil || reloaded[created.ID].HistoryBoundary == nil || reloaded[created.ID].HistoryBoundary.NativeRevision != "private-external-change" {
+		t.Fatalf("reopened History Boundary = %#v err=%v", reloaded[created.ID], err)
+	}
+}
+
+func TestClaudeTurnStartDivergenceFencesWithoutImportingTurn(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h := testHub(st)
+	defer h.Shutdown()
+	cwd := t.TempDir()
+	contract := &adoptionBoundaryContract{controlPlaneContract: &controlPlaneContract{
+		contextMode: runtimecontract.ContextDeliveryFullPerTurn,
+		history:     runtimecontract.History{Turns: []runtimecontract.HistoryTurn{}},
+	}}
+	host := &adoptionGoalHost{contract: contract, alive: true}
+	candidate := nativeConversationCandidate{
+		RuntimeConversationCandidate: RuntimeConversationCandidate{
+			ID: candidateToken("claude", "native-session"), Revision: "candidate:one", RuntimeKind: "claude",
+			Name: "Existing", Cwd: cwd, UpdatedAt: "2026-08-13T00:00:00Z", Compatible: true,
+		},
+		nativeRef: "native-session", nativeRevision: "private-revision-one",
+	}
+	h.runtimeHostDrivers["claude"] = &adoptionTestDriver{controlPlaneDriver: &controlPlaneDriver{acquireHost: host}, candidate: candidate}
+	created, err := h.AdoptRuntimeConversation("claude", AdoptConversationParams{
+		CandidateID: candidate.ID, ExpectedRevision: candidate.Revision, Name: "claude-divergence-race", Cwd: cwd,
+		RuntimeConfiguration: testClaudeRuntimeConfiguration(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Resume validation has already passed. Simulate native activity in the
+	// narrow window before start_turn performs its own boundary check.
+	contract.startDivergence = "private-external-race"
+	if _, err := h.SendTask(created.ID, "must not reach Claude", time.Minute); err == nil || !strings.Contains(err.Error(), "Native Conversation Divergence") {
+		t.Fatalf("send error = %v", err)
+	}
+	fenced, err := h.GetAgent(created.ID)
+	if err != nil || fenced.Status != "fenced" || fenced.CurrentTurnID != "" || fenced.LastTurn != nil || fenced.NativeConversationDivergence == nil || fenced.NativeConversationDivergence.NativeRevision != "" {
+		t.Fatalf("public fenced Agent = %#v err=%v", fenced.Agent, err)
+	}
+	if rt := h.runtimes[created.ID]; rt == nil || rt.activeTurn != nil {
+		t.Fatalf("active Turn survived divergence: %#v", rt)
+	}
+	history, err := h.CanonicalHistory(created.ID, 10, 0)
+	if err != nil || history.Total != 0 {
+		t.Fatalf("History imported a rejected Turn: %#v err=%v", history, err)
+	}
+	var persisted map[string]*Agent
+	if err := st.LoadAgents(&persisted); err != nil || persisted[created.ID].NativeConversationDivergence == nil || persisted[created.ID].NativeConversationDivergence.NativeRevision != "private-external-race" {
+		t.Fatalf("private divergence fence = %#v err=%v", persisted[created.ID], err)
+	}
+	events, err := st.ReadEvents(globalEventLogID, 0, 100)
+	encoded, _ := json.Marshal(events)
+	if err != nil || !strings.Contains(string(encoded), "nativeConversationDivergence") || strings.Contains(string(encoded), "private-external-race") {
+		t.Fatalf("public divergence events = %s err=%v", encoded, err)
 	}
 }
 

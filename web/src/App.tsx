@@ -769,6 +769,8 @@ export default function App() {
                       providerId: d.providerId ?? s.providerId,
 					  processAlive: d.processAlive ?? s.processAlive,
 					  capabilitySnapshot: d.capabilitySnapshot ?? s.capabilitySnapshot,
+					  historyBoundary: Object.prototype.hasOwnProperty.call(d, "historyBoundary") ? d.historyBoundary || undefined : s.historyBoundary,
+					  nativeConversationDivergence: Object.prototype.hasOwnProperty.call(d, "nativeConversationDivergence") ? d.nativeConversationDivergence || undefined : s.nativeConversationDivergence,
                       effort: d.effort ?? s.effort,
                       sandbox: d.sandbox ?? s.sandbox,
                       approvalPolicy: d.approvalPolicy ?? s.approvalPolicy,
@@ -1589,11 +1591,13 @@ export default function App() {
 					<div className="mt-1 text-muted-foreground">Source conversation workspace</div>
 					<div className="break-all font-mono text-muted-foreground">{inspectedCandidate.cwd}</div>
 					<div className="mt-1 text-muted-foreground">Updated {new Date(inspectedCandidate.updatedAt).toLocaleString()} · {inspectedCandidate.compatible ? "Ready to adopt" : inspectedCandidate.compatibility || "Incompatible"}</div>
+					{inspectedCandidate.alreadyBound ? <div className="mt-1 font-medium text-warning">Already bound to a Loom Agent.</div> : null}
+					<div className="mt-2 border-t border-border pt-2 text-warning">History Boundary: existing native content stays available to Claude but is not imported as Loom Turns. Loom History starts empty.</div>
 				</div> : null}
 				<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
 					Stable Agent workspace
 					<Input value={newCwd} onChange={(event) => setNewCwd(event.target.value)} placeholder="/absolute/path/used-for-future-turns" spellCheck={false} className="font-mono text-[12px]" />
-					<span className="block text-[10px] font-normal leading-4">Future Turns resume the native conversation in this workspace. It may differ from the source workspace above.</span>
+					<span className="block text-[10px] font-normal leading-4">Future Turns resume the native conversation in this workspace. Runtime scope rules are revalidated at adoption.</span>
 				</label>
 			</> : null}
 			{newRuntimeKind === "codex" ? <>

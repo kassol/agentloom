@@ -431,6 +431,14 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, 200, map[string]any{"agent": agent})
 	})
+	mux.HandleFunc("POST /api/agents/{key}/runtime/conversation/recover", func(w http.ResponseWriter, r *http.Request) {
+		agent, err := s.hub.RecoverNativeConversationDivergence(r.PathValue("key"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"agent": agent})
+	})
 	mux.HandleFunc("GET /api/agents/{key}/thread/history", func(w http.ResponseWriter, r *http.Request) {
 		count, _ := strconv.Atoi(r.URL.Query().Get("count"))
 		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))

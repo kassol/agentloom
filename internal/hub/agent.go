@@ -923,10 +923,22 @@ func (h *Hub) sendTaskWithContextReserved(key, text string, artifactIDs []string
 		// The Thread can be evicted between resume and turn/start. Keep the
 		// already-reserved Turn and retry this idempotent pre-start sequence once.
 		if resumeErr := h.resumeAgentThread(agentID, rt); resumeErr == nil {
-			turnID, _, err = startTurn()
+			turnID, startOutcome, err = startTurn()
 		} else {
 			err = fmt.Errorf("%v; retry %v", err, resumeErr)
 		}
+	}
+	typedNativeDivergence := startOutcome.State == runtimecontract.LifecycleRejected && startOutcome.Failure != nil &&
+		startOutcome.Failure.Code == runtimecontract.FailureCodeNativeConversationDivergence && startOutcome.Failure.Phase == runtimecontract.FailurePhaseTurnStart
+	if err != nil && typedNativeDivergence {
+		revision := ""
+		if evidence, ok := contract.(runtimeNativeDivergenceEvidence); ok {
+			revision = evidence.NativeDivergenceRevision()
+		}
+		if fenceErr := h.fenceNativeConversationDivergence(agentID, revision); fenceErr != nil {
+			return SendResult{}, errf(500, "persist Native Conversation Divergence fence: %s", fenceErr)
+		}
+		return SendResult{}, errf(409, "Native Conversation Divergence fences this Agent until Owner recovery")
 	}
 	if err != nil {
 		if isRuntimeIndeterminate(err) {
@@ -1402,13 +1414,14 @@ func closeRuntimeBinding(rt *runtime, binding runtimecontract.Binding) {
 // ordinary Agent APIs. Native Runtime references and diagnostic payloads are
 // intentionally absent.
 type CanonicalHistory struct {
-	ID       string                 `json:"id"`
-	Name     string                 `json:"name"`
-	Cwd      string                 `json:"cwd"`
-	ThreadID string                 `json:"threadId"`
-	Status   string                 `json:"status"`
-	Total    int                    `json:"total"`
-	Turns    []CanonicalHistoryTurn `json:"turns"`
+	ID              string                 `json:"id"`
+	Name            string                 `json:"name"`
+	Cwd             string                 `json:"cwd"`
+	ThreadID        string                 `json:"threadId"`
+	Status          string                 `json:"status"`
+	HistoryBoundary *HistoryBoundary       `json:"historyBoundary,omitempty"`
+	Total           int                    `json:"total"`
+	Turns           []CanonicalHistoryTurn `json:"turns"`
 }
 
 type CanonicalHistoryTurn struct {
@@ -1506,7 +1519,7 @@ func (h *Hub) CanonicalHistory(key string, count, offset int) (CanonicalHistory,
 		}
 	}
 	h.mu.Unlock()
-	result := CanonicalHistory{ID: view.ID, Name: view.Name, Cwd: view.Cwd, ThreadID: view.ThreadID, Status: view.Status, Turns: []CanonicalHistoryTurn{}}
+	result := CanonicalHistory{ID: view.ID, Name: view.Name, Cwd: view.Cwd, ThreadID: view.ThreadID, Status: view.Status, HistoryBoundary: view.HistoryBoundary, Turns: []CanonicalHistoryTurn{}}
 	if view.nativeRuntimeRef == "" {
 		return result, nil
 	}

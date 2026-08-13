@@ -620,7 +620,7 @@ func TestCmdAdoptSendsExplicitClaudeRuntimeConfiguration(t *testing.T) {
 		if body["candidateId"] != "conversation-1" || body["expectedRevision"] != "candidate-1" || body["cwd"] != stableCwd || strings.Join(stringValues(configuration["settingSources"]), ",") != "project,local" {
 			t.Fatalf("body = %#v", body)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"agent": map[string]any{"id": "agent-adopted", "name": "adopted", "cwd": stableCwd, "sourceCwd": "/tmp/original", "threadId": "thread-adopted", "runtimeConfiguration": configuration}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"agent": map[string]any{"id": "agent-adopted", "name": "adopted", "cwd": stableCwd, "sourceCwd": "/tmp/original", "threadId": "thread-adopted", "runtimeConfiguration": configuration, "historyBoundary": map[string]any{"disclosure": "Native content is not imported as Loom Turns."}}})
 	}))
 	defer server.Close()
 	previousBase, previousColor := base, useColor
@@ -629,7 +629,7 @@ func TestCmdAdoptSendsExplicitClaudeRuntimeConfiguration(t *testing.T) {
 	output := captureStdout(t, func() {
 		cmdAdopt(args{positional: []string{"adopted"}, flags: map[string]string{"runtime": "claude", "candidate": "conversation-1", "revision": "candidate-1", "cwd": stableCwd, "auth-category": "gateway", "auth-source": "gateway"}, flagValues: map[string][]string{"setting-source": {"project", "local"}}})
 	})
-	if !strings.Contains(output, "adopted adopted") || !strings.Contains(output, stableCwd) || !strings.Contains(output, "/tmp/original") || !strings.Contains(output, "settings: project, local") || !strings.Contains(output, "auth:     gateway / gateway") {
+	if !strings.Contains(output, "adopted adopted") || !strings.Contains(output, stableCwd) || !strings.Contains(output, "/tmp/original") || !strings.Contains(output, "Native content is not imported as Loom Turns.") || !strings.Contains(output, "settings: project, local") || !strings.Contains(output, "auth:     gateway / gateway") {
 		t.Fatalf("output = %q", output)
 	}
 }

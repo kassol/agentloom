@@ -48,11 +48,39 @@ type RuntimeConversationCandidate struct {
 	UpdatedAt     string `json:"updatedAt"`
 	Compatible    bool   `json:"compatible"`
 	Compatibility string `json:"compatibility,omitempty"`
+	AlreadyBound  bool   `json:"alreadyBound"`
 }
 
 type nativeConversationCandidate struct {
 	RuntimeConversationCandidate
-	nativeRef string
+	nativeRef      string
+	nativeRevision string
+}
+
+type HistoryBoundary struct {
+	Kind           string `json:"kind"`
+	CreatedAt      string `json:"createdAt"`
+	ImportedTurns  int    `json:"importedTurns"`
+	Disclosure     string `json:"disclosure"`
+	NativeRevision string `json:"nativeRevision,omitempty"`
+}
+
+type NativeConversationDivergence struct {
+	Code           string `json:"code"`
+	DetectedAt     string `json:"detectedAt"`
+	Summary        string `json:"summary"`
+	Recovery       string `json:"recovery"`
+	NativeRevision string `json:"nativeRevision,omitempty"`
+}
+
+type runtimeNativeDivergenceEvidence interface {
+	NativeDivergenceRevision() string
+}
+
+const historyBoundaryDisclosure = "Native conversation content before this History Boundary remains in Claude context but is not imported as Loom Turns."
+
+type runtimeHistoryBoundaryConfiguration interface {
+	SetRuntimeHistoryBoundary(*HistoryBoundary, func(string) error)
 }
 
 type runtimeConversationCatalog interface {
@@ -132,7 +160,11 @@ func (h *Hub) DiscoverRuntimeConversations(kind string) ([]RuntimeConversationCa
 	}
 	result := make([]RuntimeConversationCandidate, 0, len(native))
 	for _, candidate := range native {
-		result = append(result, candidate.RuntimeConversationCandidate)
+		public := candidate.RuntimeConversationCandidate
+		h.mu.Lock()
+		public.AlreadyBound = h.agentByNativeBindingLocked(kind, candidate.nativeRef) != nil
+		h.mu.Unlock()
+		result = append(result, public)
 	}
 	return result, nil
 }
@@ -148,7 +180,11 @@ func (h *Hub) InspectRuntimeConversation(kind, candidateID string) (RuntimeConve
 	if err != nil || inspected.ID != candidateID {
 		return RuntimeConversationCandidate{}, errf(409, "conversation candidate is no longer available")
 	}
-	return inspected.RuntimeConversationCandidate, nil
+	public := inspected.RuntimeConversationCandidate
+	h.mu.Lock()
+	public.AlreadyBound = h.agentByNativeBindingLocked(kind, inspected.nativeRef) != nil
+	h.mu.Unlock()
+	return public, nil
 }
 
 func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (AgentView, error) {
@@ -279,6 +315,12 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 		}
 		p.Cwd = stableCwd
 	}
+	if kind == "claude" {
+		sourceCwd, cwdErr := normalizeAdoptionCwd(candidate.Cwd)
+		if cwdErr != nil || p.Cwd != sourceCwd {
+			return AgentView{}, errf(409, "Claude adoption requires the inspected conversation workspace")
+		}
+	}
 
 	h.mu.Lock()
 	if h.stopping {
@@ -327,17 +369,41 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 	configureRuntimeWorkspace(contract, p.Cwd)
 	configureRuntimeOwnerConfiguration(contract, p.RuntimeConfiguration)
 	binding := runtimecontract.Binding{SchemaVersion: runtimecontract.BindingSchemaVersion, RuntimeKind: kind, NativeRef: candidate.nativeRef}
+	boundary := (*HistoryBoundary)(nil)
+	if kind == "claude" {
+		inspector, ok := contract.(runtimeOwnerConfigurationInspector)
+		if !ok {
+			return AgentView{}, errf(500, "Claude Runtime configuration inspection is unavailable")
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+		_, configurationFailure := inspector.InspectRuntimeOwnerConfiguration(ctx, binding, p.Cwd, p.RuntimeConfiguration)
+		cancel()
+		if configurationFailure != nil {
+			return AgentView{}, errf(409, "Claude Runtime configuration scope could not be validated")
+		}
+		if candidate.nativeRevision == "" {
+			return AgentView{}, errf(409, "Claude conversation boundary could not be verified")
+		}
+		boundary = &HistoryBoundary{Kind: "history_boundary", CreatedAt: now(), ImportedTurns: 0, Disclosure: historyBoundaryDisclosure, NativeRevision: candidate.nativeRevision}
+		if configured, ok := contract.(runtimeHistoryBoundaryConfiguration); ok {
+			configured.SetRuntimeHistoryBoundary(boundary, nil)
+		} else {
+			return AgentView{}, errf(500, "Claude Runtime History Boundary support is unavailable")
+		}
+	}
 	ctx, cancel = context.WithTimeout(context.Background(), h.effectiveThreadResumeTimeout())
 	outcome := contract.ResumeBinding(ctx, binding)
 	cancel()
 	if err := runtimeLifecycleOutcomeError(outcome, runtimecontract.LifecycleCompleted, false); err != nil {
 		return AgentView{}, errf(409, "Runtime conversation could not be resumed")
 	}
-	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	history, failure := contract.ReadHistory(ctx, runtimecontract.HistoryRequest{Binding: binding, Count: 1})
-	cancel()
-	if failure != nil || history.Validate() != nil {
-		return AgentView{}, errf(409, "Runtime conversation history could not be verified")
+	if kind != "claude" {
+		ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+		history, failure := contract.ReadHistory(ctx, runtimecontract.HistoryRequest{Binding: binding, Count: 1})
+		cancel()
+		if failure != nil || history.Validate() != nil {
+			return AgentView{}, errf(409, "Runtime conversation history could not be verified")
+		}
 	}
 
 	threadID := newIntegrationID("thr")
@@ -345,7 +411,7 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 	if goalErr != nil {
 		return AgentView{}, goalErr
 	}
-	meta := &Agent{ID: agentID, Name: p.Name, Cwd: p.Cwd, SourceCwd: candidate.Cwd, ThreadID: threadID, RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: kind, NativeRef: candidate.nativeRef}, RuntimeTurnBindings: map[string]string{}, Sandbox: p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort, RuntimeConfiguration: p.RuntimeConfiguration, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
+	meta := &Agent{ID: agentID, Name: p.Name, Cwd: p.Cwd, SourceCwd: candidate.Cwd, ThreadID: threadID, RuntimeBinding: RuntimeBinding{SchemaVersion: RuntimeBindingSchemaVersion, Kind: kind, NativeRef: candidate.nativeRef}, HistoryBoundary: boundary, RuntimeTurnBindings: map[string]string{}, Sandbox: p.Sandbox, ApprovalPolicy: p.ApprovalPolicy, ProviderID: p.ProviderID, Model: p.Model, Effort: p.Effort, RuntimeConfiguration: p.RuntimeConfiguration, Status: "idle", CreatedAt: now(), UpdatedAt: now()}
 	rt := &runtime{agentID: agentID, agentHost: host, runtimeContract: contract, binding: binding, ready: make(chan struct{}), approvals: map[string]*approval{}}
 	close(rt.ready)
 	h.mu.Lock()
@@ -388,9 +454,122 @@ func (h *Hub) AdoptRuntimeConversation(kind string, p AdoptConversationParams) (
 		}
 	}
 	committed = true
+	if configured, ok := contract.(runtimeHistoryBoundaryConfiguration); ok && boundary != nil {
+		configured.SetRuntimeHistoryBoundary(boundary, func(revision string) error {
+			return h.commitHistoryBoundaryRevision(agentID, revision)
+		})
+	}
 	host.SetFailureHandler(func(err error) { h.onRuntimeFailure(rt, err) })
 	contract.SetEventHandler(func(event runtimecontract.Event) { h.onCanonicalRuntimeEvent(rt, event) })
 	h.emitLocked(agentID, "loom/agent-adopted", map[string]any{"id": agentID, "name": p.Name, "cwd": p.Cwd, "sourceCwd": candidate.Cwd, "threadId": meta.ThreadID, "runtimeKind": kind})
+	h.emitStatusLocked(meta, meta.Status)
+	view := h.viewLocked(meta)
+	h.mu.Unlock()
+	return view, nil
+}
+
+func (h *Hub) commitHistoryBoundaryRevision(agentID, revision string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta := h.agents[agentID]
+	if meta == nil || meta.HistoryBoundary == nil || strings.TrimSpace(revision) == "" {
+		return errors.New("History Boundary is unavailable")
+	}
+	previous := meta.HistoryBoundary.NativeRevision
+	previousUpdatedAt := meta.UpdatedAt
+	meta.HistoryBoundary.NativeRevision = revision
+	meta.UpdatedAt = now()
+	if err := h.persistAgentsLocked(); err != nil {
+		meta.HistoryBoundary.NativeRevision = previous
+		meta.UpdatedAt = previousUpdatedAt
+		return err
+	}
+	return nil
+}
+
+func (h *Hub) fenceNativeConversationDivergence(agentID, revision string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	meta := h.agents[agentID]
+	if meta == nil || meta.HistoryBoundary == nil {
+		return errf(409, "Agent has no adoptive History Boundary")
+	}
+	previous := *meta
+	meta.NativeConversationDivergence = &NativeConversationDivergence{
+		Code: runtimecontract.FailureCodeNativeConversationDivergence, DetectedAt: now(),
+		Summary:        "Claude native context changed after adoption. Loom imported no native content and fenced execution.",
+		Recovery:       "Explicitly accept the current native revision to establish a new History Boundary.",
+		NativeRevision: revision,
+	}
+	meta.Status = "fenced"
+	meta.LastError = "Native Conversation Divergence"
+	meta.CurrentTask = ""
+	meta.CurrentTurnID = ""
+	meta.UpdatedAt = now()
+	if err := h.persistAgentsLocked(); err != nil {
+		*meta = previous
+		return err
+	}
+	if rt := h.runtimes[agentID]; rt != nil && rt.activeTurn != nil && !rt.activeTurn.finished {
+		turn := rt.activeTurn
+		turn.finished = true
+		close(turn.stopWatchdog)
+		rt.activeTurn = nil
+		h.abortTurnApprovalsLocked(agentID, turn.turnID, rt, "the native conversation diverged before the Turn started")
+		rt.approvals = map[string]*approval{}
+		h.finishInboxAttemptLocked(turn, "interrupted", "Native Conversation Divergence")
+		h.finishAgentMessageTurnLocked(turn, "interrupted", "Native Conversation Divergence")
+	}
+	h.emitStatusLocked(meta, meta.Status)
+	return nil
+}
+
+func (h *Hub) RecoverNativeConversationDivergence(key string) (AgentView, error) {
+	h.mu.Lock()
+	if h.stopping {
+		h.mu.Unlock()
+		return AgentView{}, errf(503, "CodexLoom is shutting down")
+	}
+	meta := h.resolveLocked(key)
+	if meta == nil {
+		h.mu.Unlock()
+		return AgentView{}, errf(404, "agent not found: %s", key)
+	}
+	if meta.NativeConversationDivergence == nil || meta.HistoryBoundary == nil || meta.NativeConversationDivergence.NativeRevision == "" {
+		h.mu.Unlock()
+		return AgentView{}, errf(409, "Agent has no recoverable Native Conversation Divergence")
+	}
+	agentID := meta.ID
+	targetRevision := meta.NativeConversationDivergence.NativeRevision
+	if rt := h.runtimes[agentID]; rt != nil && rt.agentHost != nil {
+		host := rt.agentHost
+		h.mu.Unlock()
+		host.Close()
+		h.mu.Lock()
+		meta = h.agents[agentID]
+		if meta == nil || meta.NativeConversationDivergence == nil || meta.HistoryBoundary == nil || meta.NativeConversationDivergence.NativeRevision != targetRevision {
+			h.mu.Unlock()
+			return AgentView{}, errf(409, "Native Conversation Divergence changed during recovery")
+		}
+	}
+	previousBoundary := *meta.HistoryBoundary
+	previousDivergence := meta.NativeConversationDivergence
+	previousStatus, previousLastError, previousUpdatedAt := meta.Status, meta.LastError, meta.UpdatedAt
+	meta.HistoryBoundary.NativeRevision = targetRevision
+	meta.HistoryBoundary.CreatedAt = now()
+	meta.NativeConversationDivergence = nil
+	meta.Status, meta.LastError, meta.UpdatedAt = "idle", "", now()
+	if err := h.persistAgentsLocked(); err != nil {
+		*meta.HistoryBoundary = previousBoundary
+		meta.NativeConversationDivergence = previousDivergence
+		meta.Status, meta.LastError, meta.UpdatedAt = previousStatus, previousLastError, previousUpdatedAt
+		h.mu.Unlock()
+		return AgentView{}, errf(500, "persist Native Conversation Divergence recovery: %s", err)
+	}
+	delete(h.runtimes, meta.ID)
+	publicBoundary := *meta.HistoryBoundary
+	publicBoundary.NativeRevision = ""
+	h.emitLocked(meta.ID, "loom/native-conversation-recovered", map[string]any{"agentId": meta.ID, "historyBoundary": &publicBoundary})
 	h.emitStatusLocked(meta, meta.Status)
 	view := h.viewLocked(meta)
 	h.mu.Unlock()

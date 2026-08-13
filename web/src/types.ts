@@ -30,6 +30,18 @@ export interface Agent {
   sourceCwd?: string;
   threadId: string;
   runtimeBinding: { kind: string };
+  historyBoundary?: {
+    kind: string;
+    createdAt: string;
+    importedTurns: number;
+    disclosure: string;
+  };
+  nativeConversationDivergence?: {
+    code: "native_conversation_divergence" | string;
+    detectedAt: string;
+    summary: string;
+    recovery: string;
+  };
   capabilitySnapshot: CapabilitySnapshot;
   sandbox: string;
   approvalPolicy: string;
@@ -162,6 +174,7 @@ export interface RuntimeConversationCandidate {
   updatedAt: string;
   compatible: boolean;
   compatibility?: string;
+  alreadyBound?: boolean;
 }
 
 export interface RuntimeModel {

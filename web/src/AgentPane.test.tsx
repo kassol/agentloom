@@ -98,6 +98,35 @@ describe("AgentPane", () => {
     });
   });
 
+  it("discloses the History Boundary and offers divergence recovery", async () => {
+    render(<AgentPane
+      {...props}
+      agent={{
+        ...testAgent,
+        historyBoundary: {
+          kind: "native_conversation_adoption",
+          createdAt: "2026-08-13T00:00:00Z",
+          importedTurns: 0,
+          disclosure: "Existing native content remains outside Loom history.",
+        },
+        nativeConversationDivergence: {
+          code: "native_conversation_divergence",
+          detectedAt: "2026-08-13T00:01:00Z",
+          summary: "The native conversation changed outside Loom.",
+          recovery: "Accept the current native context.",
+        },
+      }}
+      active
+    />);
+
+    expect(screen.getByText(/Existing native content remains outside Loom history/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Accept current context" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      "/api/agents/agent-scroll/runtime/conversation/recover",
+      expect.objectContaining({ method: "POST" }),
+    ));
+  });
+
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
