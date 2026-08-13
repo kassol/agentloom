@@ -41,6 +41,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -80,8 +81,26 @@ func DefaultDir() string {
 	if d := os.Getenv("CODEX_HUB_DATA"); d != "" {
 		return d
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
+	home, _ := os.UserHomeDir()
+	config, _ := os.UserConfigDir()
+	return defaultDirFor(runtime.GOOS, os.Getenv("LOCALAPPDATA"), config, home)
+}
+
+func defaultDirFor(goos, localAppData, configDir, home string) string {
+	if goos == "windows" {
+		root := strings.TrimSpace(localAppData)
+		if root == "" {
+			root = strings.TrimSpace(configDir)
+		}
+		if root == "" {
+			root = strings.TrimSpace(home)
+		}
+		if root == "" {
+			return "CodexLoom"
+		}
+		return filepath.Join(root, "CodexLoom")
+	}
+	if strings.TrimSpace(home) == "" {
 		return ".codex-loom"
 	}
 	return filepath.Join(home, ".codex-loom")

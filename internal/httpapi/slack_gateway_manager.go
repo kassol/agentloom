@@ -26,6 +26,9 @@ var installManagedSlackGateway = func(s *Server, connection hub.PlatformConnecti
 }
 
 func (s *Server) installSlackGateway(connection hub.PlatformConnection, address hub.AgentAddress, appID, teamID, botUserID, hubURL string) (managedSlackGateway, error) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		return managedSlackGateway{}, fmt.Errorf("automatic Slack gateway management is unsupported on %s", runtime.GOOS)
+	}
 	wrapper, err := siblingExecutable("loom-slack-gateway")
 	if err != nil {
 		return managedSlackGateway{}, err
@@ -93,7 +96,10 @@ func (s *Server) installSlackLaunchAgent(connectionID string, arguments []string
 	if err := writePrivateFile(unitPath, []byte(plist)); err != nil {
 		return managedSlackGateway{}, err
 	}
-	uid := fmt.Sprint(os.Getuid())
+	uid, err := currentUserID()
+	if err != nil {
+		return managedSlackGateway{}, err
+	}
 	target := "gui/" + uid + "/" + label
 	_ = exec.Command("launchctl", "bootout", target).Run()
 	legacyUnits := stopLegacySlackGateways(connectionID)
@@ -193,6 +199,10 @@ func stopLegacySlackGateways(connectionID string) []string {
 	if err != nil {
 		return nil
 	}
+	uid, err := currentUserID()
+	if err != nil {
+		return nil
+	}
 	paths, _ := filepath.Glob(filepath.Join(home, "Library", "LaunchAgents", "*.plist"))
 	stopped := make([]string, 0)
 	for _, path := range paths {
@@ -204,7 +214,7 @@ func stopLegacySlackGateways(connectionID string) []string {
 		if !strings.Contains(text, connectionID) || !strings.Contains(text, "gateway/slack.mjs") {
 			continue
 		}
-		if err := exec.Command("launchctl", "bootout", "gui/"+fmt.Sprint(os.Getuid()), path).Run(); err == nil {
+		if err := exec.Command("launchctl", "bootout", "gui/"+uid, path).Run(); err == nil {
 			stopped = append(stopped, path)
 		}
 	}

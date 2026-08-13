@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -212,6 +213,9 @@ func TestParallImportRequestCanReuseStoredCredential(t *testing.T) {
 }
 
 func TestParallImportRequestRejectsUnsafeKeyFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACLs are not represented by os.FileMode")
+	}
 	dir := t.TempDir()
 	openPath := filepath.Join(dir, "open.key")
 	if err := os.WriteFile(openPath, []byte("secret"), 0o644); err != nil {
@@ -243,6 +247,14 @@ func TestRequireSecureSecretTransport(t *testing.T) {
 	}
 	if err := requireSecureSecretTransport("http://100.66.47.40:4870"); err == nil || !strings.Contains(err.Error(), "non-loopback") {
 		t.Fatalf("insecure remote transport error = %v", err)
+	}
+}
+
+func TestCanaryRootForUserScope(t *testing.T) {
+	got := canaryRootFor(filepath.Join("tmp", "loom"), "owner-123")
+	want := filepath.Join("tmp", "loom", "codexloom-canary-owner-123")
+	if got != want {
+		t.Fatalf("canaryRootFor() = %q, want %q", got, want)
 	}
 }
 

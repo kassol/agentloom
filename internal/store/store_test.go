@@ -7,6 +7,15 @@ import (
 	"testing"
 )
 
+func TestDefaultDirForPlatform(t *testing.T) {
+	if got, want := defaultDirFor("windows", `C:\Users\Owner\AppData\Local`, "", ""), filepath.Join(`C:\Users\Owner\AppData\Local`, "CodexLoom"); got != want {
+		t.Fatalf("Windows default dir = %q, want %q", got, want)
+	}
+	if got, want := defaultDirFor("linux", "", "", "/home/owner"), filepath.Join("/home/owner", ".codex-loom"); got != want {
+		t.Fatalf("Linux default dir = %q, want %q", got, want)
+	}
+}
+
 func TestOpenMigratesLegacyCodexHubDirectory(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

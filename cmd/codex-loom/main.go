@@ -9,17 +9,18 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/yan5xu/codex-loom/internal/claudegen"
 	"github.com/yan5xu/codex-loom/internal/httpapi"
 	"github.com/yan5xu/codex-loom/internal/hub"
+	"github.com/yan5xu/codex-loom/internal/platform"
+	"github.com/yan5xu/codex-loom/internal/processlifecycle"
 	"github.com/yan5xu/codex-loom/internal/store"
 	"github.com/yan5xu/codex-loom/internal/webui"
 )
@@ -39,6 +40,7 @@ func main() {
 	port := flag.Int("port", defaultPort, "listen port")
 	dataDir := flag.String("data", store.DefaultDir(), "data directory")
 	canary := flag.Bool("canary", false, "run a passive, read-only development canary")
+	openBrowser := flag.Bool("open", false, "open the WebUI in the default browser")
 	flag.Parse()
 
 	if err := hub.PreflightPiRuntime(context.Background()); err != nil {
@@ -90,10 +92,8 @@ func main() {
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		s := <-sig
-		log.Printf("[codex-loom] %s — shutting down", s)
+		reason := processlifecycle.WaitForShutdown()
+		log.Printf("[codex-loom] %s — shutting down", reason)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = httpServer.Shutdown(ctx)
 		cancel()
@@ -106,8 +106,18 @@ func main() {
 		}
 	}()
 
-	log.Printf("[codex-loom] listening on http://localhost:%d (mode: %s, data: %s)", *port, mode, *dataDir)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	listener, err := net.Listen("tcp", listenAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+	webURL := fmt.Sprintf("http://localhost:%d", *port)
+	log.Printf("[codex-loom] listening on %s (mode: %s, data: %s)", webURL, mode, *dataDir)
+	if *openBrowser {
+		if err := platform.OpenBrowser(webURL); err != nil {
+			log.Printf("[codex-loom] open browser: %v", err)
+		}
+	}
+	if err := httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 	<-shutdownDone

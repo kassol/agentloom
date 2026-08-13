@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/processlifecycle"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
@@ -83,8 +83,8 @@ func TestPiHostCloseWaitsForRPCProcessExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	host.Close()
-	if err := syscall.Kill(pid, 0); err != syscall.ESRCH {
-		t.Fatalf("Pi RPC pid %d remained after Host close: %v", pid, err)
+	if processlifecycle.Alive(pid) {
+		t.Fatalf("Pi RPC pid %d remained after Host close", pid)
 	}
 }
 
@@ -323,8 +323,8 @@ func TestPiCreatePersistenceFailureClosesStartedProcessWithoutDeletingSessionEvi
 	if readPIDErr != nil || parsePIDErr != nil {
 		t.Fatalf("read rolled-back Pi pid: raw=%q read=%v parse=%v", rawRolledBackPID, readPIDErr, parsePIDErr)
 	}
-	if err := syscall.Kill(rolledBackPID, 0); err != syscall.ESRCH {
-		t.Fatalf("rolled-back Pi pid %d was not reaped: %v", rolledBackPID, err)
+	if processlifecycle.Alive(rolledBackPID) {
+		t.Fatalf("rolled-back Pi pid %d was not reaped", rolledBackPID)
 	}
 	entries, globErr := filepath.Glob(filepath.Join(dataDir, "pi", "*", "session-*.jsonl"))
 	if globErr != nil || len(entries) != 1 {

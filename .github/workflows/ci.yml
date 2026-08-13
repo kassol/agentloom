@@ -46,6 +46,15 @@ jobs:
       - name: Vet Go packages
         run: go vet ./...
 
+      - name: Cross-compile Windows packages and tests
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          go build ./...
+          go test -exec=true -run '^$' ./...
+
       - name: Run Go tests with the race detector
         run: go test -race ./...
 
@@ -57,3 +66,47 @@ jobs:
 
       - name: Run frontend browser tests
         run: npm --prefix web run test:browser
+
+  windows:
+    name: Windows build and core tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install and build WebUI
+        shell: pwsh
+        run: |
+          npm --prefix web ci
+          npm --prefix web run build
+
+      - name: Build Hub, CLI, reloader, and gateways
+        shell: pwsh
+        run: ./scripts/build.ps1 -SkipWeb
+
+      - name: Run Windows-native core tests
+        shell: pwsh
+        run: |
+          go test ./internal/platform ./internal/processlifecycle ./internal/backup
+          go test ./internal/store -run 'TestDefaultDirForPlatform|TestS0WriterLeaseIsProcessWide|TestReadNDJSON'
+          go test ./internal/httpapi -run 'TestWindowsManagedGatewaysAreExplicitlyUnsupported'
+          go test ./cmd/codex-loom ./cmd/codex-loom-reloader ./cmd/loom -run 'TestCanonicalExecutable|TestCanaryRootForUserScope|TestBuild'
+
+      - name: Compile every Windows package and test binary
+        shell: pwsh
+        run: |
+          go build ./...
+          go test -run '^$' ./...

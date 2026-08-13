@@ -10,9 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/processlifecycle"
 )
 
 func TestBridgeRejectsEveryHandshakeMismatchBeforePublishing(t *testing.T) {
@@ -818,6 +819,5 @@ func matrixIDs() func() string {
 }
 
 func matrixProcessAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || !errors.Is(err, syscall.ESRCH)
+	return processlifecycle.Alive(pid)
 }

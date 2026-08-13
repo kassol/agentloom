@@ -12,16 +12,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
+	"strings"
 	"time"
+
+	"github.com/yan5xu/codex-loom/internal/platform"
+	"github.com/yan5xu/codex-loom/internal/processlifecycle"
 )
 
 func main() {
 	oldPID := flag.Int("pid", 0, "CodexLoom PID to replace")
 	exe := flag.String("exe", "", "CodexLoom executable to start")
 	cwd := flag.String("cwd", "", "working directory for the new process")
-	logPath := flag.String("log", "/tmp/codex-loom-reloader.log", "reloader log path")
-	childLogPath := flag.String("child-log", "/tmp/codex-loom.log", "new CodexLoom stdout/stderr log path")
+	logPath := flag.String("log", filepath.Join(os.TempDir(), "codex-loom-reloader.log"), "reloader log path")
+	childLogPath := flag.String("child-log", filepath.Join(os.TempDir(), "codex-loom.log"), "new CodexLoom stdout/stderr log path")
 	delay := flag.Duration("delay", 300*time.Millisecond, "delay before stopping the old process")
 	timeout := flag.Duration("timeout", 60*time.Second, "time to wait for graceful shutdown")
 	flag.Parse()
@@ -45,9 +48,9 @@ func main() {
 	time.Sleep(*delay)
 
 	if processAlive(*oldPID) {
-		log.Printf("sending SIGTERM to oldPID=%d", *oldPID)
-		if err := syscall.Kill(*oldPID, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
-			log.Fatalf("send SIGTERM: %v", err)
+		log.Printf("requesting graceful shutdown of oldPID=%d", *oldPID)
+		if err := processlifecycle.RequestGracefulStop(*oldPID); err != nil {
+			log.Fatalf("request graceful shutdown: %v", err)
 		}
 	}
 
@@ -56,9 +59,9 @@ func main() {
 		time.Sleep(150 * time.Millisecond)
 	}
 	if processAlive(*oldPID) {
-		log.Printf("oldPID=%d still alive after %s; sending SIGKILL", *oldPID, *timeout)
-		if err := syscall.Kill(*oldPID, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-			log.Fatalf("send SIGKILL: %v", err)
+		log.Printf("oldPID=%d still alive after %s; forcing termination", *oldPID, *timeout)
+		if err := processlifecycle.ForceKill(*oldPID); err != nil {
+			log.Fatalf("force termination: %v", err)
 		}
 		killDeadline := time.Now().Add(3 * time.Second)
 		for processAlive(*oldPID) && time.Now().Before(killDeadline) {
@@ -79,7 +82,7 @@ func main() {
 	if *cwd != "" {
 		cmd.Dir = *cwd
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	processlifecycle.ConfigureDetached(cmd)
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("start new CodexLoom: %v", err)
 	}
@@ -88,17 +91,20 @@ func main() {
 }
 
 func processAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || err == syscall.EPERM
+	return processlifecycle.Alive(pid)
 }
 
 func canonicalExecutable(exe string) string {
-	if filepath.Base(exe) != "codex-hub" {
+	if !sameExecutableName(filepath.Base(exe), platform.ExecutableName("codex-hub")) {
 		return exe
 	}
-	canonical := filepath.Join(filepath.Dir(exe), "codex-loom")
-	if info, err := os.Stat(canonical); err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+	canonical := filepath.Join(filepath.Dir(exe), platform.ExecutableName("codex-loom"))
+	if info, err := os.Stat(canonical); err == nil && platform.IsExecutableFile(info) {
 		return canonical
 	}
 	return exe
+}
+
+func sameExecutableName(left, right string) bool {
+	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 }

@@ -29,6 +29,9 @@ var retireManagedParallGateways = func(s *Server, connectionIDs []string) error 
 }
 
 func (s *Server) installParallGateway(connection hub.PlatformConnection, address hub.AgentAddress, orgID, agentID, hubURL string) (managedParallGateway, error) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		return managedParallGateway{}, fmt.Errorf("automatic Parall gateway management is unsupported on %s", runtime.GOOS)
+	}
 	wrapper, err := siblingExecutable("loom-parall-gateway")
 	if err != nil {
 		return managedParallGateway{}, err
@@ -71,7 +74,10 @@ func (s *Server) retireParallGateways(connectionIDs []string) error {
 	}
 	switch runtime.GOOS {
 	case "darwin":
-		uid := fmt.Sprint(os.Getuid())
+		uid, err := currentUserID()
+		if err != nil {
+			return err
+		}
 		paths, _ := filepath.Glob(filepath.Join(home, "Library", "LaunchAgents", "*.plist"))
 		for _, connectionID := range connectionIDs {
 			label := "com.codexloom.parall." + safeServicePart(connectionID)
@@ -149,7 +155,10 @@ func (s *Server) installParallLaunchAgent(connectionID string, arguments []strin
 	if err := writePrivateFile(unitPath, []byte(plist)); err != nil {
 		return managedParallGateway{}, err
 	}
-	uid := fmt.Sprint(os.Getuid())
+	uid, err := currentUserID()
+	if err != nil {
+		return managedParallGateway{}, err
+	}
 	target := "gui/" + uid + "/" + label
 	_ = exec.Command("launchctl", "bootout", target).Run()
 	legacyUnits := stopLegacyParallGateways(connectionID)
@@ -223,6 +232,10 @@ func stopLegacyParallGateways(connectionID string) []string {
 	if err != nil {
 		return nil
 	}
+	uid, err := currentUserID()
+	if err != nil {
+		return nil
+	}
 	paths, _ := filepath.Glob(filepath.Join(home, "Library", "LaunchAgents", "*.plist"))
 	stopped := make([]string, 0)
 	for _, path := range paths {
@@ -234,7 +247,7 @@ func stopLegacyParallGateways(connectionID string) []string {
 		if !strings.Contains(text, connectionID) || !strings.Contains(text, "gateway/parall.mjs") {
 			continue
 		}
-		if err := exec.Command("launchctl", "bootout", "gui/"+fmt.Sprint(os.Getuid()), path).Run(); err == nil {
+		if err := exec.Command("launchctl", "bootout", "gui/"+uid, path).Run(); err == nil {
 			stopped = append(stopped, path)
 		}
 	}

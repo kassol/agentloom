@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/yan5xu/codex-loom/internal/parall"
 )
@@ -57,7 +56,7 @@ func main() {
 		"PRLL_ORG_ID="+strings.TrimSpace(*orgID),
 		"PRLL_AGENT_ID="+strings.TrimSpace(*agentID),
 	)
-	if err := syscall.Exec(*node, arguments, environment); err != nil {
+	if err := runNode(*node, arguments, environment); err != nil {
 		fatalf("start Parall gateway: %v", err)
 	}
 }

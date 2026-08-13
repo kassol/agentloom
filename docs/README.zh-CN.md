@@ -67,6 +67,7 @@ Troubleshooting 到 Reference 的 Owner 任务路径；本地图继续说明仓�
 | [WebUI pane reference](webui-panes.md) | 页面级数据源、写操作、SSE 订阅与关键状态 |
 | [Technical debt audit](technical-debt-audit.md) | 工程审计与修复记录 |
 | [Operations checklist](operations.md) | 发布、重启、回滚、备份与恢复演练 |
+| [Native Windows support](windows.md) | Windows 支持版本、PowerShell 构建、生命周期、限制、备份与回滚 |
 | [Markdown rendering fixture](markdown-rendering-fixture.md) | 渲染器测试内容 |
 | [chub compatibility](chub-communication.md) | 历史兼容说明 |
 

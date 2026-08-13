@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/yan5xu/codex-loom/internal/hub"
+	"github.com/yan5xu/codex-loom/internal/platform"
 )
 
 type managedFeishuGateway struct {
@@ -25,6 +26,9 @@ var installNativeFeishuGateway = func(s *Server, connection hub.PlatformConnecti
 }
 
 func (s *Server) installFeishuGateway(connection hub.PlatformConnection, address hub.AgentAddress, appID, hubURL string) (managedFeishuGateway, error) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		return managedFeishuGateway{}, fmt.Errorf("automatic Feishu gateway management is unsupported on %s", runtime.GOOS)
+	}
 	binary, err := siblingExecutable("loom-feishu-gateway")
 	if err != nil {
 		return managedFeishuGateway{}, err
@@ -83,7 +87,10 @@ func (s *Server) installFeishuLaunchAgent(connectionID string, arguments []strin
 	if err := writePrivateFile(unitPath, []byte(plist)); err != nil {
 		return managedFeishuGateway{}, err
 	}
-	uid := fmt.Sprint(os.Getuid())
+	uid, err := currentUserID()
+	if err != nil {
+		return managedFeishuGateway{}, err
+	}
 	serviceTarget := "gui/" + uid + "/" + label
 	_ = exec.Command("launchctl", "bootout", serviceTarget).Run()
 	legacyUnits := stopLegacyLarkGateways(connectionID)
@@ -147,12 +154,13 @@ func siblingExecutable(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	candidates := []string{filepath.Join(filepath.Dir(current), name)}
-	if path, err := exec.LookPath(name); err == nil {
+	nativeName := platform.ExecutableName(name)
+	candidates := []string{filepath.Join(filepath.Dir(current), nativeName)}
+	if path, err := exec.LookPath(nativeName); err == nil {
 		candidates = append(candidates, path)
 	}
 	for _, candidate := range candidates {
-		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+		if info, err := os.Stat(candidate); err == nil && platform.IsExecutableFile(info) {
 			return candidate, nil
 		}
 	}
@@ -161,6 +169,10 @@ func siblingExecutable(name string) (string, error) {
 
 func stopLegacyLarkGateways(connectionID string) []string {
 	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	uid, err := currentUserID()
 	if err != nil {
 		return nil
 	}
@@ -175,7 +187,7 @@ func stopLegacyLarkGateways(connectionID string) []string {
 		if !strings.Contains(text, connectionID) || !strings.Contains(text, "gateway/lark.mjs") {
 			continue
 		}
-		if err := exec.Command("launchctl", "bootout", "gui/"+fmt.Sprint(os.Getuid()), path).Run(); err == nil {
+		if err := exec.Command("launchctl", "bootout", "gui/"+uid, path).Run(); err == nil {
 			stopped = append(stopped, path)
 		}
 	}

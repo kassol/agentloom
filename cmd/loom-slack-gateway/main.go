@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	loomslack "github.com/yan5xu/codex-loom/internal/slack"
 )
@@ -53,7 +52,7 @@ func main() {
 		arguments = append(arguments, "--state-file", *stateFile)
 	}
 	environment := append(os.Environ(), "SLACK_BOT_TOKEN="+tokens.Bot, "SLACK_APP_TOKEN="+tokens.App)
-	if err := syscall.Exec(*node, arguments, environment); err != nil {
+	if err := runNode(*node, arguments, environment); err != nil {
 		fatalf("start Slack gateway: %v", err)
 	}
 }

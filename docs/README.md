@@ -76,6 +76,7 @@ should be verified against the current build before publication.
 | [WebUI pane reference](webui-panes.md) | Page-level data sources, writes, SSE subscriptions, and key state |
 | [Technical debt audit](technical-debt-audit.md) | Engineering audit and remediation record |
 | [Operations checklist](operations.md) | Release, restart, rollback, backup, and restore drill |
+| [Native Windows support](windows.md) | Supported Windows versions, PowerShell build, lifecycle, limitations, backup, and rollback |
 | [Markdown rendering fixture](markdown-rendering-fixture.md) | Renderer test content |
 | [chub compatibility](chub-communication.md) | Legacy compatibility notes |
 

@@ -103,6 +103,9 @@ Pi is required at every startup. If it is not in `PATH`, set `PI_BIN` to its
 executable; CodexLoom verifies the minimum version but never installs or
 updates Pi.
 
+On Windows 11, use the canonical PowerShell build and operations guide:
+[Native Windows support](docs/windows.md).
+
 ### Owner Path in the WebUI
 
 Open <http://localhost:4870>. If you are still deciding what deserves a

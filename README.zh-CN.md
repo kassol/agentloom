@@ -81,6 +81,9 @@ make release
 每次启动都必须具备 Pi。若 Pi 不在 `PATH`，请用 `PI_BIN` 指定其可执行文件；
 CodexLoom 只校验最低版本，不会自动安装或更新 Pi。
 
+Windows 11 请使用规范的 PowerShell 构建与运维说明：
+[Native Windows support](docs/windows.md)。
+
 ### Owner 的 WebUI 路径
 
 打开 <http://localhost:4870>。如果还在判断什么工作值得建立长期 Agent，
