@@ -373,7 +373,7 @@ export function BlockView({ block }: { block: Block }) {
       return (
         <details className="my-2 overflow-hidden rounded-md border border-border bg-card shadow-card">
           <summary className="flex cursor-pointer select-none items-center gap-2 px-3 py-2.5">
-            <span className="flex-1 truncate font-mono text-[12.5px]">{block.command}</span>
+            <span className={`flex-1 truncate text-[12.5px] ${block.description ? "font-medium" : "font-mono"}`}>{block.description || block.command}</span>
             {finished ? (
               <span
                 className={`shrink-0 rounded-md px-2 py-0.5 text-[10.5px] font-medium ${

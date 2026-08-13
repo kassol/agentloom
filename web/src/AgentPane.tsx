@@ -12,6 +12,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "./components/ui/popover
 import { subscribeThreadEvents } from "./thread-events";
 import { oldestWaitingMs } from "./product-state";
 import { formatOptionalUsageMetric, usageMetricAvailable } from "./usage";
+import { agentNameError, agentNameHint } from "./agent-name";
 
 
 function capabilityAvailable(agent: Agent, id: string) {
@@ -250,20 +251,6 @@ export function AgentPane({
       if (secondFrame) window.cancelAnimationFrame(secondFrame);
     };
   }, [active, agent.id]);
-  const measureFeedRow = useCallback((node: HTMLDivElement | null) => {
-    feedVirtualizer.measureElement(node);
-    if (!node) return;
-    const index = Number(node.dataset.index);
-    if (!Number.isInteger(index)) return;
-
-    // Virtual rows first appear while the user is scrolling. TanStack Virtual
-    // deliberately skips its synchronous measurement in that state and waits
-    // for ResizeObserver, which can leave a tall Markdown block at the 96px
-    // estimate long enough for following rows to render on top of it. Measure
-    // once on mount; the virtualizer's observer still handles later resizes.
-    feedVirtualizer.resizeItem(index, node.getBoundingClientRect().height);
-  }, [feedVirtualizer]);
-
   const PAGE = 25;
 
   useEffect(() => () => {
@@ -382,7 +369,7 @@ export function AgentPane({
   }, [configOpen, configSection, agent.id, agent.currentTurnId, agent.lastTurn?.turnId]);
 
   const setResourceEnabled = async (resource: RuntimeResourceSnapshot["resources"][number], enabled: boolean) => {
-    if (!runtimeResources || savingResourceID) return;
+    if (!runtimeResources || savingResourceID || !resource.path) return;
     setSavingResourceID(resource.id);
     try {
       const data = await api("PATCH", `/api/agents/${agent.id}/skills/config`, {
@@ -876,12 +863,9 @@ export function AgentPane({
   const saveConfig = async () => {
     if (running || savingConfig) return;
     const nextName = nameDraft.trim();
-    if (!nextName) {
-      onError("name is required");
-      return;
-    }
-    if (!/^[a-zA-Z0-9_-]+$/.test(nextName)) {
-      onError("name must match [a-zA-Z0-9_-]+");
+    const nameError = agentNameError(nextName);
+    if (nameError) {
+      onError(nameError);
       return;
     }
     setSavingConfig(true);
@@ -1176,6 +1160,7 @@ export function AgentPane({
                       spellCheck={false}
                       className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition placeholder:text-muted-foreground/60 focus:ring-ring/25 disabled:opacity-60"
                     />
+					<span className="mt-1 block text-[10px] leading-4 text-muted-foreground">{agentNameHint}</span>
                   </label>
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Provider</span>
@@ -1285,6 +1270,13 @@ export function AgentPane({
 					  <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{runtimeResources.semantics}</p>
 					  <div className="mt-1 font-mono text-[9px] text-muted-foreground">snapshot {runtimeResources.revision}</div>
 					</div>
+					{runtimeResources.configuration ? <div className="mb-3 border-y border-border py-2.5 text-[10.5px]">
+					  <div className="grid gap-2 sm:grid-cols-2">
+						<div><span className="block text-[9px] font-semibold uppercase text-muted-foreground">Settings</span><span className="mt-0.5 block text-foreground">{runtimeResources.configuration.settingSources.join(" · ")}</span></div>
+						<div><span className="block text-[9px] font-semibold uppercase text-muted-foreground">Authentication</span><span className="mt-0.5 block text-foreground">{runtimeResources.configuration.authentication.category} / {runtimeResources.configuration.authentication.source} · {runtimeResources.configuration.authentication.validation}</span></div>
+					  </div>
+					  {runtimeResources.configuration.authentication.evidence?.map((evidence, index) => <div key={`${evidence.kind}:${index}`} className="mt-2 text-[10px] leading-4 text-muted-foreground"><span className="font-medium text-foreground">{evidence.kind}</span> · {evidence.summary}</div>)}
+					</div> : null}
 					{!runtimeResources.policy.available || !runtimeResources.policy.mutable ? (
 					  <div className="mb-3 rounded-md bg-warning/10 px-2.5 py-2 text-[11px] leading-4 text-warning">
 						{runtimeResources.policy.reason}. {runtimeResources.policy.alternative}.
@@ -1298,11 +1290,11 @@ export function AgentPane({
 						  <span className={`size-2 shrink-0 rounded-full ${resource.enabled ? "bg-success" : "bg-muted-foreground/40"}`} />
 						  <div className="min-w-0 flex-1">
 							<div className="flex items-center gap-2"><span className="truncate text-[12px] font-medium">{resource.name}</span><span className="font-mono text-[9px] uppercase text-muted-foreground">{resource.kind}</span></div>
-							<div className="truncate font-mono text-[9px] text-muted-foreground" title={resource.path}>{resource.path}</div>
-							{resource.description ? <div className="mt-0.5 text-[10.5px] text-muted-foreground">{resource.description}</div> : null}
+							{runtimeResources.runtimeKind !== "claude" && resource.path ? <div className="truncate font-mono text-[9px] text-muted-foreground" title={resource.path}>{resource.path}</div> : runtimeResources.runtimeKind !== "claude" && resource.source ? <div className="truncate text-[9px] text-muted-foreground">{resource.source}</div> : null}
+							{runtimeResources.runtimeKind !== "claude" && resource.description ? <div className="mt-0.5 text-[10.5px] text-muted-foreground">{resource.description}</div> : null}
 						  </div>
-						  <span className={`font-mono text-[9px] ${resource.enabled ? "text-success" : "text-muted-foreground"}`}>{resource.enabled ? "enabled" : "disabled"}</span>
-						  {resource.kind === "skill" ? <button
+						  <span className={`font-mono text-[9px] ${resource.enabled ? "text-success" : "text-muted-foreground"}`}>{resource.status || (resource.enabled ? "enabled" : "disabled")}</span>
+						  {resource.kind === "skill" && resource.path && runtimeResources.runtimeKind !== "claude" ? <button
 							onClick={() => setResourceEnabled(resource, !resource.enabled)}
 							disabled={!runtimeResources.policy.mutable || Boolean(savingResourceID)}
 							aria-label={`${resource.enabled ? "Disable" : "Enable"} ${resource.name}`}
@@ -1441,7 +1433,7 @@ export function AgentPane({
                   <div
                     key={virtualRow.key}
                     data-index={virtualRow.index}
-                    ref={measureFeedRow}
+                    ref={feedVirtualizer.measureElement}
                     className="absolute left-0 top-0 flow-root w-full py-px"
                     style={{ transform: `translateY(${virtualRow.start}px)` }}
                   >

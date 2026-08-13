@@ -27,6 +27,7 @@ export interface Agent {
   id: string;
   name: string;
   cwd: string;
+  sourceCwd?: string;
   threadId: string;
   runtimeBinding: { kind: string };
   capabilitySnapshot: CapabilitySnapshot;
@@ -35,6 +36,7 @@ export interface Agent {
   providerId?: string;
   model?: string;
   effort?: string;
+  runtimeConfiguration?: RuntimeOwnerConfiguration;
   status: string;
   currentTask: string;
   currentTurnId: string;
@@ -57,6 +59,7 @@ export interface Agent {
     status: "completed" | "interrupted" | "failed" | string;
     completedAt: string;
   };
+	workDisposition?: WorkDisposition;
 	recovery?: {
 		predecessorTurnId: string;
 		runtimeKind: string;
@@ -75,6 +78,35 @@ export interface Agent {
   lastSeq: number;
 }
 
+export interface WorkWakeSource {
+	kind: "human_request" | "approval" | "trigger" | "message" | "schedule" | "goal" | string;
+	id: string;
+	topicId?: string;
+	sourceTurnId?: string;
+	summary?: string;
+	resumeAction?: string;
+}
+
+export interface WorkObligation {
+	kind: "goal" | "topic" | "message" | "inbox" | string;
+	id: string;
+	topicId?: string;
+	sourceTurnId?: string;
+	summary?: string;
+}
+
+export interface WorkDisposition {
+	kind: "completed" | "continuing" | "needs_you" | "waiting_approval" | "waiting_external" | "waiting_agent" | "waiting_time" | "paused" | "failed" | "unclassified" | string;
+	threadId: string;
+	turnId: string;
+	topicId?: string;
+	turnStatus?: string;
+	wakeSources?: WorkWakeSource[];
+	unfinished?: WorkObligation[];
+	guidance?: string;
+	recordedAt: string;
+}
+
 export interface CapabilitySnapshot {
   revision: string;
   capabilities: Array<{
@@ -91,6 +123,17 @@ export interface RuntimeConversationCapabilities {
   runtimeKind: string;
   revision: string;
   capabilities: Array<{ id: string; available: boolean; reason?: string }>;
+}
+
+export interface RuntimeAuthenticationSelection {
+  category: "console" | "cloud" | "gateway" | string;
+  source: string;
+}
+
+export interface RuntimeOwnerConfiguration {
+  configured: boolean;
+  settingSources: string[];
+  authentication: RuntimeAuthenticationSelection;
 }
 
 export interface RuntimeConversationCandidate {
@@ -127,11 +170,12 @@ export interface RuntimeResourceSnapshot {
     id: string;
     name: string;
     description?: string;
-    kind: "skill" | "prompt" | "extension" | string;
-    path: string;
+    kind: "skill" | "prompt" | "extension" | "plugin" | "mcp" | "command" | string;
+    path?: string;
     scope?: string;
     source?: string;
     enabled: boolean;
+    status?: string;
   }>;
   policy: {
     available?: boolean;
@@ -142,6 +186,13 @@ export interface RuntimeResourceSnapshot {
     disabledPaths?: string[];
     effective: boolean;
     evidence?: Array<{ kind: string; summary: string; observedAt?: string }>;
+  };
+  configuration?: {
+    settingSources: string[];
+    authentication: RuntimeAuthenticationSelection & {
+      validation: string;
+      evidence?: Array<{ kind: string; summary: string; observedAt?: string }>;
+    };
   };
 }
 
@@ -873,6 +924,10 @@ export interface Schedule {
   id: string;
   name: string;
   to: string;
+	agentId?: string;
+	threadId?: string;
+	sourceTurnId?: string;
+	topicId?: string;
   subject: string;
   body: string;
   response: "required" | "none";

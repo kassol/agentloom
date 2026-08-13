@@ -1,8 +1,9 @@
 import { Activity, BookOpen, Cable, ChevronRight, CircleHelp, CirclePause, Inbox as InboxIcon, Info, Menu, Network, PanelLeftClose, PanelLeftOpen, Plus, RotateCw, Settings2, X } from "lucide-react";
 import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type ModelProvider, type ModelProviderResponse, type RemoteSnapshot, type RuntimeConversationCandidate, type RuntimeConversationCapabilities, type TopicSummary } from "./types";
-import { createRuntimeOptions, runtimeConfigurationNote, runtimeLabel, type CreateRuntimeKind } from "./runtime-options";
+import { api, type Agent, type BackupStatus, type HumanRequest, type InboxEntry, type ModelProvider, type ModelProviderResponse, type RemoteSnapshot, type RuntimeConversationCandidate, type RuntimeConversationCapabilities, type RuntimeOwnerConfiguration, type TopicSummary } from "./types";
+import { createRuntimeOptions, defaultRuntimeConfiguration, runtimeConfigurationNote, runtimeConfigurationSpec, runtimeLabel, type CreateRuntimeKind } from "./runtime-options";
+import { adoptionWorkspaceRequest, defaultAdoptionWorkspace } from "./adoption-workspace";
 import { summarizeTask } from "./feed";
 import { BrandLockup, BrandMark } from "./components/BrandMark";
 import { Button } from "./components/ui/button";
@@ -19,6 +20,7 @@ import { moveItem, reorderItem, type DropEdge } from "./tab-order";
 import { SidebarAgentDirectory } from "./SidebarAgentDirectory";
 import type { OverviewSection } from "./OverviewPane";
 import type { SettingsSection } from "./SettingsPane";
+import { agentNameError, agentNameHint } from "./agent-name";
 
 const AgentPane = lazy(() => import("./AgentPane").then((module) => ({ default: module.AgentPane })));
 const InboxPane = lazy(() => import("./InboxPane").then((module) => ({ default: module.InboxPane })));
@@ -471,7 +473,8 @@ function AgentTabs({
                     <span className="font-mono text-[9px] uppercase text-muted-foreground">{agentRuntimeLabel(agent)}</span>
                   </div>
                   <dl className="mt-3 grid grid-cols-[58px_minmax(0,1fr)] gap-x-2 gap-y-2 text-[10.5px]">
-                    <dt className="text-muted-foreground">Workspace</dt><dd className="min-w-0 truncate font-mono" title={agent.cwd}>{agent.cwd}</dd>
+					<dt className="text-muted-foreground">Workspace</dt><dd className="min-w-0 truncate font-mono" title={agent.cwd}>{agent.cwd}</dd>
+					{agent.sourceCwd ? <><dt className="text-muted-foreground">Source</dt><dd className="min-w-0 truncate font-mono" title={agent.sourceCwd}>{agent.sourceCwd}</dd></> : null}
                     <dt className="text-muted-foreground">Thread</dt><dd className="min-w-0 truncate font-mono" title={agent.threadId || undefined}>{agent.threadId || "Not started"}</dd>
                     <dt className="text-muted-foreground">Provider</dt><dd className="font-mono">{agent.providerId || "openai"}</dd>
                     <dt className="text-muted-foreground">Model</dt><dd className="font-mono">{agent.model || "Default"}</dd>
@@ -587,14 +590,17 @@ export default function App() {
   const [newDomain, setNewDomain] = useState("");
 	const [newRuntimeKind, setNewRuntimeKind] = useState<CreateRuntimeKind>("codex");
 	const [newCandidateId, setNewCandidateId] = useState("");
+	const [newRuntimeConfiguration, setNewRuntimeConfiguration] = useState<RuntimeOwnerConfiguration | undefined>();
   const [newProviderId, setNewProviderId] = useState("openai");
   const [newModel, setNewModel] = useState("");
   const [newEffort, setNewEffort] = useState("");
   const [creatingAgent, setCreatingAgent] = useState(false);
+  const [newAgentError, setNewAgentError] = useState("");
   const [toast, setToast] = useState<string | null>(null);
   const [restarting, setRestarting] = useState(false);
 	const runtimeCatalogs = runtimeCatalogQuery.data?.runtimes || [];
 	const selectedRuntimeCatalog = runtimeCatalogs.find((runtime) => runtime.runtimeKind === newRuntimeKind);
+	const selectedRuntimeConfigurationSpec = runtimeConfigurationSpec(newRuntimeKind);
 	const adoptionAvailable = selectedRuntimeCatalog?.capabilities.some((capability) => capability.id === "conversation_adoption" && capability.available) || false;
 	const conversationCandidatesQuery = useQuery<{ candidates: RuntimeConversationCandidate[] }>({
 		queryKey: ["runtime-conversations", newRuntimeKind],
@@ -607,6 +613,11 @@ export default function App() {
 		enabled: newAgentOpen && newAgentMode === "adopt" && Boolean(newCandidateId),
 	});
 	const inspectedCandidate = conversationCandidateQuery.data?.candidate;
+
+	useEffect(() => {
+		if (newAgentMode !== "adopt" || !inspectedCandidate) return;
+		setNewCwd(defaultAdoptionWorkspace(inspectedCandidate));
+	}, [newAgentMode, inspectedCandidate?.id]);
 
   useEffect(() => {
     if (!newAgentOpen || creatableProviders.length === 0 || creatableProviders.some((provider) => provider.id === newProviderId)) return;
@@ -787,22 +798,32 @@ export default function App() {
 
   const create = async () => {
     if (creatingAgent) return;
-	if (!newName.trim() || (newAgentMode === "create" && !newCwd.trim())) {
-	  showToast(newAgentMode === "adopt" ? "name required" : "name and cwd required");
+	const nameError = agentNameError(newName);
+	if (nameError) {
+	  setNewAgentError(nameError);
       return;
     }
-	if (newAgentMode === "create" && !newCwd.trim().startsWith("/")) {
-      showToast("working directory must be an absolute path");
+	if (!newCwd.trim()) {
+	  setNewAgentError("Enter a working directory.");
+	  return;
+	}
+	if (!newCwd.trim().startsWith("/")) {
+	  setNewAgentError("Working directory must be an absolute path.");
       return;
     }
 	if (newAgentMode === "adopt" && (!inspectedCandidate || !inspectedCandidate.compatible)) {
-	  showToast("inspect a compatible conversation first");
+	  setNewAgentError("Inspect a compatible conversation first.");
 	  return;
 	}
 	if (newAgentMode === "create" && newRuntimeKind === "codex" && !creatableProviders.some((provider) => provider.id === newProviderId)) {
-      showToast("configure and verify a model Provider first");
+	  setNewAgentError("Configure and verify a model Provider first.");
       return;
     }
+	if (selectedRuntimeConfigurationSpec && (!newRuntimeConfiguration?.settingSources.length || !newRuntimeConfiguration.authentication.category || !newRuntimeConfiguration.authentication.source)) {
+	  setNewAgentError("Select Claude settings and authentication.");
+	  return;
+	}
+	setNewAgentError("");
     setCreatingAgent(true);
     try {
 	  const config = {
@@ -810,9 +831,10 @@ export default function App() {
 		providerId: newRuntimeKind === "codex" && newProviderId !== "openai" ? newProviderId : "",
         model: newRuntimeKind === "codex" ? newModel.trim() : "",
         effort: newRuntimeKind === "codex" ? newEffort : "",
+		runtimeConfiguration: newRuntimeConfiguration,
 	  };
 	  const data = newAgentMode === "adopt"
-		? await api("POST", `/api/runtimes/${encodeURIComponent(newRuntimeKind)}/conversations/adopt`, { ...config, candidateId: inspectedCandidate!.id, expectedRevision: inspectedCandidate!.revision })
+		? await api("POST", `/api/runtimes/${encodeURIComponent(newRuntimeKind)}/conversations/adopt`, { ...config, ...adoptionWorkspaceRequest(inspectedCandidate!, newCwd) })
 		: await api("POST", "/api/agents", { ...config, cwd: newCwd.trim(), runtimeKind: newRuntimeKind });
       if (newDomain.trim()) {
         await api("PUT", `/api/agents/${encodeURIComponent(data.agent.id)}/profile`, { identity: "", domain: newDomain.trim(), scope: "", expectedVersion: 0 });
@@ -824,7 +846,10 @@ export default function App() {
       setNewModel("");
       setNewEffort("");
 	  setNewCandidateId("");
+	  setNewRuntimeConfiguration(undefined);
+	  setNewRuntimeKind("codex");
 	  setNewAgentMode("create");
+	  setNewAgentError("");
       setNewAgentOpen(false);
       await refresh();
       setOpenAgentIds((ids) => (ids.includes(data.agent.id) ? ids : [...ids, data.agent.id]));
@@ -836,7 +861,7 @@ export default function App() {
       setCurrent(data.agent.id);
 	  setView("agents");
     } catch (err: any) {
-      showToast(err.message);
+	  setNewAgentError(err.message);
     } finally {
       setCreatingAgent(false);
     }
@@ -1495,7 +1520,7 @@ export default function App() {
 
       {sidebarCollapsed ? <Button variant="outline" size="icon" onClick={() => setSidebarCollapsed(false)} title="Expand sidebar" aria-label="Expand sidebar" className="fixed bottom-3 left-3 z-20 hidden shadow-card md:inline-flex"><PanelLeftOpen /></Button> : null}
 
-      <Dialog open={newAgentOpen} onOpenChange={setNewAgentOpen}>
+      <Dialog open={newAgentOpen} onOpenChange={(open) => { setNewAgentOpen(open); if (!open) setNewAgentError(""); }}>
         <DialogContent>
           <DialogHeader>
 			<DialogTitle>{newAgentMode === "adopt" ? "Adopt conversation" : "Create agent"}</DialogTitle>
@@ -1506,33 +1531,63 @@ export default function App() {
 				<button type="button" onClick={() => setNewAgentMode("create")} className={`h-8 rounded-sm ${newAgentMode === "create" ? "bg-background font-medium shadow-sm" : "text-muted-foreground"}`}>Create new</button>
 				<button type="button" onClick={() => adoptionAvailable && setNewAgentMode("adopt")} disabled={!adoptionAvailable} title={adoptionAvailable ? "Adopt an existing conversation" : "Selected Runtime does not support discovery"} className={`h-8 rounded-sm ${newAgentMode === "adopt" ? "bg-background font-medium shadow-sm" : "text-muted-foreground"} disabled:opacity-40`}>Adopt existing</button>
 			</div>
-            <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
-              Agent name
-              <Input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="codex-research" spellCheck={false} />
-            </label>
+			<div className="space-y-1.5 text-[11px] text-muted-foreground">
+			  <label htmlFor="new-agent-name" className="block font-medium">Agent name</label>
+			  <Input id="new-agent-name" value={newName} onChange={(event) => { setNewName(event.target.value); if (newAgentError) setNewAgentError(agentNameError(event.target.value)); }} placeholder="研发助手" spellCheck={false} aria-invalid={Boolean(newAgentError && agentNameError(newName))} aria-describedby="new-agent-name-hint" />
+			  <span id="new-agent-name-hint" className="block text-[10px] leading-4">{agentNameHint}</span>
+			  {newAgentError && agentNameError(newName) ? <span role="alert" className="block text-[10px] leading-4 text-destructive">{newAgentError}</span> : null}
+			</div>
 			{newAgentMode === "create" ? <label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
 				Working directory
 				<Input value={newCwd} onChange={(event) => setNewCwd(event.target.value)} placeholder="/absolute/path/to/workspace" spellCheck={false} className="font-mono text-[12px]" />
 			</label> : null}
 			<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
 				Runtime
-				<select value={newRuntimeKind} onChange={(event) => { setNewRuntimeKind(event.target.value as CreateRuntimeKind); setNewCandidateId(""); }} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px]">
+				<select value={newRuntimeKind} onChange={(event) => { const kind = event.target.value as CreateRuntimeKind; setNewRuntimeKind(kind); setNewRuntimeConfiguration(defaultRuntimeConfiguration(kind)); setNewCandidateId(""); }} className="h-9 w-full rounded-sm border border-input bg-background px-3 font-mono text-[12px]">
 					{createRuntimeOptions(runtimeCatalogs).map((runtime) => <option key={runtime.runtimeKind} value={runtime.runtimeKind}>{runtimeLabel(runtime.runtimeKind)}</option>)}
 				</select>
 			</label>
+			{selectedRuntimeConfigurationSpec && newRuntimeConfiguration ? <div className="space-y-3 border-y border-border py-3">
+				<div><div className="text-[11px] font-semibold text-foreground">Claude settings</div><p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">Choose every native settings layer this Agent may load.</p></div>
+				<div className="grid gap-2 sm:grid-cols-3">
+					{selectedRuntimeConfigurationSpec.settingSources.map((source) => <label key={source.id} className="flex min-w-0 items-start gap-2 text-[10.5px]">
+						<input type="checkbox" checked={newRuntimeConfiguration.settingSources.includes(source.id)} onChange={(event) => setNewRuntimeConfiguration((current) => current && ({ ...current, settingSources: event.target.checked ? [...current.settingSources, source.id] : current.settingSources.filter((value) => value !== source.id) }))} className="mt-0.5 size-3.5 accent-primary" />
+						<span><span className="block font-medium text-foreground">{source.label}</span><span className="block leading-4 text-muted-foreground">{source.description}</span></span>
+					</label>)}
+				</div>
+				<div className="grid gap-3 sm:grid-cols-2">
+					<label className="text-[10.5px] font-medium text-muted-foreground">Authentication category
+						<select value={newRuntimeConfiguration.authentication.category} onChange={(event) => { const category = event.target.value; const source = selectedRuntimeConfigurationSpec.authentication.find((item) => item.category === category)?.sources[0]?.id || ""; setNewRuntimeConfiguration((current) => current && ({ ...current, authentication: { category, source } })); }} className="mt-1 h-9 w-full rounded-sm border border-input bg-background px-3 text-[12px]">
+							{selectedRuntimeConfigurationSpec.authentication.map((category) => <option key={category.category} value={category.category}>{category.label}</option>)}
+						</select>
+					</label>
+					<label className="text-[10.5px] font-medium text-muted-foreground">Authentication source
+						<select value={newRuntimeConfiguration.authentication.source} onChange={(event) => setNewRuntimeConfiguration((current) => current && ({ ...current, authentication: { ...current.authentication, source: event.target.value } }))} className="mt-1 h-9 w-full rounded-sm border border-input bg-background px-3 text-[12px]">
+							{selectedRuntimeConfigurationSpec.authentication.find((category) => category.category === newRuntimeConfiguration.authentication.category)?.sources.map((source) => <option key={source.id} value={source.id}>{source.label}</option>)}
+						</select>
+					</label>
+				</div>
+				{newRuntimeConfiguration.settingSources.length === 0 ? <p className="text-[10px] text-destructive">Select at least one settings source.</p> : null}
+			</div> : null}
 			{newAgentMode === "adopt" ? <>
 				<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
 					Native conversation
-					<select value={newCandidateId} onChange={(event) => setNewCandidateId(event.target.value)} disabled={conversationCandidatesQuery.isLoading} className="h-9 w-full rounded-sm border border-input bg-background px-3 text-[12px]">
+					<select value={newCandidateId} onChange={(event) => { setNewCandidateId(event.target.value); setNewCwd(""); }} disabled={conversationCandidatesQuery.isLoading} className="h-9 w-full rounded-sm border border-input bg-background px-3 text-[12px]">
 						<option value="">{conversationCandidatesQuery.isLoading ? "Discovering…" : "Select a conversation"}</option>
 						{(conversationCandidatesQuery.data?.candidates || []).map((candidate) => <option key={candidate.id} value={candidate.id} disabled={!candidate.compatible}>{candidate.name || "Untitled"} · {candidate.cwd}</option>)}
 					</select>
 				</label>
 				{inspectedCandidate ? <div className="rounded-md border border-border bg-muted/25 px-3 py-2 text-[10.5px] leading-4">
 					<div className="font-medium text-foreground">{inspectedCandidate.name || "Untitled conversation"}</div>
-					<div className="mt-1 break-all font-mono text-muted-foreground">{inspectedCandidate.cwd}</div>
+					<div className="mt-1 text-muted-foreground">Source conversation workspace</div>
+					<div className="break-all font-mono text-muted-foreground">{inspectedCandidate.cwd}</div>
 					<div className="mt-1 text-muted-foreground">Updated {new Date(inspectedCandidate.updatedAt).toLocaleString()} · {inspectedCandidate.compatible ? "Ready to adopt" : inspectedCandidate.compatibility || "Incompatible"}</div>
 				</div> : null}
+				<label className="block space-y-1.5 text-[11px] font-medium text-muted-foreground">
+					Stable Agent workspace
+					<Input value={newCwd} onChange={(event) => setNewCwd(event.target.value)} placeholder="/absolute/path/used-for-future-turns" spellCheck={false} className="font-mono text-[12px]" />
+					<span className="block text-[10px] font-normal leading-4">Future Turns resume the native conversation in this workspace. It may differ from the source workspace above.</span>
+				</label>
 			</> : null}
 			{newRuntimeKind === "codex" ? <>
             <div className="grid gap-3 sm:grid-cols-2">
@@ -1576,9 +1631,10 @@ export default function App() {
               Domain <span className="font-normal text-muted-foreground/70">optional</span>
               <textarea value={newDomain} onChange={(event) => setNewDomain(event.target.value)} placeholder="The enduring subject this Agent will maintain" rows={3} className="w-full resize-y rounded-sm border border-input bg-background px-3 py-2 text-[12px] leading-5 outline-none focus:border-ring focus:ring-2 focus:ring-ring/15" />
             </label>
+			{newAgentError && !agentNameError(newName) ? <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">{newAgentError}</div> : null}
           </div>
           <DialogFooter showCloseButton>
-            <Button onClick={create} disabled={creatingAgent || (newAgentMode === "create" && newRuntimeKind === "codex" && creatableProviders.length === 0) || (newAgentMode === "adopt" && !inspectedCandidate?.compatible)}>{creatingAgent ? <span className="spinner size-3" /> : <Plus />}{creatingAgent ? (newAgentMode === "adopt" ? "Adopting" : "Creating") : (newAgentMode === "adopt" ? "Adopt conversation" : "Create agent")}</Button>
+            <Button onClick={create} disabled={creatingAgent || Boolean(selectedRuntimeConfigurationSpec && !newRuntimeConfiguration?.settingSources.length) || (newAgentMode === "create" && newRuntimeKind === "codex" && creatableProviders.length === 0) || (newAgentMode === "adopt" && !inspectedCandidate?.compatible)}>{creatingAgent ? <span className="spinner size-3" /> : <Plus />}{creatingAgent ? (newAgentMode === "adopt" ? "Adopting" : "Creating") : (newAgentMode === "adopt" ? "Adopt conversation" : "Create agent")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1648,6 +1704,9 @@ export default function App() {
                 onSelectAgent={selectAgent}
                 onOpenNeedsYou={selectNeedsYou}
                 onOpenExternal={selectIntegrations}
+				onOpenMessages={selectMessages}
+				onOpenSchedules={selectSchedules}
+				onOpenTopics={selectTopics}
               />
             ) : view === "settings" ? (
               <SettingsPane

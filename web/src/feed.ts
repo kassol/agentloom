@@ -146,6 +146,7 @@ export type Block =
       id: string;
       ts?: string;
       command: string;
+      description?: string;
       status: string;
       exitCode: number | null;
       durationMs: number | null;
@@ -316,10 +317,11 @@ function reduceCanonicalRuntimeEvent(state: FeedState, ev: LoomEvent): FeedState
     case "tool_call": {
       const key = `c:${id}`;
       const command = runtimeToolCommand(content.toolCall);
+      const description = typeof content.toolCall?.description === "string" ? content.toolCall.description.trim() : "";
       if (state.index[key] === undefined) {
-		return push(state, { kind: "command", id, ts: ev.ts, command, status: "running", exitCode: null, durationMs: null, output: "" }, key);
+		return push(state, { kind: "command", id, ts: ev.ts, command, ...(description ? { description } : {}), status: "running", exitCode: null, durationMs: null, output: "" }, key);
       }
-      return update(state, key, (block) => block.kind === "command" ? { ...block, command: command || block.command } : block);
+      return update(state, key, (block) => block.kind === "command" ? { ...block, command: command || block.command, ...(description ? { description } : {}) } : block);
     }
     case "tool_result": {
       const toolCallId = content.toolResult?.toolCallId || id;

@@ -428,6 +428,35 @@ describe("AgentPane scroll restoration", () => {
 	expect(view.getByRole("button", { name: "Disable review" })).toBeDisabled();
   });
 
+	it("shows pathless Claude resources and configuration evidence without native paths", async () => {
+	const resourceAgent: Agent = { ...testAgent, runtimeBinding: { kind: "claude" }, processAlive: true, capabilitySnapshot: capabilitySnapshot("resource_inventory") };
+	vi.mocked(fetch).mockImplementation(async (input) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  if (url.endsWith("/skills")) return new Response(JSON.stringify({ resources: {
+		agentId: resourceAgent.id, agentName: resourceAgent.name, runtimeKind: "claude", revision: "claude-resources-1", semantics: "Claude native resources",
+		resources: [
+		  { id: "command:review", name: "review", kind: "command", enabled: true, status: "ready", source: "project settings" },
+		  { id: "mcp:github", name: "github", kind: "mcp", enabled: true, status: "connected", path: "/Users/owner/.claude/native.json", description: "Loaded from /Users/owner/.claude/native.json" },
+		  { id: "extension:tools", name: "tools", kind: "extension", enabled: false, status: "disabled" },
+		],
+		configuration: { settingSources: ["user", "project"], authentication: { category: "console", source: "api_key", validation: "accepted", evidence: [{ kind: "native_ack", summary: "API key accepted" }] } },
+		policy: { available: false, mutable: false, effective: false, reason: "Claude policy is native", alternative: "use Claude settings" },
+	  } }), { status: 200, headers: { "Content-Type": "application/json" } });
+	  return new Response(JSON.stringify(url.includes("/thread/history") ? { total: 0, turns: [] } : { artifacts: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+	const view = render(<AgentPane {...props} agent={resourceAgent} active configRequestNonce={1} />);
+	fireEvent.click(view.getByRole("button", { name: "Resources" }));
+	expect(await view.findByText("user · project")).toBeInTheDocument();
+	expect(view.getByText("console / api_key · accepted")).toBeInTheDocument();
+	expect(view.getByText(/API key accepted/)).toBeInTheDocument();
+	expect(view.getByText("command")).toBeInTheDocument();
+	expect(view.getByText("mcp")).toBeInTheDocument();
+	expect(view.getByText("extension")).toBeInTheDocument();
+	expect(view.container).not.toHaveTextContent("project settings");
+	expect(view.container).not.toHaveTextContent("/Users/owner/.claude/native.json");
+	expect(view.queryByRole("button", { name: "Disable review" })).not.toBeInTheDocument();
+  });
+
   it("keeps Runtime model and Agent config saves independent on failure", async () => {
 	const onError = vi.fn();
 	vi.mocked(fetch).mockImplementation(async (input, init) => {
@@ -465,6 +494,23 @@ describe("AgentPane scroll restoration", () => {
 	const view = render(<AgentPane {...props} agent={agent} active configRequestNonce={1} />);
 	expect(view.getByText("Sandbox").closest("label")?.querySelector("select")).toBeDisabled();
 	expect(view.getByText("Approval Policy").closest("label")?.querySelector("select")).toBeEnabled();
+  });
+
+  it("allows a Unicode Agent name when saving config", async () => {
+	const onAgentUpdated = vi.fn();
+	vi.mocked(fetch).mockImplementation(async (input, init) => {
+	  const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+	  if (url.endsWith("/config") && init?.method === "PATCH") {
+		const body = JSON.parse(String(init.body));
+		return new Response(JSON.stringify({ agent: { ...testAgent, name: body.name } }), { status: 200, headers: { "Content-Type": "application/json" } });
+	  }
+	  return new Response(JSON.stringify(url.includes("/thread/history") ? { total: 0, turns: [] } : { artifacts: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+	});
+	const view = render(<AgentPane {...props} onAgentUpdated={onAgentUpdated} active configRequestNonce={1} />);
+	const nameInput = await waitFor(() => view.getByText("Name").closest("label")?.querySelector("input") as HTMLInputElement);
+	fireEvent.change(nameInput, { target: { value: "产品负责人" } });
+	fireEvent.click(view.getByRole("button", { name: "Save Agent Config" }));
+	await waitFor(() => expect(onAgentUpdated).toHaveBeenCalledWith(expect.objectContaining({ name: "产品负责人" })));
   });
 
   it("reconciles the current Goal after an optimistic revision conflict", async () => {

@@ -56,6 +56,20 @@ describe("Runtime-normalized live events", () => {
     ]);
   });
 
+  it("keeps an exec purpose as the primary label while retaining the raw command", () => {
+    const toolCall = { name: "exec_command", description: "Confirm the repository state", arguments: { command: "git status --short" } };
+    const live = reduceFeed(emptyFeed, {
+      seq: 1, ts: "2026-08-13T00:00:00Z", type: "loom/runtime-event",
+      data: { kind: "content", contentPhase: "started", content: { id: "call-1", kind: "tool_call", toolCall } },
+    });
+    expect(live.blocks[0]).toMatchObject({ kind: "command", command: "git status --short", description: "Confirm the repository state" });
+
+    const history = reduceFeed(emptyFeed, { seq: 0, ts: "", type: "__history__", data: { turns: [{
+      turnId: "turn-history", state: "completed", content: [{ id: "call-history", kind: "tool_call", toolCall }],
+    }] } });
+    expect(history.blocks[0]).toMatchObject({ kind: "command", command: "git status --short", description: "Confirm the repository state" });
+  });
+
   it("shows one control error for paired terminal events and never invents tool success", () => {
     const events = [
       { type: "loom/runtime-event", data: { kind: "content", turnId: "turn-1", contentPhase: "completed", content: { id: "call-1", kind: "tool_call", toolCall: { name: "bash", arguments: { command: "deploy --prod" } } } } },

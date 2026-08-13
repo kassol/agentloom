@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, BarChart3, CheckCircle2, CircleHelp, Inbox, RadioTower, Users } from "lucide-react";
+import { Activity, AlertTriangle, BarChart3, CalendarClock, CheckCircle2, CircleHelp, Inbox, MessageSquare, RadioTower, ShieldCheck, Users } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import type { Agent, HumanRequest, InboxEntry, PlatformConnection, RemoteSnapshot } from "./types";
@@ -22,6 +22,9 @@ export function OverviewPane({
   onSelectAgent,
   onOpenNeedsYou,
   onOpenExternal,
+	onOpenMessages,
+	onOpenSchedules,
+	onOpenTopics,
 }: {
   section: OverviewSection;
   agents: Agent[];
@@ -32,6 +35,9 @@ export function OverviewPane({
   onSelectAgent: (id: string) => void;
   onOpenNeedsYou: (requestID?: string) => void;
   onOpenExternal: () => void;
+	onOpenMessages: () => void;
+	onOpenSchedules: () => void;
+	onOpenTopics: (topicID?: string) => void;
 }) {
   const [range, setRange] = useState<UsageDateRange>(() => readUsageLocation(window.location.hash));
   return (
@@ -58,6 +64,9 @@ export function OverviewPane({
           onOpenNeedsYou={onOpenNeedsYou}
           onOpenCapacity={() => onSectionChange("capacity")}
           onOpenExternal={onOpenExternal}
+		  onOpenMessages={onOpenMessages}
+		  onOpenSchedules={onOpenSchedules}
+		  onOpenTopics={onOpenTopics}
         />
       ) : section === "capacity" ? (
         <CapacityPane onSelectAgent={onSelectAgent} embedded controlledRange={range} onControlledRangeChange={setRange} />
@@ -76,7 +85,7 @@ function OverviewTab({ active, icon: Icon, label, onClick }: { active: boolean; 
   );
 }
 
-function StatusOverview({ agents, requests, entries, remote, onSelectAgent, onOpenNeedsYou, onOpenCapacity, onOpenExternal }: {
+function StatusOverview({ agents, requests, entries, remote, onSelectAgent, onOpenNeedsYou, onOpenCapacity, onOpenExternal, onOpenMessages, onOpenSchedules, onOpenTopics }: {
   agents: Agent[];
   requests: HumanRequest[];
   entries: InboxEntry[];
@@ -85,6 +94,9 @@ function StatusOverview({ agents, requests, entries, remote, onSelectAgent, onOp
   onOpenNeedsYou: (requestID?: string) => void;
   onOpenCapacity: () => void;
   onOpenExternal: () => void;
+	onOpenMessages: () => void;
+	onOpenSchedules: () => void;
+	onOpenTopics: (topicID?: string) => void;
 }) {
   const connectionsQuery = useQuery<{ connections: PlatformConnection[] }>({
     queryKey: ["overview-connections"],
@@ -95,6 +107,9 @@ function StatusOverview({ agents, requests, entries, remote, onSelectAgent, onOp
   const enabledConnections = connections.filter((connection) => connection.enabled);
   const executing = agents.filter(isAgentExecuting);
   const openRequests = requests.filter((request) => request.state === "open");
+	const pendingApprovals = agents.flatMap((agent) => agent.pendingApprovals.filter((approval) => approval.status === "pending").map((approval) => ({ agent, approval })));
+	const managedWaits = agents.filter((agent) => ["waiting_external", "waiting_agent", "waiting_time"].includes(agent.workDisposition?.kind || ""));
+	const unclassifiedStops = agents.filter((agent) => agent.workDisposition?.kind === "unclassified");
   const activeEntries = entries.filter((entry) => !["handled", "cancelled"].includes(entry.item.state));
   const failedEntries = activeEntries.filter((entry) => ["failed", "pending_access", "interrupted"].includes(entry.item.state));
   const agentHealth = agents.map((agent) => ({
@@ -151,6 +166,33 @@ function StatusOverview({ agents, requests, entries, remote, onSelectAgent, onOp
                 {openRequests.length === 0 ? <div className="px-2 py-6 text-center text-[11px] text-muted-foreground">No Owner decision waiting.</div> : null}
               </div>
             </section>
+
+			<section className="min-w-0">
+			  <div className="mb-2 flex items-center justify-between"><h2 className="text-[12px] font-semibold uppercase text-muted-foreground">Work destinations</h2><span className={`font-mono text-[9.5px] ${pendingApprovals.length || unclassifiedStops.length ? "text-warning" : "text-muted-foreground"}`}>{pendingApprovals.length + managedWaits.length + unclassifiedStops.length ? "managed state" : "clear"}</span></div>
+			  <div className="divide-y divide-border border-y border-border">
+				{pendingApprovals.map(({ agent, approval }) => (
+				  <button key={approval.approvalId} type="button" onClick={() => onSelectAgent(agent.id)} className="flex w-full min-w-0 items-center gap-3 px-2 py-3 text-left hover:bg-muted/40" aria-label={`Open pending approval for ${agent.name}`}>
+					<ShieldCheck className="size-3.5 shrink-0 text-warning" /><span className="min-w-0 flex-1"><span className="block truncate text-[12px] font-semibold">Pending approvals</span><span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">{agent.name} · {approval.method}</span></span>
+				  </button>
+				))}
+				{managedWaits.map((agent) => {
+				  const disposition = agent.workDisposition!;
+				  const wake = disposition.wakeSources?.[0];
+				  const label = disposition.kind === "waiting_external" ? "Waiting on external fact" : disposition.kind === "waiting_agent" ? "Waiting on Agent" : "Waiting until scheduled time";
+				  const Icon = disposition.kind === "waiting_external" ? RadioTower : disposition.kind === "waiting_agent" ? MessageSquare : CalendarClock;
+				  const open = disposition.kind === "waiting_agent" ? onOpenMessages : disposition.kind === "waiting_time" ? onOpenSchedules : wake?.topicId || disposition.topicId ? () => onOpenTopics(wake?.topicId || disposition.topicId) : () => onSelectAgent(agent.id);
+				  return <button key={agent.id} type="button" onClick={open} className="flex w-full min-w-0 items-center gap-3 px-2 py-3 text-left hover:bg-muted/40" aria-label={`Open ${disposition.kind === "waiting_agent" ? "Agent Message" : disposition.kind === "waiting_time" ? "Schedule" : "external"} wait for ${agent.name}`}>
+					<Icon className="size-3.5 shrink-0 text-[var(--loom-teal)]" /><span className="min-w-0 flex-1"><span className="block truncate text-[12px] font-semibold">{label}</span><span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">{agent.name}{wake?.summary ? ` · ${wake.summary}` : ""}</span></span>
+				  </button>;
+				})}
+				{unclassifiedStops.map((agent) => (
+				  <button key={agent.id} type="button" onClick={() => onSelectAgent(agent.id)} className="flex w-full min-w-0 items-center gap-3 px-2 py-3 text-left hover:bg-muted/40" aria-label={`Open stopped Agent ${agent.name}`}>
+					<AlertTriangle className="size-3.5 shrink-0 text-warning" /><span className="min-w-0 flex-1"><span className="block truncate text-[12px] font-semibold">Missing durable next step</span><span className="mt-0.5 block text-[10.5px] text-muted-foreground">{agent.name} · Create Needs You if Owner input is required; otherwise add the matching managed wake.</span></span>
+				  </button>
+				))}
+				{pendingApprovals.length === 0 && managedWaits.length === 0 && unclassifiedStops.length === 0 ? <div className="px-2 py-6 text-center text-[11px] text-muted-foreground">No unclassified stopped work.</div> : null}
+			  </div>
+			</section>
 
             <section className="min-w-0">
               <div className="mb-2 flex items-center justify-between"><h2 className="text-[12px] font-semibold uppercase text-muted-foreground">Team Health</h2><span className={`font-mono text-[9.5px] ${agentHealth.length > 0 || connectorIssues.length > 0 || connectionsQuery.isError ? "text-destructive" : "text-muted-foreground"}`}>{agentHealth.length > 0 || connectorIssues.length > 0 || connectionsQuery.isError ? "capability issues" : "clear"}</span></div>
