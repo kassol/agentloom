@@ -327,7 +327,8 @@ func TestCodexDisconnectAfterTurnStartWriteIsInterruptedAndReconciledOnce(t *tes
 	for time.Now().Before(deadline) {
 		view, _ := h.GetAgent(agent.ID)
 		requests, _ := h.ListHumanRequests(agent.ID, "all")
-		if view.LastTurn != nil && view.LastTurn.Status == "interrupted" && len(requests) == 1 {
+		if view.LastTurn != nil && view.LastTurn.Status == "interrupted" && len(requests) == 1 &&
+			validCodexTransportRecovery(view.Recovery) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -343,8 +344,12 @@ func TestCodexDisconnectAfterTurnStartWriteIsInterruptedAndReconciledOnce(t *tes
 	if view.LastTurn == nil || view.LastTurn.Status != "interrupted" || len(requests) != 1 {
 		t.Fatalf("uncertain Codex Turn truth = Agent %#v requests=%#v", view.Agent, requests)
 	}
-	if view.Recovery == nil || view.Recovery.Cause != "process_exit" || view.Recovery.RuntimeKind != "codex" {
-		t.Fatalf("Codex process exit recovery = %#v", view.Recovery)
+	if !validCodexTransportRecovery(view.Recovery) {
+		t.Fatalf("Codex transport recovery = %#v", view.Recovery)
+	}
+	if view.Recovery.Cause == "command_indeterminate" &&
+		(view.Recovery.FailurePhase != string(runtimecontract.FailurePhaseTurnStart) || view.Recovery.FailureCode != "transport_closed") {
+		t.Fatalf("typed Codex transport recovery = %#v", view.Recovery)
 	}
 	if !strings.Contains(requests[0].Context, "may have partially completed") {
 		t.Fatalf("Needs You lacks actionable uncertainty: %#v", requests[0])
@@ -352,6 +357,11 @@ func TestCodexDisconnectAfterTurnStartWriteIsInterruptedAndReconciledOnce(t *tes
 	if got := countMethod(readRequestMethods(t, logPath), "turn/start"); got != 1 {
 		t.Fatalf("uncertain original prompt was replayed: turn/start count=%d", got)
 	}
+}
+
+func validCodexTransportRecovery(recovery *RecoveryView) bool {
+	return recovery != nil && recovery.RuntimeKind == "codex" &&
+		(recovery.Cause == "process_exit" || recovery.Cause == "command_indeterminate")
 }
 
 func TestTypedIndeterminatePersistsCommandCauseAndFailureIdentity(t *testing.T) {
