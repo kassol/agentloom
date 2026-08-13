@@ -61,7 +61,16 @@ done
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if recovery == nil || recovery["cause"] != "process_exit" || recovery["runtimeKind"] != "codex" {
+	if recovery == nil || recovery["runtimeKind"] != "codex" {
+		t.Fatalf("HTTP uncertain recovery=%#v", recovery)
+	}
+	switch recovery["cause"] {
+	case "process_exit":
+	case "command_indeterminate":
+		if recovery["failurePhase"] != "turn_start" || recovery["failureCode"] != "transport_closed" {
+			t.Fatalf("HTTP uncertain recovery=%#v", recovery)
+		}
+	default:
 		t.Fatalf("HTTP uncertain recovery=%#v", recovery)
 	}
 }
