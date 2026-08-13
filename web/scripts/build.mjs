@@ -39,7 +39,7 @@ const previousFiles = oldCurrentFiles.size > 0
     ? new Set(JSON.parse(readFileSync(previousAssetsPath, "utf8")))
     : filesBeforeBuild;
 
-execFileSync(path.join(webDir, "node_modules/.bin/vite"), ["build"], {
+execFileSync(process.execPath, [path.join(webDir, "node_modules/vite/bin/vite.js"), "build"], {
   cwd: webDir,
   stdio: "inherit",
 });
