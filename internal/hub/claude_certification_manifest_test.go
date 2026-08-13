@@ -113,6 +113,19 @@ func TestClaudePreviewWorkflowDefinesFourRequiredRowsAndGatesMissingResults(t *t
 	if !strings.Contains(string(smoke), generation) || !strings.Contains(string(verifier), generation) {
 		t.Fatalf("preview scripts do not require current generation %q", generation)
 	}
+	releaseGates, err := os.ReadFile(filepath.Join("..", "..", "scripts", "verify-release-gates.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string][]byte{
+		"run-claude-preview-smoke.sh":      smoke,
+		"verify-claude-preview-results.sh": verifier,
+		"verify-release-gates.sh":          releaseGates,
+	} {
+		if strings.Contains(string(content), "rg ") {
+			t.Fatalf("%s depends on non-portable ripgrep availability", path)
+		}
+	}
 }
 
 func TestClaudePreviewResultVerifierRequiresCurrentCommitAndAllRows(t *testing.T) {

@@ -45,10 +45,10 @@ else
   ) >"$log_file" 2>&1
   code=$?
   set -e
-  if [ "$code" -eq 0 ] && rg -q -- '--- PASS: TestClaudeRuntimeManagedGenerationRealSmoke' "$log_file"; then
+  if [ "$code" -eq 0 ] && grep -Fq -- '--- PASS: TestClaudeRuntimeManagedGenerationRealSmoke' "$log_file"; then
     status=passed
     reason=verified
-  elif [ "$code" -eq 0 ] && rg -q -- '--- SKIP: TestClaudeRuntimeManagedGenerationRealSmoke' "$log_file"; then
+  elif [ "$code" -eq 0 ] && grep -Fq -- '--- SKIP: TestClaudeRuntimeManagedGenerationRealSmoke' "$log_file"; then
     status=missing
     reason=smoke_skipped
   else
