@@ -147,6 +147,14 @@ func newClaudeRuntimeHostDriver(st *store.Store, options claudebridge.DriverOpti
 	return d
 }
 
+// NewClaudeRuntimeHostDriver constructs the Claude Driver around an explicit
+// supervised bridge resolver. Production uses the managed-generation
+// constructor below; deterministic cross-package certification uses this seam
+// to exercise the same Driver and Contract without a model or credential.
+func NewClaudeRuntimeHostDriver(st *store.Store, options claudebridge.DriverOptions) RuntimeHostDriver {
+	return newClaudeRuntimeHostDriver(st, options)
+}
+
 func newDefaultClaudeRuntimeHostDriver(st *store.Store, manager *claudegen.Manager) *claudeRuntimeHostDriver {
 	if manager == nil {
 		manager = claudegen.Default()
@@ -195,6 +203,7 @@ func (d *claudeRuntimeHostDriver) Acquire(ctx context.Context, request AgentHost
 	contract.cwd = request.Cwd
 	host := &claudeAgentHost{bridge: bridge, contract: contract}
 	contract.host = host
+	contract.release = host.Close
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.shutdown {
@@ -359,11 +368,20 @@ type claudeRuntimeContract struct {
 	opPhases                  map[string]runtimecontract.FailurePhase
 	opTurns                   map[string]string
 	pendingContext            map[string]*runtimecontract.ContextEvidence
+	predecessorByTurn         map[string]string
 	afterLedgerCommitForTest  func()
 	beforeLedgerCommitForTest func()
 	historyBoundary           *HistoryBoundary
 	historyBoundaryCommit     func(string) error
 	divergenceRevision        string
+	certificationPolicy       *claudeCertificationTurnPolicy
+}
+
+type claudeCertificationTurnPolicy struct {
+	Purpose      string   `json:"purpose"`
+	AllowedTools []string `json:"allowedTools"`
+	MaxTurns     int      `json:"maxTurns"`
+	MaxBudgetUSD float64  `json:"maxBudgetUsd"`
 }
 
 type claudeCallback struct {
@@ -377,7 +395,7 @@ type claudeCallback struct {
 func newClaudeRuntimeContract(agentID string, st *store.Store, bridge *claudebridge.Bridge) *claudeRuntimeContract {
 	c := &claudeRuntimeContract{
 		agentID: agentID, st: st, bridge: bridge, terminal: map[string]bool{}, waiting: map[string]bool{}, fenced: map[string]bool{}, pendingOps: map[string]bool{}, terminalOps: map[string]string{},
-		opPhases: map[string]runtimecontract.FailurePhase{}, opTurns: map[string]string{}, callbacks: map[string]claudeCallback{}, callbackProposals: map[string]string{}, pendingContext: map[string]*runtimecontract.ContextEvidence{},
+		opPhases: map[string]runtimecontract.FailurePhase{}, opTurns: map[string]string{}, callbacks: map[string]claudeCallback{}, callbackProposals: map[string]string{}, pendingContext: map[string]*runtimecontract.ContextEvidence{}, predecessorByTurn: map[string]string{},
 	}
 	if bridge != nil {
 		c.generationID = bridge.GenerationID()
@@ -553,6 +571,15 @@ func (c *claudeRuntimeContract) SetRuntimeEffort(effort string) {
 func (c *claudeRuntimeContract) SetRuntimeModelImageEvidence(evidence runtimeModelImageEvidence) {
 	c.mu.Lock()
 	c.imageInput = evidence.Available && evidence.GenerationID != "" && evidence.GenerationID == c.generationID && evidence.ModelID == c.model
+	c.mu.Unlock()
+}
+
+func (c *claudeRuntimeContract) setCertificationTurnPolicy(policy claudeCertificationTurnPolicy) {
+	c.mu.Lock()
+	cloned := policy
+	cloned.AllowedTools = make([]string, len(policy.AllowedTools))
+	copy(cloned.AllowedTools, policy.AllowedTools)
+	c.certificationPolicy = &cloned
 	c.mu.Unlock()
 }
 
@@ -843,6 +870,9 @@ func (c *claudeRuntimeContract) CreateBinding(ctx context.Context, request runti
 }
 
 func (c *claudeRuntimeContract) ResumeBinding(ctx context.Context, binding runtimecontract.Binding) runtimecontract.Outcome {
+	if err := ctx.Err(); err != nil {
+		return claudeFailure(runtimecontract.LifecycleRejected, runtimecontract.FailurePhaseBindingResume, "binding_resume_cancelled", err)
+	}
 	c.mu.Lock()
 	unstarted, ledgerErr := len(c.turns) == 0 && !c.observed, c.ledgerErr
 	boundaryRevision := ""
@@ -855,9 +885,6 @@ func (c *claudeRuntimeContract) ResumeBinding(ctx context.Context, binding runti
 		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseBindingResume, "ledger_unavailable", ledgerErr)
 	}
 	if unstarted {
-		if err := ctx.Err(); err != nil {
-			return claudeFailure(runtimecontract.LifecycleRejected, runtimecontract.FailurePhaseBindingResume, "binding_resume_cancelled", err)
-		}
 		return runtimecontract.Outcome{State: runtimecontract.LifecycleCompleted}
 	}
 	response, outcome := c.command(ctx, "resume_binding", "", runtimecontract.FailurePhaseBindingResume, map[string]any{"sessionRef": binding.NativeRef, "cwd": c.cwd, "expectedRevision": boundaryRevision})
@@ -889,6 +916,9 @@ func (c *claudeRuntimeContract) seedTurnBindings(bindings map[string]string) {
 }
 
 func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimecontract.TurnRequest) runtimecontract.Outcome {
+	if err := ctx.Err(); err != nil {
+		return claudeFailure(runtimecontract.LifecycleRejected, runtimecontract.FailurePhaseTurnStart, "turn_start_cancelled", err)
+	}
 	if failure := c.ValidateInput(ctx, request.Binding, request.Input); failure != nil {
 		return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: failure}
 	}
@@ -907,8 +937,9 @@ func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimeco
 		boundaryRevision = c.historyBoundary.NativeRevision
 	}
 	configuration := c.runtimeConfigurationPayloadLocked()
+	certificationPolicy := c.certificationPolicy
 	c.mu.Unlock()
-	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input, "model": model, "thinkingLevel": effort, "configuration": configuration, "boundaryRevision": boundaryRevision})
+	response, outcome := c.command(ctx, "start_turn", request.TurnID, runtimecontract.FailurePhaseTurnStart, map[string]any{"sessionRef": request.Binding.NativeRef, "cwd": c.cwd, "resume": resume, "input": request.Input, "model": model, "thinkingLevel": effort, "configuration": configuration, "boundaryRevision": boundaryRevision, "certificationPolicy": certificationPolicy})
 	if outcome.State != runtimecontract.LifecycleAccepted {
 		var rejected struct {
 			Code           string `json:"code"`
@@ -944,12 +975,20 @@ func (c *claudeRuntimeContract) StartTurn(ctx context.Context, request runtimeco
 }
 
 func (c *claudeRuntimeContract) ContinueTurn(ctx context.Context, request runtimecontract.CausalInput) runtimecontract.Outcome {
+	if err := ctx.Err(); err != nil {
+		return claudeFailure(runtimecontract.LifecycleRejected, runtimecontract.FailurePhaseTurnContinue, "turn_continue_cancelled", err)
+	}
 	if failure := c.ValidateInput(ctx, request.Binding, request.Input); failure != nil {
 		return runtimecontract.Outcome{State: runtimecontract.LifecycleRejected, Failure: failure}
 	}
 	if err := c.persistLedgerFence(); err != nil {
 		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseTurnContinue, "ledger_unavailable", err)
 	}
+	c.mu.Lock()
+	if request.PredecessorTurnID != "" {
+		c.predecessorByTurn[request.TurnID] = request.PredecessorTurnID
+	}
+	c.mu.Unlock()
 	_, outcome := c.command(ctx, "continue_turn", request.TurnID, runtimecontract.FailurePhaseTurnContinue, map[string]any{"sessionRef": request.Binding.NativeRef, "runtimeTurnRef": request.RuntimeTurnRef, "input": request.Input})
 	if outcome.State == runtimecontract.LifecycleAccepted {
 		if evidence := claudeContextEvidence(request.TurnID, request.Input, "user"); evidence != nil {
@@ -987,6 +1026,9 @@ func (c *claudeRuntimeContract) persistAcceptedContext(turnID string, evidence *
 }
 
 func (c *claudeRuntimeContract) InterruptTurn(ctx context.Context, request runtimecontract.TurnTarget) runtimecontract.Outcome {
+	if err := ctx.Err(); err != nil {
+		return claudeFailure(runtimecontract.LifecycleRejected, runtimecontract.FailurePhaseTurnInterrupt, "turn_interrupt_cancelled", err)
+	}
 	if err := c.persistLedgerFence(); err != nil {
 		return claudeFailure(runtimecontract.LifecycleFailed, runtimecontract.FailurePhaseTurnInterrupt, "ledger_unavailable", err)
 	}
@@ -1098,7 +1140,10 @@ func (c *claudeRuntimeContract) CapabilitySnapshot(context.Context, runtimecontr
 	return claudeControlPlaneCapabilitySnapshot(imageInput)
 }
 
-func (c *claudeRuntimeContract) CloseBinding(context.Context, runtimecontract.Binding) runtimecontract.Outcome {
+func (c *claudeRuntimeContract) CloseBinding(ctx context.Context, _ runtimecontract.Binding) runtimecontract.Outcome {
+	if err := ctx.Err(); err != nil {
+		return claudeFailure(runtimecontract.LifecycleRejected, runtimecontract.FailurePhaseClose, "binding_close_cancelled", err)
+	}
 	if c.release != nil {
 		c.release()
 	}
@@ -1179,6 +1224,7 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 		return
 	}
 	c.mu.Lock()
+	event.PredecessorTurnID = c.predecessorByTurn[event.TurnID]
 	nativeRevision := ""
 	if event.Kind == runtimecontract.EventTerminal {
 		var terminal struct {
@@ -1218,6 +1264,9 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 		nextTerminal[turnID] = terminal
 	}
 	turn := claudeLedgerTurn(&nextTurns, event.TurnID)
+	if event.PredecessorTurnID != "" {
+		turn.PredecessorTurnID = event.PredecessorTurnID
+	}
 	switch event.Kind {
 	case runtimecontract.EventTurnStarted:
 		turn.State = runtimecontract.LifecycleAccepted
@@ -1292,6 +1341,7 @@ func (c *claudeRuntimeContract) handleBridgeEvent(source claudebridge.Event) {
 	c.turns, c.terminal = nextTurns, nextTerminal
 	if event.Kind == runtimecontract.EventTerminal {
 		delete(c.waiting, event.TurnID)
+		delete(c.predecessorByTurn, event.TurnID)
 		for operation, turnID := range c.opTurns {
 			if turnID == event.TurnID {
 				delete(c.opPhases, operation)

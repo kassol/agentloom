@@ -174,15 +174,27 @@ the Web or Hub to route through a hidden per-Agent fallback.
 ## Certification
 
 The shared conformance runner executes the same causal story for Codex, Pi,
-and a minimal Driver/Host/Contract fixture: create, resume, configuration hook
-effects, start, ordered typed stream, history, continue on the same binding and
-Turn, interrupt, typed failure phases, close ownership, Driver shutdown, Store
-reopen, identity-preserving acquire, and idempotent close/shutdown. Every
-advertised capability is exercised; an unrecognized available capability is a
-test failure.
+Claude, and a minimal Driver/Host/Contract fixture: create, resume,
+configuration hook effects, start, ordered typed stream, history, continue on
+the same binding and Turn, interrupt, typed failure phases, close ownership,
+Driver shutdown, Store reopen, identity-preserving acquire, and idempotent
+close/shutdown. Claude uses its Store-backed Canonical Turn Ledger and
+supervised bridge reopen in this runner; it does not substitute a Claude-only
+story. Every advertised capability is exercised; an unrecognized available
+capability is a test failure. Goal remains Loom-owned, so an available Goal
+descriptor is certified through the shared Loom Goal behavior and does not
+require a Claude-native hook.
 
 Deterministic fake protocol processes cover ordering, steering, interruption,
 failure, and recovery in CI. The opt-in `CODEX_REAL_BIN` and `PI_REAL_BIN`
 smokes prove that the supported official binaries can traverse the same
 Driver/Contract boundary and preserve binding and canonical history across a
-real process restart. They complement rather than replace the shared suite.
+real process restart. The opt-in Claude smoke instead resolves the exact active
+managed generation and requires `CLAUDE_REAL_SMOKE=1` plus an explicit
+`CLAUDE_REAL_API_KEY`. It performs one no-tool, no-write, low-budget Turn and
+certifies typed content/usage, interrupt receipt plus terminal, Canonical Ledger
+History after bridge and Store reopen, and complete process-tree cleanup. These
+real smokes complement rather than replace the shared suite. See
+[Claude Runtime developer-preview certification](claude-runtime-certification.md)
+for the four-platform result contract; missing results keep production support
+gated.

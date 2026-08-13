@@ -487,9 +487,20 @@ func New(st *store.Store) *Hub {
 // canaries: it loads projections without importing external registries,
 // reconciling live runtime state, or starting workers.
 type OpenOptions struct {
-	Passive           bool
-	RuntimeAPIURL     string
-	ClaudeGenerations *claudegen.Manager
+	Passive            bool
+	RuntimeAPIURL      string
+	ClaudeGenerations  *claudegen.Manager
+	RuntimeHostDrivers map[string]RuntimeHostDriver
+}
+
+func cloneRuntimeHostDrivers(source map[string]RuntimeHostDriver) map[string]RuntimeHostDriver {
+	cloned := make(map[string]RuntimeHostDriver, len(source))
+	for kind, driver := range source {
+		if driver != nil {
+			cloned[kind] = driver
+		}
+	}
+	return cloned
 }
 
 // Open loads all durable projections before starting background work. Required
@@ -563,7 +574,7 @@ func OpenWithOptions(st *store.Store, options OpenOptions) (*Hub, error) {
 		goals:                        map[string]*ThreadGoal{},
 		seqs:                         map[string]int64{},
 		runtimes:                     map[string]*runtime{},
-		runtimeHostDrivers:           map[string]RuntimeHostDriver{},
+		runtimeHostDrivers:           cloneRuntimeHostDrivers(options.RuntimeHostDrivers),
 		turnRecoveryInFlight:         map[string]bool{},
 		subs:                         map[string]map[*subscriber]struct{}{},
 		globalSubs:                   map[*subscriber]struct{}{},

@@ -23,6 +23,9 @@ activation is a separate explicit operation. Activation retains one compatible
 previous generation for explicit rollback and never rolls back automatically.
 The acknowledgement is tied to Anthropic's Commercial Terms effective
 June 17, 2025; a future manifest revision requires a new acknowledgement.
+This is an install-time acknowledgement only. Written legal acceptance for
+production distribution/support is a separate release record and cannot be
+inferred from installation state.
 
 Generations live outside Agent workspaces and Loom backups in the platform data
 directory (`~/Library/Application Support/CodexLoom/claude-runtime` on macOS;
@@ -35,3 +38,5 @@ Supported preview hosts are macOS 14+ and Ubuntu 22.04+ with glibc, on arm64 or
 x64. Windows, musl Linux, and other platforms report `unsupported` with an
 alternative and perform no download. Production readiness remains false until
 the release's legal acceptance and four-platform real smoke gates are complete.
+The exact result rows and missing-result behavior are defined in
+[claude-runtime-certification.md](claude-runtime-certification.md).

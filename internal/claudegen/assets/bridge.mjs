@@ -293,6 +293,22 @@ function usageFrom(result) {
   }, details: {observedAt: {available: true, value: new Date().toISOString(), source: "canonical_turn_ledger"}, models}};
 }
 
+function certificationOptions(policy) {
+  if (policy == null) return {};
+  if (policy?.purpose !== "real_smoke" || !Array.isArray(policy.allowedTools) || policy.allowedTools.length !== 0
+    || policy.maxTurns !== 1 || !Number.isFinite(policy.maxBudgetUsd) || policy.maxBudgetUsd <= 0 || policy.maxBudgetUsd > 0.05) {
+    throw new Error("Claude certification Turn policy is invalid");
+  }
+  return {
+    tools: [],
+    allowedTools: [],
+    permissionMode: "dontAsk",
+    maxTurns: 1,
+    maxBudgetUsd: policy.maxBudgetUsd,
+    includePartialMessages: true
+  };
+}
+
 function assistantContent(message) {
   const blocks = Array.isArray(message?.message?.content) ? message.message.content : [];
   return blocks.flatMap((block, index) => {
@@ -347,7 +363,8 @@ async function runTurn(frame) {
       env: selectedAuthenticationEnvironment(configuration),
       ...(payload.resume ? {resume: sessionRef} : {sessionId: sessionRef}),
       ...(developer ? {systemPrompt: {type: "preset", preset: "claude_code", append: developer}} : {}),
-      canUseTool: (toolName, input, callbackOptions) => requestPermission(turn, toolName, input, callbackOptions)
+      canUseTool: (toolName, input, callbackOptions) => requestPermission(turn, toolName, input, callbackOptions),
+      ...certificationOptions(payload.certificationPolicy)
     };
 	let releaseInput;
 	const inputReady = new Promise((resolve) => { releaseInput = resolve; });
@@ -387,7 +404,17 @@ async function runTurn(frame) {
 	  if (message?.type === "assistant" && !message.parent_tool_use_id && turn.expectedModel && message.message?.model !== turn.expectedModel) {
 		throw new Error("Claude SDK used a different model than the committed selection");
 	  }
-      const content = message?.type === "assistant" ? assistantContent(message) : message?.type === "user" ? toolResultContent(message) : [];
+	  if (message?.type === "stream_event" && message.event?.type === "content_block_delta"
+		&& message.event?.delta?.type === "text_delta" && message.event.delta.text) {
+		turn.certificationStreamed = true;
+		emit(frame, "content", {
+		  runtimeTurnRef, phase: "delta",
+		  content: {id: `certification-assistant-${message.event.index || 0}`, kind: "assistant_text", text: message.event.delta.text}
+		});
+		continue;
+	  }
+      const content = message?.type === "assistant" && !turn.certificationStreamed
+		? assistantContent(message) : message?.type === "user" ? toolResultContent(message) : [];
       for (const block of content) {
         emit(frame, "content", {runtimeTurnRef, phase: "completed", content: block});
       }

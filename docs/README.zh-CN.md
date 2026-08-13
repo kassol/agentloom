@@ -58,6 +58,9 @@ Troubleshooting 到 Reference 的 Owner 任务路径；本地图继续说明仓�
 |---|---|
 | [Development handbook](handbook.md) | 架构、存储、API、迁移、构建与运维 |
 | [HTTP/SSE API reference](http-api.md) | 当前 REST 与 SSE 路由契约，按领域分组 |
+| [Runtime Contract v2](runtime-contract.md) | Driver／Contract 所有权、typed lifecycle、能力与 conformance |
+| [Claude Runtime generation](claude-runtime-generation.md) | exact managed generation、安装、激活、回滚与 preview host 边界 |
+| [Claude Runtime certification](claude-runtime-certification.md) | shared conformance、real smoke、四平台结果契约与 production gate |
 | [Documentation coverage matrix](documentation-coverage.md) | 代码区域与权威文档的覆盖审计与剩余缺口 |
 | [Model Provider 与模型目录](model-provider.md) | per-Agent Provider 切换与静态模型目录运维 |
 | [Codex app-server protocol](codex-app-server-protocol.md) | 适配器与协议观察记录 |

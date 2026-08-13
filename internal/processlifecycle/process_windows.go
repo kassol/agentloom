@@ -32,6 +32,10 @@ func Alive(pid int) bool {
 	return err == nil && status == uint32(windows.WAIT_TIMEOUT)
 }
 
+// Windows preview support is unavailable; retain a compile-safe leader check
+// for callers that report process cleanup diagnostics.
+func GroupAlive(pid int) bool { return Alive(pid) }
+
 // RequestGracefulStop signals the named event owned by the target CodexLoom
 // process. This avoids emulating Unix signals on Windows.
 func RequestGracefulStop(pid int) error {

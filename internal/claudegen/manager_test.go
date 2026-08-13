@@ -359,7 +359,7 @@ export function query({prompt, options}) {
 	write(map[string]any{"kind": "close"})
 }
 
-func TestEmbeddedBridgeClassifiesTerminalBeforeInterruptReceipt(t *testing.T) {
+func TestEmbeddedBridgeCertificationStreamsBeforeInterruptAndClassifiesTerminal(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node is unavailable")
@@ -381,6 +381,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let interruptRequested = false;
 export function query({prompt, options}) {
   if (JSON.stringify(options.settingSources) !== JSON.stringify(["project","local"])) throw new Error("settingSources not explicit");
+  if (!options.includePartialMessages || JSON.stringify(options.tools) !== "[]" || JSON.stringify(options.allowedTools) !== "[]" || options.maxTurns !== 1 || options.maxBudgetUsd !== 0.05) throw new Error("certification policy not enforced");
   return {
     async accountInfo() { return {apiProvider:"firstParty",apiKeySource:"project"}; },
     async streamInput() {},
@@ -389,6 +390,7 @@ export function query({prompt, options}) {
     async *[Symbol.asyncIterator]() {
       await prompt[Symbol.asyncIterator]().next();
       yield {type:"system", subtype:"init", session_id:options.sessionId};
+      yield {type:"stream_event", uuid:"stream", session_id:options.sessionId, parent_tool_use_id:null, event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:"streamed"}}};
       while (!interruptRequested) await delay(2);
       yield {type:"result", subtype:"error_during_execution", terminal_reason:"aborted_streaming", session_id:options.sessionId, usage:{},num_turns:1,total_cost_usd:0};
     }
@@ -434,12 +436,19 @@ export function query({prompt, options}) {
 	_ = read()
 	session := "11111111-1111-4111-8111-111111111111"
 	configuration := map[string]any{"settingSources": []string{"project", "local"}, "authentication": map[string]any{"category": "console", "source": "api_key"}}
-	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "configuration": configuration, "input": []any{map[string]any{"kind": "text", "role": "user", "text": "work"}}}})
+	policy := map[string]any{"purpose": "real_smoke", "allowedTools": []string{}, "maxTurns": 1, "maxBudgetUsd": 0.05}
+	write(map[string]any{"kind": "command", "command": "start_turn", "requestId": "start", "turnId": "turn", "operation": "op-start", "payload": map[string]any{"sessionRef": session, "cwd": app, "configuration": configuration, "certificationPolicy": policy, "input": []any{map[string]any{"kind": "text", "role": "user", "text": "work"}}}})
 	var runtimeTurnRef any
-	for runtimeTurnRef == nil {
+	sawAssistantDelta := false
+	for runtimeTurnRef == nil || !sawAssistantDelta {
 		frame := read()
 		if frame["kind"] == "response" && frame["operation"] == "op-start" {
 			runtimeTurnRef = frame["data"].(map[string]any)["runtimeTurnRef"]
+		}
+		if frame["kind"] == "event" && frame["event"] == "content" {
+			data := frame["data"].(map[string]any)
+			content := data["content"].(map[string]any)
+			sawAssistantDelta = data["phase"] == "delta" && content["kind"] == "assistant_text" && content["text"] == "streamed"
 		}
 	}
 	write(map[string]any{"kind": "command", "command": "interrupt_turn", "requestId": "interrupt", "turnId": "turn", "operation": "op-interrupt", "payload": map[string]any{"runtimeTurnRef": runtimeTurnRef}})
@@ -658,7 +667,8 @@ func TestStatusReportsUnreadableStateAsBroken(t *testing.T) {
 
 func TestCurrentCompatibilityRowAndSupportedPlatformsAreExact(t *testing.T) {
 	manifest := CurrentManifest()
-	if manifest.NodeVersion != "24.19.0" || manifest.SDKVersion != "0.3.228" || manifest.ClaudeCodeVersion != "2.1.228" || len(manifest.Platforms) != 4 {
+	if manifest.ID != "claude-runtime-v9-node24.19.0-sdk0.3.228" ||
+		manifest.NodeVersion != "24.19.0" || manifest.SDKVersion != "0.3.228" || manifest.ClaudeCodeVersion != "2.1.228" || len(manifest.Platforms) != 4 {
 		t.Fatalf("current manifest = %#v", manifest)
 	}
 	if manifest.BridgeSHA256 == "" || manifest.PackageLockSHA256 == "" || manifest.SDKIntegrity == "" {

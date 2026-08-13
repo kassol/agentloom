@@ -1,0 +1,98 @@
+name: Claude preview smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_install_terms:
+        description: Accept the exact manifest's Anthropic terms for this ephemeral install
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-preview-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Claude preview · ${{ matrix.row }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - row: darwin-arm64
+            os: darwin
+            arch: arm64
+            runner: macos-14-xlarge
+          - row: darwin-x64
+            os: darwin
+            arch: x64
+            runner: macos-14
+          - row: linux-arm64
+            os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - row: linux-x64
+            os: linux
+            arch: x64
+            runner: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run exact-generation no-tool smoke
+        id: smoke
+        continue-on-error: true
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/codexloom-claude-preview
+          CLAUDE_PREVIEW_ANTHROPIC_API_KEY: ${{ secrets.CLAUDE_PREVIEW_ANTHROPIC_API_KEY }}
+          CLAUDE_PREVIEW_INSTALL_EXACT_GENERATION: ${{ inputs.accept_install_terms && '1' || '0' }}
+          CLAUDE_PREVIEW_ACCEPT_INSTALL_TERMS: ${{ inputs.accept_install_terms && '1' || '0' }}
+        run: |
+          sh scripts/run-claude-preview-smoke.sh \
+            '${{ matrix.os }}' '${{ matrix.arch }}' \
+            '${{ runner.temp }}/claude-preview-results/${{ matrix.row }}.json'
+
+      - name: Upload typed row result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: claude-preview-${{ matrix.row }}
+          path: |
+            ${{ runner.temp }}/claude-preview-results/${{ matrix.row }}.json
+            ${{ runner.temp }}/claude-preview-results/${{ matrix.row }}.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Keep missing or failed evidence gated
+        if: always()
+        run: test '${{ steps.smoke.outcome }}' = success
+
+  result-contract:
+    name: Claude preview · four-row result contract
+    if: always()
+    needs: smoke
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download every available row
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: claude-preview-*
+          path: results
+          merge-multiple: true
+
+      - name: Require four passing exact-generation results
+        run: sh scripts/verify-claude-preview-results.sh results

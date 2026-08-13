@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -38,6 +40,11 @@ jobs:
         run: |
           corepack enable
           corepack prepare pnpm@11.1.2 --activate
+
+      - name: Verify formatting, whitespace, and public Runtime dependencies
+        run: |
+          sh -n scripts/verify-release-gates.sh
+          sh scripts/verify-release-gates.sh
 
       # make build is the production path and performs the job's sole frozen install.
       - name: Build production binaries

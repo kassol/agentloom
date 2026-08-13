@@ -9,11 +9,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	gort "runtime"
 	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/claudebridge"
+	"github.com/yan5xu/codex-loom/internal/claudegen"
 	"github.com/yan5xu/codex-loom/internal/hub"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
@@ -263,9 +266,10 @@ func TestMixedRuntimeCoreStorySurvivesRestartWithoutLeakingNativeIdentity(t *tes
 	assertRuntimeNeutralJSON(t, []any{humanRequest, deliveredRequest, finalTopic}, nativePiPathFragment, "native-claude-session-secret", "native-user-", "native-assistant-")
 }
 
-func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *testing.T) {
+func TestCanonicalMixedRuntimeHTTPAndSSEExecuteCodexPiClaudeAcrossRestart(t *testing.T) {
 	paths := configureMixedRuntimeStoryPi(t)
 	codexBin, sessionsDir := configureMixedRuntimeStoryCodex(t)
+	claudeDriver := configureMixedRuntimeStoryClaude(t)
 	t.Setenv("CODEX_LOOM_CODEX_BIN", codexBin)
 	t.Setenv("CODEX_SESSIONS_DIR", sessionsDir)
 	t.Setenv("PINIX_EDGE_NAMES", t.TempDir()+"/missing-edge-names.json")
@@ -275,17 +279,27 @@ func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := hub.Open(st)
+	h, err := hub.OpenWithOptions(st, hub.OpenOptions{RuntimeHostDrivers: map[string]hub.RuntimeHostDriver{"claude": claudeDriver(st)}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	handler := New(h, st, web).Handler()
 	codexAgent := topicRequest(t, handler, http.MethodPost, "/api/agents", map[string]any{"name": "codex-live", "cwd": workDir, "runtimeKind": "codex"}, http.StatusCreated)["agent"].(map[string]any)
 	piAgent := topicRequest(t, handler, http.MethodPost, "/api/agents", map[string]any{"name": "pi-live", "cwd": workDir, "runtimeKind": "pi"}, http.StatusCreated)["agent"].(map[string]any)
-	codexID, piID := codexAgent["id"].(string), piAgent["id"].(string)
+	claudeAgent := topicRequest(t, handler, http.MethodPost, "/api/agents", map[string]any{
+		"name": "claude-live", "cwd": workDir, "runtimeKind": "claude",
+		"runtimeConfiguration": map[string]any{
+			"configured": true, "settingSources": []string{"project"},
+			"authentication": map[string]any{"category": "console", "source": "api_key"},
+		},
+	}, http.StatusCreated)["agent"].(map[string]any)
+	codexID, piID, claudeID := codexAgent["id"].(string), piAgent["id"].(string), claudeAgent["id"].(string)
 	codexStart := topicRequest(t, handler, http.MethodPost, "/api/agents/"+codexID+"/turns", map[string]any{"text": "run the Codex check", "timeoutSec": 2}, http.StatusAccepted)
 	codexTurnID := codexStart["turnId"].(string)
 	waitForMixedRuntimeTerminal(t, handler, codexID, codexTurnID, "interrupted")
+	claudeStart := topicRequest(t, handler, http.MethodPost, "/api/agents/"+claudeID+"/turns", map[string]any{"text": "run the Claude check", "timeoutSec": 2}, http.StatusAccepted)
+	claudeTurnID := claudeStart["turnId"].(string)
+	waitForMixedRuntimeTerminal(t, handler, claudeID, claudeTurnID, "completed")
 
 	piStart := topicRequest(t, handler, http.MethodPost, "/api/agents/"+piID+"/turns", map[string]any{"text": "run the Pi check", "timeoutSec": 2}, http.StatusAccepted)
 	piTurnID := piStart["turnId"].(string)
@@ -320,7 +334,7 @@ func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *test
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	restarted, err := hub.Open(reopened)
+	restarted, err := hub.OpenWithOptions(reopened, hub.OpenOptions{RuntimeHostDrivers: map[string]hub.RuntimeHostDriver{"claude": claudeDriver(reopened)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +348,11 @@ func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *test
 	for _, runtime := range []struct {
 		id, turnID, wantState string
 		wantKinds             []string
-	}{{codexID, codexTurnID, "interrupted", []string{"user_text", "tool_call", "tool_result", "assistant_text"}}, {piID, piTurnID, "completed", []string{"user_text", "assistant_text"}}} {
+	}{
+		{codexID, codexTurnID, "interrupted", []string{"user_text", "tool_call", "tool_result", "assistant_text"}},
+		{piID, piTurnID, "completed", []string{"user_text", "assistant_text"}},
+		{claudeID, claudeTurnID, "completed", []string{"user_text", "assistant_text"}},
+	} {
 		body := storyJSONRequest(t, restartHandler, http.MethodGet, "/api/agents/"+runtime.id+"/thread/history?count=10", nil, http.StatusOK)
 		var history struct {
 			Turns []struct {
@@ -364,7 +382,7 @@ func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *test
 				t.Fatalf("%s history missing %s: %s", runtime.id, kind, body)
 			}
 		}
-		assertRuntimeNeutralJSON(t, json.RawMessage(body), "native-codex-mixed", "native-codex-turn", "/pi/"+piID+"/", "native-user-", "native-assistant-", "Bearer private")
+		assertRuntimeNeutralJSON(t, json.RawMessage(body), "native-codex-mixed", "native-codex-turn", "/pi/"+piID+"/", "native-user-", "native-assistant-", "native-claude-mixed-turn", "native-claude-user", "native-claude-answer", "Bearer private")
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		request := httptest.NewRequest(http.MethodGet, "/api/agents/"+runtime.id+"/thread/events?tail=200", nil).WithContext(ctx)
@@ -373,7 +391,7 @@ func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *test
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"type":"loom/runtime-event"`) {
 			t.Fatalf("%s canonical SSE = %d %s", runtime.id, response.Code, response.Body.String())
 		}
-		assertRuntimeNeutralJSON(t, response.Body.String(), "native-codex-mixed", "native-codex-turn", "/pi/"+piID+"/", `"type":"item/`, `"compatibility":true`)
+		assertRuntimeNeutralJSON(t, response.Body.String(), "native-codex-mixed", "native-codex-turn", "/pi/"+piID+"/", "native-claude-mixed-turn", "native-claude-user", "native-claude-answer", `"type":"item/`, `"compatibility":true`)
 	}
 	storedMessage := topicRequest(t, restartHandler, http.MethodGet, "/api/comms/messages/"+message["id"].(string), nil, http.StatusOK)["message"].(map[string]any)
 	if storedMessage["sourceTurnId"] != piTurnID || storedMessage["deliveredTurnId"] != deliveredCodexTurnID {
@@ -410,7 +428,7 @@ func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	thirdHub, err := hub.Open(thirdStore)
+	thirdHub, err := hub.OpenWithOptions(thirdStore, hub.OpenOptions{RuntimeHostDrivers: map[string]hub.RuntimeHostDriver{"claude": claudeDriver(thirdStore)}})
 	if err != nil {
 		_ = thirdStore.Close()
 		t.Fatal(err)
@@ -422,6 +440,7 @@ func TestCanonicalMixedRuntimeHTTPAndSSEExecuteBothAdaptersAcrossRestart(t *test
 	thirdHandler := New(thirdHub, thirdStore, web).Handler()
 	assertCanonicalReopenPublicSurface(t, thirdHandler, codexID, codexTurnID)
 	assertCanonicalReopenPublicSurface(t, thirdHandler, piID, piTurnID)
+	assertCanonicalReopenPublicSurface(t, thirdHandler, claudeID, claudeTurnID)
 }
 
 func assertCanonicalReopenPublicSurface(t *testing.T, handler http.Handler, agentID, turnID string) {
@@ -432,7 +451,7 @@ func assertCanonicalReopenPublicSurface(t *testing.T, handler http.Handler, agen
 		"/api/turns/" + turnID,
 	} {
 		body := storyJSONRequest(t, handler, http.MethodGet, path, nil, http.StatusOK)
-		assertRuntimeNeutralJSON(t, json.RawMessage(body), "native-codex-mixed", "native-codex-turn", "/private/native/session.jsonl", "sk-mixed-private", `"type":"item/`, `"compatibility":true`)
+		assertRuntimeNeutralJSON(t, json.RawMessage(body), "native-codex-mixed", "native-codex-turn", "native-claude-mixed-turn", "native-claude-user", "native-claude-answer", "/private/native/session.jsonl", "sk-mixed-private", `"type":"item/`, `"compatibility":true`)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -443,7 +462,7 @@ func assertCanonicalReopenPublicSurface(t *testing.T, handler http.Handler, agen
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"type":"loom/runtime-event"`) {
 			t.Fatalf("canonical reopen SSE %s = %d %s", path, response.Code, response.Body.String())
 		}
-		assertRuntimeNeutralJSON(t, response.Body.String(), "native-codex-mixed", "native-codex-turn", "/private/native/session.jsonl", "sk-mixed-private", `"type":"item/`, `"compatibility":true`)
+		assertRuntimeNeutralJSON(t, response.Body.String(), "native-codex-mixed", "native-codex-turn", "native-claude-mixed-turn", "native-claude-user", "native-claude-answer", "/private/native/session.jsonl", "sk-mixed-private", `"type":"item/`, `"compatibility":true`)
 	}
 }
 
@@ -459,6 +478,54 @@ func waitForMixedRuntimeTerminal(t *testing.T, handler http.Handler, agentID, tu
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s Turn %s status %s", agentID, turnID, status)
+}
+
+func configureMixedRuntimeStoryClaude(t *testing.T) func(*store.Store) hub.RuntimeHostDriver {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "claude-mixed-story.sh")
+	hello := fmt.Sprintf(`{"kind":"hello","protocolVersion":1,"bridgeBuild":"claude-bridge-v1","nodeVersion":"24.19.0","sdkVersion":"0.3.228","claudeCodeVersion":"2.1.228","os":%q,"arch":%q,"capabilities":["interrupt","approval","hooks","mcp","session_resume"]}`, gort.GOOS, gort.GOARCH)
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' '` + hello + `'
+IFS= read -r init
+request_id=$(printf '%s' "$init" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p')
+printf '{"kind":"ready","requestId":"%s","capabilities":["interrupt","approval","hooks","mcp","session_resume"]}\n' "$request_id"
+while IFS= read -r line; do
+  [ "$line" = '{"kind":"close"}' ] && exit 0
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p')
+  operation=$(printf '%s' "$line" | sed -n 's/.*"operation":"\([^"]*\)".*/\1/p')
+  turn_id=$(printf '%s' "$line" | sed -n 's/.*"turnId":"\([^"]*\)".*/\1/p')
+  command=$(printf '%s' "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')
+  case "$command" in
+    inspect_configuration)
+      data='{"settingSources":["project"],"authentication":{"category":"console","source":"api_key","validation":"accepted"}}' ;;
+    inspect_model_control)
+      data='{"current":{"provider":"anthropic","id":"default","thinkingLevels":["default"],"defaultThinkingLevel":"default","imageInput":false},"models":[{"provider":"anthropic","id":"default","thinkingLevels":["default"],"defaultThinkingLevel":"default","imageInput":false}],"thinkingLevel":"default"}' ;;
+    resume_binding)
+      printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":{}}\n' "$request_id" "$turn_id" "$operation"
+      printf '{"kind":"event","class":"control","event":"binding_resumed","turnId":"%s","operation":"%s","data":{}}\n' "$turn_id" "$operation"
+      continue ;;
+    start_turn)
+      printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":{"runtimeTurnRef":"native-claude-mixed-turn"}}\n' "$request_id" "$turn_id" "$operation"
+      printf '{"kind":"event","class":"control","event":"turn_started","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-claude-mixed-turn"}}\n' "$turn_id" "$operation"
+      printf '{"kind":"event","class":"control","event":"content","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-claude-mixed-turn","phase":"completed","content":{"id":"native-claude-user","kind":"user_text","text":"run the Claude check"}}}\n' "$turn_id" "$operation"
+      printf '{"kind":"event","class":"control","event":"content","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-claude-mixed-turn","phase":"completed","content":{"id":"native-claude-answer","kind":"assistant_text","text":"Claude checked"}}}\n' "$turn_id" "$operation"
+      printf '{"kind":"event","class":"control","event":"usage","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-claude-mixed-turn","usage":{"inputTokens":{"available":true,"value":5,"source":"claude_agent_sdk"},"cachedInputTokens":{"available":true,"value":0,"source":"claude_agent_sdk"},"outputTokens":{"available":true,"value":2,"source":"claude_agent_sdk"},"reasoningOutputTokens":{"available":false,"source":"claude_agent_sdk"},"totalTokens":{"available":true,"value":7,"source":"claude_agent_sdk"},"calls":{"available":true,"value":1,"source":"claude_agent_sdk"},"costMicros":{"available":true,"value":1,"source":"claude_agent_sdk"}}}}\n' "$turn_id" "$operation"
+      printf '{"kind":"event","class":"control","event":"turn_completed","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-claude-mixed-turn"}}\n' "$turn_id" "$operation"
+      continue ;;
+    *) printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":false,"error":"unsupported"}\n' "$request_id" "$turn_id" "$operation"; continue ;;
+  esac
+  printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":%s}\n' "$request_id" "$turn_id" "$operation" "$data"
+done
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return func(st *store.Store) hub.RuntimeHostDriver {
+		return hub.NewClaudeRuntimeHostDriver(st, claudebridge.DriverOptions{ResolveActive: func(context.Context) (claudebridge.LaunchSpec, error) {
+			return claudebridge.LaunchSpec{NodePath: "/bin/sh", BridgePath: path, Manifest: claudegen.CurrentManifest()}, nil
+		}})
+	}
 }
 
 func configureMixedRuntimeStoryCodex(t *testing.T) (string, string) {

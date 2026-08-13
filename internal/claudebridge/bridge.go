@@ -269,6 +269,15 @@ func (b *Bridge) GenerationID() string {
 	return b.generationID
 }
 
+// ProcessID returns the supervised process-group leader for cleanup
+// certification. It exposes no executable path or command arguments.
+func (b *Bridge) ProcessID() int {
+	if b == nil || b.cmd == nil || b.cmd.Process == nil {
+		return 0
+	}
+	return b.cmd.Process.Pid
+}
+
 func (b *Bridge) handshake(ctx context.Context, manifest claudegen.Manifest) error {
 	raw, err := b.readFrame(ctx)
 	if err != nil {

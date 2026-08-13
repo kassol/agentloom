@@ -41,6 +41,20 @@
    重点确认 `restart required` 不再出现、Agent 数量和 Thread history 正确、managed
    Gateway heartbeat 恢复为 `connected`。
 
+## Claude developer preview 平台结果
+
+Claude Runtime 仍是 developer preview，`productionReady=false`。发布人员必须按
+[Claude Runtime certification](claude-runtime-certification.md) 保存
+`darwin-arm64`、`darwin-x64`、`linux-arm64`、`linux-x64` 四行、同一 commit 和
+exact generation 的 typed smoke result。运行
+`sh scripts/verify-claude-preview-results.sh <results-directory>`；任何 runner
+不可用、credential 缺失、skip、失败或 artifact 缺失都保持 gate 关闭，不能用空 job
+或手工勾选代替。
+
+安装时的 `--accept-terms` 只确认 manifest 对应条款，不等于 production 所需的书面
+legal acceptance。书面记录与四行 smoke evidence 是两个独立 gate；developer preview
+认证不设置 production support。
+
 ## 回滚清单
 
 1. 保留上一次可用的 `bin/` 和 `internal/webui/dist` 产物；不要只覆盖 `bin/codex-hub`。

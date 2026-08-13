@@ -3,47 +3,67 @@ package hub
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	gort "runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/yan5xu/codex-loom/internal/claudebridge"
+	"github.com/yan5xu/codex-loom/internal/claudegen"
 	"github.com/yan5xu/codex-loom/internal/runtimecontract"
 	"github.com/yan5xu/codex-loom/internal/store"
 )
 
 type runtimeConformanceFixture struct {
-	driver               RuntimeHostDriver
-	agentID              string
-	createCwd            string
-	prepareBinding       func(runtimecontract.Binding) runtimecontract.Binding
-	emitAfterStart       func(runtimecontract.Binding, runtimecontract.Outcome)
-	emitAfterStop        func(runtimecontract.Binding, runtimecontract.Outcome)
-	emitAfterReopenStart func(runtimecontract.Binding, runtimecontract.Outcome)
-	emitAfterReopenStop  func(runtimecontract.Binding, runtimecontract.Outcome)
-	expectedUsageTotal   int64
-	maintainContext      func(runtimecontract.ContextMaintenanceCapability, runtimecontract.Binding) runtimecontract.Outcome
-	verifyEffects        func(runtimecontract.Binding, runtimecontract.Outcome)
-	reopen               func(context.Context, AgentHost, runtimecontract.Binding) (RuntimeHostDriver, AgentHost, runtimecontract.Contract, runtimecontract.Outcome)
-	verifyClosed         func(AgentHost)
-	cleanup              func()
+	driver                 RuntimeHostDriver
+	agentID                string
+	createCwd              string
+	prepareBinding         func(runtimecontract.Binding) runtimecontract.Binding
+	emitAfterStart         func(runtimecontract.Binding, runtimecontract.Outcome)
+	emitAfterStop          func(runtimecontract.Binding, runtimecontract.Outcome)
+	emitAfterReopenStart   func(runtimecontract.Binding, runtimecontract.Outcome)
+	emitAfterReopenStop    func(runtimecontract.Binding, runtimecontract.Outcome)
+	expectedUsageTotal     int64
+	historyOmitsRuntimeRef bool
+	maintainContext        func(runtimecontract.ContextMaintenanceCapability, runtimecontract.Binding) runtimecontract.Outcome
+	verifyEffects          func(runtimecontract.Binding, runtimecontract.Outcome)
+	reopen                 func(context.Context, AgentHost, runtimecontract.Binding) (RuntimeHostDriver, AgentHost, runtimecontract.Contract, runtimecontract.Outcome)
+	verifyClosed           func(AgentHost)
+	cleanup                func()
 }
 
-func TestRuntimeContractConformanceCodexPiAndMinimalFake(t *testing.T) {
+func TestRuntimeContractConformanceCodexPiClaudeAndMinimalFake(t *testing.T) {
 	tests := []struct {
 		name string
 		new  func(*testing.T) runtimeConformanceFixture
 	}{
 		{name: "codex", new: newCodexConformanceFixture},
 		{name: "pi", new: newPiConformanceFixture},
+		{name: "claude", new: newClaudeConformanceFixture},
 		{name: "minimal fake", new: newMinimalConformanceFixture},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			runRuntimeContractConformance(t, test.new(t))
 		})
+	}
+}
+
+func TestRuntimeContractCertificationRejectsUnknownAvailableCapability(t *testing.T) {
+	contract := &minimalConformanceContract{}
+	snapshot := contract.CapabilitySnapshot(context.Background(), runtimecontract.Binding{})
+	snapshot.Capabilities = append(snapshot.Capabilities, runtimecontract.CapabilityDescriptor{
+		ID:           "future_private_capability",
+		Availability: runtimecontract.CapabilityAvailable,
+		Revision:     "runtime-contract-v2",
+	})
+	if err := validateRuntimeCapabilityHooks(contract, snapshot); err == nil || !strings.Contains(err.Error(), "without its typed hook") {
+		t.Fatalf("unknown available capability validation = %v", err)
 	}
 }
 
@@ -175,7 +195,11 @@ func runRuntimeContractConformance(t *testing.T, fixture runtimeConformanceFixtu
 	}
 
 historyReady:
-	if observed.RuntimeTurnRef != started.RuntimeTurnRef || !conformanceHistoryMatchesStream(observed.Content, stream) {
+	expectedHistoryRef := started.RuntimeTurnRef
+	if fixture.historyOmitsRuntimeRef {
+		expectedHistoryRef = ""
+	}
+	if observed.RuntimeTurnRef != expectedHistoryRef || !conformanceHistoryMatchesStream(observed.Content, stream) {
 		t.Fatalf("history did not preserve stream correlation/content: turn=%#v stream=%#v", observed, stream)
 	}
 	if fixture.expectedUsageTotal > 0 && conformanceUsageTotal(observed.Usage) != fixture.expectedUsageTotal {
@@ -200,7 +224,7 @@ historyReady:
 		seeder.seedTurnBindings(map[string]string{"turn-conformance": started.RuntimeTurnRef})
 	}
 	reopenedHistory, failure := contract.ReadHistory(ctx, runtimecontract.HistoryRequest{Binding: binding, Count: 10})
-	if failure != nil || reopenedHistory.Validate() != nil || !conformanceHistoryHasTurn(reopenedHistory, "turn-conformance", started.RuntimeTurnRef) {
+	if failure != nil || reopenedHistory.Validate() != nil || !conformanceHistoryHasTurn(reopenedHistory, "turn-conformance", expectedHistoryRef) {
 		t.Fatalf("history after true reopen = %#v, failure=%#v", reopenedHistory, failure)
 	}
 	if descriptor, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilityUsageReporting); ok && descriptor.Availability == runtimecontract.CapabilityAvailable {
@@ -249,7 +273,11 @@ historyReady:
 		t.Fatalf("causal stream after reopen lost predecessor-correlated content/terminal: %#v", causalStream)
 	}
 	causalHistory, failure := contract.ReadHistory(ctx, runtimecontract.HistoryRequest{Binding: binding, Count: 20})
-	causalTurn, causalFound := conformanceHistoryTurn(causalHistory, "turn-after-reopen", causal.RuntimeTurnRef)
+	causalHistoryRef := causal.RuntimeTurnRef
+	if fixture.historyOmitsRuntimeRef {
+		causalHistoryRef = ""
+	}
+	causalTurn, causalFound := conformanceHistoryTurn(causalHistory, "turn-after-reopen", causalHistoryRef)
 	if failure != nil || causalHistory.Validate() != nil || !causalFound {
 		t.Fatalf("causal history after true reopen = %#v, failure=%#v", causalHistory, failure)
 	}
@@ -259,7 +287,7 @@ historyReady:
 	if streamedUsage := conformanceStreamUsage(causalStream); streamedUsage != nil && conformanceUsageTotal(causalTurn.Usage) != conformanceUsageTotal(streamedUsage) {
 		t.Fatalf("causal history usage did not match stream: turn=%#v stream=%#v", causalTurn.Usage, streamedUsage)
 	}
-	if !conformanceHistoryHasTurn(causalHistory, "turn-conformance", started.RuntimeTurnRef) {
+	if !conformanceHistoryHasTurn(causalHistory, "turn-conformance", expectedHistoryRef) {
 		t.Fatalf("causal history overwrote the reopened predecessor: %#v", causalHistory)
 	}
 	certifyMandatoryFailurePhases(t, contract, binding)
@@ -398,6 +426,13 @@ func collectConformanceStream(t *testing.T, events <-chan runtimecontract.Event)
 
 func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contract, binding runtimecontract.Binding, snapshot runtimecontract.CapabilitySnapshot, maintainContext func(runtimecontract.ContextMaintenanceCapability, runtimecontract.Binding) runtimecontract.Outcome) {
 	t.Helper()
+	if descriptor, ok := capabilityDescriptor(snapshot, runtimecontract.CapabilityRuntimeConfiguration); ok && descriptor.Availability == runtimecontract.CapabilityAvailable {
+		contract.(runtimeOwnerConfiguration).SetRuntimeOwnerConfiguration(RuntimeConfiguration{
+			Configured:     true,
+			SettingSources: []string{"project"},
+			Authentication: RuntimeAuthentication{Category: RuntimeAuthConsole, Source: "api_key"},
+		})
+	}
 	for _, descriptor := range snapshot.Capabilities {
 		if descriptor.Availability != runtimecontract.CapabilityAvailable {
 			if descriptor.Reason == "" || descriptor.Alternative == "" {
@@ -412,7 +447,9 @@ func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contrac
 			contract.(runtimeApprovalConfiguration).SetRuntimeApprovalPolicy("on-request")
 			capability := contract.(runtimecontract.ApprovalCapability)
 			capability.SetApprovalHandler(func(proposal runtimecontract.ApprovalProposal) {
-				_ = capability.ResolveApproval(context.Background(), proposal.ID, runtimecontract.ApprovalApprove)
+				go func() {
+					_ = capability.ResolveApproval(context.Background(), proposal.ID, runtimecontract.ApprovalApprove)
+				}()
 			})
 		case runtimecontract.CapabilityResourceInventory:
 			inventory, failure := contract.(runtimecontract.ResourceInventoryCapability).InspectResources(context.Background(), runtimecontract.ResourceInventoryRequest{Binding: binding, Cwd: "/tmp/one"})
@@ -428,6 +465,20 @@ func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contrac
 			state, failure := contract.(runtimecontract.ResourcePolicyCapability).InspectResourcePolicy(context.Background(), runtimecontract.ResourcePolicyRequest{Binding: binding, Cwd: "/tmp/one", DisabledPaths: paths})
 			if failure != nil || state.Validate() != nil || !state.Effective || len(state.DisabledPaths) != 1 || state.DisabledPaths[0] != paths[0] {
 				t.Fatalf("native resource policy = %#v, failure=%v", state, failure)
+			}
+		case runtimecontract.CapabilityRuntimeConfiguration:
+			configuration := RuntimeConfiguration{
+				Configured:     true,
+				SettingSources: []string{"project"},
+				Authentication: RuntimeAuthentication{Category: RuntimeAuthConsole, Source: "api_key"},
+			}
+			contract.(runtimeOwnerConfiguration).SetRuntimeOwnerConfiguration(configuration)
+			evidence, failure := contract.(runtimeOwnerConfigurationInspector).InspectRuntimeOwnerConfiguration(context.Background(), binding, "/tmp/one", configuration)
+			if failure != nil || !slices.Equal(evidence.SettingSources, configuration.SettingSources) ||
+				evidence.Authentication.Category != configuration.Authentication.Category ||
+				evidence.Authentication.Source != configuration.Authentication.Source ||
+				evidence.Authentication.Validation != "accepted" {
+				t.Fatalf("Runtime configuration evidence = %#v, failure=%v", evidence, failure)
 			}
 		case runtimecontract.CapabilityContextDelivery:
 			_ = contract.(runtimecontract.ContextDeliveryPolicy).ContextDeliveryMode()
@@ -474,8 +525,18 @@ func certifyAvailableRuntimeHooks(t *testing.T, contract runtimecontract.Contrac
 				}
 			}
 			selection := RuntimeModelSelection{Provider: model.Provider, Model: model.ID}
-			if _, failure := capability.SelectModel(context.Background(), binding, selection); failure != nil {
+			selected, failure := capability.SelectModel(context.Background(), binding, selection)
+			if failure != nil {
 				t.Fatalf("model switch: %v", failure)
+			}
+			if selected.Current.ImageInput {
+				input, ok := contract.(runtimecontract.InputCapability)
+				if !ok {
+					t.Fatal("image-capable selected model has no typed InputCapability")
+				}
+				if failure := input.ValidateInput(context.Background(), binding, []runtimecontract.InputBlock{{Kind: runtimecontract.InputImage, Ref: "data:image/png;base64,iVBORw0KGgo=", MIMEType: "image/png"}}); failure != nil {
+					t.Fatalf("selected image-capable model rejected typed image input: %#v", failure)
+				}
 			}
 		case runtimecontract.CapabilityManualCompaction:
 			capability := contract.(runtimecontract.ContextMaintenanceCapability)
@@ -704,6 +765,127 @@ func newPiConformanceFixture(t *testing.T) runtimeConformanceFixture {
 		verifyClosed: func(handle AgentHost) {
 			if handle.Alive() {
 				t.Fatal("Pi process remained alive after CloseBinding")
+			}
+		},
+		cleanup: func() { _ = st.Close() },
+	}
+}
+
+func newClaudeConformanceFixture(t *testing.T) runtimeConformanceFixture {
+	t.Helper()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridgePath := filepath.Join(t.TempDir(), "claude-conformance.sh")
+	logPath := filepath.Join(t.TempDir(), "claude-conformance.log")
+	hello := fmt.Sprintf(`{"kind":"hello","protocolVersion":1,"bridgeBuild":"claude-bridge-v1","nodeVersion":"24.19.0","sdkVersion":"0.3.228","claudeCodeVersion":"2.1.228","os":%q,"arch":%q,"capabilities":["interrupt","approval","hooks","mcp","session_resume"]}`, gort.GOOS, gort.GOARCH)
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' '` + hello + `'
+IFS= read -r init
+request_id=$(printf '%s' "$init" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p')
+printf '{"kind":"ready","requestId":"%s","capabilities":["interrupt","approval","hooks","mcp","session_resume"]}\n' "$request_id"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$1"
+  [ "$line" = '{"kind":"close"}' ] && exit 0
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p')
+  operation=$(printf '%s' "$line" | sed -n 's/.*"operation":"\([^"]*\)".*/\1/p')
+  turn_id=$(printf '%s' "$line" | sed -n 's/.*"turnId":"\([^"]*\)".*/\1/p')
+  command=$(printf '%s' "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')
+  case "$command" in
+    inspect_configuration)
+      data='{"settingSources":["project"],"authentication":{"category":"console","source":"api_key","validation":"accepted"}}' ;;
+    inspect_resources)
+      data='{"resources":[{"id":"skill:conformance","name":"conformance","kind":"skill","enabled":true}],"configuration":{"settingSources":["project"],"authentication":{"category":"console","source":"api_key","validation":"accepted"}}}' ;;
+    inspect_model_control|select_model)
+      if printf '%s' "$line" | grep -q '"model":"vision"'; then current='{"provider":"anthropic","id":"vision","thinkingLevels":["default"],"defaultThinkingLevel":"default","imageInput":true}'
+      else current='{"provider":"anthropic","id":"default","thinkingLevels":["default"],"defaultThinkingLevel":"default","imageInput":false}'; fi
+      data="{\"current\":$current,\"models\":[{\"provider\":\"anthropic\",\"id\":\"default\",\"thinkingLevels\":[\"default\"],\"defaultThinkingLevel\":\"default\",\"imageInput\":false},{\"provider\":\"anthropic\",\"id\":\"vision\",\"thinkingLevels\":[\"default\"],\"defaultThinkingLevel\":\"default\",\"imageInput\":true}],\"thinkingLevel\":\"default\"}" ;;
+    resume_binding)
+      data='{}'
+      printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":%s}\n' "$request_id" "$turn_id" "$operation" "$data"
+      printf '{"kind":"event","class":"control","event":"binding_resumed","turnId":"%s","operation":"%s","data":{}}\n' "$turn_id" "$operation"
+      continue ;;
+    start_turn)
+      data='{"runtimeTurnRef":"native-claude-conformance"}'
+      printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":%s}\n' "$request_id" "$turn_id" "$operation" "$data"
+      printf '{"kind":"event","class":"control","event":"turn_started","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-claude-conformance"}}\n' "$turn_id" "$operation"
+      continue ;;
+    continue_turn)
+      data='{}'
+      printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":%s}\n' "$request_id" "$turn_id" "$operation" "$data"
+      printf '{"kind":"event","class":"control","event":"content","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-claude-conformance","phase":"completed","content":{"id":"native-answer","kind":"assistant_text","text":"continued"}}}\n' "$turn_id" "$operation"
+      printf '{"kind":"event","class":"control","event":"usage","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-claude-conformance","usage":{"inputTokens":{"available":true,"value":6,"source":"claude_agent_sdk"},"cachedInputTokens":{"available":true,"value":0,"source":"claude_agent_sdk"},"outputTokens":{"available":true,"value":3,"source":"claude_agent_sdk"},"reasoningOutputTokens":{"available":false,"source":"claude_agent_sdk"},"totalTokens":{"available":true,"value":9,"source":"claude_agent_sdk"},"calls":{"available":true,"value":1,"source":"claude_agent_sdk"},"costMicros":{"available":true,"value":1,"source":"claude_agent_sdk"}}}}\n' "$turn_id" "$operation"
+      printf '{"kind":"event","class":"control","event":"approval","turnId":"%s","operation":"%s","data":{"callbackId":"native-callback","toolCallId":"native-tool","toolName":"Bash","input":{"command":"printf conformance"}}}\n' "$turn_id" "$operation"
+      continue ;;
+    interrupt_turn)
+      data='{}'
+      printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":%s}\n' "$request_id" "$turn_id" "$operation" "$data"
+      printf '{"kind":"event","class":"control","event":"turn_interrupted","turnId":"%s","operation":"%s","data":{"runtimeTurnRef":"native-claude-conformance"}}\n' "$turn_id" "$operation"
+      continue ;;
+    resolve_approval) data='{}' ;;
+    *) printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":false,"error":"unsupported"}\n' "$request_id" "$turn_id" "$operation"; continue ;;
+  esac
+  printf '{"kind":"response","requestId":"%s","turnId":"%s","operation":"%s","accepted":true,"data":%s}\n' "$request_id" "$turn_id" "$operation" "$data"
+done
+`
+	if err := os.WriteFile(bridgePath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	newDriver := func(currentStore *store.Store) *claudeRuntimeHostDriver {
+		manifest := claudegen.CurrentManifest()
+		driver := newClaudeRuntimeHostDriver(currentStore, claudebridge.DriverOptions{ResolveActive: func(context.Context) (claudebridge.LaunchSpec, error) {
+			return claudebridge.LaunchSpec{NodePath: "/bin/sh", BridgePath: bridgePath, Args: []string{logPath}, Manifest: manifest}, nil
+		}})
+		driver.activeGeneration = func() (string, error) { return manifest.ID, nil }
+		return driver
+	}
+	driver := newDriver(st)
+	return runtimeConformanceFixture{
+		driver: driver, agentID: "claude-conformance", expectedUsageTotal: 9, historyOmitsRuntimeRef: true,
+		verifyEffects: func(runtimecontract.Binding, runtimecontract.Outcome) {
+			deadline := time.Now().Add(time.Second)
+			for {
+				logged, readErr := os.ReadFile(logPath)
+				value := string(logged)
+				if readErr == nil && strings.Contains(value, `"command":"resolve_approval"`) {
+					for _, expected := range []string{`"command":"inspect_configuration"`, `"command":"inspect_resources"`, `"command":"select_model"`, `runtime-contract-context-sentinel`, `"decision":"approve"`} {
+						if !strings.Contains(value, expected) {
+							t.Fatalf("Claude capability had no observable bridge effect %q: %s", expected, value)
+						}
+					}
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("Claude Approval effect did not settle: %s, err=%v", logged, readErr)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		},
+		reopen: func(ctx context.Context, handle AgentHost, binding runtimecontract.Binding) (RuntimeHostDriver, AgentHost, runtimecontract.Contract, runtimecontract.Outcome) {
+			persistConformanceBinding(t, st, "claude-conformance", binding)
+			handle.Close()
+			handle.Close()
+			_ = driver.Shutdown(ctx)
+			_ = driver.Shutdown(ctx)
+			_ = st.Close()
+			st = reopenConformanceStore(t, dataDir, "claude-conformance", binding)
+			driver = newDriver(st)
+			newHandle, acquireErr := driver.Acquire(ctx, AgentHostRequest{AgentID: "claude-conformance", Cwd: "/tmp/one"})
+			if acquireErr != nil {
+				return driver, handle, handle.Contract(), conformanceFailure(acquireErr, runtimecontract.FailurePhaseBindingResume)
+			}
+			contract := newHandle.Contract()
+			contract.(runtimeOwnerConfiguration).SetRuntimeOwnerConfiguration(testClaudeRuntimeConfiguration())
+			contract.(runtimeProviderConfiguration).SetRuntimeProvider("anthropic", "vision")
+			contract.(runtimeEffortConfiguration).SetRuntimeEffort("default")
+			return driver, newHandle, contract, contract.ResumeBinding(ctx, binding)
+		},
+		verifyClosed: func(handle AgentHost) {
+			if handle.Alive() {
+				t.Fatal("Claude Bridge remained alive after CloseBinding")
 			}
 		},
 		cleanup: func() { _ = st.Close() },
