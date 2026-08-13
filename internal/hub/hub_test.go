@@ -831,3 +831,35 @@ func TestAgentViewDoesNotAliasLastTurn(t *testing.T) {
 		t.Fatalf("AgentView LastTurn changed through Hub state alias: %#v", view.LastTurn)
 	}
 }
+
+func TestGetAgentDoesNotProjectStaleRolloutAsRestartInterrupted(t *testing.T) {
+	const threadID = "test-thread-stale-rollout"
+	dir := t.TempDir()
+	writeTestRollout(t, dir, threadID, "2000-01-01T00:00:00Z")
+	t.Setenv("CODEX_SESSIONS_DIR", dir)
+
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHub(st)
+	h.agents["agent-1"] = &Agent{
+		ID: "agent-1", Name: "worker", ThreadID: "loom-" + threadID,
+		RuntimeBinding: RuntimeBinding{Kind: "codex", NativeRef: threadID}, Status: "idle",
+		LastTurn: &TurnSummary{TurnID: "turn-completed", Task: "finished work", Status: "completed", CompletedAt: now()},
+	}
+
+	view, err := h.GetAgent("agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != "idle" {
+		t.Fatalf("status = %q, want durable idle status", view.Status)
+	}
+	if view.LastTurn == nil || view.LastTurn.TurnID != "turn-completed" || view.LastTurn.Status != "completed" {
+		t.Fatalf("last Turn = %#v, want durable completed Turn", view.LastTurn)
+	}
+	if _, err := h.ContinueInterruptedTurn("agent-1", time.Second); hubErrorStatus(err) != 409 {
+		t.Fatalf("ContinueInterruptedTurn error = %v, want 409 for non-actionable idle Agent", err)
+	}
+}
