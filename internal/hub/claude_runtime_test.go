@@ -674,6 +674,16 @@ func TestClaudeLegacyEmptyModelUsesSDKDefault(t *testing.T) {
 	}
 }
 
+func TestClaudeExplicitDefaultModelAlsoUsesAnthropicProvider(t *testing.T) {
+	provider, model, effort := "", "default", runtimecontract.ThinkingLevelDefault
+	if !defaultClaudeModelConfiguration("claude", &provider, &model, &effort) {
+		t.Fatal("explicit Claude default model was not normalized")
+	}
+	if provider != "anthropic" || model != "default" || effort != runtimecontract.ThinkingLevelDefault {
+		t.Fatalf("explicit Claude defaults = provider %q model %q effort %q", provider, model, effort)
+	}
+}
+
 func TestOpenMigratesLegacyClaudeModelToSDKDefault(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

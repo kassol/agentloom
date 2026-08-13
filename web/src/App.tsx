@@ -476,7 +476,7 @@ function AgentTabs({
 					<dt className="text-muted-foreground">Workspace</dt><dd className="min-w-0 truncate font-mono" title={agent.cwd}>{agent.cwd}</dd>
 					{agent.sourceCwd ? <><dt className="text-muted-foreground">Source</dt><dd className="min-w-0 truncate font-mono" title={agent.sourceCwd}>{agent.sourceCwd}</dd></> : null}
                     <dt className="text-muted-foreground">Thread</dt><dd className="min-w-0 truncate font-mono" title={agent.threadId || undefined}>{agent.threadId || "Not started"}</dd>
-                    <dt className="text-muted-foreground">Provider</dt><dd className="font-mono">{agent.providerId || "openai"}</dd>
+                    <dt className="text-muted-foreground">Provider</dt><dd className="font-mono">{agent.providerId || (agent.runtimeBinding.kind === "claude" ? "anthropic" : agent.runtimeBinding.kind === "codex" ? "openai" : "Runtime default")}</dd>
                     <dt className="text-muted-foreground">Model</dt><dd className="font-mono">{agent.model || "Default"}</dd>
                     <dt className="text-muted-foreground">Reasoning</dt><dd className="font-mono">{agent.effort === "xhigh" ? "Extra high" : agent.effort || "Default"}</dd>
                     <dt className="text-muted-foreground">Sandbox</dt><dd className="font-mono">{agent.sandbox || "danger-full-access"}</dd>

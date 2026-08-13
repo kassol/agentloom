@@ -10,7 +10,7 @@ expected_os=$1
 expected_arch=$2
 result=$3
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-generation=claude-runtime-v14-node24.19.0-sdk0.3.228
+generation=claude-runtime-v16-node24.19.0-sdk0.3.228
 case "$(uname -s)" in
   Darwin) actual_os=darwin ;;
   Linux) actual_os=linux ;;

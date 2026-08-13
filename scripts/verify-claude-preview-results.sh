@@ -8,7 +8,7 @@ fi
 
 directory=$1
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-generation=claude-runtime-v14-node24.19.0-sdk0.3.228
+generation=claude-runtime-v16-node24.19.0-sdk0.3.228
 expected_commit=$(git -C "$root" rev-parse HEAD)
 missing=0
 verified_commit=

@@ -234,14 +234,21 @@ const generationImageModels = new Set([
 
 function modelDescriptor(raw) {
   const levels = ["default", ...(raw?.supportsEffort && Array.isArray(raw.supportedEffortLevels) ? raw.supportedEffortLevels : [])];
+	const resolvedModel = typeof raw?.resolvedModel === "string" ? raw.resolvedModel.replace(/\[[^\]]+\]$/, "") : "";
   return {
     provider: "anthropic", id: String(raw?.value || ""), displayName: String(raw?.displayName || raw?.value || ""),
     reasoning: Boolean(raw?.supportsAdaptiveThinking || raw?.supportsEffort), thinkingLevels: [...new Set(levels)],
-    defaultThinkingLevel: "default", imageInput: typeof raw?.resolvedModel === "string" && generationImageModels.has(raw.resolvedModel)
+    defaultThinkingLevel: "default", imageInput: generationImageModels.has(resolvedModel)
   };
 }
 
-const modelCatalog = (raw) => [{provider: "anthropic", id: "default", displayName: "SDK default", reasoning: true, thinkingLevels: ["default"], defaultThinkingLevel: "default", imageInput: false}, ...(Array.isArray(raw) ? raw : []).map(modelDescriptor).filter((model) => model.id)];
+function modelCatalog(raw) {
+  const models = (Array.isArray(raw) ? raw : []).map(modelDescriptor).filter((model) => model.id);
+  if (!models.some((model) => model.id === "default")) {
+    models.unshift({provider: "anthropic", id: "default", displayName: "SDK default", reasoning: true, thinkingLevels: ["default"], defaultThinkingLevel: "default", imageInput: false});
+  }
+  return models;
+}
 
 function modelState(models, requested) {
   const current = models.find((model) => model.provider === requested.provider && model.id === requested.model);

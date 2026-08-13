@@ -650,11 +650,23 @@ func validEffort(effort string) bool {
 }
 
 func defaultClaudeModelConfiguration(kind string, provider, model, effort *string) bool {
-	if kind != "claude" || strings.TrimSpace(*model) != "" {
+	if kind != "claude" {
 		return false
 	}
-	*provider, *model, *effort = "anthropic", "default", runtimecontract.ThinkingLevelDefault
-	return true
+	changed := false
+	if strings.TrimSpace(*provider) == "" {
+		*provider = "anthropic"
+		changed = true
+	}
+	if strings.TrimSpace(*model) == "" {
+		*model = "default"
+		changed = true
+	}
+	if strings.TrimSpace(*effort) == "" {
+		*effort = runtimecontract.ThinkingLevelDefault
+		changed = true
+	}
+	return changed
 }
 
 func validateModelEffort(providerID, model, effort string) error {

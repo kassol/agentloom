@@ -292,11 +292,18 @@ describe("AgentPane", () => {
 	  processAlive: false,
       capabilitySnapshot: capabilitySnapshot("approval_policy", "model_configuration", "context_delivery", "goal"),
     };
+	piAgent.capabilitySnapshot.capabilities.push({
+	  id: "runtime_configuration", availability: "unavailable", reason: "not exposed", alternative: "use native settings", revision: "test", scope: testScope,
+	});
+	piAgent.capabilitySnapshot.capabilities.push({
+	  id: "image_input", availability: "unavailable", reason: "text only", alternative: "select another model", revision: "test", scope: testScope,
+	});
     const view = render(<AgentPane {...props} agent={piAgent} onError={onError} active configRequestNonce={1} />);
 
     expect(view.getByText("Runtime capabilities")).toBeInTheDocument();
     expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Checked on start");
-    expect(view.getByText("History").nextElementSibling).toHaveTextContent("Available");
+	expect(view.queryByText("History")).toBeNull();
+	expect(view.getByText("Runtime configuration").nextElementSibling).toHaveTextContent("Unavailable");
     expect(view.getByText("Goal support").nextElementSibling).toHaveTextContent("Available");
     expect(view.getByDisplayValue("agent-scroll")).toBeEnabled();
 	expect(view.queryByText("Provider configuration")).toBeNull();
@@ -407,7 +414,7 @@ describe("AgentPane", () => {
 	expect(await view.findByText("snapshot revision-1")).toBeInTheDocument();
 	view.rerender(<AgentPane {...props} agent={{
 	  ...before,
-	  capabilitySnapshot: { revision: "revision-2", capabilities: [] },
+	  capabilitySnapshot: { revision: "revision-2", capabilities: [{ id: "image_input", availability: "unavailable", reason: "text only", alternative: "select another model", revision: "test", scope: testScope }] },
 	}} active configRequestNonce={1} />);
 	expect(view.getByText("snapshot revision-2")).toBeInTheDocument();
 	expect(view.getByText("Image input").nextElementSibling).toHaveTextContent("Unavailable");

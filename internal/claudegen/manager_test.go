@@ -194,7 +194,7 @@ export function query({prompt, options}) {
 	async accountInfo() { return {apiProvider:"firstParty",apiKeySource:"project",email:"must-not-escape@example.com"}; },
 		async reloadSkills() { return {skills:[{name:"ship",description:"skill",argumentHint:""}]}; },
 		async reloadPlugins() { return {commands:[{name:"ship",description:"skill",argumentHint:""},{name:"review",description:"command",argumentHint:""}],agents:[],plugins:[{name:"safe-plugin",path:"/private/native/plugin"}],mcpServers:[{name:"safe-mcp",status:"connected",config:{command:"secret-helper",args:["--token","secret"]}}],error_count:0}; },
-	async supportedModels() { return [{value:"sonnet",resolvedModel:"claude-sonnet-4-6",displayName:"Sonnet",supportsEffort:true,supportedEffortLevels:["low","high"],supportsAdaptiveThinking:true},{value:"legacy",resolvedModel:"claude-3-7-sonnet-20250219",displayName:"Legacy"},{value:"unknown",displayName:"Unknown"}]; },
+	async supportedModels() { return [{value:"default",resolvedModel:"claude-opus-5[1m]",displayName:"Default",supportsEffort:true,supportedEffortLevels:["low","high"],supportsAdaptiveThinking:true},{value:"sonnet",resolvedModel:"claude-sonnet-4-6",displayName:"Sonnet",supportsEffort:true,supportedEffortLevels:["low","high"],supportsAdaptiveThinking:true},{value:"legacy",resolvedModel:"claude-3-7-sonnet-20250219",displayName:"Legacy"},{value:"unknown",displayName:"Unknown"}]; },
 	async setModel(model) { selectedModel = model; },
 	async applyFlagSettings(settings) { selectedEffort = settings.effortLevel; },
     async streamInput(stream) { for await (const message of stream) queued.push(message); },
@@ -273,7 +273,7 @@ export function query({prompt, options}) {
 	inspected := read()
 	state := inspected["data"].(map[string]any)
 	catalogModels := state["models"].([]any)
-	if state["thinkingLevel"] != "default" || catalogModels[0].(map[string]any)["id"] != "default" || catalogModels[0].(map[string]any)["imageInput"] != false || catalogModels[1].(map[string]any)["imageInput"] != true || catalogModels[2].(map[string]any)["imageInput"] != true || catalogModels[3].(map[string]any)["imageInput"] != false {
+	if state["thinkingLevel"] != "default" || len(catalogModels) != 4 || catalogModels[0].(map[string]any)["id"] != "default" || catalogModels[0].(map[string]any)["imageInput"] != true || catalogModels[1].(map[string]any)["imageInput"] != true || catalogModels[2].(map[string]any)["imageInput"] != true || catalogModels[3].(map[string]any)["imageInput"] != false {
 		t.Fatalf("generation model evidence = %#v", state)
 	}
 	write(map[string]any{"kind": "command", "command": "select_model", "requestId": "select", "operation": "op-select", "payload": map[string]any{"sessionRef": "11111111-1111-4111-8111-111111111111", "cwd": app, "current": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "default"}, "selection": map[string]any{"provider": "anthropic", "model": "sonnet", "thinkingLevel": "high"}, "configuration": configuration}})
@@ -943,7 +943,7 @@ func TestStatusReportsUnreadableStateAsBroken(t *testing.T) {
 
 func TestCurrentCompatibilityRowAndSupportedPlatformsAreExact(t *testing.T) {
 	manifest := CurrentManifest()
-	if manifest.ID != "claude-runtime-v14-node24.19.0-sdk0.3.228" ||
+	if manifest.ID != "claude-runtime-v16-node24.19.0-sdk0.3.228" ||
 		manifest.NodeVersion != "24.19.0" || manifest.SDKVersion != "0.3.228" || manifest.ClaudeCodeVersion != "2.1.228" || len(manifest.Platforms) != 4 {
 		t.Fatalf("current manifest = %#v", manifest)
 	}

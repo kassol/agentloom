@@ -20,6 +20,28 @@ function capabilityAvailable(agent: Agent, id: string) {
   return agent.capabilitySnapshot.capabilities.some((capability) => capability.id === id && capability.availability === "available");
 }
 
+const capabilityLabels: Record<string, string> = {
+  sandbox_configuration: "Sandbox configuration",
+  approval_policy: "Approval policy",
+  resource_inventory: "Resource inventory",
+  resource_policy: "Resource policy",
+  runtime_configuration: "Runtime configuration",
+  context_delivery: "Context delivery",
+  native_rename: "Native rename",
+  native_archive: "Native archive",
+  goal: "Goal support",
+  remote: "Remote",
+  usage_reporting: "Usage reporting",
+  model_configuration: "Model configuration",
+  manual_compaction: "Manual compaction",
+  image_input: "Image input",
+};
+
+function defaultRuntimeProvider(agent: Agent) {
+  if (agent.providerId) return agent.providerId;
+  return agent.runtimeBinding.kind === "claude" ? "anthropic" : agent.runtimeBinding.kind === "codex" ? "openai" : "";
+}
+
 function readableRuntimeError(value: string) {
   const trimmed = value.trim();
   if (!trimmed.startsWith("{")) return trimmed;
@@ -125,7 +147,7 @@ export function AgentPane({
   const [configOpen, setConfigOpen] = useState(false);
   const [configSection, setConfigSection] = useState<"profile" | "team" | "external" | "triggers" | "runtime" | "context" | "resources" | "usage">("profile");
   const [nameDraft, setNameDraft] = useState(agent.name);
-  const [providerDraft, setProviderDraft] = useState(agent.providerId || "openai");
+  const [providerDraft, setProviderDraft] = useState(defaultRuntimeProvider(agent));
   const [modelDraft, setModelDraft] = useState(agent.model || "");
 	const [runtimeModels, setRuntimeModels] = useState<RuntimeModel[]>([]);
 	const [runtimeModelCurrent, setRuntimeModelCurrent] = useState<RuntimeModel | null>(null);
@@ -136,6 +158,7 @@ export function AgentPane({
   const [savingConfig, setSavingConfig] = useState(false);
 	const [savingRuntimeModel, setSavingRuntimeModel] = useState(false);
 	const [runtimeModelSaveStatus, setRuntimeModelSaveStatus] = useState<"" | "saved" | "failed">("");
+	const [runtimeModelLoadError, setRuntimeModelLoadError] = useState("");
   const [runtimeConfiguration, setRuntimeConfiguration] = useState<RuntimeConfigurationView | null>(null);
   const [runtimeConfigurationDraft, setRuntimeConfigurationDraft] = useState<RuntimeOwnerConfiguration | null>(null);
   const [savingRuntimeConfiguration, setSavingRuntimeConfiguration] = useState(false);
@@ -290,7 +313,7 @@ export function AgentPane({
 
   useEffect(() => {
     setNameDraft(agent.name);
-    setProviderDraft(agent.providerId || "openai");
+    setProviderDraft(defaultRuntimeProvider(agent));
     setModelDraft(agent.model || "");
     setEffortDraft(agent.effort || "");
     setSandboxDraft(agent.sandbox || "danger-full-access");
@@ -341,6 +364,7 @@ export function AgentPane({
 	  api("GET", `/api/agents/${agent.id}/runtime/models`)
 		.then((data) => {
 		  if (cancelled) return;
+		  setRuntimeModelLoadError("");
 		  const current = data.current as RuntimeModel;
 		  setRuntimeModels((data.models || []) as RuntimeModel[]);
 		  setRuntimeModelCurrent(current);
@@ -349,10 +373,11 @@ export function AgentPane({
 		  setModelDraft(current.id);
 		  setEffortDraft(data.thinkingLevel ?? "");
 		})
-		.catch(() => {
+		.catch((error: Error) => {
 		  if (cancelled) return;
 		  setRuntimeModels([]);
 		  setRuntimeModelCurrent(null);
+		  setRuntimeModelLoadError(error.message);
 		});
 	  return () => { cancelled = true; };
 	}, [configOpen, configSection, agent.id, modelConfigurationAvailable, agent.capabilitySnapshot.revision]);
@@ -1218,18 +1243,13 @@ export function AgentPane({
 					<div className="mb-1.5 text-[10px] font-semibold uppercase text-muted-foreground">Runtime capabilities</div>
 					{agent.capabilitySnapshot.revision ? <div className="mb-1.5 font-mono text-[9px] text-muted-foreground">snapshot {agent.capabilitySnapshot.revision}</div> : null}
 					<div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10.5px]">
-					  {([
-						["Image input", imageInputAvailable],
-						["History", true],
-						["Goal support", goalAvailable],
-						["Native archive", nativeArchiveAvailable],
-						["Remote", remoteAvailable],
-						["Usage reporting", usageAvailable],
-						["Sandbox configuration", sandboxConfigurationAvailable],
-						["Manual compaction", compactionAvailable],
-					  ] as Array<[string, boolean]>).map(([label, available]) => (
-						<div key={label} className="flex items-center justify-between gap-2"><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{label === "Image input" && runtimeModelIdentityChanged ? `${available ? "Available" : "Unavailable"} after Save` : available ? "Available" : label === "Image input" && !agent.processAlive ? "Checked on start" : "Unavailable"}</span></div>
-					  ))}
+					  {agent.capabilitySnapshot.capabilities.map((capability) => {
+						const label = capabilityLabels[capability.id] || capability.id;
+						const available = capability.id === "image_input" && runtimeModelIdentityChanged ? imageInputAvailable : capability.availability === "available";
+						const state = capability.id === "image_input" && runtimeModelIdentityChanged ? `${available ? "Available" : "Unavailable"} after Save` : available ? "Available" : capability.id === "image_input" && !agent.processAlive ? "Checked on start" : "Unavailable";
+						const detail = [capability.reason, capability.alternative && `Alternative: ${capability.alternative}`].filter(Boolean).join(" · ");
+						return <div key={capability.id} className="flex items-center justify-between gap-2" title={detail || undefined}><span>{label}</span><span className={`font-mono text-[9px] ${available ? "text-success" : "text-muted-foreground"}`}>{state}</span></div>;
+					  })}
 					</div>
 					{agent.contextMaintenance ? <div className={`mt-2 rounded-sm px-2 py-1.5 text-[10.5px] ${agent.contextMaintenance.state === "completed" ? "bg-success/10 text-success" : agent.contextMaintenance.state === "started" ? "bg-warning/10 text-warning" : "bg-destructive/10 text-destructive"}`}>
 					  Context maintenance {agent.contextMaintenance.state}{agent.contextMaintenance.error ? ` · ${readableRuntimeError(agent.contextMaintenance.error)}` : ""}
@@ -1349,6 +1369,7 @@ export function AgentPane({
 					<span className={`text-[11px] ${runtimeModelSaveStatus === "failed" ? "text-destructive" : "text-muted-foreground"}`}>{runtimeModelSaveStatus === "saved" ? "Runtime model saved." : runtimeModelSaveStatus === "failed" ? "Runtime model save failed; Agent config was not changed." : "Model selection is saved independently from Agent config."}</span>
 					<button onClick={saveRuntimeModel} disabled={running || savingRuntimeModel || !runtimeModelChanged || !pendingModelSelectionValid || pendingImageConflict} className="shrink-0 rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-60">{savingRuntimeModel ? "Saving Runtime Model" : "Save Runtime Model"}</button>
 				  </div>}
+				  {runtimeModelLoadError ? <div className="mb-3 rounded-md bg-destructive/10 px-2 py-1.5 text-[11px] text-destructive">Model controls unavailable: {readableRuntimeError(runtimeModelLoadError)}</div> : null}
                   <label className="mb-2 block">
                     <span className="mb-1 block text-[11px] text-muted-foreground">Sandbox</span>
                     <select value={sandboxDraft} onChange={(e) => setSandboxDraft(e.target.value)} disabled={running || !sandboxConfigurationAvailable} className="h-8 w-full rounded-md bg-background px-2.5 font-mono text-[12px] outline-none ring-1 ring-border transition focus:ring-ring/25 disabled:opacity-60">
