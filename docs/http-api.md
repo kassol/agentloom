@@ -195,6 +195,18 @@ Runtime-native Turn ID 或 Session/rollout path。
 | GET | `/api/topics/{id}/artifacts` | List Topic artifacts |
 | GET | `/api/topics/{id}/artifacts/{artifactId}` | Download/preview Topic artifact |
 
+## Host Files
+
+只读 Host 文件访问，路径必须是绝对路径。所有端点受允许根围栏约束：允许根 =
+每个 Agent 的工作目录（`cwd`）+ Loom data directory，按请求实时收集；请求路径与
+允许根都会先解析符号链接再做包含判定，越界返回 403 `path_not_allowed`。
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/files` | 无 `path` 参数返回允许根列表（`kind:"roots"`）；带 `path` 返回文件 stat 或目录列表 |
+| GET | `/api/files/preview` | 限长文本预览，`maxBytes` 默认 256KB、上限 1MB |
+| GET | `/api/files/content` | 完整内容；`preview=1` 时 audio/video inline 播放，SVG 强制 attachment |
+
 ## Triggers
 
 | Method | Path | Purpose |

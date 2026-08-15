@@ -124,6 +124,7 @@ func (s *Server) Handler() http.Handler {
 	s.registerOrganizationRoutes(mux)
 	s.registerTriggerRoutes(mux)
 	s.registerTopicRoutes(mux)
+	s.registerFileRoutes(mux)
 
 	mux.HandleFunc("/", s.serveWeb)
 

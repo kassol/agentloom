@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUpRight, BarChart3, CalendarClock, Check, ChevronRight, CircleHelp, Copy, FileText, GitBranch, Inbox, Loader2, MessageSquare, Network, Paperclip, Pause, Pencil, Play, Plus, RadioTower, RefreshCw, RotateCcw, Send, SkipForward, Square, Target, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUpRight, BarChart3, CalendarClock, Check, ChevronRight, CircleHelp, Copy, FileText, FolderOpen, GitBranch, Inbox, Loader2, MessageSquare, Network, Paperclip, Pause, Pencil, Play, Plus, RadioTower, RefreshCw, RotateCcw, Send, SkipForward, Square, Target, Trash2, X } from "lucide-react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
@@ -104,6 +104,7 @@ export function AgentPane({
   onHumanRequestChanged,
   onPendingWorkChanged,
   onOpenUsage,
+  onOpenHostFile,
   onTrackTopic,
   onError,
   onAgentUpdated,
@@ -118,6 +119,7 @@ export function AgentPane({
   onHumanRequestChanged: () => Promise<unknown> | void;
   onPendingWorkChanged: () => Promise<unknown> | void;
   onOpenUsage: (agentID: string) => void;
+  onOpenHostFile?: (path: string) => void;
   onTrackTopic: () => void;
   onError: (msg: string) => void;
   onAgentUpdated: (agent: Agent) => void;
@@ -1320,6 +1322,18 @@ export function AgentPane({
                         {cwdCopyStatus === "copied" ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
                         <span aria-live="polite">{cwdCopyLabel}</span>
                       </button>
+                      {onOpenHostFile ? (
+                        <button
+                          type="button"
+                          onClick={() => onOpenHostFile(agent.cwd)}
+                          aria-label="Browse the working directory in Host files"
+                          title="Browse the working directory in Host files"
+                          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                        >
+                          <FolderOpen className="size-3.5" />
+                          Browse
+                        </button>
+                      ) : null}
                     </div>
                     <div className="mt-1 text-[10px] leading-4 text-muted-foreground">Codex reads project context such as AGENTS.md from this long-lived directory. Read only.</div>
                   </div>
@@ -1620,7 +1634,7 @@ export function AgentPane({
                         </button>
                       </div>
                     ) : (
-                      <BlockView block={row.block} />
+                      <BlockView block={row.block} onOpenHostFile={onOpenHostFile} />
                     )}
                   </div>
                 );
