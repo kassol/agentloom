@@ -9,7 +9,7 @@ operations contract.
 - Windows 11 22H2 or newer on x86-64.
 - PowerShell 7 or Windows PowerShell 5.1.
 - Go 1.25, as pinned by `go.mod`.
-- Node.js 22 and pnpm 11.1.2, pinned by `web/package.json`.
+- Node.js 22 and pnpm 11.21.0, pinned by `web/package.json`.
 - Git for Windows.
 - `codex` in `PATH`, plus Pi 0.84.1 or newer in `PATH` (or `PI_BIN`).
 

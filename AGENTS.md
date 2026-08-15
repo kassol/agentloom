@@ -58,7 +58,7 @@ attacker who already controls the local Owner account?
 
 ## Frontend package manager
 
-The WebUI uses pnpm 11.1.2, pinned by the `packageManager` field in
+The WebUI uses pnpm 11.21.0, pinned by the `packageManager` field in
 `web/package.json`. Use `web/pnpm-lock.yaml` as the only frontend lockfile and
 install dependencies with `pnpm --dir web install --frozen-lockfile`.
 
