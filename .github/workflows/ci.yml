@@ -39,7 +39,7 @@ jobs:
       - name: Enable pinned pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.2 --activate
+          corepack prepare pnpm@11.21.0 --activate
 
       - name: Verify formatting, whitespace, and public Runtime dependencies
         run: |
@@ -99,7 +99,7 @@ jobs:
         shell: pwsh
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.2 --activate
+          corepack prepare pnpm@11.21.0 --activate
 
       - name: Install and build WebUI
         shell: pwsh
